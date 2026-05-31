@@ -1,0 +1,37 @@
+# 复制为 configs/run.yaml，然后按需修改。
+
+# full: OCR 提取原文字幕后立刻翻译
+# extract: 只提取原文字幕
+# translate: 只翻译已有 source_srt
+mode: full
+
+input_video: "E:/Videos/demo.mp4"
+source_srt: "outputs/demo/source.srt"
+output_dir: "outputs/demo"
+
+source_language: "korean"
+target_language: "简体中文"
+glossary: "configs/glossary.example.yaml"
+
+ocr:
+  # auto: 有 GPU 版 Paddle 就用 GPU，否则用 CPU
+  # cpu / gpu / gpu:0: 手动指定
+  device: "auto"
+  sample_fps: 3.0
+  bottom_ratio: 0.42
+  scan_full_frame: false
+
+translation:
+  provider: "volcengine"
+  batch_size: 40
+  # 不建议把 API Key 写在这里。放到 .env 的 ARK_API_KEY。
+  model: null
+  base_url: null
+
+sidecar:
+  enabled: true
+  copy_source: true
+  copy_translated: true
+  # 输出到视频同级目录，例如 demo.source.srt 和 demo.zh.srt。
+  source_suffix: ".source"
+  translated_suffix: ".zh"

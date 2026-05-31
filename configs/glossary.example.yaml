@@ -1,0 +1,19 @@
+program:
+  source: "런닝맨"
+  zh: "Running Man"
+  type: "show_title"
+
+characters:
+  - source: "유재석"
+    zh: "刘在石"
+    aliases: ["재석", "유느님"]
+    type: "person"
+  - source: "김종국"
+    zh: "金钟国"
+    aliases: ["종국"]
+    type: "person"
+
+terms:
+  - source: "막내"
+    zh: "老幺"
+    note: "综艺语境，不要翻成最小的孩子。"

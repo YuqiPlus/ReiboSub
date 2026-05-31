@@ -1,0 +1,27 @@
+[project]
+name = "video-translate"
+version = "0.1.0"
+description = "Extract hard subtitles from videos, filter overlay noise, and prepare translated subtitle files."
+requires-python = ">=3.10"
+dependencies = [
+    "opencv-python>=4.8",
+    "paddleocr>=2.7",
+    "paddlepaddle>=2.6",
+    "pyyaml>=6.0",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+video-translate = "video_translate.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["video_translate*"]
