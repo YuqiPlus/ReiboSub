@@ -1,0 +1,107 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from video_translate.pipeline import extract_subtitles_from_video
+from video_translate.subtitle.sidecar import SidecarConfig, copy_sidecar_subtitles
+from video_translate.translate.volcengine import translate_srt_with_volcengine
+
+
+def run_config(config_path: Path) -> None:
+    config = _load_yaml(config_path)
+    root = config_path.resolve().parent.parent
+
+    mode = str(config.get("mode", "full")).lower()
+    output_dir = _resolve_path(root, config.get("output_dir", "outputs/demo"))
+    source_srt = _resolve_path(root, config.get("source_srt", output_dir / "source.srt"))
+    glossary = _optional_path(root, config.get("glossary"))
+    target_language = str(config.get("target_language", "简体中文"))
+    input_video: Path | None = None
+
+    if mode in {"full", "extract"}:
+        input_video = _resolve_path(root, config["input_video"])
+        ocr = config.get("ocr", {}) or {}
+        source_language = str(config.get("source_language", "korean"))
+        outputs = extract_subtitles_from_video(
+            input_video,
+            output_dir,
+            lang=source_language,
+            sample_fps=float(ocr.get("sample_fps", 3.0)),
+            bottom_ratio=float(ocr.get("bottom_ratio", 0.42)),
+            scan_full_frame=bool(ocr.get("scan_full_frame", False)),
+            device=str(ocr.get("device", "auto")),
+        )
+        source_srt = outputs["source_srt"]
+        print(f"source_srt: {source_srt}")
+
+    if mode in {"full", "translate"}:
+        translation = config.get("translation", {}) or {}
+        provider = str(translation.get("provider", "volcengine")).lower()
+        if provider != "volcengine":
+            raise ValueError(f"暂不支持翻译 provider: {provider}")
+        zh_srt = output_dir / "zh.srt"
+        translate_srt_with_volcengine(
+            source_srt,
+            zh_srt,
+            glossary_path=glossary,
+            batch_size=int(translation.get("batch_size", 40)),
+            model=translation.get("model"),
+            base_url=translation.get("base_url"),
+            target_language=target_language,
+        )
+        print(f"zh_srt: {zh_srt}")
+    else:
+        zh_srt = None
+
+    if mode not in {"full", "extract", "translate"}:
+        raise ValueError(f"未知 mode: {mode}")
+
+    sidecar = _sidecar_config(config.get("sidecar", {}) or {})
+    if sidecar.enabled:
+        if input_video is None:
+            input_video = _optional_path(root, config.get("input_video"))
+        if input_video is None:
+            raise ValueError("sidecar.enabled=true 时需要配置 input_video。")
+        copied = copy_sidecar_subtitles(
+            input_video,
+            source_srt=source_srt,
+            translated_srt=zh_srt,
+            config=sidecar,
+        )
+        for name, path in copied.items():
+            print(f"{name}: {path}")
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    import yaml
+
+    if not path.exists():
+        raise FileNotFoundError(f"配置文件不存在: {path}")
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"配置文件必须是 YAML 对象: {path}")
+    return data
+
+
+def _resolve_path(root: Path, value: Any) -> Path:
+    path = Path(str(value)).expanduser()
+    if path.is_absolute():
+        return path
+    return root / path
+
+
+def _optional_path(root: Path, value: Any) -> Path | None:
+    if value in {None, ""}:
+        return None
+    return _resolve_path(root, value)
+
+
+def _sidecar_config(raw: dict[str, Any]) -> SidecarConfig:
+    return SidecarConfig(
+        enabled=bool(raw.get("enabled", False)),
+        copy_source=bool(raw.get("copy_source", True)),
+        copy_translated=bool(raw.get("copy_translated", True)),
+        source_suffix=str(raw.get("source_suffix", ".source")),
+        translated_suffix=str(raw.get("translated_suffix", ".zh")),
+    )
