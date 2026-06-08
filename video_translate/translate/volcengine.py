@@ -26,6 +26,7 @@ def translate_srt_with_volcengine(
     api_key: str | None = None,
     base_url: str | None = None,
     target_language: str = "简体中文",
+    ignored_texts: list[str] | None = None,
 ) -> Path:
     _load_dotenv(source_srt)
     key = api_key or os.environ.get("ARK_API_KEY")
@@ -48,6 +49,7 @@ def translate_srt_with_volcengine(
             glossary.to_context([cue.text for cue in batch]),
             selected_model,
             target_language,
+            ignored_texts or [],
         )
         result = _request_translation(endpoint, key, payload)
         mapping = _parse_translation_mapping(result)
@@ -71,6 +73,7 @@ def _build_payload(
     context: dict[str, Any],
     model: str,
     target_language: str,
+    ignored_texts: list[str],
 ) -> dict[str, Any]:
     subtitles = [
         {
@@ -87,9 +90,11 @@ def _build_payload(
     )
     user = {
         "context": context,
+        "ignored_texts": ignored_texts,
         "rules": [
             "遵守术语表和角色名翻译。",
             "修复明显 OCR 断字或多余空格。",
+            "ignored_texts 中的内容是 logo、水印、固定角标或不应进入字幕正文的噪声；如果输入中残留这些内容，请删除而不是翻译。",
             "不要翻译 logo、水印或节目固定标题，输入里若出现也保持克制处理。",
             "输出格式为 [{\"id\": 1, \"zh\": \"中文字幕\"}]。",
         ],

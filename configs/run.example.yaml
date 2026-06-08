@@ -21,6 +21,32 @@ ocr:
   bottom_ratio: 0.42
   scan_full_frame: false
 
+filters:
+  # Exact matching after OCR normalization. Use this for known logos,
+  # watermarks, platform names, or fixed screen text you do not want in SRT.
+  ignored_texts:
+    - "Disney+"
+  # Contains matching is stronger. Use only when you want to remove a term even
+  # when it appears inside a longer OCR line.
+  ignored_contains: []
+  # Regex matching on raw OCR text. Useful for OCR variants like DiSNEp+.
+  ignored_patterns:
+    - "disn[e3][yp]?\\+?"
+
+subtitle:
+  # Join adjacent OCR tracks when text is the same/similar and the gap is short.
+  merge_gap_seconds: 0.85
+  same_text_similarity: 0.88
+  merge_same_start_seconds: 0.16
+  merge_short_fragment_gap_seconds: 0.50
+  short_fragment_max_chars: 14
+  short_fragment_similarity: 0.55
+  # OCR sees the last sampled frame, so cue ends usually need a small tail.
+  end_padding_seconds: 0.35
+  min_duration_seconds: 0.60
+  max_next_overlap_seconds: 0.04
+  enforce_no_overlap: true
+
 translation:
   provider: "volcengine"
   batch_size: 40
