@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from video_translate.pipeline import extract_subtitles_from_video
+from video_translate.pipeline import CueTimingConfig, extract_subtitles_from_video
 from video_translate.subtitle.sidecar import SidecarConfig, copy_sidecar_subtitles
 from video_translate.translate.volcengine import translate_srt_with_volcengine
 
@@ -18,6 +18,11 @@ def run_config(config_path: Path) -> None:
     glossary = _optional_path(root, config.get("glossary"))
     target_language = str(config.get("target_language", "简体中文"))
     input_video: Path | None = None
+    filters = config.get("filters", {}) or {}
+    ignored_texts = _string_list(filters.get("ignored_texts", []))
+    ignored_contains = _string_list(filters.get("ignored_contains", []))
+    ignored_patterns = _string_list(filters.get("ignored_patterns", []))
+    cue_timing = _cue_timing_config(config.get("subtitle", {}) or {})
 
     if mode in {"full", "extract"}:
         input_video = _resolve_path(root, config["input_video"])
@@ -31,6 +36,10 @@ def run_config(config_path: Path) -> None:
             bottom_ratio=float(ocr.get("bottom_ratio", 0.42)),
             scan_full_frame=bool(ocr.get("scan_full_frame", False)),
             device=str(ocr.get("device", "auto")),
+            ignored_texts=ignored_texts,
+            ignored_contains=ignored_contains,
+            ignored_patterns=ignored_patterns,
+            cue_timing=cue_timing,
         )
         source_srt = outputs["source_srt"]
         print(f"source_srt: {source_srt}")
@@ -49,6 +58,7 @@ def run_config(config_path: Path) -> None:
             model=translation.get("model"),
             base_url=translation.get("base_url"),
             target_language=target_language,
+            ignored_texts=ignored_texts,
         )
         print(f"zh_srt: {zh_srt}")
     else:
@@ -104,4 +114,27 @@ def _sidecar_config(raw: dict[str, Any]) -> SidecarConfig:
         copy_translated=bool(raw.get("copy_translated", True)),
         source_suffix=str(raw.get("source_suffix", ".source")),
         translated_suffix=str(raw.get("translated_suffix", ".zh")),
+    )
+
+
+def _string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return [str(item) for item in value if str(item).strip()]
+
+
+def _cue_timing_config(raw: dict[str, Any]) -> CueTimingConfig:
+    return CueTimingConfig(
+        merge_gap_seconds=float(raw.get("merge_gap_seconds", 0.85)),
+        end_padding_seconds=float(raw.get("end_padding_seconds", 0.35)),
+        min_duration_seconds=float(raw.get("min_duration_seconds", 0.60)),
+        same_text_similarity=float(raw.get("same_text_similarity", 0.88)),
+        max_next_overlap_seconds=float(raw.get("max_next_overlap_seconds", 0.04)),
+        enforce_no_overlap=bool(raw.get("enforce_no_overlap", True)),
+        merge_same_start_seconds=float(raw.get("merge_same_start_seconds", 0.16)),
+        merge_short_fragment_gap_seconds=float(raw.get("merge_short_fragment_gap_seconds", 0.50)),
+        short_fragment_max_chars=int(raw.get("short_fragment_max_chars", 14)),
+        short_fragment_similarity=float(raw.get("short_fragment_similarity", 0.55)),
     )
