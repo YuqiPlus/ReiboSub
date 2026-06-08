@@ -4,11 +4,12 @@ import re
 from dataclasses import dataclass
 
 from video_translate.models import TextTrack, TrackKind
-from video_translate.utils.text import comparable_text
+from video_translate.utils.text import comparable_text, text_similarity
 
 
 _LETTER_RE = re.compile(r"[\u3040-\u30ff\u3130-\u318f\uac00-\ud7af\u4e00-\u9fffA-Za-z]")
 _CJK_OR_HANGUL_RE = re.compile(r"[\u3040-\u30ff\u3130-\u318f\uac00-\ud7af\u4e00-\u9fff]")
+_KNOWN_OVERLAY_RE = re.compile(r"(?:disn[e3][yp]?\+?|disney|©\s*\d{4}\s*disney)", re.IGNORECASE)
 
 
 @dataclass(slots=True)
@@ -21,18 +22,25 @@ class ClassificationConfig:
     bottom_region_threshold: float = 0.52
     min_main_subtitle_confidence: float = 0.45
     min_subtitle_duration: float = 0.45
+    ignored_texts: tuple[str, ...] = ()
+    ignored_contains: tuple[str, ...] = ()
+    ignored_patterns: tuple[str, ...] = ()
 
 
 def classify_tracks(tracks: list[TextTrack], config: ClassificationConfig | None = None) -> list[TextTrack]:
     config = config or ClassificationConfig()
     for track in tracks:
         track.kind, track.reason = classify_track(track, config)
+    _mark_known_overlays(tracks)
     _mark_grouped_persistent_overlays(tracks, config)
     _mark_short_noise(tracks, config)
     return tracks
 
 
 def classify_track(track: TextTrack, config: ClassificationConfig) -> tuple[TrackKind, str]:
+    if _matches_user_ignored_text(track, config):
+        return TrackKind.PERSISTENT_OVERLAY, "user_ignored_text"
+
     if _is_short_noise(track, config):
         return TrackKind.UNKNOWN, "short_junk_text"
 
@@ -57,14 +65,19 @@ def classify_track(track: TextTrack, config: ClassificationConfig) -> tuple[Trac
 
 
 def _mark_grouped_persistent_overlays(tracks: list[TextTrack], config: ClassificationConfig) -> None:
-    groups: dict[str, list[TextTrack]] = {}
+    groups: list[list[TextTrack]] = []
     for track in tracks:
         key = comparable_text(track.text)
         if len(key) < 3:
             continue
-        groups.setdefault(key, []).append(track)
+        for group in groups:
+            if _similar_overlay_candidate(track, group[0], config):
+                group.append(track)
+                break
+        else:
+            groups.append([track])
 
-    for candidates in groups.values():
+    for candidates in groups:
         total_duration = sum(track.duration for track in candidates)
         duration_ratio = 0.0
         if config.video_duration and config.video_duration > 0:
@@ -78,6 +91,43 @@ def _mark_grouped_persistent_overlays(tracks: list[TextTrack], config: Classific
             track.reason = "repeated_text_stable_position"
 
 
+def _mark_known_overlays(tracks: list[TextTrack]) -> None:
+    for track in tracks:
+        if _KNOWN_OVERLAY_RE.search(track.text):
+            track.kind = TrackKind.PERSISTENT_OVERLAY
+            track.reason = "known_overlay_text"
+
+
+def _matches_user_ignored_text(track: TextTrack, config: ClassificationConfig) -> bool:
+    text = track.text.strip()
+    key = comparable_text(text)
+    for ignored in config.ignored_texts:
+        ignored_key = comparable_text(ignored)
+        if ignored_key and ignored_key == key:
+            return True
+    for ignored in config.ignored_contains:
+        ignored_key = comparable_text(ignored)
+        if ignored_key and ignored_key in key:
+            return True
+    for pattern in config.ignored_patterns:
+        if pattern and re.search(pattern, text, re.IGNORECASE):
+            return True
+    return False
+
+
+def _similar_overlay_candidate(track: TextTrack, other: TextTrack, config: ClassificationConfig) -> bool:
+    if text_similarity(track.text, other.text) < 0.72:
+        return False
+    bbox = track.average_bbox
+    other_bbox = other.average_bbox
+    center = ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+    other_center = ((other_bbox[0] + other_bbox[2]) / 2, (other_bbox[1] + other_bbox[3]) / 2)
+    return (
+        abs(center[0] - other_center[0]) <= config.grouped_stable_position_tolerance
+        and abs(center[1] - other_center[1]) <= config.grouped_stable_position_tolerance
+    )
+
+
 def _mark_short_noise(tracks: list[TextTrack], config: ClassificationConfig) -> None:
     for track in tracks:
         if _is_short_noise(track, config):
@@ -89,8 +139,6 @@ def _is_short_noise(track: TextTrack, config: ClassificationConfig) -> bool:
     key = comparable_text(track.text)
     if not key:
         return True
-    if track.duration > config.min_subtitle_duration or track.sample_count > 2:
-        return False
     if len(key) <= 2:
         return True
     has_letter = bool(_LETTER_RE.search(track.text))
@@ -99,6 +147,8 @@ def _is_short_noise(track: TextTrack, config: ClassificationConfig) -> bool:
         return True
     if not has_cjk_or_hangul and len(key) <= 4:
         return True
+    if track.duration > config.min_subtitle_duration or track.sample_count > 2:
+        return False
     return False
 
 
