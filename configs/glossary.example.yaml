@@ -1,19 +1,35 @@
 program:
-  source: "런닝맨"
-  zh: "Running Man"
+  source: "골드랜드"
+  zh: "赌金"
+  aliases: ["Gold Land", "골드 랜드"]
   type: "show_title"
 
 characters:
-  - source: "유재석"
-    zh: "刘在石"
-    aliases: ["재석", "유느님"]
+  - source: "희주"
+    zh: "禧主"
+    aliases: ["히주", "희쥬", "Hee-joo", "Heeju"]
     type: "person"
-  - source: "김종국"
-    zh: "金钟国"
-    aliases: ["종국"]
+    note: "角色/人名，始终翻译为禧主。"
+  - source: "박보영"
+    zh: "朴宝英"
+    aliases: ["보영", "Park Boyoung", "Park Bo-young"]
+    type: "person"
+  - source: "김성철"
+    zh: "金圣喆"
+    aliases: ["성철", "Kim Sungcheol", "Kim Sung-cheol"]
+    type: "person"
+  - source: "이현욱"
+    zh: "李铉旭"
+    aliases: ["현욱", "Lee Hyunwook", "Lee Hyun-wook"]
     type: "person"
 
 terms:
-  - source: "막내"
-    zh: "老幺"
-    note: "综艺语境，不要翻成最小的孩子。"
+  - source: "키링"
+    zh: "钥匙扣"
+    note: "周边商品语境。"
+  - source: "굿즈"
+    zh: "周边"
+    note: "粉丝商品、活动物料语境。"
+  - source: "제작발표회"
+    zh: "制作发布会"
+    note: "影视发布会语境。"
