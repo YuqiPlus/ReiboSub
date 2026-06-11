@@ -7,3 +7,27 @@ outputs/
 __pycache__/
 *.pyc
 .pytest_cache/
+.vscode/
+
+# Local downloaded media and generated subtitle/video artifacts
+YoutubeDownloads/
+Download/
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+*.m4v
+*.mp3
+*.wav
+*.flac
+*.aac
+*.srt
+*.ass
+*.vtt
+# macOS local metadata
+.DS_Store
+._*
+
+# Per-task glossary drafts and reviewed terms
+configs/glossaries/
