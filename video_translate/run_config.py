@@ -59,6 +59,20 @@ def run_config(config_path: Path) -> None:
             base_url=translation.get("base_url"),
             target_language=target_language,
             ignored_texts=ignored_texts,
+            ignored_patterns=ignored_patterns,
+            extra_prompt=str(translation.get("extra_prompt", "") or ""),
+            dedupe_translated=bool(translation.get("dedupe_translated", False)),
+            dedupe_similarity=float(translation.get("dedupe_similarity", 0.88)),
+            dedupe_max_gap_seconds=float(translation.get("dedupe_max_gap_seconds", 1.2)),
+            llm_cleanup_translated=bool(translation.get("llm_cleanup_translated", False)),
+            llm_cleanup_max_gap_seconds=float(translation.get("llm_cleanup_max_gap_seconds", 1.8)),
+            llm_cleanup_max_window_size=int(translation.get("llm_cleanup_max_window_size", 6)),
+            cleanup_residual_fragments=bool(translation.get("cleanup_residual_fragments", False)),
+            residual_max_gap_seconds=float(translation.get("residual_max_gap_seconds", 3.0)),
+            residual_short_text_chars=int(translation.get("residual_short_text_chars", 6)),
+            retime_translated=bool(translation.get("retime_translated", False)),
+            retime_chars_per_second=float(translation.get("retime_chars_per_second", 7.5)),
+            retime_max_extension_seconds=float(translation.get("retime_max_extension_seconds", 2.5)),
         )
         print(f"zh_srt: {zh_srt}")
     else:
@@ -129,6 +143,8 @@ def _cue_timing_config(raw: dict[str, Any]) -> CueTimingConfig:
     return CueTimingConfig(
         merge_gap_seconds=float(raw.get("merge_gap_seconds", 0.85)),
         end_padding_seconds=float(raw.get("end_padding_seconds", 0.35)),
+        sample_interval_seconds=float(raw["sample_interval_seconds"]) if raw.get("sample_interval_seconds") is not None else None,
+        sample_end_extension_ratio=float(raw.get("sample_end_extension_ratio", 0.75)),
         min_duration_seconds=float(raw.get("min_duration_seconds", 0.60)),
         same_text_similarity=float(raw.get("same_text_similarity", 0.88)),
         max_next_overlap_seconds=float(raw.get("max_next_overlap_seconds", 0.04)),
@@ -137,4 +153,7 @@ def _cue_timing_config(raw: dict[str, Any]) -> CueTimingConfig:
         merge_short_fragment_gap_seconds=float(raw.get("merge_short_fragment_gap_seconds", 0.50)),
         short_fragment_max_chars=int(raw.get("short_fragment_max_chars", 14)),
         short_fragment_similarity=float(raw.get("short_fragment_similarity", 0.55)),
+        snapshot_similarity=float(raw.get("snapshot_similarity", 0.72)),
+        snapshot_max_gap_seconds=float(raw["snapshot_max_gap_seconds"]) if raw.get("snapshot_max_gap_seconds") is not None else None,
+        snapshot_min_confidence=float(raw.get("snapshot_min_confidence", 0.50)),
     )
