@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import csv
+import re
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -10,13 +11,15 @@ from video_translate.ocr.classifier import ClassificationConfig, classify_tracks
 from video_translate.ocr.extractor import ExtractConfig, extract_video_ocr
 from video_translate.ocr.text_track import build_text_tracks
 from video_translate.subtitle.srt import write_srt
-from video_translate.utils.text import text_similarity
+from video_translate.utils.text import normalize_ocr_text, text_similarity
 
 
 @dataclass(slots=True)
 class CueTimingConfig:
     merge_gap_seconds: float = 0.85
     end_padding_seconds: float = 0.35
+    sample_interval_seconds: float | None = None
+    sample_end_extension_ratio: float = 0.75
     min_duration_seconds: float = 0.60
     same_text_similarity: float = 0.88
     max_next_overlap_seconds: float = 0.04
@@ -25,6 +28,9 @@ class CueTimingConfig:
     merge_short_fragment_gap_seconds: float = 0.50
     short_fragment_max_chars: int = 14
     short_fragment_similarity: float = 0.55
+    snapshot_similarity: float = 0.72
+    snapshot_max_gap_seconds: float | None = None
+    snapshot_min_confidence: float = 0.50
 
 
 def extract_subtitles_from_video(
@@ -41,6 +47,9 @@ def extract_subtitles_from_video(
     ignored_patterns: list[str] | None = None,
     cue_timing: CueTimingConfig | None = None,
 ) -> dict[str, Path]:
+    timing = cue_timing or CueTimingConfig()
+    if timing.sample_interval_seconds is None and sample_fps > 0:
+        timing.sample_interval_seconds = 1.0 / sample_fps
     boxes = extract_video_ocr(
         video_path,
         lang=lang,
@@ -61,7 +70,7 @@ def extract_subtitles_from_video(
             ignored_patterns=tuple(ignored_patterns or []),
         ),
     )
-    return write_extraction_outputs(tracks, out_dir, cue_timing=cue_timing)
+    return write_extraction_outputs(tracks, out_dir, cue_timing=timing)
 
 
 def merge_ocr_samples(
@@ -75,6 +84,9 @@ def merge_ocr_samples(
 ) -> dict[str, Path]:
     raw = json.loads(ocr_json_path.read_text(encoding="utf-8"))
     boxes = [OCRBox.from_dict(item) for item in raw]
+    timing = cue_timing or CueTimingConfig()
+    if timing.sample_interval_seconds is None:
+        timing.sample_interval_seconds = _sample_interval_hint(boxes)
     tracks = build_text_tracks(boxes)
     classify_tracks(
         tracks,
@@ -85,7 +97,7 @@ def merge_ocr_samples(
             ignored_patterns=tuple(ignored_patterns or []),
         ),
     )
-    return write_extraction_outputs(tracks, out_dir, cue_timing=cue_timing)
+    return write_extraction_outputs(tracks, out_dir, cue_timing=timing)
 
 
 def reprocess_tracks_json(
@@ -99,6 +111,9 @@ def reprocess_tracks_json(
 ) -> dict[str, Path]:
     raw = json.loads(tracks_json_path.read_text(encoding="utf-8"))
     tracks = [TextTrack.from_dict(item) for item in raw]
+    timing = cue_timing or CueTimingConfig()
+    if timing.sample_interval_seconds is None:
+        timing.sample_interval_seconds = _tracks_sample_interval_hint(tracks)
     classify_tracks(
         tracks,
         ClassificationConfig(
@@ -108,7 +123,7 @@ def reprocess_tracks_json(
             ignored_patterns=tuple(ignored_patterns or []),
         ),
     )
-    return write_extraction_outputs(tracks, out_dir, cue_timing=cue_timing)
+    return write_extraction_outputs(tracks, out_dir, cue_timing=timing)
 
 
 def write_extraction_outputs(
@@ -147,6 +162,24 @@ def write_extraction_outputs(
     }
 
 
+def _sample_interval_hint(boxes: list[OCRBox]) -> float | None:
+    times = sorted({round(box.time, 3) for box in boxes})
+    return _median_positive_delta(times)
+
+
+def _tracks_sample_interval_hint(tracks: list[TextTrack]) -> float | None:
+    times = sorted({round(box.time, 3) for track in tracks for box in track.boxes})
+    return _median_positive_delta(times)
+
+
+def _median_positive_delta(times: list[float]) -> float | None:
+    deltas = [right - left for left, right in zip(times, times[1:]) if right - left > 0.001]
+    if not deltas:
+        return None
+    deltas.sort()
+    return deltas[len(deltas) // 2]
+
+
 def _video_duration_hint(boxes: list[OCRBox]) -> float | None:
     if not boxes:
         return None
@@ -159,7 +192,211 @@ def _tracks_duration_hint(tracks: list[TextTrack]) -> float | None:
     return max(track.end for track in tracks)
 
 
+@dataclass(slots=True)
+class _SubtitleSnapshot:
+    time: float
+    text: str
+    boxes: list[OCRBox]
+    confidence: float
+
+
+_HANGUL_RE = re.compile(r"[\u3130-\u318f\uac00-\ud7af]")
+_CJK_HANGUL_LATIN_RE = re.compile(r"[\u3040-\u30ff\u3130-\u318f\uac00-\ud7af\u4e00-\u9fffA-Za-z]")
+_DATE_TIME_TOKEN_RE = re.compile(r"[年月日월일년时時분秒회화%％]")
+
+
+def _tracks_to_snapshot_cues(tracks: list[TextTrack], timing: CueTimingConfig) -> list[SubtitleCue]:
+    boxes = [
+        box
+        for track in tracks
+        for box in track.boxes
+        if _is_subtitle_snapshot_box(box, timing)
+    ]
+    snapshots = _build_subtitle_snapshots(boxes)
+    if not snapshots:
+        return []
+
+    raw_cues: list[SubtitleCue] = []
+    current: list[_SubtitleSnapshot] = []
+    for snapshot in snapshots:
+        if not current:
+            current = [snapshot]
+            continue
+        if _snapshot_belongs_to_segment(current, snapshot, timing):
+            current.append(snapshot)
+            continue
+        _append_snapshot_cue(raw_cues, current, timing)
+        current = [snapshot]
+    _append_snapshot_cue(raw_cues, current, timing)
+    return raw_cues
+
+
+def _is_subtitle_snapshot_box(box: OCRBox, timing: CueTimingConfig) -> bool:
+    text = normalize_ocr_text(box.text)
+    if not text or box.confidence < timing.snapshot_min_confidence:
+        return False
+    if not _CJK_HANGUL_LATIN_RE.search(text):
+        return False
+    return not _is_numeric_visual_noise(text)
+
+
+def _is_numeric_visual_noise(text: str) -> bool:
+    if _DATE_TIME_TOKEN_RE.search(text):
+        return False
+    digits = sum(char.isdigit() for char in text)
+    letters = sum(1 for char in text if _CJK_HANGUL_LATIN_RE.match(char))
+    hangul = len(_HANGUL_RE.findall(text))
+    if digits >= 2 and hangul <= 1:
+        return True
+    if digits < 3:
+        return False
+    if hangul <= 2 and digits >= 3:
+        return True
+    return letters <= 3 and digits >= 4
+
+
+def _build_subtitle_snapshots(boxes: list[OCRBox]) -> list[_SubtitleSnapshot]:
+    by_time: dict[float, list[OCRBox]] = {}
+    for box in boxes:
+        by_time.setdefault(round(box.time, 3), []).append(box)
+
+    snapshots: list[_SubtitleSnapshot] = []
+    for time in sorted(by_time):
+        frame_boxes = by_time[time]
+        text = _merge_boxes_text(frame_boxes)
+        if not text:
+            continue
+        confidence = sum(box.confidence for box in frame_boxes) / len(frame_boxes)
+        snapshots.append(_SubtitleSnapshot(time=time, text=text, boxes=frame_boxes, confidence=confidence))
+    return snapshots
+
+
+def _merge_boxes_text(boxes: list[OCRBox]) -> str:
+    rows: list[list[OCRBox]] = []
+    for box in sorted(boxes, key=lambda item: (_box_center_y(item), item.bbox[0])):
+        for row in rows:
+            if abs(_box_center_y(box) - _box_row_center_y(row)) <= 42:
+                row.append(box)
+                break
+        else:
+            rows.append([box])
+
+    lines: list[str] = []
+    for row in sorted(rows, key=_box_row_center_y):
+        ordered = sorted(row, key=lambda item: item.bbox[0])
+        pieces = _remove_contained_texts([normalize_ocr_text(box.text) for box in ordered])
+        line = _join_text_fragments(pieces)
+        if line:
+            lines.append(line)
+    return "\n".join(_dedupe_texts(lines))
+
+
+def _snapshot_belongs_to_segment(
+    current: list[_SubtitleSnapshot],
+    snapshot: _SubtitleSnapshot,
+    timing: CueTimingConfig,
+) -> bool:
+    previous = current[-1]
+    if snapshot.time - previous.time > _snapshot_continuity_gap(timing):
+        return False
+    current_text = _choose_snapshot_text(current)
+    return _snapshot_text_related(current_text, snapshot.text, timing)
+
+
+def _snapshot_continuity_gap(timing: CueTimingConfig) -> float:
+    if timing.snapshot_max_gap_seconds is not None:
+        return timing.snapshot_max_gap_seconds
+    sample_gap = timing.sample_interval_seconds or 0.0
+    return max(timing.merge_gap_seconds, sample_gap * 2.25)
+
+
+def _snapshot_text_related(left: str, right: str, timing: CueTimingConfig) -> bool:
+    left_text = _single_line_text(left)
+    right_text = _single_line_text(right)
+    if not left_text or not right_text:
+        return False
+    if left_text == right_text:
+        return True
+    if _short_fragment_related(left_text, right_text, timing):
+        return True
+    return text_similarity(left_text, right_text) >= timing.snapshot_similarity
+
+
+def _append_snapshot_cue(
+    cues: list[SubtitleCue],
+    snapshots: list[_SubtitleSnapshot],
+    timing: CueTimingConfig,
+) -> None:
+    if not snapshots:
+        return
+    text = _choose_snapshot_text(snapshots)
+    if _should_drop_snapshot_segment(snapshots, text):
+        return
+    start = snapshots[0].time
+    end = snapshots[-1].time
+    if timing.sample_interval_seconds is not None:
+        end += max(0.0, timing.sample_interval_seconds * timing.sample_end_extension_ratio)
+    cues.append(
+        SubtitleCue(
+            index=len(cues) + 1,
+            start=start,
+            end=max(end, start + 0.35),
+            text=text,
+            source_track_id=None,
+        )
+    )
+
+
+def _choose_snapshot_text(snapshots: list[_SubtitleSnapshot]) -> str:
+    candidates = [_clean_snapshot_text(snapshot.text) for snapshot in snapshots if snapshot.text.strip()]
+    candidates = _remove_contained_texts(candidates)
+    if not candidates:
+        return ""
+
+    def score(text: str) -> tuple[int, float, int]:
+        key = _compact_text(text)
+        similar_count = sum(1 for candidate in candidates if _snapshot_text_related(text, candidate, CueTimingConfig()))
+        confidence = max(
+            (snapshot.confidence for snapshot in snapshots if _snapshot_text_related(text, snapshot.text, CueTimingConfig())),
+            default=0.0,
+        )
+        return (similar_count, confidence, len(key))
+
+    return max(candidates, key=score)
+
+
+def _clean_snapshot_text(text: str) -> str:
+    lines = [_join_text_fragments(_remove_contained_texts([part.strip() for part in line.split() if part.strip()])) for line in text.splitlines()]
+    return "\n".join(_dedupe_texts([line for line in lines if line]))
+
+
+def _should_drop_snapshot_segment(snapshots: list[_SubtitleSnapshot], text: str) -> bool:
+    key = _compact_text(text)
+    if not key:
+        return True
+    if _is_numeric_visual_noise(text):
+        return True
+    max_confidence = max((snapshot.confidence for snapshot in snapshots), default=0.0)
+    if len(snapshots) == 1 and len(key) <= 3 and max_confidence < 0.90:
+        return True
+    if len(key) <= 2 and len(snapshots) == 1 and max_confidence < 0.98:
+        return True
+    return False
+
+
+def _box_center_y(box: OCRBox) -> float:
+    return (box.bbox[1] + box.bbox[3]) / 2
+
+
+def _box_row_center_y(row: list[OCRBox]) -> float:
+    return sum(_box_center_y(box) for box in row) / len(row)
+
+
 def _tracks_to_cues(tracks: list[TextTrack], timing: CueTimingConfig) -> list[SubtitleCue]:
+    snapshot_cues = _tracks_to_snapshot_cues(tracks, timing)
+    if snapshot_cues:
+        return _retime_cues(_merge_adjacent_cues(snapshot_cues, timing), timing)
+
     grouped: list[list[TextTrack]] = []
     for track in sorted(tracks, key=lambda item: (item.start, item.end, item.average_bbox[1], item.average_bbox[0])):
         placed = False
@@ -175,7 +412,7 @@ def _tracks_to_cues(tracks: list[TextTrack], timing: CueTimingConfig) -> list[Su
     for index, group in enumerate(grouped, start=1):
         text = _merge_group_text(group)
         start = min(track.start for track in group)
-        end = max(track.end for track in group)
+        end = _observed_group_end(group, timing)
         raw_cues.append(
             SubtitleCue(
                 index=index,
@@ -186,6 +423,13 @@ def _tracks_to_cues(tracks: list[TextTrack], timing: CueTimingConfig) -> list[Su
             )
         )
     return _retime_cues(_merge_adjacent_cues(raw_cues, timing), timing)
+
+
+def _observed_group_end(group: list[TextTrack], timing: CueTimingConfig) -> float:
+    observed_end = max(track.end for track in group)
+    if timing.sample_interval_seconds is None:
+        return observed_end
+    return observed_end + max(0.0, timing.sample_interval_seconds * timing.sample_end_extension_ratio)
 
 
 def _belongs_to_cue_group(track: TextTrack, group: list[TextTrack]) -> bool:

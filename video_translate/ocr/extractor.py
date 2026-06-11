@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -46,7 +47,7 @@ def _resolve_device(device: str, paddle) -> str:
     normalized = (device or "auto").strip().lower()
     has_cuda = bool(paddle.device.is_compiled_with_cuda())
     if normalized == "auto":
-        return "gpu:0" if has_cuda else "cpu"
+        return "gpu:1" if has_cuda else "cpu"
     if normalized.startswith("gpu") and not has_cuda:
         raise RuntimeError(
             "当前环境安装的是 CPU 版 paddlepaddle，无法使用 GPU。"
@@ -69,10 +70,15 @@ def extract_video_ocr(
         raise RuntimeError(f"无法打开视频: {video_path}")
 
     native_fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    video_duration = frame_count / native_fps if frame_count else None
     step = max(1, round(native_fps / config.sample_fps))
+    total_samples = (frame_count + step - 1) // step if frame_count else None
     frame_index = 0
+    sampled_count = 0
     boxes: list[OCRBox] = []
 
+    _print_ocr_progress(0, total_samples, 0.0, video_duration)
     try:
         while True:
             ok, frame = capture.read()
@@ -84,11 +90,53 @@ def extract_video_ocr(
 
             time_seconds = frame_index / native_fps
             boxes.extend(_ocr_frame(ocr, frame, time_seconds, frame_index, config))
+            sampled_count += 1
+            _print_ocr_progress(sampled_count, total_samples, time_seconds, video_duration)
             frame_index += 1
     finally:
         capture.release()
+        _finish_ocr_progress()
 
     return boxes
+
+
+def _print_ocr_progress(
+    sampled_count: int,
+    total_samples: int | None,
+    time_seconds: float,
+    video_duration: float | None,
+) -> None:
+    width = 28
+    if total_samples:
+        ratio = min(1.0, sampled_count / total_samples)
+        filled = min(width, int(width * ratio))
+        bar = "#" * filled + "-" * (width - filled)
+        percent = ratio * 100
+        message = (
+            f"\rOCR [{bar}] {percent:6.2f}% "
+            f"{sampled_count}/{total_samples} samples "
+            f"{_format_duration(time_seconds)}/{_format_duration(video_duration)}"
+        )
+    else:
+        message = f"\rOCR {sampled_count} samples {_format_duration(time_seconds)}"
+    sys.stderr.write(message)
+    sys.stderr.flush()
+
+
+def _finish_ocr_progress() -> None:
+    sys.stderr.write("\n")
+    sys.stderr.flush()
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "--:--"
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
 
 def _ocr_frame(ocr, frame, time_seconds: float, frame_index: int, config: ExtractConfig) -> Iterable[OCRBox]:
