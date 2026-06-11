@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from video_translate.utils.text import comparable_text
+
 
 @dataclass(slots=True)
 class GlossaryEntry:
@@ -13,6 +15,16 @@ class GlossaryEntry:
     type: str = "term"
     aliases: list[str] = field(default_factory=list)
     note: str = ""
+    always: bool = False
+
+    def names(self) -> list[str]:
+        return [self.source, *self.aliases]
+
+    def matches(self, text: str) -> bool:
+        text_key = comparable_text(text)
+        if not text_key:
+            return False
+        return any(_contains_glossary_name(text_key, name) for name in self.names())
 
     def to_dict(self) -> dict[str, Any]:
         data = {"source": self.source, "zh": self.zh, "type": self.type}
@@ -20,6 +32,8 @@ class GlossaryEntry:
             data["aliases"] = self.aliases
         if self.note:
             data["note"] = self.note
+        if self.always:
+            data["always"] = self.always
         return data
 
 
@@ -32,8 +46,7 @@ class Glossary:
         joined = "\n".join(texts)
         result: list[GlossaryEntry] = []
         for entry in self.entries:
-            names = [entry.source, *entry.aliases]
-            if any(name and name in joined for name in names):
+            if entry.always or entry.matches(joined):
                 result.append(entry)
         return result
 
@@ -53,11 +66,15 @@ def load_glossary(path: Path | None) -> Glossary:
     entries: list[GlossaryEntry] = []
 
     if raw.get("program"):
-        program = _entry_from_mapping(raw["program"], default_type="program")
+        program = _optional_entry_from_mapping(raw["program"], default_type="program")
     for item in raw.get("characters", []) or []:
-        entries.append(_entry_from_mapping(item, default_type="person"))
+        entry = _optional_entry_from_mapping(item, default_type="person")
+        if entry:
+            entries.append(entry)
     for item in raw.get("terms", []) or []:
-        entries.append(_entry_from_mapping(item, default_type="term"))
+        entry = _optional_entry_from_mapping(item, default_type="term")
+        if entry:
+            entries.append(entry)
     return Glossary(program=program, entries=entries)
 
 
@@ -74,11 +91,21 @@ def _load_mapping(path: Path) -> dict[str, Any]:
     return data
 
 
-def _entry_from_mapping(data: dict[str, Any], default_type: str) -> GlossaryEntry:
+def _optional_entry_from_mapping(data: dict[str, Any], default_type: str) -> GlossaryEntry | None:
+    source = str(data.get("source", "")).strip()
+    zh = str(data.get("zh", "")).strip()
+    if not source or not zh:
+        return None
     return GlossaryEntry(
-        source=str(data["source"]),
-        zh=str(data["zh"]),
+        source=source,
+        zh=zh,
         type=str(data.get("type", default_type)),
         aliases=[str(value) for value in data.get("aliases", []) or []],
         note=str(data.get("note", "")),
+        always=bool(data.get("always", False)),
     )
+
+
+def _contains_glossary_name(text_key: str, name: str) -> bool:
+    name_key = comparable_text(name)
+    return bool(name_key and name_key in text_key)
