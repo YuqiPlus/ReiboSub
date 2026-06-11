@@ -178,6 +178,20 @@ Apply a translated JSON result back to SRT:
 python -m video_translate apply-translation "outputs/demo/source.srt" "outputs/demo/translated.json" --out "outputs/demo/zh.srt"
 ```
 
+## YouTube Helper Scripts
+
+The top-level helper scripts use stable command-style names:
+
+```bash
+python download_youtube_subtitles.py "https://www.youtube.com/watch?v=..." --sub-langs ko,en
+python download_youtube_video.py "https://www.youtube.com/watch?v=..."
+python generate_glossary_from_subtitles.py "YoutubeDownloads/example.ko.srt" --out "configs/glossaries/example.draft.yaml"
+python translate_downloaded_subtitles.py "YoutubeDownloads/example.ko.srt" --glossary "configs/glossary.example.yaml"
+python run_agent_ui.py --host 0.0.0.0 --port 7860
+```
+
+Downloaded videos and subtitles are ignored by Git. Per-task glossary drafts under `configs/glossaries/` are also ignored; keep reusable examples in `configs/glossary.example.yaml`.
+
 ## Outputs
 
 Typical output files:
