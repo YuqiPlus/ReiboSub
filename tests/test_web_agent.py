@@ -105,3 +105,20 @@ def test_parse_title_translation_accepts_json_and_plain_text():
     assert web_agent._parse_title_translation('{"zh_title": "朴宝英香港迪士尼乐园 Vlog"}') == "朴宝英香港迪士尼乐园 Vlog"
     assert web_agent._parse_title_translation('```json\n{"zh_title":"标题"}\n```') == "标题"
     assert web_agent._parse_title_translation('朴宝英香港旅行') == "朴宝英香港旅行"
+
+
+def test_ocr_config_can_preserve_translation_timing(tmp_path: Path):
+    cfg = web_agent._ocr_config(
+        tmp_path / "demo.mp4",
+        tmp_path / "out",
+        extra_hint="朴宝英",
+        preserve_timing=True,
+    )
+
+    translation = cfg["translation"]
+    assert translation["dedupe_translated"] is False
+    assert translation["llm_cleanup_translated"] is False
+    assert translation["cleanup_residual_fragments"] is False
+    assert translation["retime_translated"] is False
+    assert "保持时间轴模式" in translation["extra_prompt"]
+
