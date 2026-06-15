@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -838,23 +839,50 @@ def _print_glossary_context(context: dict[str, Any]) -> None:
 
 
 def _request_translation(url: str, api_key: str, payload: dict[str, Any]) -> str:
-    response = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=120,
-    )
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        body = response.text.strip()
-        model = payload.get("model", "")
-        raise RuntimeError(f"Volcengine request failed: status={response.status_code}, model={model}, url={url}, body={body}") from exc
-    data = response.json()
-    return str(data["choices"][0]["message"]["content"])
+    timeout = _request_timeout_seconds()
+    max_attempts = _request_max_attempts()
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=timeout,
+            )
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                status = response.status_code
+                if attempt < max_attempts and (status == 429 or 500 <= status < 600):
+                    _sleep_before_retry(attempt, max_attempts, f"status={status}")
+                    continue
+                body = response.text.strip()
+                model = payload.get("model", "")
+                raise RuntimeError(f"Volcengine request failed: status={status}, model={model}, url={url}, body={body}") from exc
+            data = response.json()
+            return str(data["choices"][0]["message"]["content"])
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            if attempt >= max_attempts:
+                raise
+            _sleep_before_retry(attempt, max_attempts, repr(exc))
+    raise RuntimeError("Volcengine request failed after retries")
+
+
+def _request_timeout_seconds() -> float:
+    return float(os.environ.get("ARK_REQUEST_TIMEOUT", "240"))
+
+
+def _request_max_attempts() -> int:
+    return max(1, int(os.environ.get("ARK_REQUEST_RETRIES", "3")))
+
+
+def _sleep_before_retry(attempt: int, max_attempts: int, reason: str) -> None:
+    wait_seconds = min(2 ** (attempt - 1), 8)
+    print(f"translate_request_retry: attempt {attempt}/{max_attempts} wait={wait_seconds}s {reason}", flush=True)
+    time.sleep(wait_seconds)
 
 
 def _request_translation_mapping(url: str, api_key: str, payload: dict[str, Any], batch_label: str) -> dict[int, str]:
