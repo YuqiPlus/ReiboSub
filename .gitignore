@@ -1,7 +1,9 @@
 .cache/
 models/
 .env
+.env.backup.*
 configs/run.yaml
+configs/llm.yaml
 outputs/
 frontend/node_modules/
 frontend/dist/
@@ -33,4 +35,7 @@ Download/
 ._*
 
 # Per-task glossary drafts and reviewed terms
-configs/glossaries/
+configs/glossaries/*
+!configs/glossaries/
+!configs/glossaries/examples/
+!configs/glossaries/examples/glossary.example.yaml

@@ -11,7 +11,7 @@ output_dir: "outputs/demo"
 
 source_language: "korean"
 target_language: "简体中文"
-glossary: "configs/glossary.example.yaml"
+glossary: "configs/glossaries/examples/glossary.example.yaml"
 
 ocr:
   # auto: 有 GPU 版 Paddle 就用 GPU，否则用 CPU
@@ -50,7 +50,7 @@ subtitle:
 translation:
   provider: "volcengine"
   batch_size: 40
-  # 不建议把 API Key 写在这里。放到 .env 的 ARK_API_KEY。
+  # 不建议把 API Key 写在这里。放到 .env 的 LLM_API_KEY。
   model: null
   base_url: null
 
