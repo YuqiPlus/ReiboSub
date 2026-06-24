@@ -4,7 +4,7 @@ from pathlib import Path
 
 import requests
 
-import correct_asr_subtitles as correct_asr
+from video_translate.tools import correct_asr
 
 
 def test_correct_asr_subtitles_preserves_timing_and_replaces_text(monkeypatch, tmp_path: Path):

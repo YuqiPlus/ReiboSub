@@ -178,17 +178,21 @@ Apply a translated JSON result back to SRT:
 python -m video_translate apply-translation "outputs/demo/source.srt" "outputs/demo/translated.json" --out "outputs/demo/zh.srt"
 ```
 
-## YouTube Helper Scripts
+## Command-Line Tools
 
-The top-level helper scripts use stable command-style names:
+Tool implementations live under `video_translate.youtube` and `video_translate.tools`.
+Prefer module commands for new automation:
 
 ```bash
-python download_youtube_subtitles.py "https://www.youtube.com/watch?v=..." --sub-langs ko,en
-python download_youtube_video.py "https://www.youtube.com/watch?v=..."
-python generate_glossary_from_subtitles.py "YoutubeDownloads/example.ko.srt" --out "configs/glossaries/example.draft.yaml"
-python translate_downloaded_subtitles.py "YoutubeDownloads/example.ko.srt" --glossary "configs/glossary.example.yaml"
+python -m video_translate.youtube.download_subtitles "https://www.youtube.com/watch?v=..." --sub-langs ko,en
+python -m video_translate.youtube.download_video "https://www.youtube.com/watch?v=..."
+python -m video_translate.tools.generate_glossary "YoutubeDownloads/example.ko.srt" --out "configs/glossaries/example.draft.yaml"
+python -m video_translate.tools.translate_subtitles "YoutubeDownloads/example.ko.srt" --glossary "configs/glossary.example.yaml"
 python run_agent_ui.py --host 0.0.0.0 --port 7860
 ```
+
+The old top-level helper names, such as `download_youtube_video.py` and
+`translate_downloaded_subtitles.py`, are kept as thin compatibility wrappers.
 
 Downloaded videos and subtitles are ignored by Git. Per-task glossary drafts under `configs/glossaries/` are also ignored; keep reusable examples in `configs/glossary.example.yaml`.
 

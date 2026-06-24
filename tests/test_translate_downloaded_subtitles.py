@@ -1,18 +1,13 @@
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 
 import pytest
+from video_translate.tools import translate_subtitles
 
 
 def _load_module():
-    path = Path(__file__).resolve().parents[1] / "translate_downloaded_subtitles.py"
-    spec = importlib.util.spec_from_file_location("translate_downloaded_subtitles_1_linux", path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return translate_subtitles
 
 
 def test_default_output_path_uses_zh_suffix():

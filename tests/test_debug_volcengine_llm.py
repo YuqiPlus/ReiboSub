@@ -3,7 +3,7 @@ from __future__ import annotations
 from argparse import Namespace
 from pathlib import Path
 
-import debug_volcengine_llm as debug_llm
+from video_translate.tools import debug_llm
 
 
 def test_mask_secret_keeps_only_edges():

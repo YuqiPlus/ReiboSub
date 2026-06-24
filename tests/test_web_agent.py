@@ -518,7 +518,7 @@ def test_download_video_job_builds_video_download_command(monkeypatch, tmp_path:
         __import__("time").sleep(0.01)
 
     assert job.status == "done"
-    assert calls[0][1].endswith("download_youtube_video.py")
+    assert calls[0][:3] == ["/python", "-m", "video_translate.youtube.download_video"]
     assert calls[0][-1] == "abc123"
     assert job.result["input_video"].endswith("demo.h264.mp4")
 
@@ -721,7 +721,7 @@ def test_audio_local_video_job_builds_transcription_command(monkeypatch, tmp_pat
         __import__("time").sleep(0.01)
 
     assert job.status == "done"
-    assert calls[0][1].endswith("transcribe_audio_subtitles.py")
+    assert calls[0][:3] == ["/python", "-m", "video_translate.tools.transcribe_audio"]
     assert "--language" in calls[0]
     assert calls[0][calls[0].index("--language") + 1] == "korean"
     assert "--model-size" in calls[0]
@@ -799,7 +799,7 @@ def test_correct_asr_subtitle_job_builds_correction_command(monkeypatch, tmp_pat
         __import__("time").sleep(0.01)
 
     assert job.status == "done"
-    assert calls[0][1].endswith("correct_asr_subtitles.py")
+    assert calls[0][:3] == ["/python", "-m", "video_translate.tools.correct_asr"]
     assert "--glossary" in calls[0]
     assert calls[0][calls[0].index("--glossary") + 1] == str(glossary)
     assert "--extra-prompt" in calls[0]

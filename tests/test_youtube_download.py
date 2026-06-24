@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
+
+from video_translate.youtube import download_subtitles, download_video
 
 
 def _load_subtitle_module():
-    path = Path(__file__).resolve().parents[1] / "download_youtube_subtitles.py"
-    spec = importlib.util.spec_from_file_location("youtube_subtitles_1_linux", path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return download_subtitles
+
+
+def _load_video_module():
+    return download_video
 
 
 def test_parse_subtitle_languages_from_csv():
@@ -56,11 +56,7 @@ def test_build_subtitle_options_can_download_auto_only(tmp_path):
 
 
 def test_video_download_main_uses_cli_url(monkeypatch):
-    path = Path(__file__).resolve().parents[1] / "download_youtube_video.py"
-    spec = importlib.util.spec_from_file_location("youtube_dl_1_linux_video", path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
+    module = _load_video_module()
     calls = []
 
     def fake_download_video(url, quality=module.DEFAULT_QUALITY, output_dir=module.DEFAULT_OUTPUT_DIR):
@@ -74,11 +70,7 @@ def test_video_download_main_uses_cli_url(monkeypatch):
 
 
 def test_video_download_template_matches_subtitle_basename(monkeypatch, tmp_path):
-    path = Path(__file__).resolve().parents[1] / "download_youtube_video.py"
-    spec = importlib.util.spec_from_file_location("youtube_dl_1_linux_video_template", path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
+    module = _load_video_module()
     captured = {}
 
     class FakeYoutubeDL:
@@ -106,11 +98,7 @@ def test_video_download_template_matches_subtitle_basename(monkeypatch, tmp_path
 
 
 def test_video_download_retries_403_with_smaller_chunks(monkeypatch, tmp_path):
-    path = Path(__file__).resolve().parents[1] / "download_youtube_video.py"
-    spec = importlib.util.spec_from_file_location("youtube_dl_1_linux_video_retry", path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
+    module = _load_video_module()
     calls = []
 
     class FakeYoutubeDL:
@@ -141,11 +129,7 @@ def test_video_download_retries_403_with_smaller_chunks(monkeypatch, tmp_path):
 
 
 def test_video_download_falls_back_to_720p_after_repeated_403(monkeypatch, tmp_path):
-    path = Path(__file__).resolve().parents[1] / "download_youtube_video.py"
-    spec = importlib.util.spec_from_file_location("youtube_dl_1_linux_video_720_fallback", path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
+    module = _load_video_module()
     calls = []
 
     class FakeYoutubeDL:
@@ -174,11 +158,7 @@ def test_video_download_falls_back_to_720p_after_repeated_403(monkeypatch, tmp_p
 
 
 def test_video_download_does_not_retry_non_retriable_error(monkeypatch, tmp_path):
-    path = Path(__file__).resolve().parents[1] / "download_youtube_video.py"
-    spec = importlib.util.spec_from_file_location("youtube_dl_1_linux_video_no_retry", path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
+    module = _load_video_module()
     calls = []
 
     class FakeYoutubeDL:
