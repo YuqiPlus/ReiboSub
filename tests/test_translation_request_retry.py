@@ -27,8 +27,8 @@ def test_request_translation_retries_timeout(monkeypatch):
             raise requests.Timeout("slow")
         return _FakeResponse()
 
-    monkeypatch.setenv("ARK_REQUEST_TIMEOUT", "5")
-    monkeypatch.setenv("ARK_REQUEST_RETRIES", "2")
+    monkeypatch.setenv("LLM_REQUEST_TIMEOUT", "5")
+    monkeypatch.setenv("LLM_REQUEST_RETRIES", "2")
     monkeypatch.setattr(volcengine.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(volcengine.requests, "post", fake_post)
 

@@ -8,7 +8,7 @@ from typing import Any
 import yaml
 
 
-DEFAULT_PROVIDER = "volcengine"
+DEFAULT_PROVIDER = "openai-compatible"
 DEFAULT_CONFIG_PATH = Path("configs") / "llm.yaml"
 
 
@@ -16,6 +16,7 @@ DEFAULT_CONFIG_PATH = Path("configs") / "llm.yaml"
 class LLMTaskConfig:
     model: str | None = None
     base_url: str | None = None
+    api_key: str | None = None
     provider: str = DEFAULT_PROVIDER
     fallback_models: tuple[str, ...] = ()
 
@@ -28,24 +29,32 @@ def load_llm_task_config(task: str, *, root: Path | None = None, explicit_model:
     task_config = tasks.get(task) if isinstance(tasks.get(task), dict) else {}
     env_model_name = str(task_config.get("env_model") or "").strip()
     env_base_url_name = str(task_config.get("env_base_url") or "").strip()
+    env_api_key_name = str(task_config.get("env_api_key") or defaults.get("env_api_key") or "").strip()
 
     model = (
         _clean(explicit_model)
         or _env(env_model_name)
         or _clean(task_config.get("model"))
-        or _clean(defaults.get("model"))
+        or _env("LLM_MODEL")
         or _env("ARK_MODEL")
+        or _clean(defaults.get("model"))
     )
     base_url = (
         _clean(explicit_base_url)
         or _env(env_base_url_name)
         or _clean(task_config.get("base_url"))
-        or _clean(defaults.get("base_url"))
+        or _env("LLM_BASE_URL")
         or _env("ARK_BASE_URL")
+        or _clean(defaults.get("base_url"))
+    )
+    api_key = (
+        _env(env_api_key_name)
+        or _env("LLM_API_KEY")
+        or _env("ARK_API_KEY")
     )
     provider = _clean(task_config.get("provider")) or _clean(defaults.get("provider")) or DEFAULT_PROVIDER
     fallback_models = _clean_list(task_config.get("fallback_models") or defaults.get("fallback_models"))
-    return LLMTaskConfig(model=model, base_url=base_url, provider=provider, fallback_models=tuple(fallback_models))
+    return LLMTaskConfig(model=model, base_url=base_url, api_key=api_key, provider=provider, fallback_models=tuple(fallback_models))
 
 
 def _load_config(path: Path) -> dict[str, Any]:

@@ -49,16 +49,16 @@ def correct_asr_srt(
     out_srt = (out_srt or default_output_path(source_srt)).expanduser().resolve()
 
     _load_dotenv(source_srt)
-    key = os.environ.get("ARK_API_KEY")
     task_llm = load_llm_task_config(
         "asr_correction",
         explicit_model=model,
         explicit_base_url=base_url,
     )
+    key = getattr(task_llm, "api_key", None) or os.environ.get("LLM_API_KEY") or os.environ.get("ARK_API_KEY")
     selected_model = task_llm.model or DEFAULT_ASR_CORRECTION_MODEL
     endpoint = _chat_completions_url(task_llm.base_url or DEFAULT_BASE_URL)
     if not key:
-        raise RuntimeError("缺少 ARK_API_KEY，请先配置火山方舟 API Key。")
+        raise RuntimeError("缺少 LLM_API_KEY，请先配置 OpenAI-compatible API Key。")
     if not selected_model:
         raise RuntimeError("缺少 ASR 纠错模型，请传 --model 或配置 ASR_CORRECTION_MODEL。")
 

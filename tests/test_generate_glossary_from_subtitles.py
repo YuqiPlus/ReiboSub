@@ -218,8 +218,8 @@ def test_request_chat_completion_retries_timeout(monkeypatch):
         return FakeResponse()
 
     monkeypatch.setattr(module.requests, "post", fake_post)
-    monkeypatch.setenv("ARK_REQUEST_RETRIES", "2")
-    monkeypatch.setenv("ARK_REQUEST_TIMEOUT", "12")
+    monkeypatch.setenv("LLM_REQUEST_RETRIES", "2")
+    monkeypatch.setenv("LLM_REQUEST_TIMEOUT", "12")
     monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
 
     result = module._request_chat_completion("https://example.test", "key", {"model": "m"})

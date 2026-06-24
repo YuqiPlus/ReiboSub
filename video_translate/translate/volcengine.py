@@ -46,20 +46,20 @@ def translate_srt_with_volcengine(
     retime_max_extension_seconds: float = 2.5,
 ) -> Path:
     _load_dotenv(source_srt)
-    key = api_key or os.environ.get("ARK_API_KEY")
     task_llm = load_llm_task_config(
         "subtitle_translation",
         explicit_model=model,
         explicit_base_url=base_url,
     )
+    key = api_key or getattr(task_llm, "api_key", None) or os.environ.get("LLM_API_KEY") or os.environ.get("ARK_API_KEY")
     selected_model = task_llm.model
     fallback_models = [item for item in task_llm.fallback_models if item and item != selected_model]
     endpoint = _chat_completions_url(task_llm.base_url or DEFAULT_BASE_URL)
 
     if not key:
-        raise RuntimeError("缺少 ARK_API_KEY，请先配置火山方舟 API Key。")
+        raise RuntimeError("缺少 LLM_API_KEY，请先配置 OpenAI-compatible API Key。")
     if not selected_model:
-        raise RuntimeError("缺少 ARK_MODEL，请先配置火山方舟模型名或接入点 ID。")
+        raise RuntimeError("缺少 LLM_MODEL 或任务专用模型配置。")
 
     cues = read_srt(source_srt)
     glossary = load_glossary(glossary_path)
@@ -963,11 +963,11 @@ def _request_translation(
 
 
 def _request_timeout_seconds() -> float:
-    return float(os.environ.get("ARK_REQUEST_TIMEOUT", "240"))
+    return float(os.environ.get("LLM_REQUEST_TIMEOUT") or os.environ.get("ARK_REQUEST_TIMEOUT", "240"))
 
 
 def _request_max_attempts() -> int:
-    return max(1, int(os.environ.get("ARK_REQUEST_RETRIES", "3")))
+    return max(1, int(os.environ.get("LLM_REQUEST_RETRIES") or os.environ.get("ARK_REQUEST_RETRIES", "3")))
 
 
 def _sleep_before_retry(attempt: int, max_attempts: int, reason: str) -> None:

@@ -1,0 +1,44 @@
+# Copy this file to configs/llm.yaml and adjust for your provider/models.
+# This example uses Volcengine Ark model names. If you use another
+# OpenAI-compatible provider, replace the model names below.
+#
+# Model selection order:
+#   1. CLI/function explicit --model
+#   2. task-specific env var, e.g. ASR_CORRECTION_MODEL
+#   3. tasks.<task>.model below
+#   4. .env global default: LLM_MODEL
+#   5. defaults.model below, if you choose to set one
+#
+# API/base URL:
+#   - Put your API key and base URL in .env as LLM_API_KEY / LLM_BASE_URL.
+#   - .env.example shows Volcengine Ark:
+#     LLM_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
+
+defaults:
+  provider: openai-compatible
+  # Leave model empty to use .env LLM_MODEL as the global default.
+  # Volcengine Ark strong model example:
+  # model: doubao-seed-2.0-pro
+
+tasks:
+  # Small and frequent tasks usually work well with a faster/cheaper model.
+  title_translation:
+    # Volcengine Ark light model example:
+    # model: doubao-seed-2.0-lite
+
+  glossary:
+    # Leave empty to use the global default model.
+    # model: doubao-seed-2.0-pro
+
+  subtitle_translation:
+    # Leave empty to use the global default model.
+    # model: doubao-seed-2.0-pro
+    # fallback_models:
+    #   - doubao-seed-2.0-lite
+
+  asr_correction:
+    # model: doubao-seed-2.0-lite
+    env_model: ASR_CORRECTION_MODEL
+
+  hybrid_source_reconstruction:
+    # model: doubao-seed-2.0-lite

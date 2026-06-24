@@ -102,8 +102,8 @@ def main(argv=None):
     parser.add_argument("--out", type=Path, default=None, help="Output translated .srt path; default is <source>.zh.srt")
     parser.add_argument("--glossary", type=Path, default=None, help="Task glossary YAML/JSON for names and terms")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--model", default=None, help="Override ARK_MODEL")
-    parser.add_argument("--base-url", default=None, help="Override ARK_BASE_URL")
+    parser.add_argument("--model", default=None, help="Override LLM_MODEL")
+    parser.add_argument("--base-url", default=None, help="Override LLM_BASE_URL")
     parser.add_argument("--target-language", default=DEFAULT_TARGET_LANGUAGE)
     parser.add_argument("--extra-prompt", default="", help="Extra task instruction appended to the default prompt")
     parser.add_argument(

@@ -22,14 +22,14 @@ ROOT = Path(__file__).resolve().parents[2]
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     _load_dotenv(ROOT)
-    key = os.environ.get("ARK_API_KEY", "")
     task_llm = resolve_debug_llm(args)
+    key = task_llm.api_key or ""
     model = task_llm.model or ""
     endpoint = _chat_completions_url(task_llm.base_url or DEFAULT_BASE_URL)
     if not key:
-        raise RuntimeError("缺少 ARK_API_KEY")
+        raise RuntimeError("缺少 LLM_API_KEY")
     if not model:
-        raise RuntimeError("缺少 ARK_MODEL")
+        raise RuntimeError("缺少 LLM_MODEL 或任务专用模型配置")
 
     payload = build_payload(args, model)
     payload_json = json.dumps(payload, ensure_ascii=False)
@@ -60,8 +60,9 @@ def resolve_debug_llm(args: argparse.Namespace) -> LLMTaskConfig:
             explicit_base_url=args.base_url,
         )
     return LLMTaskConfig(
-        model=args.model or os.environ.get("ARK_MODEL", ""),
-        base_url=args.base_url or os.environ.get("ARK_BASE_URL") or DEFAULT_BASE_URL,
+        model=args.model or os.environ.get("LLM_MODEL") or os.environ.get("ARK_MODEL", ""),
+        base_url=args.base_url or os.environ.get("LLM_BASE_URL") or os.environ.get("ARK_BASE_URL") or DEFAULT_BASE_URL,
+        api_key=os.environ.get("LLM_API_KEY") or os.environ.get("ARK_API_KEY", ""),
     )
 
 
