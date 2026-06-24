@@ -191,8 +191,12 @@ python -m video_translate.tools.translate_subtitles "YoutubeDownloads/example.ko
 python run_agent_ui.py --host 0.0.0.0 --port 7860
 ```
 
-The old top-level helper names, such as `download_youtube_video.py` and
-`translate_downloaded_subtitles.py`, are kept as thin compatibility wrappers.
+Thin script wrappers are kept under `scripts/` for manual use, for example:
+
+```bash
+python scripts/download_youtube_video.py "https://www.youtube.com/watch?v=..."
+python scripts/translate_downloaded_subtitles.py "YoutubeDownloads/example.ko.srt"
+```
 
 Downloaded videos and subtitles are ignored by Git. Per-task glossary drafts under `configs/glossaries/` are also ignored; keep reusable examples in `configs/glossary.example.yaml`.
 
