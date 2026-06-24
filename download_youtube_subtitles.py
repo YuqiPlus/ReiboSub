@@ -1,9 +1,10 @@
 import argparse
 import os
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
+
+from video_translate.youtube_url import normalize_youtube_url
 
 
 DEFAULT_OUTPUT_DIR = "/path/to/Video_Translate/YoutubeDownloads"
@@ -15,35 +16,7 @@ DEFAULT_CONVERT_SUBTITLES = "srt"
 
 
 def normalize_url(url):
-    url = url.strip()
-
-    if not url.startswith(("http://", "https://")):
-        return "https://www.youtube.com/watch?v=" + url
-
-    parsed = urlparse(url)
-    domain = parsed.netloc.lower()
-    path = parsed.path.strip("/")
-    video_id = None
-
-    if "youtube.com" in domain:
-        query = parse_qs(parsed.query)
-        if "v" in query:
-            video_id = query["v"][0]
-        elif path.startswith("shorts/"):
-            parts = path.split("/")
-            if len(parts) >= 2:
-                video_id = parts[1]
-        elif path.startswith("embed/"):
-            parts = path.split("/")
-            if len(parts) >= 2:
-                video_id = parts[1]
-    elif "youtu.be" in domain:
-        video_id = path.split("/")[0]
-
-    if not video_id:
-        raise ValueError("无法从输入中解析 YouTube 视频 ID: " + url)
-
-    return "https://www.youtube.com/watch?v=" + video_id
+    return normalize_youtube_url(url)
 
 
 def parse_subtitle_languages(value):
