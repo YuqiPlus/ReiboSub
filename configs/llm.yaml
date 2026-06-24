@@ -1,0 +1,24 @@
+defaults:
+  provider: volcengine
+  base_url: https://ark.cn-beijing.volces.com/api/coding/v3
+  model: doubao-seed-2.0-pro
+
+tasks:
+  title_translation:
+    model: doubao-seed-2.0-lite
+
+  glossary:
+    model: doubao-seed-2.0-pro
+
+  subtitle_translation:
+    model: doubao-seed-2.0-pro
+    fallback_models:
+      - doubao-seed-2.0-lite
+      - minimax-m2.7
+
+  asr_correction:
+    model: doubao-seed-2.0-lite
+    env_model: ASR_CORRECTION_MODEL
+
+  hybrid_source_reconstruction:
+    model: doubao-seed-2.0-lite
