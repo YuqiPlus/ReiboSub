@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
+import requests
 import yaml
 
 
@@ -197,3 +200,109 @@ def test_parse_or_repair_candidate_response_skips_unrepairable_json(monkeypatch)
     )
 
     assert parsed == {"program": None, "characters": [], "terms": []}
+
+
+def test_request_chat_completion_retries_timeout(monkeypatch):
+    module = _load_module()
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    def fake_post(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) == 1:
+            raise requests.Timeout("slow")
+        return FakeResponse()
+
+    monkeypatch.setattr(module.requests, "post", fake_post)
+    monkeypatch.setenv("ARK_REQUEST_RETRIES", "2")
+    monkeypatch.setenv("ARK_REQUEST_TIMEOUT", "12")
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+
+    result = module._request_chat_completion("https://example.test", "key", {"model": "m"})
+
+    assert result == "ok"
+    assert len(calls) == 2
+    assert calls[0][1]["timeout"] == 12
+
+
+def test_default_glossary_batch_size_is_stable():
+    module = _load_module()
+
+    assert module.DEFAULT_BATCH_SIZE == 40
+
+
+def test_generate_glossary_splits_batch_after_timeout(monkeypatch, tmp_path):
+    module = _load_module()
+    source = tmp_path / "source.srt"
+    source.write_text(
+        "\n".join(
+            [
+                "1",
+                "00:00:00,000 --> 00:00:01,000",
+                "렐짱 안녕",
+                "",
+                "2",
+                "00:00:01,000 --> 00:00:02,000",
+                "다이브 반가워",
+                "",
+                "3",
+                "00:00:02,000 --> 00:00:03,000",
+                "나오이 레이입니다",
+                "",
+                "4",
+                "00:00:03,000 --> 00:00:04,000",
+                "아이브 이야기",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "draft.yaml"
+    calls = []
+
+    def fake_request(endpoint, api_key, payload, **kwargs):
+        user_payload = json.loads(payload["messages"][1]["content"])
+        ids = [item["id"] for item in user_payload["subtitles"]]
+        calls.append(ids)
+        assert kwargs == {"max_attempts": 1}
+        if ids == [1, 2, 3, 4]:
+            raise requests.Timeout("slow glossary")
+        return json.dumps(
+            {
+                "program": None,
+                "characters": [
+                    {
+                        "source": f"candidate-{ids[0]}",
+                        "suggested_zh": "",
+                        "evidence_ids": ids,
+                        "confidence": 0.5,
+                    }
+                ],
+                "terms": [],
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setenv("ARK_API_KEY", "key")
+    monkeypatch.setattr(module, "_load_dotenv", lambda _path: None)
+    monkeypatch.setattr(
+        module,
+        "load_llm_task_config",
+        lambda *args, **kwargs: SimpleNamespace(model="model", base_url="https://example.test", provider="volcengine"),
+    )
+    monkeypatch.setattr(module, "_request_chat_completion", fake_request)
+
+    module.generate_glossary_draft(source, out, batch_size=4, max_chars_per_batch=9999)
+
+    assert calls == [[1, 2, 3, 4], [1, 2], [3, 4]]
+    loaded = yaml.safe_load(out.read_text(encoding="utf-8"))
+    assert [item["source"] for item in loaded["characters"]] == ["candidate-1", "candidate-3"]

@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -8,12 +9,13 @@ import requests
 import yaml
 
 from video_translate.subtitle.srt import read_srt
+from video_translate.llm_config import load_llm_task_config
 from video_translate.translate.volcengine import DEFAULT_BASE_URL, _chat_completions_url, _load_dotenv, _parse_json_content
 from video_translate.utils.text import comparable_text
 
 
 DEFAULT_TARGET_LANGUAGE = "简体中文"
-DEFAULT_BATCH_SIZE = 120
+DEFAULT_BATCH_SIZE = 40
 DEFAULT_MAX_CHARS_PER_BATCH = 9000
 COMMON_SKIP_TERMS = [
     "Disney",
@@ -148,8 +150,9 @@ def generate_glossary_draft(
 
     _load_dotenv(source_srt)
     key = api_key or os.environ.get("ARK_API_KEY")
-    selected_model = model or os.environ.get("ARK_MODEL")
-    endpoint = _chat_completions_url(base_url or os.environ.get("ARK_BASE_URL") or DEFAULT_BASE_URL)
+    task_llm = load_llm_task_config("glossary", explicit_model=model, explicit_base_url=base_url)
+    selected_model = task_llm.model
+    endpoint = _chat_completions_url(task_llm.base_url or DEFAULT_BASE_URL)
     if not key:
         raise RuntimeError("缺少 ARK_API_KEY，请先配置火山方舟 API Key。")
     if not selected_model:
@@ -163,21 +166,15 @@ def generate_glossary_draft(
     batches = list(_chunk_cues(cues, batch_size=batch_size, max_chars=max_chars_per_batch))
     for batch_index, batch in enumerate(batches, start=1):
         print(f"glossary_batch: {batch_index}/{len(batches)} cues {batch[0]['id']}-{batch[-1]['id']}", flush=True)
-        payload = build_extraction_payload(
+        parsed = _request_batch_candidates(
             batch,
+            endpoint=endpoint,
+            api_key=key,
             model=selected_model,
             source_language=source_language,
             target_language=target_language,
             extra_hint=extra_hint,
-        )
-        content = _request_chat_completion(endpoint, key, payload)
-        parsed = parse_or_repair_candidate_response(
-            content,
-            endpoint=endpoint,
-            api_key=key,
-            model=selected_model,
-            batch_index=batch_index,
-            total_batches=len(batches),
+            batch_label=f"{batch_index}/{len(batches)}",
         )
         draft = merge_candidate_drafts(draft, parsed)
 
@@ -185,6 +182,70 @@ def generate_glossary_draft(
     normalized = normalize_draft_for_yaml(draft, fill_suggestions=fill_suggestions)
     write_glossary_yaml(normalized, out_yaml, source_srt=source_srt, fill_suggestions=fill_suggestions)
     return out_yaml
+
+
+def _request_batch_candidates(
+    batch: list[dict[str, Any]],
+    *,
+    endpoint: str,
+    api_key: str,
+    model: str,
+    source_language: str,
+    target_language: str,
+    extra_hint: str,
+    batch_label: str,
+) -> dict[str, Any]:
+    payload = build_extraction_payload(
+        batch,
+        model=model,
+        source_language=source_language,
+        target_language=target_language,
+        extra_hint=extra_hint,
+    )
+    try:
+        content = _request_chat_completion(endpoint, api_key, payload, max_attempts=1)
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        if len(batch) <= 1:
+            print(f"glossary_batch_skipped: {batch_label} request_failed {exc}", flush=True)
+            return {"program": None, "characters": [], "terms": []}
+        mid = max(1, len(batch) // 2)
+        left = batch[:mid]
+        right = batch[mid:]
+        print(
+            f"glossary_batch_split: {batch_label} size={len(batch)} -> {len(left)}+{len(right)} after {type(exc).__name__}",
+            flush=True,
+        )
+        return merge_candidate_drafts(
+            _request_batch_candidates(
+                left,
+                endpoint=endpoint,
+                api_key=api_key,
+                model=model,
+                source_language=source_language,
+                target_language=target_language,
+                extra_hint=extra_hint,
+                batch_label=f"{batch_label}a",
+            ),
+            _request_batch_candidates(
+                right,
+                endpoint=endpoint,
+                api_key=api_key,
+                model=model,
+                source_language=source_language,
+                target_language=target_language,
+                extra_hint=extra_hint,
+                batch_label=f"{batch_label}b",
+            ),
+        )
+    return parse_or_repair_candidate_response(
+        content,
+        endpoint=endpoint,
+        api_key=api_key,
+        model=model,
+        batch_index=0,
+        total_batches=0,
+        batch_label=batch_label,
+    )
 
 
 def parse_or_repair_candidate_response(
@@ -195,17 +256,19 @@ def parse_or_repair_candidate_response(
     model: str,
     batch_index: int,
     total_batches: int,
+    batch_label: str | None = None,
 ) -> dict[str, Any]:
+    label = batch_label or f"{batch_index}/{total_batches}"
     try:
         return parse_candidate_response(content)
     except Exception as exc:  # noqa: BLE001 - LLM JSON can be malformed in several ways.
-        print(f"glossary_batch_parse_retry: {batch_index}/{total_batches} {exc}", flush=True)
+        print(f"glossary_batch_parse_retry: {label} {exc}", flush=True)
 
     try:
         repaired = _request_chat_completion(endpoint, api_key, build_json_repair_payload(content, model=model))
         return parse_candidate_response(repaired)
     except Exception as exc:  # noqa: BLE001 - skip one batch instead of failing whole glossary.
-        print(f"glossary_batch_skipped: {batch_index}/{total_batches} invalid_json_after_repair {exc}", flush=True)
+        print(f"glossary_batch_skipped: {label} invalid_json_after_repair {exc}", flush=True)
         return {"program": None, "characters": [], "terms": []}
 
 
@@ -330,21 +393,54 @@ def write_glossary_yaml(data: dict[str, Any], out_yaml: Path, *, source_srt: Pat
     out_yaml.write_text("\n".join(header) + "\n" + text, encoding="utf-8")
 
 
-def _request_chat_completion(url: str, api_key: str, payload: dict[str, Any]) -> str:
-    response = requests.post(
-        url,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=120,
-    )
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        body = response.text.strip()
-        model = payload.get("model", "")
-        raise RuntimeError(f"Volcengine request failed: status={response.status_code}, model={model}, url={url}, body={body}") from exc
-    data = response.json()
-    return str(data["choices"][0]["message"]["content"])
+def _request_chat_completion(
+    url: str,
+    api_key: str,
+    payload: dict[str, Any],
+    *,
+    max_attempts: int | None = None,
+) -> str:
+    timeout = _request_timeout_seconds()
+    max_attempts = max(1, max_attempts or _request_max_attempts())
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=timeout,
+            )
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                status = response.status_code
+                if attempt < max_attempts and (status == 429 or 500 <= status < 600):
+                    _sleep_before_retry(attempt, max_attempts, f"status={status}")
+                    continue
+                body = response.text.strip()
+                model = payload.get("model", "")
+                raise RuntimeError(f"Volcengine request failed: status={status}, model={model}, url={url}, body={body}") from exc
+            data = response.json()
+            return str(data["choices"][0]["message"]["content"])
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            if attempt >= max_attempts:
+                raise
+            _sleep_before_retry(attempt, max_attempts, repr(exc))
+    raise RuntimeError("Volcengine request failed after retries")
+
+
+def _request_timeout_seconds() -> float:
+    return float(os.environ.get("ARK_REQUEST_TIMEOUT", "240"))
+
+
+def _request_max_attempts() -> int:
+    return max(1, int(os.environ.get("ARK_REQUEST_RETRIES", "3")))
+
+
+def _sleep_before_retry(attempt: int, max_attempts: int, reason: str) -> None:
+    wait_seconds = min(2 ** (attempt - 1), 8)
+    print(f"glossary_request_retry: attempt {attempt}/{max_attempts} wait={wait_seconds}s {reason}", flush=True)
+    time.sleep(wait_seconds)
 
 
 def _chunk_cues(cues, *, batch_size: int, max_chars: int):

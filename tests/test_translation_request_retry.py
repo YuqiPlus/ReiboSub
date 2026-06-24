@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import requests
+from types import SimpleNamespace
 
 from video_translate.translate import volcengine
 
@@ -33,3 +35,82 @@ def test_request_translation_retries_timeout(monkeypatch):
     assert volcengine._request_translation("https://example.test", "key", {"model": "m"}) == "ok"
     assert len(calls) == 2
     assert calls[0]["timeout"] == 5.0
+
+
+def test_translate_batch_splits_after_timeout(monkeypatch, tmp_path):
+    source = tmp_path / "source.srt"
+    source.write_text(
+        "\n\n".join(
+            [
+                "1\n00:00:00,000 --> 00:00:01,000\n하나",
+                "2\n00:00:01,000 --> 00:00:02,000\n둘",
+                "3\n00:00:02,000 --> 00:00:03,000\n셋",
+                "4\n00:00:03,000 --> 00:00:04,000\n넷",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.srt"
+    calls = []
+
+    def fake_request_mapping(_endpoint, _key, payload, batch_label, **kwargs):
+        user = json.loads(payload["messages"][1]["content"])
+        ids = [item["id"] for item in user["subtitles"]]
+        calls.append((batch_label, ids))
+        if ids == [1, 2, 3, 4]:
+            raise requests.Timeout("slow batch")
+        return {cue_id: f"译文{cue_id}" for cue_id in ids}
+
+    monkeypatch.setenv("ARK_API_KEY", "key")
+    monkeypatch.setattr(volcengine, "_load_dotenv", lambda _path: None)
+    monkeypatch.setattr(
+        volcengine,
+        "load_llm_task_config",
+        lambda *args, **kwargs: SimpleNamespace(model="model", base_url="https://example.test", fallback_models=()),
+    )
+    monkeypatch.setattr(volcengine, "_request_translation_mapping", fake_request_mapping)
+
+    volcengine.translate_srt_with_volcengine(source, out, batch_size=4)
+
+    assert calls == [("1/1", [1, 2, 3, 4]), ("1/1a", [1, 2]), ("1/1b", [3, 4])]
+    text = out.read_text(encoding="utf-8")
+    assert "译文1" in text
+    assert "译文4" in text
+
+
+def test_translate_batch_uses_fallback_model_after_timeout(monkeypatch, tmp_path):
+    source = tmp_path / "source.srt"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\n하나\n", encoding="utf-8")
+    out = tmp_path / "out.srt"
+    calls = []
+
+    def fake_request_mapping(_endpoint, _key, payload, batch_label, **kwargs):
+        model = payload["model"]
+        user = json.loads(payload["messages"][1]["content"])
+        ids = [item["id"] for item in user["subtitles"]]
+        calls.append((batch_label, model, ids, kwargs))
+        if model == "doubao-seed-2.0-pro":
+            raise requests.Timeout("slow primary")
+        return {cue_id: f"备用译文{cue_id}" for cue_id in ids}
+
+    monkeypatch.setenv("ARK_API_KEY", "key")
+    monkeypatch.setattr(volcengine, "_load_dotenv", lambda _path: None)
+    monkeypatch.setattr(
+        volcengine,
+        "load_llm_task_config",
+        lambda *args, **kwargs: SimpleNamespace(
+            model="doubao-seed-2.0-pro",
+            base_url="https://example.test",
+            fallback_models=("doubao-seed-2.0-lite",),
+        ),
+    )
+    monkeypatch.setattr(volcengine, "_request_translation_mapping", fake_request_mapping)
+
+    volcengine.translate_srt_with_volcengine(source, out, batch_size=1)
+
+    assert calls == [
+        ("1/1", "doubao-seed-2.0-pro", [1], {"max_attempts": 1}),
+        ("1/1 fallback doubao-seed-2.0-lite", "doubao-seed-2.0-lite", [1], {"max_attempts": 1}),
+    ]
+    assert "备用译文1" in out.read_text(encoding="utf-8")
