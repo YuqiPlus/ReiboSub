@@ -5,12 +5,15 @@ import mimetypes
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -138,8 +141,61 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
     GLOSSARY_DIR.mkdir(parents=True, exist_ok=True)
     JOB_DIR.mkdir(parents=True, exist_ok=True)
     server = ThreadingHTTPServer((host, port), AgentHandler)
-    print(f"Video Translate Agent UI: http://{host}:{port}", flush=True)
+    print(f"Video Translate Agent UI listening on {host}:{port}", flush=True)
+    for url in _browse_urls(host, port):
+        print(f"  {url}", flush=True)
     server.serve_forever()
+
+
+def _browse_urls(host: str, port: int) -> list[str]:
+    if host not in {"0.0.0.0", "::"}:
+        return [f"http://{_format_url_host(host)}:{port}"]
+
+    hosts = ["127.0.0.1", *_local_ipv4_addresses()]
+    urls: list[str] = []
+    for item in hosts:
+        url = f"http://{item}:{port}"
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+
+def _local_ipv4_addresses() -> list[str]:
+    addresses: set[str] = set()
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_DGRAM):
+            address = info[4][0]
+            if _is_browsable_ipv4(address):
+                addresses.add(address)
+    except OSError:
+        pass
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("8.8.8.8", 80))
+            address = probe.getsockname()[0]
+            if _is_browsable_ipv4(address):
+                addresses.add(address)
+    except OSError:
+        pass
+
+    return sorted(addresses, key=_ipv4_sort_key)
+
+
+def _is_browsable_ipv4(address: str) -> bool:
+    return bool(address and not address.startswith(("127.", "169.254.")) and address != "0.0.0.0")
+
+
+def _ipv4_sort_key(address: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in address.split("."))
+    except ValueError:
+        return (999, 999, 999, 999)
+
+
+def _format_url_host(host: str) -> str:
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
 
 
 def probe_video(
@@ -1041,7 +1097,7 @@ def download_video_job(payload: dict[str, Any]) -> Job:
     before = _snapshot_video_files(DOWNLOAD_DIR)
 
     def target(job_id: str) -> dict[str, Any]:
-        _run_command(job_id, _module_command("video_translate.youtube.download_video", url))
+        _run_command(job_id, _module_command("video_translate.youtube.download_video", url, "--output-dir", DOWNLOAD_DIR))
         videos = _changed_video_files(DOWNLOAD_DIR, before)
         if not videos:
             videos = _matching_video_files(DOWNLOAD_DIR, title)
@@ -1065,7 +1121,7 @@ def ocr_full_job(payload: dict[str, Any]) -> Job:
         out_dir.mkdir(parents=True, exist_ok=True)
         before_videos = _snapshot_video_files(DOWNLOAD_DIR)
         _append_log(job_id, "download_video_start")
-        _run_command(job_id, _module_command("video_translate.youtube.download_video", url))
+        _run_command(job_id, _module_command("video_translate.youtube.download_video", url, "--output-dir", DOWNLOAD_DIR))
         videos = _changed_video_files(DOWNLOAD_DIR, before_videos)
         if not videos:
             videos = _newest_video_files(DOWNLOAD_DIR, limit=1)
@@ -1931,6 +1987,7 @@ def _matching_media_files(directory: Path, patterns: list[str], title: str) -> l
     title = str(title or "").strip()
     if not title:
         return []
+    title_key = _filename_match_key(title)
     candidates: list[Path] = []
     for pattern in patterns:
         candidates.extend(path for path in directory.glob(pattern) if path.is_file() and not path.name.startswith("._"))
@@ -1939,6 +1996,7 @@ def _matching_media_files(directory: Path, patterns: list[str], title: str) -> l
 
     def score(path: Path) -> tuple[int, float]:
         stem = path.stem
+        stem_key = _filename_match_key(stem)
         if stem == title:
             rank = 0
         elif stem.startswith(title + "."):
@@ -1947,12 +2005,25 @@ def _matching_media_files(directory: Path, patterns: list[str], title: str) -> l
             rank = 2
         elif title in stem:
             rank = 3
+        elif stem_key == title_key:
+            rank = 4
+        elif stem_key.startswith(title_key):
+            rank = 5
+        elif title_key and title_key in stem_key:
+            rank = 6
+        elif title_key and SequenceMatcher(None, title_key, stem_key).ratio() >= 0.86:
+            rank = 7
         else:
             rank = 99
         return (rank, -path.stat().st_mtime)
 
     matches = [path for path in candidates if score(path)[0] < 99]
     return sorted(matches, key=score)
+
+
+def _filename_match_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return "".join(char for char in normalized if char.isalnum())
 
 
 def _required_str(payload: dict[str, Any], name: str) -> str:
@@ -1970,8 +2041,18 @@ def _resolve_project_path(value: Any) -> Path:
 
 
 def _ensure_under_root(path: Path) -> None:
-    if not _is_relative_to(path, ROOT):
-        raise ValueError(f"路径不在项目目录下: {path}")
+    if not any(_is_relative_to(path, allowed) for allowed in _allowed_path_roots()):
+        allowed_text = "、".join(str(root) for root in _allowed_path_roots())
+        raise ValueError(f"路径不在允许的工作目录下: {path}。允许目录: {allowed_text}")
+
+
+def _allowed_path_roots() -> list[Path]:
+    roots: list[Path] = []
+    for path in [ROOT, DOWNLOAD_DIR, JOB_DIR, GLOSSARY_DIR]:
+        resolved = path.resolve()
+        if resolved not in roots:
+            roots.append(resolved)
+    return roots
 
 
 def _is_relative_to(path: Path, parent: Path) -> bool:

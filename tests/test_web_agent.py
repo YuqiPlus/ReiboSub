@@ -271,6 +271,46 @@ def test_agent_translate_after_glossary_exposes_sidecar_paths(monkeypatch, tmp_p
     assert snapshot["result"]["translate_subtitle"]["translated_sidecar"] == str(sidecar)
 
 
+def test_matching_media_files_handles_yt_dlp_sanitized_title(tmp_path: Path):
+    title = "멜로 눈빛 장착한 두부들이 왔습니다♥ | 🎥라이브 짧게보기"
+    video = tmp_path / "멜로 눈빛 장착한 두부들이 왔습니다♥ ｜ 🎥라이브 짧게보기.mp4"
+    subtitle = tmp_path / "멜로 눈빛 장착한 두부들이 왔습니다♥ ｜ 🎥라이브 짧게보기.en.srt"
+    video.write_bytes(b"video")
+    subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\nhello\n", encoding="utf-8")
+
+    assert web_agent._matching_video_files(tmp_path, title) == [video]
+    assert web_agent._matching_subtitle_files(tmp_path, title, "en") == [subtitle]
+
+
+def test_allowed_paths_include_external_download_dir(tmp_path: Path, monkeypatch):
+    root = tmp_path / "project"
+    downloads = tmp_path / "external_downloads"
+    jobs = root / "outputs" / "agent_jobs"
+    glossaries = root / "configs" / "glossaries"
+    root.mkdir()
+    downloads.mkdir()
+    jobs.mkdir(parents=True)
+    glossaries.mkdir(parents=True)
+    video = downloads / "demo.mp4"
+    video.write_bytes(b"video")
+    outside = tmp_path / "outside" / "secret.txt"
+    outside.parent.mkdir()
+    outside.write_text("secret", encoding="utf-8")
+
+    monkeypatch.setattr(web_agent, "ROOT", root)
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
+    monkeypatch.setattr(web_agent, "JOB_DIR", jobs)
+    monkeypatch.setattr(web_agent, "GLOSSARY_DIR", glossaries)
+
+    web_agent._ensure_under_root(video)
+    try:
+        web_agent._ensure_under_root(outside)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unconfigured external path should be rejected")
+
+
 def _wait_agent_status(session_id: str, status: str, timeout: float = 2.0):
     deadline = time.time() + timeout
     snapshot = None
