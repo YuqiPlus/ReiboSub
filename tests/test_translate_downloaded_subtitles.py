@@ -55,3 +55,24 @@ def test_translate_downloaded_subtitles_preserves_timing_mode(monkeypatch, tmp_p
     assert calls["llm_cleanup_translated"] is False
     assert calls["cleanup_residual_fragments"] is False
     assert calls["retime_translated"] is False
+
+
+def test_translate_downloaded_subtitles_can_enable_readability_retime(monkeypatch, tmp_path):
+    module = _load_module()
+    source = tmp_path / "video.ko.srt"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\n박보영\n", encoding="utf-8")
+    calls = {}
+
+    def fake_translate_srt_with_volcengine(source_srt, out_srt, **kwargs):
+        calls.update(kwargs)
+        return out_srt
+
+    monkeypatch.setattr(module, "translate_srt_with_volcengine", fake_translate_srt_with_volcengine)
+
+    module.translate_downloaded_subtitles(source, translation_mode="readability_retime")
+
+    assert calls["dedupe_translated"] is True
+    assert calls["llm_cleanup_translated"] is True
+    assert calls["cleanup_residual_fragments"] is True
+    assert calls["retime_translated"] is True
+    assert "强力精修模式" in calls["extra_prompt"]
