@@ -126,7 +126,12 @@ def test_agent_session_hybrid_downloads_anchor_video_and_generates_glossary(monk
     monkeypatch.setattr(web_agent, "download_subtitle_job", lambda payload: calls.append(f"subtitle:{payload['lang']}") or done_job("subtitle", {"subtitle_path": str(anchor)}))
     monkeypatch.setattr(web_agent, "download_video_job", lambda payload: calls.append("video") or done_job("video", {"input_video": str(video)}))
     monkeypatch.setattr(web_agent, "hybrid_anchor_ocr_job", lambda payload: calls.append(f"hybrid:{payload['anchor_srt']}:{payload['input_video']}") or done_job("hybrid", {"source_srt": str(hybrid), "debug_json": str(tmp_path / "hybrid.debug.json")}))
-    monkeypatch.setattr(web_agent, "generate_glossary_job", lambda payload: calls.append(f"glossary:{payload['source_srt']}") or done_job("glossary", {"glossary_path": str(glossary), "content": "characters: []\n"}))
+    def fake_generate_glossary(payload):
+        calls.append(f"glossary:{payload['source_srt']}:{payload.get('out', '')}")
+        assert payload["out"].endswith(f"agent_jobs/{session.id}/glossary.draft.yaml")
+        return done_job("glossary", {"glossary_path": str(glossary), "content": "characters: []\n"})
+
+    monkeypatch.setattr(web_agent, "generate_glossary_job", fake_generate_glossary)
 
     session = web_agent.start_agent_session({"url": "abc123", "embedded_subtitle_hint": "yes"})
     snapshot = _wait_agent_phase(session.id, "confirm_subtitle")
@@ -137,7 +142,7 @@ def test_agent_session_hybrid_downloads_anchor_video_and_generates_glossary(monk
 
     assert snapshot["result"]["source_srt"] == str(hybrid)
     assert snapshot["result"]["source_kind"] == "hybrid_anchor_ocr"
-    assert calls == ["subtitle:en", "video", f"hybrid:{anchor}:{video}", f"glossary:{hybrid}"]
+    assert calls == ["subtitle:en", "video", f"hybrid:{anchor}:{video}", f"glossary:{hybrid}:{web_agent.JOB_DIR / session.id / 'glossary.draft.yaml'}"]
 
 
 def test_cancel_agent_session_cancels_current_child_job(monkeypatch):
@@ -208,7 +213,8 @@ def test_agent_session_downloads_generates_glossary_then_waits(monkeypatch, tmp_
         return done_job("download", {"subtitle_path": str(source)})
 
     def fake_glossary(payload):
-        calls.append(f"glossary:{payload['source_srt']}")
+        calls.append(f"glossary:{payload['source_srt']}:{payload.get('out', '')}")
+        assert payload["out"].endswith(f"agent_jobs/{session.id}/glossary.draft.yaml")
         return done_job("glossary", {"glossary_path": str(glossary), "content": "characters: []\n"})
 
     monkeypatch.setattr(web_agent, "download_subtitle_job", fake_download)
@@ -221,7 +227,48 @@ def test_agent_session_downloads_generates_glossary_then_waits(monkeypatch, tmp_
     assert snapshot["question"]["kind"] == "review_glossary"
     assert snapshot["result"]["source_srt"] == str(source)
     assert snapshot["result"]["glossary_path"] == str(glossary)
-    assert calls == [f"download:ko:manual", f"glossary:{source}"]
+    assert calls == [f"download:ko:manual", f"glossary:{source}:{web_agent.JOB_DIR / session.id / 'glossary.draft.yaml'}"]
+
+
+def test_agent_translate_after_glossary_exposes_sidecar_paths(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    source = tmp_path / "source.srt"
+    glossary = tmp_path / "glossary.yaml"
+    translated = tmp_path / "source.zh.srt"
+    sidecar = tmp_path / "video.zh.srt"
+    session = web_agent.AgentSession(
+        id="agent1",
+        status="waiting",
+        phase="review_glossary",
+        payload={},
+        result={"source_srt": str(source), "glossary_path": str(glossary)},
+    )
+    with web_agent._LOCK:
+        web_agent._AGENT_SESSIONS[session.id] = session
+
+    def done_job(name, result):
+        return web_agent.Job(id=name, name=name, status="done", result=result)
+
+    monkeypatch.setattr(
+        web_agent,
+        "translate_subtitle_job",
+        lambda payload: done_job(
+            "translate",
+            {
+                "translated_srt": str(translated),
+                "translated_sidecar": str(sidecar),
+                "translation_mode": payload["translation_mode"],
+            },
+        ),
+    )
+
+    web_agent._agent_translate_after_glossary(session, use_glossary=True)
+    snapshot = web_agent.get_agent_session(session.id).to_dict()
+
+    assert snapshot["status"] == "done"
+    assert snapshot["result"]["translated_srt"] == str(translated)
+    assert snapshot["result"]["translated_sidecar"] == str(sidecar)
+    assert snapshot["result"]["translate_subtitle"]["translated_sidecar"] == str(sidecar)
 
 
 def _wait_agent_status(session_id: str, status: str, timeout: float = 2.0):
@@ -319,6 +366,49 @@ terms:
     assert written["items"][0]["reviewed"] is True
     assert written["items"][1]["zh"] == ""
     assert written["items"][1]["reviewed"] is True
+
+
+def test_glossary_write_allows_agent_job_glossary(tmp_path: Path, monkeypatch):
+    job_dir = tmp_path / "outputs" / "agent_jobs" / "job123"
+    job_dir.mkdir(parents=True)
+    path = job_dir / "glossary.draft.yaml"
+    path.write_text(
+        """characters:
+- source: 보영
+  zh: ""
+  suggested_zh: 宝英
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+    monkeypatch.setattr(web_agent, "GLOSSARY_DIR", tmp_path / "configs" / "glossaries")
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "outputs" / "agent_jobs")
+
+    text_result = web_agent.write_text_file({"path": str(path), "content": "characters: []\n"})
+    item_result = web_agent.write_glossary_items(
+        {
+            "path": str(path),
+            "items": [{"section": "characters", "index": 0, "zh": "宝英", "reviewed": True}],
+        }
+    )
+
+    assert text_result["saved"] is True
+    assert item_result["saved"] is True
+
+
+def test_glossary_write_rejects_project_file_outside_allowed_dirs(tmp_path: Path, monkeypatch):
+    path = tmp_path / "README.md"
+    path.write_text("do not overwrite", encoding="utf-8")
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+    monkeypatch.setattr(web_agent, "GLOSSARY_DIR", tmp_path / "configs" / "glossaries")
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "outputs" / "agent_jobs")
+
+    try:
+        web_agent.write_text_file({"path": str(path), "content": "bad"})
+    except ValueError as exc:
+        assert "只允许保存" in str(exc)
+    else:
+        raise AssertionError("write_text_file should reject paths outside glossary/job directories")
 
 
 def test_glossary_item_keeps_romanized_hint_without_suggestion():
@@ -659,6 +749,46 @@ sidecar:
     assert job.status == "done"
     assert sidecar.read_text(encoding="utf-8").endswith("朴宝英\n")
     assert job.result["translated_sidecar"] == str(sidecar)
+
+
+def test_download_video_job_uses_existing_file_matching_title(monkeypatch, tmp_path: Path):
+    downloads = tmp_path / "YoutubeDownloads"
+    downloads.mkdir()
+    target = downloads / "Target Video.mp4"
+    wrong_newer = downloads / "Wrong Newer Video.mp4"
+    target.write_text("target", encoding="utf-8")
+    wrong_newer.write_text("wrong", encoding="utf-8")
+    now = time.time()
+    __import__("os").utime(target, (now - 100, now - 100))
+    __import__("os").utime(wrong_newer, (now, now))
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
+    monkeypatch.setattr(web_agent, "PYTHON", "/python")
+    monkeypatch.setattr(web_agent, "_run_command", lambda job_id, args: None)
+
+    job = web_agent.download_video_job({"url": "abc123", "title": "Target Video"})
+    snapshot = _wait_job_status(job.id, "done")
+
+    assert snapshot["result"]["input_video"] == str(target)
+
+
+def test_download_subtitle_job_uses_existing_file_matching_title_and_language(monkeypatch, tmp_path: Path):
+    downloads = tmp_path / "YoutubeDownloads"
+    downloads.mkdir()
+    target = downloads / "Target Video.en.srt"
+    wrong_newer = downloads / "Wrong Newer Video.en.srt"
+    target.write_text("target", encoding="utf-8")
+    wrong_newer.write_text("wrong", encoding="utf-8")
+    now = time.time()
+    __import__("os").utime(target, (now - 100, now - 100))
+    __import__("os").utime(wrong_newer, (now, now))
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
+    monkeypatch.setattr(web_agent, "PYTHON", "/python")
+    monkeypatch.setattr(web_agent, "_run_command", lambda job_id, args: None)
+
+    job = web_agent.download_subtitle_job({"url": "abc123", "lang": "en", "kind": "manual", "title": "Target Video"})
+    snapshot = _wait_job_status(job.id, "done")
+
+    assert snapshot["result"]["subtitle_path"] == str(target)
 
 
 

@@ -14,17 +14,17 @@ def build_agent_plan(
     embedded_subtitle_hint: str = "unknown",
 ) -> dict[str, Any]:
     normalized = [_normalize_caption(item) for item in captions if isinstance(item, dict)]
-    target_caption = _find_caption(normalized, target_language, kind="manual") or _find_caption(normalized, target_language, kind="auto")
+    target_caption = _find_caption(normalized, target_language, kind="manual")
     if target_caption:
         return _plan(
             route="download_target_subtitle",
             selected_subtitle=target_caption,
             requires_translation=False,
             needs_source_correction=False,
-            confidence=0.95 if target_caption["kind"] == "manual" else 0.86,
-            recommended_action="download_subtitle",
-            reasons=["检测到目标语言字幕，优先直接下载。"],
-        )
+                confidence=0.95,
+                recommended_action="download_subtitle",
+                reasons=["检测到目标语言字幕，优先直接下载。"],
+            )
 
     source_language = detected_source_language.strip().lower()
     if source_language:
@@ -39,18 +39,6 @@ def build_agent_plan(
                 recommended_action="download_then_translate_subtitle",
                 reasons=["没有目标语言字幕，检测到原声语言的作者字幕，适合作为翻译源。"],
             )
-        auto_source = _find_caption(normalized, source_language, kind="auto")
-        if auto_source:
-            return _plan(
-                route="translate_auto_subtitle",
-                selected_subtitle=auto_source,
-                requires_translation=True,
-                needs_source_correction=True,
-                confidence=0.76,
-                recommended_action="download_correct_translate_subtitle",
-                reasons=["没有目标语言字幕，检测到原声语言的自动字幕，建议先纠错再翻译。"],
-            )
-
     hint = _normalize_embedded_subtitle_hint(embedded_subtitle_hint)
     english_manual = _find_caption(normalized, "en", kind="manual")
     if english_manual and hint == "yes":
@@ -64,7 +52,7 @@ def build_agent_plan(
             reasons=["检测到英文人工字幕，且用户确认画面有内嵌字幕；推荐用英文时间轴定轴，并用韩文 OCR 提升翻译精度。"],
         )
 
-    english = english_manual or _find_caption(normalized, "en", kind="auto")
+    english = english_manual
     if english:
         return _plan(
             route="translate_fallback_subtitle",

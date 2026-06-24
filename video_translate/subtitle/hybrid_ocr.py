@@ -211,14 +211,14 @@ def reconstruct_korean_cues_with_llm(
     if not context_cues:
         return {}
     _load_dotenv(Path.cwd())
-    key = os.environ.get("ARK_API_KEY")
     task_llm = load_llm_task_config("hybrid_source_reconstruction", explicit_model=model, explicit_base_url=base_url)
+    key = getattr(task_llm, "api_key", None) or os.environ.get("LLM_API_KEY") or os.environ.get("ARK_API_KEY")
     selected_model = task_llm.model
     endpoint = _chat_completions_url(task_llm.base_url or DEFAULT_BASE_URL)
     if not key:
-        raise RuntimeError("缺少 ARK_API_KEY，请先配置火山方舟 API Key。")
+        raise RuntimeError("缺少 LLM_API_KEY，请先配置 OpenAI-compatible API Key。")
     if not selected_model:
-        raise RuntimeError("缺少 hybrid_source_reconstruction 模型配置或 ARK_MODEL。")
+        raise RuntimeError("缺少 hybrid_source_reconstruction 模型配置或 LLM_MODEL。")
 
     mapping: dict[int, str] = {}
     total_batches = max(1, (len(context_cues) + batch_size - 1) // batch_size)
@@ -297,6 +297,9 @@ def build_reconstruction_payload(cues: list[SubtitleCue], model: str) -> dict[st
             "每条输出必须保持同一个 id，不得合并、拆分、删除或新增条目。",
             "英文参考的时间轴可信，最终韩文原句必须对应该英文参考的语义。",
             "韩文 OCR 候选可能有错字、漏字、串到前后句或时间错位；请结合英文参考纠正。",
+            "韩文 OCR 候选可能包含说话人姓名、屏幕姓名牌、频道水印或固定画面标签；这些默认不是台词内容。",
+            "除非英文参考明确包含称呼或说话人信息，否则不要把说话人姓名并入韩文原句。",
+            "如果必须保留说话人标签，请使用“说话人: 台词”格式，不要用逗号把说话人和台词连成一句。",
             "如果 OCR 候选与英文参考明显不对应，可以参考前后条目判断；仍无法判断时，可按英文参考回译成自然韩文，但不要编造专有名词。",
             "只输出韩文原句，不要中文，不要解释，不要保留“韩文OCR候选/英文参考”标签。",
         ],

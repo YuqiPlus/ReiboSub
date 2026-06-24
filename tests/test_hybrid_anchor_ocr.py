@@ -85,3 +85,14 @@ def test_reconstruct_korean_cues_splits_batch_when_model_returns_bad_json(monkey
 
     assert mapping == {1: "안녕", 2: "고마워"}
     assert calls == [[1, 2], [1], [2]]
+
+
+def test_hybrid_reconstruction_prompt_treats_speaker_labels_as_labels():
+    payload = hybrid_ocr.build_reconstruction_payload(
+        [SubtitleCue(index=1, start=0.0, end=1.0, text="韩文OCR候选：BOYOUNG 안녕\n英文参考：Hello")],
+        "lite",
+    )
+
+    content = payload["messages"][1]["content"]
+    assert "说话人姓名" in content
+    assert "不要用逗号" in content

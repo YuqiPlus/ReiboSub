@@ -30,7 +30,19 @@ def test_agent_plan_uses_source_language_manual_subtitle_when_no_chinese():
     assert plan["requires_translation"] is True
 
 
-def test_agent_plan_uses_source_language_auto_subtitle_when_manual_missing():
+def test_agent_plan_does_not_recommend_target_language_auto_subtitle():
+    captions = [
+        {"lang": "zh-Hans", "kind": "auto"},
+        {"lang": "ko", "kind": "auto"},
+    ]
+
+    plan = build_agent_plan(captions, target_language="zh", detected_source_language="ko")
+
+    assert plan["route"] == "diagnose_ocr_asr"
+    assert plan["selected_subtitle"] is None
+
+
+def test_agent_plan_does_not_recommend_source_language_auto_subtitle():
     captions = [
         {"lang": "en", "kind": "manual"},
         {"lang": "ko", "kind": "auto"},
@@ -38,9 +50,18 @@ def test_agent_plan_uses_source_language_auto_subtitle_when_manual_missing():
 
     plan = build_agent_plan(captions, target_language="zh", detected_source_language="ko")
 
-    assert plan["route"] == "translate_auto_subtitle"
-    assert plan["selected_subtitle"]["lang"] == "ko"
-    assert plan["needs_source_correction"] is True
+    assert plan["route"] == "translate_fallback_subtitle"
+    assert plan["selected_subtitle"]["lang"] == "en"
+    assert plan["needs_source_correction"] is False
+
+
+def test_agent_plan_does_not_recommend_english_auto_fallback_subtitle():
+    captions = [{"lang": "en", "kind": "auto"}]
+
+    plan = build_agent_plan(captions, target_language="zh", detected_source_language="ko")
+
+    assert plan["route"] == "diagnose_ocr_asr"
+    assert plan["selected_subtitle"] is None
 
 
 def test_agent_plan_recommends_hybrid_when_english_manual_and_embedded_subtitles_exist():

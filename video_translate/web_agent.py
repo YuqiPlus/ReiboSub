@@ -58,6 +58,8 @@ PYTHON = sys.executable
 _HYBRID_TRANSLATION_PROMPT = """本次源字幕是 hybrid 格式：时间轴来自作者上传的英文人工字幕，文本中可能同时包含“韩文OCR”和“英文参考”。
 翻译时必须优先依据“韩文OCR”的韩文原文，英文参考只用于理解上下文和兜底。
 如果某条只有“英文参考”没有“韩文OCR”，才允许按英文参考翻译。
+OCR 里的说话人姓名、屏幕姓名牌、频道水印或固定画面标签，默认不是台词内容；不要把它们用逗号接进句子。
+如果确实需要保留说话人，请使用“姓名：台词”格式；不要使用“姓名，台词”格式。
 输出时不要保留“韩文OCR：”“英文参考：”这些标签。
 """
 
@@ -191,14 +193,14 @@ def translate_title_text(title: str, *, model: str | None = None, base_url: str 
     if not title:
         raise ValueError("标题为空")
     _load_dotenv(ROOT)
-    key = os.environ.get("ARK_API_KEY")
     task_llm = load_llm_task_config("title_translation", explicit_model=model, explicit_base_url=base_url)
+    key = getattr(task_llm, "api_key", None) or os.environ.get("LLM_API_KEY") or os.environ.get("ARK_API_KEY")
     selected_model = task_llm.model
     endpoint = _chat_completions_url(task_llm.base_url or DEFAULT_BASE_URL)
     if not key:
-        raise RuntimeError("缺少 ARK_API_KEY，请先配置火山方舟 API Key。")
+        raise RuntimeError("缺少 LLM_API_KEY，请先配置 OpenAI-compatible API Key。")
     if not selected_model:
-        raise RuntimeError("缺少 ARK_MODEL，请先配置火山方舟模型名或接入点 ID。")
+        raise RuntimeError("缺少 LLM_MODEL 或 title_translation 任务专用模型配置。")
     content = _request_translation(endpoint, key, build_title_translation_payload(title, selected_model))
     zh = _parse_title_translation(content)
     return {"title": title, "zh_title": zh}
@@ -488,7 +490,9 @@ def _agent_use_recommended_subtitle(session: AgentSession) -> None:
     selected = plan.get("selected_subtitle") or {}
     url = str(probe.get("normalized_url") or result.get("normalized_url") or session.payload.get("url") or "")
     _agent_set_phase(session.id, "download_subtitle")
-    subtitle_job = download_subtitle_job({"url": url, "lang": selected.get("lang"), "kind": selected.get("kind")})
+    subtitle_job = download_subtitle_job(
+        {"url": url, "lang": selected.get("lang"), "kind": selected.get("kind"), "title": probe.get("title") or ""}
+    )
     subtitle_result = _wait_for_job(subtitle_job, session_id=session.id)
     source_srt = str(subtitle_result.get("subtitle_path") or "")
     _agent_update_result(session.id, {"source_srt": source_srt, "download_subtitle": subtitle_result})
@@ -498,7 +502,13 @@ def _agent_use_recommended_subtitle(session: AgentSession) -> None:
     if plan.get("needs_source_correction"):
         _agent_log(session.id, "source_correction_suggested")
     _agent_set_phase(session.id, "generate_glossary")
-    glossary_job = generate_glossary_job({"source_srt": source_srt, "extra_hint": str(session.payload.get("extra_hint") or "")})
+    glossary_job = generate_glossary_job(
+        {
+            "source_srt": source_srt,
+            "extra_hint": str(session.payload.get("extra_hint") or ""),
+            "out": str(_agent_glossary_path(session)),
+        }
+    )
     glossary_result = _wait_for_job(glossary_job, session_id=session.id)
     glossary_path = str(glossary_result.get("glossary_path") or "")
     _agent_update_result(session.id, {"glossary_path": glossary_path, "generate_glossary": glossary_result})
@@ -534,7 +544,11 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
         }
     )
     translated = _wait_for_job(job, session_id=session.id)
-    _agent_done(session.id, {"translate_subtitle": translated, "translated_srt": translated.get("translated_srt")})
+    done_result = {"translate_subtitle": translated, "translated_srt": translated.get("translated_srt")}
+    for key in ("translated_sidecar", "source_sidecar"):
+        if translated.get(key):
+            done_result[key] = translated.get(key)
+    _agent_done(session.id, done_result)
 
 
 def _agent_continue_route_without_subtitle(session_id: str, plan: dict[str, Any]) -> None:
@@ -590,14 +604,14 @@ def _agent_run_hybrid_anchor_ocr(session: AgentSession) -> None:
 
     _agent_set_phase(session.id, "download_anchor_subtitle")
     subtitle_result = _wait_for_job(
-        download_subtitle_job({"url": url, "lang": selected.get("lang"), "kind": selected.get("kind")}),
+        download_subtitle_job({"url": url, "lang": selected.get("lang"), "kind": selected.get("kind"), "title": probe.get("title") or ""}),
         session_id=session.id,
     )
     anchor_srt = str(subtitle_result.get("subtitle_path") or "")
     _agent_update_result(session.id, {"anchor_srt": anchor_srt, "download_subtitle": subtitle_result})
 
     _agent_set_phase(session.id, "download_video_for_hybrid")
-    video_result = _wait_for_job(download_video_job({"url": url}), session_id=session.id)
+    video_result = _wait_for_job(download_video_job({"url": url, "title": probe.get("title") or ""}), session_id=session.id)
     input_video = str(video_result.get("input_video") or "")
     _agent_update_result(session.id, {"input_video": input_video, "download_video": video_result})
 
@@ -623,7 +637,14 @@ def _agent_run_hybrid_anchor_ocr(session: AgentSession) -> None:
     )
 
     _agent_set_phase(session.id, "generate_glossary")
-    glossary_job = generate_glossary_job({"source_srt": source_srt, "extra_hint": extra_hint, "source_language": "korean"})
+    glossary_job = generate_glossary_job(
+        {
+            "source_srt": source_srt,
+            "extra_hint": extra_hint,
+            "source_language": "korean",
+            "out": str(_agent_glossary_path(session)),
+        }
+    )
     glossary_result = _wait_for_job(glossary_job, session_id=session.id)
     glossary_path = str(glossary_result.get("glossary_path") or "")
     _agent_update_result(session.id, {"glossary_path": glossary_path, "generate_glossary": glossary_result})
@@ -646,7 +667,8 @@ def _agent_run_hybrid_anchor_ocr(session: AgentSession) -> None:
 def _agent_run_asr(session: AgentSession) -> None:
     _agent_set_phase(session.id, "download_video_for_asr")
     url = str(session.result.get("normalized_url") or session.payload.get("url") or "")
-    video_result = _wait_for_job(download_video_job({"url": url}), session_id=session.id)
+    probe = session.result.get("probe") or {}
+    video_result = _wait_for_job(download_video_job({"url": url, "title": probe.get("title") or ""}), session_id=session.id)
     input_video = str(video_result.get("input_video") or "")
     _agent_update_result(session.id, {"input_video": input_video, "download_video": video_result})
     _agent_set_phase(session.id, "audio_asr")
@@ -736,6 +758,16 @@ def _agent_set_phase(session_id: str, phase: str) -> None:
         session.logs.append(f"agent_phase: {phase}")
 
 
+def _agent_workspace(session: AgentSession) -> Path:
+    path = JOB_DIR / session.id
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _agent_glossary_path(session: AgentSession) -> Path:
+    return _agent_workspace(session) / "glossary.draft.yaml"
+
+
 def _agent_update_result(session_id: str, values: dict[str, Any]) -> None:
     with _LOCK:
         session = _AGENT_SESSIONS.get(session_id)
@@ -804,6 +836,7 @@ def download_subtitle_job(payload: dict[str, Any]) -> Job:
     url = _required_str(payload, "url")
     lang = _required_str(payload, "lang")
     kind = str(payload.get("kind") or "manual")
+    title = str(payload.get("title") or "").strip()
     before = _snapshot_files(DOWNLOAD_DIR, "*.srt")
 
     def target(job_id: str) -> dict[str, Any]:
@@ -815,7 +848,11 @@ def download_subtitle_job(payload: dict[str, Any]) -> Job:
         _run_command(job_id, args)
         changed = _changed_files(DOWNLOAD_DIR, "*.srt", before)
         if not changed:
+            changed = _matching_subtitle_files(DOWNLOAD_DIR, title, lang)
+        if not changed and not title:
             changed = _newest_files(DOWNLOAD_DIR, "*.srt", limit=3)
+        if not changed:
+            raise RuntimeError(f"字幕下载完成后没有找到匹配文件: title={title or '<unknown>'}, lang={lang}")
         return {"subtitle_paths": [str(path) for path in changed], "subtitle_path": str(changed[0]) if changed else ""}
 
     return start_job(f"下载字幕 {lang} {kind}", target)
@@ -831,6 +868,7 @@ def generate_glossary_job(payload: dict[str, Any]) -> Job:
     _ensure_under_root(out)
 
     def target(job_id: str) -> dict[str, Any]:
+        out.parent.mkdir(parents=True, exist_ok=True)
         args = _module_command("video_translate.tools.generate_glossary", source_srt, "--out", out, "--source-language", source_language)
         if extra_hint.strip():
             args.extend(["--extra-hint", extra_hint.strip()])
@@ -999,13 +1037,18 @@ def _copy_source_sidecar_for_run_config(run_config: Path, source_srt: Path) -> d
 
 def download_video_job(payload: dict[str, Any]) -> Job:
     url = _required_str(payload, "url")
+    title = str(payload.get("title") or "").strip()
     before = _snapshot_video_files(DOWNLOAD_DIR)
 
     def target(job_id: str) -> dict[str, Any]:
         _run_command(job_id, _module_command("video_translate.youtube.download_video", url))
         videos = _changed_video_files(DOWNLOAD_DIR, before)
         if not videos:
+            videos = _matching_video_files(DOWNLOAD_DIR, title)
+        if not videos and not title:
             videos = _newest_video_files(DOWNLOAD_DIR, limit=3)
+        if not videos:
+            raise RuntimeError(f"视频下载完成后没有找到匹配文件: title={title or '<unknown>'}")
         return {"video_paths": [str(path) for path in videos], "input_video": str(videos[0]) if videos else ""}
 
     return start_job("下载视频", target)
@@ -1323,8 +1366,7 @@ def write_text_file(payload: dict[str, Any]) -> dict[str, Any]:
     path = _resolve_project_path(_required_str(payload, "path"))
     content = str(payload.get("content") or "")
     _ensure_under_root(path)
-    if not _is_relative_to(path, GLOSSARY_DIR):
-        raise ValueError("UI 只允许保存 configs/glossaries 下的 glossary 文件")
+    _ensure_writable_glossary_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return {"path": str(path), "saved": True}
@@ -1352,8 +1394,7 @@ def read_glossary_items(payload: dict[str, Any]) -> dict[str, Any]:
 def write_glossary_items(payload: dict[str, Any]) -> dict[str, Any]:
     path = _resolve_project_path(_required_str(payload, "path"))
     _ensure_under_root(path)
-    if not _is_relative_to(path, GLOSSARY_DIR):
-        raise ValueError("UI 只允许保存 configs/glossaries 下的 glossary 文件")
+    _ensure_writable_glossary_path(path)
     original_text = path.read_text(encoding="utf-8")
     source_srt = _source_srt_from_glossary_text(original_text, path)
     data = _load_yaml_text(original_text, path)
@@ -1376,6 +1417,12 @@ def write_glossary_items(payload: dict[str, Any]) -> dict[str, Any]:
         text = f"# source_srt: {source_srt}\n{text}"
     path.write_text(text, encoding="utf-8")
     return {"path": str(path), "saved": True, "content": text, "items": _glossary_items(data)}
+
+
+def _ensure_writable_glossary_path(path: Path) -> None:
+    if _is_relative_to(path, GLOSSARY_DIR) or _is_relative_to(path, JOB_DIR):
+        return
+    raise ValueError("UI 只允许保存 configs/glossaries 或 outputs/agent_jobs 下的 glossary 文件")
 
 
 def _load_yaml_file(path: Path) -> dict[str, Any]:
@@ -1484,10 +1531,10 @@ def _blind_translate_glossary_context(text: str) -> str:
     if not text:
         return ""
     _load_dotenv(ROOT)
-    key = os.environ.get("ARK_API_KEY")
+    task_llm = load_llm_task_config("title_translation")
+    key = getattr(task_llm, "api_key", None) or os.environ.get("LLM_API_KEY") or os.environ.get("ARK_API_KEY")
     if not key:
         return ""
-    task_llm = load_llm_task_config("title_translation")
     selected_model = task_llm.model
     if not selected_model:
         return ""
@@ -1810,8 +1857,11 @@ def _run_command(job_id: str, args: list[str]) -> None:
 def _child_process_env() -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    cache_root = Path(env.get("VIDEO_TRANSLATE_CACHE_DIR") or ROOT / "models").expanduser().resolve()
-    env.setdefault("VIDEO_TRANSLATE_CACHE_DIR", str(cache_root))
+    cache_root = Path(env.get("VIDEO_TRANSLATE_CACHE_DIR") or ROOT / "models").expanduser()
+    if not cache_root.is_absolute():
+        cache_root = ROOT / cache_root
+    cache_root = cache_root.resolve()
+    env["VIDEO_TRANSLATE_CACHE_DIR"] = str(cache_root)
     env.setdefault("HF_HOME", str(cache_root / "huggingface"))
     for proxy_name in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]:
         env.pop(proxy_name, None)
@@ -1859,6 +1909,50 @@ def _newest_video_files(directory: Path, *, limit: int) -> list[Path]:
     for pattern in ["*.mp4", "*.mkv", "*.webm", "*.mov", "*.m4v"]:
         files.extend(_newest_files(directory, pattern, limit=20))
     return sorted(set(files), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
+
+
+def _matching_video_files(directory: Path, title: str) -> list[Path]:
+    return _matching_media_files(directory, ["*.mp4", "*.mkv", "*.webm", "*.mov", "*.m4v"], title)
+
+
+def _matching_subtitle_files(directory: Path, title: str, lang: str) -> list[Path]:
+    matches = _matching_media_files(directory, ["*.srt"], title)
+    lang_key = str(lang or "").strip()
+    if not lang_key:
+        return matches
+    exact_suffix = f".{lang_key}.srt"
+    exact = [path for path in matches if path.name.endswith(exact_suffix)]
+    if exact:
+        return exact
+    return [path for path in matches if f".{lang_key}" in path.name]
+
+
+def _matching_media_files(directory: Path, patterns: list[str], title: str) -> list[Path]:
+    title = str(title or "").strip()
+    if not title:
+        return []
+    candidates: list[Path] = []
+    for pattern in patterns:
+        candidates.extend(path for path in directory.glob(pattern) if path.is_file() and not path.name.startswith("._"))
+    if not candidates:
+        return []
+
+    def score(path: Path) -> tuple[int, float]:
+        stem = path.stem
+        if stem == title:
+            rank = 0
+        elif stem.startswith(title + "."):
+            rank = 1
+        elif stem.startswith(title):
+            rank = 2
+        elif title in stem:
+            rank = 3
+        else:
+            rank = 99
+        return (rank, -path.stat().st_mtime)
+
+    matches = [path for path in candidates if score(path)[0] < 99]
+    return sorted(matches, key=score)
 
 
 def _required_str(payload: dict[str, Any], name: str) -> str:
