@@ -11,7 +11,61 @@ Video Translate is an early-stage hard-subtitle extraction and translation tool.
 - Use a glossary to keep character names, show names, and terms consistent.
 - Copy generated subtitles next to the source video for player debugging.
 
-## Environment
+## Quick Start
+
+Clone the project and create a Python environment:
+
+```bash
+git clone https://github.com/YuqiPlus/Video_Translate.git
+cd Video_Translate
+conda create -n Video_Translate python=3.11 -y
+conda activate Video_Translate
+python -m pip install -e ".[dev]"
+```
+
+Copy the environment template:
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and at least fill:
+
+```text
+ARK_API_KEY=your_volcengine_ark_api_key
+ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
+ARK_MODEL=doubao-seed-2.0-pro
+```
+
+If YouTube needs a proxy on your network, set it explicitly:
+
+```text
+YTDLP_PROXY=http://127.0.0.1:7890
+```
+
+If you do not need a proxy, leave `YTDLP_PROXY=` empty. The project does not use
+a proxy by default.
+
+Run checks:
+
+```bash
+python -m video_translate doctor
+python -m pytest
+```
+
+Start the Agent UI:
+
+```bash
+python run_agent_ui.py
+```
+
+Open:
+
+```text
+http://127.0.0.1:7860
+```
+
+## Installation Details
 
 Create and activate a Conda environment:
 
@@ -31,6 +85,23 @@ For development and tests:
 ```bash
 python -m pip install -e ".[dev]"
 python -m pytest
+```
+
+Install optional ASR support:
+
+```bash
+python -m pip install -e ".[asr]"
+```
+
+The frontend source is under `frontend/`. The Python web server serves the built
+frontend from `frontend/dist`. If you change frontend code:
+
+```bash
+cd frontend
+npm install
+npm run build
+cd ..
+python run_agent_ui.py
 ```
 
 ### GPU Setup
@@ -85,10 +156,41 @@ Edit `.env`:
 ```text
 ARK_API_KEY=your_volcengine_ark_api_key
 ARK_MODEL=your_model_or_endpoint_id
-ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
 ```
 
 Do not commit `.env`. It is ignored by Git.
+
+### Environment Variables
+
+Most machine-specific settings should live in `.env`.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ARK_API_KEY` | empty | Volcengine Ark API key. Required for title translation, glossary, ASR correction, hybrid reconstruction, and subtitle translation. |
+| `ARK_BASE_URL` | `https://ark.cn-beijing.volces.com/api/coding/v3` in `.env.example` | OpenAI-compatible Ark endpoint base URL. |
+| `ARK_MODEL` | `doubao-seed-2.0-pro` in `.env.example` | Default model when a task-specific model is not configured. |
+| `ARK_REQUEST_TIMEOUT` | `240` | HTTP timeout in seconds for LLM calls. Increase this for long subtitle batches. |
+| `ARK_REQUEST_RETRIES` | `3` | Retry count for LLM requests. |
+| `ASR_CORRECTION_MODEL` | empty | Optional override for ASR source-text correction. |
+| `YTDLP_PROXY` | empty | Proxy used only by YouTube download/probe paths. Example: `http://127.0.0.1:7890`. |
+| `YTDLP_OUTPUT_DIR` | `YoutubeDownloads` | Default output directory for direct YouTube download scripts. Relative paths are resolved from the project root. |
+| `YTDLP_SUB_LANGS` | `ko,en.*` in code, expanded in `.env.example` | Default subtitle language list for direct subtitle downloads. |
+| `VIDEO_TRANSLATE_HOST` | `0.0.0.0` | Agent UI bind host. |
+| `VIDEO_TRANSLATE_PORT` | `7860` | Agent UI port. |
+| `VIDEO_TRANSLATE_DOWNLOAD_DIR` | `YoutubeDownloads` | Download/media directory used by the Agent UI. |
+| `VIDEO_TRANSLATE_CACHE_DIR` | `models` in Agent child processes | Local model cache root for PaddleOCR/faster-whisper. |
+| `HF_HOME` | `${VIDEO_TRANSLATE_CACHE_DIR}/huggingface` | Optional Hugging Face cache override. |
+| `PADDLE_HOME` | `${VIDEO_TRANSLATE_CACHE_DIR}/paddle` | Optional Paddle cache override. |
+| `PADDLE_PDX_CACHE_HOME` | `${VIDEO_TRANSLATE_CACHE_DIR}/paddlex` | Optional PaddleX model cache override. |
+
+Proxy note: generic `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` are removed
+from Agent child processes so local OCR/ASR/LLM work does not accidentally go
+through a YouTube proxy. Use `YTDLP_PROXY` for YouTube only.
+
+Task-specific model choices live in `configs/llm.yaml`. For example, you can use
+a faster/cheaper model for title translation and ASR correction, while keeping a
+stronger model for final subtitle translation.
 
 Edit `configs/run.yaml`:
 
@@ -142,6 +244,19 @@ Run from `configs/run.yaml`:
 python run_from_config.py
 ```
 
+Run the Agent UI:
+
+```bash
+python run_agent_ui.py --host 0.0.0.0 --port 7860
+```
+
+Or via `.env`:
+
+```text
+VIDEO_TRANSLATE_HOST=0.0.0.0
+VIDEO_TRANSLATE_PORT=7860
+```
+
 Extract subtitles from a video:
 
 ```bash
@@ -188,6 +303,7 @@ python -m video_translate.youtube.download_subtitles "https://www.youtube.com/wa
 python -m video_translate.youtube.download_video "https://www.youtube.com/watch?v=..."
 python -m video_translate.tools.generate_glossary "YoutubeDownloads/example.ko.srt" --out "configs/glossaries/example.draft.yaml"
 python -m video_translate.tools.translate_subtitles "YoutubeDownloads/example.ko.srt" --glossary "configs/glossary.example.yaml"
+python -m video_translate.tools.convert_subtitle "YoutubeDownloads/example.zh.srt" --format bcc
 python run_agent_ui.py --host 0.0.0.0 --port 7860
 ```
 

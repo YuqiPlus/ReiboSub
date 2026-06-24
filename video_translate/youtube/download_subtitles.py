@@ -4,11 +4,24 @@ from pathlib import Path
 
 import yt_dlp
 
+from video_translate.env import load_dotenv
 from video_translate.youtube_url import normalize_youtube_url
 
 
-DEFAULT_OUTPUT_DIR = "/path/to/Video_Translate/YoutubeDownloads"
-DEFAULT_PROXY = os.environ.get("YTDLP_PROXY", "http://127.0.0.1:7890")
+ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(ROOT)
+
+
+def _default_output_dir() -> str:
+    raw = os.environ.get("YTDLP_OUTPUT_DIR", "").strip()
+    path = Path(raw).expanduser() if raw else ROOT / "YoutubeDownloads"
+    if not path.is_absolute():
+        path = ROOT / path
+    return str(path.resolve())
+
+
+DEFAULT_OUTPUT_DIR = _default_output_dir()
+DEFAULT_PROXY = os.environ.get("YTDLP_PROXY", "").strip()
 DEFAULT_VIDEO_URL = "0dD1bQZBdjs"
 DEFAULT_SUBTITLE_LANGUAGES = os.environ.get("YTDLP_SUB_LANGS", "ko,en.*")
 DEFAULT_SUBTITLE_FORMAT = "srt/vtt/best"

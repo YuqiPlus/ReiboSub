@@ -22,6 +22,7 @@ import yt_dlp
 
 from video_translate.agent_planner import build_agent_plan
 from video_translate.cache import cuda_library_dirs, prepend_library_path
+from video_translate.env import load_dotenv
 from video_translate.llm_config import load_llm_task_config
 from video_translate.subtitle.srt import read_srt
 from video_translate.subtitle.sidecar import SidecarConfig, copy_sidecar_subtitles
@@ -35,13 +36,24 @@ from video_translate.translate.volcengine import (
 from video_translate.youtube_url import normalize_youtube_url
 
 ROOT = Path(__file__).resolve().parent.parent
-DOWNLOAD_DIR = ROOT / "YoutubeDownloads"
-GLOSSARY_DIR = ROOT / "configs" / "glossaries"
-JOB_DIR = ROOT / "outputs" / "agent_jobs"
+load_dotenv(ROOT)
+
+
+def _rooted_dir(env_name: str, default: Path) -> Path:
+    raw = os.environ.get(env_name, "").strip()
+    path = Path(raw).expanduser() if raw else default
+    if not path.is_absolute():
+        path = ROOT / path
+    return path.resolve()
+
+
+DOWNLOAD_DIR = _rooted_dir("VIDEO_TRANSLATE_DOWNLOAD_DIR", ROOT / "YoutubeDownloads")
+GLOSSARY_DIR = _rooted_dir("VIDEO_TRANSLATE_GLOSSARY_DIR", ROOT / "configs" / "glossaries")
+JOB_DIR = _rooted_dir("VIDEO_TRANSLATE_JOB_DIR", ROOT / "outputs" / "agent_jobs")
 FRONTEND_DIST = ROOT / "frontend" / "dist"
-DEFAULT_PROXY = os.environ.get("YTDLP_PROXY", "http://127.0.0.1:7890")
-DEFAULT_HOST = "0.0.0.0"
-DEFAULT_PORT = 7860
+DEFAULT_PROXY = os.environ.get("YTDLP_PROXY", "").strip()
+DEFAULT_HOST = os.environ.get("VIDEO_TRANSLATE_HOST", "0.0.0.0").strip() or "0.0.0.0"
+DEFAULT_PORT = int(os.environ.get("VIDEO_TRANSLATE_PORT", "7860"))
 PYTHON = sys.executable
 _HYBRID_TRANSLATION_PROMPT = """本次源字幕是 hybrid 格式：时间轴来自作者上传的英文人工字幕，文本中可能同时包含“韩文OCR”和“英文参考”。
 翻译时必须优先依据“韩文OCR”的韩文原文，英文参考只用于理解上下文和兜底。
