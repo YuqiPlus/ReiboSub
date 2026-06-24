@@ -62,7 +62,8 @@ https://www.youtube.com/watch?v=<VIDEO_ID>
 入口：
 
 - API: `/api/jobs/download-subtitle`
-- 脚本: `download_youtube_subtitles.py`
+- 模块: `python -m video_translate.youtube.download_subtitles`
+- 兼容脚本: `download_youtube_subtitles.py`
 
 能力：
 
@@ -75,7 +76,8 @@ https://www.youtube.com/watch?v=<VIDEO_ID>
 入口：
 
 - API: `/api/jobs/download-video`
-- 脚本: `download_youtube_video.py`
+- 模块: `python -m video_translate.youtube.download_video`
+- 兼容脚本: `download_youtube_video.py`
 
 能力：
 
@@ -106,7 +108,8 @@ https://www.youtube.com/watch?v=<VIDEO_ID>
 入口：
 
 - API: `/api/jobs/audio-local`
-- 脚本: `transcribe_audio_subtitles.py`
+- 模块: `python -m video_translate.tools.transcribe_audio`
+- 兼容脚本: `transcribe_audio_subtitles.py`
 
 能力：
 
@@ -139,7 +142,8 @@ https://www.youtube.com/watch?v=<VIDEO_ID>
 入口：
 
 - API: `/api/jobs/correct-asr-subtitle`
-- 脚本: `correct_asr_subtitles.py`
+- 模块: `python -m video_translate.tools.correct_asr`
+- 兼容脚本: `correct_asr_subtitles.py`
 
 能力：
 
@@ -154,7 +158,8 @@ https://www.youtube.com/watch?v=<VIDEO_ID>
 - API: `/api/jobs/generate-glossary`
 - API: `/api/read-glossary-items`
 - API: `/api/write-glossary-items`
-- 脚本: `generate_glossary_from_subtitles.py`
+- 模块: `python -m video_translate.tools.generate_glossary`
+- 兼容脚本: `generate_glossary_from_subtitles.py`
 
 能力：
 
@@ -168,7 +173,8 @@ https://www.youtube.com/watch?v=<VIDEO_ID>
 入口：
 
 - API: `/api/jobs/translate-subtitle`
-- 脚本: `translate_downloaded_subtitles.py`
+- 模块: `python -m video_translate.tools.translate_subtitles`
+- 兼容脚本: `translate_downloaded_subtitles.py`
 
 能力：
 
@@ -181,8 +187,9 @@ https://www.youtube.com/watch?v=<VIDEO_ID>
 
 入口：
 
-- 建议新增 API: `/api/jobs/convert-subtitle`
-- 建议新增脚本: `convert_subtitle_format.py`
+- API: `/api/jobs/convert-subtitle`
+- 模块: `python -m video_translate.tools.convert_subtitle`
+- 兼容脚本: `convert_subtitle_format.py`
 
 能力：
 

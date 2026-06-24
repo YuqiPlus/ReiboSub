@@ -1,21 +1,16 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import requests
 import yaml
+from video_translate.tools import generate_glossary
 
 
 def _load_module():
-    path = Path(__file__).resolve().parents[1] / "generate_glossary_from_subtitles.py"
-    spec = importlib.util.spec_from_file_location("generate_glossary_from_subtitles_1_linux", path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return generate_glossary
 
 
 def test_parse_candidate_response_accepts_fenced_json():

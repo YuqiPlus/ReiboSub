@@ -50,6 +50,10 @@ _HYBRID_TRANSLATION_PROMPT = """本次源字幕是 hybrid 格式：时间轴来�
 """
 
 
+def _module_command(module: str, *args: object) -> list[str]:
+    return [PYTHON, "-m", module, *[str(arg) for arg in args]]
+
+
 @dataclass
 class Job:
     id: str
@@ -791,7 +795,7 @@ def download_subtitle_job(payload: dict[str, Any]) -> Job:
     before = _snapshot_files(DOWNLOAD_DIR, "*.srt")
 
     def target(job_id: str) -> dict[str, Any]:
-        args = [PYTHON, str(ROOT / "download_youtube_subtitles.py"), url, "--output-dir", str(DOWNLOAD_DIR), "--sub-langs", lang]
+        args = _module_command("video_translate.youtube.download_subtitles", url, "--output-dir", DOWNLOAD_DIR, "--sub-langs", lang)
         if kind == "manual":
             args.append("--no-auto")
         elif kind == "auto":
@@ -815,7 +819,7 @@ def generate_glossary_job(payload: dict[str, Any]) -> Job:
     _ensure_under_root(out)
 
     def target(job_id: str) -> dict[str, Any]:
-        args = [PYTHON, str(ROOT / "generate_glossary_from_subtitles.py"), str(source_srt), "--out", str(out), "--source-language", source_language]
+        args = _module_command("video_translate.tools.generate_glossary", source_srt, "--out", out, "--source-language", source_language)
         if extra_hint.strip():
             args.extend(["--extra-hint", extra_hint.strip()])
         _run_command(job_id, args)
@@ -835,13 +839,14 @@ def translate_subtitle_job(payload: dict[str, Any]) -> Job:
 
     def target(job_id: str) -> dict[str, Any]:
         args = [
-            PYTHON,
-            str(ROOT / "translate_downloaded_subtitles.py"),
-            str(source_srt),
-            "--out",
-            str(out),
-            "--translation-mode",
-            translation_mode,
+            *_module_command(
+                "video_translate.tools.translate_subtitles",
+                source_srt,
+                "--out",
+                out,
+                "--translation-mode",
+                translation_mode,
+            ),
         ]
         if glossary:
             args.extend(["--glossary", str(glossary)])
@@ -866,13 +871,14 @@ def correct_asr_subtitle_job(payload: dict[str, Any]) -> Job:
 
     def target(job_id: str) -> dict[str, Any]:
         args = [
-            PYTHON,
-            str(ROOT / "correct_asr_subtitles.py"),
-            str(source_srt),
-            "--out",
-            str(out),
-            "--source-language",
-            source_language,
+            *_module_command(
+                "video_translate.tools.correct_asr",
+                source_srt,
+                "--out",
+                out,
+                "--source-language",
+                source_language,
+            ),
         ]
         if glossary:
             args.extend(["--glossary", str(glossary)])
@@ -898,13 +904,14 @@ def convert_subtitle_job(payload: dict[str, Any]) -> Job:
 
     def target(job_id: str) -> dict[str, Any]:
         args = [
-            PYTHON,
-            str(ROOT / "convert_subtitle_format.py"),
-            str(source),
-            "--format",
-            output_format,
-            "--out",
-            str(out),
+            *_module_command(
+                "video_translate.tools.convert_subtitle",
+                source,
+                "--format",
+                output_format,
+                "--out",
+                out,
+            ),
         ]
         _run_command(job_id, args)
         return {"converted_subtitle": str(out), "subtitle_path": str(out), "format": output_format}
@@ -983,7 +990,7 @@ def download_video_job(payload: dict[str, Any]) -> Job:
     before = _snapshot_video_files(DOWNLOAD_DIR)
 
     def target(job_id: str) -> dict[str, Any]:
-        _run_command(job_id, [PYTHON, str(ROOT / "download_youtube_video.py"), url])
+        _run_command(job_id, _module_command("video_translate.youtube.download_video", url))
         videos = _changed_video_files(DOWNLOAD_DIR, before)
         if not videos:
             videos = _newest_video_files(DOWNLOAD_DIR, limit=3)
@@ -1003,7 +1010,7 @@ def ocr_full_job(payload: dict[str, Any]) -> Job:
         out_dir.mkdir(parents=True, exist_ok=True)
         before_videos = _snapshot_video_files(DOWNLOAD_DIR)
         _append_log(job_id, "download_video_start")
-        _run_command(job_id, [PYTHON, str(ROOT / "download_youtube_video.py"), url])
+        _run_command(job_id, _module_command("video_translate.youtube.download_video", url))
         videos = _changed_video_files(DOWNLOAD_DIR, before_videos)
         if not videos:
             videos = _newest_video_files(DOWNLOAD_DIR, limit=1)
@@ -1084,10 +1091,11 @@ def hybrid_anchor_ocr_job(payload: dict[str, Any]) -> Job:
         _run_command(
             job_id,
             [
-                PYTHON,
-                str(ROOT / "hybrid_anchor_ocr_subtitles.py"),
-                str(input_video),
-                str(anchor_srt),
+                *_module_command(
+                    "video_translate.tools.hybrid_anchor_ocr",
+                    input_video,
+                    anchor_srt,
+                ),
                 "--out-dir",
                 str(out_dir),
                 "--lang",
@@ -1155,9 +1163,10 @@ def audio_local_video_job(payload: dict[str, Any]) -> Job:
         _run_command(
             job_id,
             [
-                PYTHON,
-                str(ROOT / "transcribe_audio_subtitles.py"),
-                str(input_video),
+                *_module_command(
+                    "video_translate.tools.transcribe_audio",
+                    input_video,
+                ),
                 "--out",
                 str(source_srt),
                 "--model-size",
