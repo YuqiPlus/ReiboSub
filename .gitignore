@@ -1,7 +1,10 @@
 .cache/
+models/
 .env
 configs/run.yaml
 outputs/
+frontend/node_modules/
+frontend/dist/
 .idea/
 *.egg-info/
 __pycache__/

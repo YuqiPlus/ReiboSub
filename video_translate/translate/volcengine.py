@@ -10,6 +10,7 @@ from typing import Any
 import requests
 
 from video_translate.models import SubtitleCue
+from video_translate.llm_config import load_llm_task_config
 from video_translate.subtitle.srt import read_srt, write_srt
 from video_translate.translate.glossary import Glossary, GlossaryEntry, load_glossary
 from video_translate.utils.text import comparable_text, text_similarity
@@ -46,8 +47,14 @@ def translate_srt_with_volcengine(
 ) -> Path:
     _load_dotenv(source_srt)
     key = api_key or os.environ.get("ARK_API_KEY")
-    selected_model = model or os.environ.get("ARK_MODEL")
-    endpoint = _chat_completions_url(base_url or os.environ.get("ARK_BASE_URL") or DEFAULT_BASE_URL)
+    task_llm = load_llm_task_config(
+        "subtitle_translation",
+        explicit_model=model,
+        explicit_base_url=base_url,
+    )
+    selected_model = task_llm.model
+    fallback_models = [item for item in task_llm.fallback_models if item and item != selected_model]
+    endpoint = _chat_completions_url(task_llm.base_url or DEFAULT_BASE_URL)
 
     if not key:
         raise RuntimeError("缺少 ARK_API_KEY，请先配置火山方舟 API Key。")
@@ -61,51 +68,53 @@ def translate_srt_with_volcengine(
     total_batches = max(1, (len(cues) + batch_size - 1) // batch_size)
     for batch_index, offset in enumerate(range(0, len(cues), batch_size), start=1):
         batch = cues[offset : offset + batch_size]
-        context = glossary.to_context([cue.text for cue in batch])
         print(f"translate_batch: {batch_index}/{total_batches} cues {batch[0].index}-{batch[-1].index}", flush=True)
-        _print_glossary_context(context)
-        payload = _build_payload(
+        mapping = _request_batch_translation_mapping(
             batch,
-            context,
-            selected_model,
-            target_language,
-            ignored_texts or [],
-            extra_prompt,
+            glossary=glossary,
+            endpoint=endpoint,
+            api_key=key,
+            model=selected_model,
+            fallback_models=fallback_models,
+            target_language=target_language,
+            ignored_texts=ignored_texts or [],
+            extra_prompt=extra_prompt,
+            batch_label=f"{batch_index}/{total_batches}",
         )
-        mapping = _request_translation_mapping(endpoint, key, payload, f"{batch_index}/{total_batches}")
         missing = [cue for cue in batch if cue.index not in mapping]
         if missing:
             print(
                 f"translate_batch_missing: {batch_index}/{total_batches} retry ids {[cue.index for cue in missing]}",
                 flush=True,
             )
-            retry_payload = _build_payload(
+            retry_mapping = _request_batch_translation_mapping(
                 missing,
-                glossary.to_context([cue.text for cue in missing]),
-                selected_model,
-                target_language,
-                ignored_texts or [],
-                extra_prompt,
+                glossary=glossary,
+                endpoint=endpoint,
+                api_key=key,
+                model=selected_model,
+                fallback_models=fallback_models,
+                target_language=target_language,
+                ignored_texts=ignored_texts or [],
+                extra_prompt=extra_prompt,
+                batch_label=f"{batch_index}/{total_batches} missing",
             )
-            retry_mapping = _request_translation_mapping(endpoint, key, retry_payload, f"{batch_index}/{total_batches} missing")
             mapping.update(retry_mapping)
             still_missing_cues = [cue for cue in missing if cue.index not in mapping]
             for missing_cue in still_missing_cues:
                 print(f"translate_single_retry: id {missing_cue.index}", flush=True)
-                single_payload = _build_payload(
-                    [missing_cue],
-                    glossary.to_context([missing_cue.text]),
-                    selected_model,
-                    target_language,
-                    ignored_texts or [],
-                    extra_prompt,
-                )
                 mapping.update(
-                    _request_translation_mapping(
-                        endpoint,
-                        key,
-                        single_payload,
-                        f"{batch_index}/{total_batches} single {missing_cue.index}",
+                    _request_batch_translation_mapping(
+                        [missing_cue],
+                        glossary=glossary,
+                        endpoint=endpoint,
+                        api_key=key,
+                        model=selected_model,
+                        fallback_models=fallback_models,
+                        target_language=target_language,
+                        ignored_texts=ignored_texts or [],
+                        extra_prompt=extra_prompt,
+                        batch_label=f"{batch_index}/{total_batches} single {missing_cue.index}",
                     )
                 )
             still_missing = [cue.index for cue in missing if cue.index not in mapping]
@@ -838,9 +847,91 @@ def _print_glossary_context(context: dict[str, Any]) -> None:
     print("translate_rag: " + " ".join(parts), flush=True)
 
 
-def _request_translation(url: str, api_key: str, payload: dict[str, Any]) -> str:
+def _request_batch_translation_mapping(
+    batch: list[SubtitleCue],
+    *,
+    glossary: Glossary,
+    endpoint: str,
+    api_key: str,
+    model: str,
+    target_language: str,
+    ignored_texts: list[str],
+    extra_prompt: str,
+    batch_label: str,
+    fallback_models: list[str] | tuple[str, ...] = (),
+) -> dict[int, str]:
+    context = glossary.to_context([cue.text for cue in batch])
+    _print_glossary_context(context)
+    payload = _build_payload(batch, context, model, target_language, ignored_texts, extra_prompt)
+    try:
+        return _request_translation_mapping(endpoint, api_key, payload, batch_label, max_attempts=1)
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        remaining_fallbacks = list(fallback_models)
+        if remaining_fallbacks:
+            fallback_model = remaining_fallbacks.pop(0)
+            print(
+                f"translate_model_fallback: {batch_label} {model} -> {fallback_model} after {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return _request_batch_translation_mapping(
+                batch,
+                glossary=glossary,
+                endpoint=endpoint,
+                api_key=api_key,
+                model=fallback_model,
+                fallback_models=remaining_fallbacks,
+                target_language=target_language,
+                ignored_texts=ignored_texts,
+                extra_prompt=extra_prompt,
+                batch_label=f"{batch_label} fallback {fallback_model}",
+            )
+        if len(batch) <= 1:
+            raise
+        midpoint = max(1, len(batch) // 2)
+        left = batch[:midpoint]
+        right = batch[midpoint:]
+        print(
+            f"translate_batch_split: {batch_label} size={len(batch)} -> {len(left)}+{len(right)} after {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        mapping = _request_batch_translation_mapping(
+            left,
+            glossary=glossary,
+            endpoint=endpoint,
+            api_key=api_key,
+            model=model,
+            fallback_models=fallback_models,
+            target_language=target_language,
+            ignored_texts=ignored_texts,
+            extra_prompt=extra_prompt,
+            batch_label=f"{batch_label}a",
+        )
+        mapping.update(
+            _request_batch_translation_mapping(
+                right,
+                glossary=glossary,
+                endpoint=endpoint,
+                api_key=api_key,
+                model=model,
+                fallback_models=fallback_models,
+                target_language=target_language,
+                ignored_texts=ignored_texts,
+                extra_prompt=extra_prompt,
+                batch_label=f"{batch_label}b",
+            )
+        )
+        return mapping
+
+
+def _request_translation(
+    url: str,
+    api_key: str,
+    payload: dict[str, Any],
+    *,
+    max_attempts: int | None = None,
+) -> str:
     timeout = _request_timeout_seconds()
-    max_attempts = _request_max_attempts()
+    max_attempts = max(1, max_attempts or _request_max_attempts())
     for attempt in range(1, max_attempts + 1):
         try:
             response = requests.post(
@@ -885,8 +976,18 @@ def _sleep_before_retry(attempt: int, max_attempts: int, reason: str) -> None:
     time.sleep(wait_seconds)
 
 
-def _request_translation_mapping(url: str, api_key: str, payload: dict[str, Any], batch_label: str) -> dict[int, str]:
-    result = _request_translation(url, api_key, payload)
+def _request_translation_mapping(
+    url: str,
+    api_key: str,
+    payload: dict[str, Any],
+    batch_label: str,
+    *,
+    max_attempts: int | None = None,
+) -> dict[int, str]:
+    if max_attempts is None:
+        result = _request_translation(url, api_key, payload)
+    else:
+        result = _request_translation(url, api_key, payload, max_attempts=max_attempts)
     try:
         return _parse_translation_mapping(result)
     except (json.JSONDecodeError, ValueError) as exc:
