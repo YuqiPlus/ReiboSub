@@ -12,6 +12,36 @@ DEFAULT_EXTRA_PROMPT = """这是作者上传或平台提供的外挂字幕，时
 如果源字幕里有说话人标签、括号说明或屏幕文字，请按中文观看习惯自然保留或翻译。
 """
 
+TRANSLATION_MODES = {
+    "translate_only": {
+        "prompt": "本次使用锁定时间轴模式：必须逐条翻译，不合并、不拆分、不删除字幕条目，不调整字幕时间。",
+        "settings": {
+            "dedupe_translated": False,
+            "llm_cleanup_translated": False,
+            "cleanup_residual_fragments": False,
+            "retime_translated": False,
+        },
+    },
+    "standard_cleanup": {
+        "prompt": "本次使用标准清理模式：可以清理明显重复、残缺或噪声字幕，但不要为了阅读速度改动时间轴。",
+        "settings": {
+            "dedupe_translated": True,
+            "llm_cleanup_translated": True,
+            "cleanup_residual_fragments": True,
+            "retime_translated": False,
+        },
+    },
+    "readability_retime": {
+        "prompt": "本次使用强力精修模式：可以清理重复和残片，并在不和下一条字幕重叠的前提下优化中文字幕显示时长。",
+        "settings": {
+            "dedupe_translated": True,
+            "llm_cleanup_translated": True,
+            "cleanup_residual_fragments": True,
+            "retime_translated": True,
+        },
+    },
+}
+
 
 def default_output_path(source_srt: Path, target_language: str = DEFAULT_TARGET_LANGUAGE) -> Path:
     suffix = ".zh" if "中文" in target_language or "Chinese" in target_language else ".translated"
@@ -28,6 +58,7 @@ def translate_downloaded_subtitles(
     base_url: str | None = None,
     target_language: str = DEFAULT_TARGET_LANGUAGE,
     extra_prompt: str = DEFAULT_EXTRA_PROMPT,
+    translation_mode: str = "translate_only",
 ) -> Path:
     source_srt = source_srt.expanduser().resolve()
     if not source_srt.exists():
@@ -40,6 +71,10 @@ def translate_downloaded_subtitles(
     else:
         out_srt = out_srt.expanduser().resolve()
 
+    mode = normalize_translation_mode(translation_mode)
+    mode_config = TRANSLATION_MODES[mode]
+    prompt = extra_prompt.rstrip() + "\n" + mode_config["prompt"] + "\n"
+
     return translate_srt_with_volcengine(
         source_srt,
         out_srt,
@@ -48,12 +83,17 @@ def translate_downloaded_subtitles(
         model=model,
         base_url=base_url,
         target_language=target_language,
-        extra_prompt=extra_prompt,
-        dedupe_translated=False,
-        llm_cleanup_translated=False,
-        cleanup_residual_fragments=False,
-        retime_translated=False,
+        extra_prompt=prompt,
+        **mode_config["settings"],
     )
+
+
+
+def normalize_translation_mode(value: str | None) -> str:
+    mode = str(value or "translate_only").strip()
+    if mode not in TRANSLATION_MODES:
+        raise ValueError(f"未知字幕翻译处理模式: {mode}")
+    return mode
 
 
 def main(argv=None):
@@ -66,6 +106,12 @@ def main(argv=None):
     parser.add_argument("--base-url", default=None, help="Override ARK_BASE_URL")
     parser.add_argument("--target-language", default=DEFAULT_TARGET_LANGUAGE)
     parser.add_argument("--extra-prompt", default="", help="Extra task instruction appended to the default prompt")
+    parser.add_argument(
+        "--translation-mode",
+        choices=sorted(TRANSLATION_MODES),
+        default="translate_only",
+        help="SRT translation post-processing mode",
+    )
     args = parser.parse_args(argv)
 
     extra_prompt = DEFAULT_EXTRA_PROMPT
@@ -81,6 +127,7 @@ def main(argv=None):
         base_url=args.base_url,
         target_language=args.target_language,
         extra_prompt=extra_prompt,
+        translation_mode=args.translation_mode,
     )
     print(f"translated_srt: {out}")
 
