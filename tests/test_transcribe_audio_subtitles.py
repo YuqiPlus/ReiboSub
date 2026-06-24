@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-import transcribe_audio_subtitles as audio_asr
+from video_translate.tools import transcribe_audio as audio_asr
 
 
 def test_format_srt_timestamp_rounds_milliseconds():
