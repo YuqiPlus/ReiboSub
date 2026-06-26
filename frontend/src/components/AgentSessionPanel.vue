@@ -22,6 +22,7 @@
           <button :disabled="starting || !url.trim()" @click="$emit('start-agent')">
             {{ starting ? '启动中' : '启动 Agent' }}
           </button>
+          <button v-if="session?.retryable" class="secondary mini" @click="$emit('retry-agent')">重试当前阶段</button>
           <button v-if="session?.cancellable" class="danger secondary mini" @click="$emit('cancel-agent')">中断</button>
         </div>
       </div>
@@ -143,6 +144,7 @@ defineEmits([
   'start-agent',
   'answer-agent',
   'cancel-agent',
+  'retry-agent',
   'open-glossary',
 ])
 

@@ -132,6 +132,12 @@ ocr:
   device: "auto"
 ```
 
+When `device` is `auto`, you can set a machine-wide default in `.env`:
+
+```text
+VIDEO_TRANSLATE_OCR_DEVICE=gpu:0
+```
+
 You can also force a device:
 
 ```yaml
@@ -189,6 +195,7 @@ Most machine-specific settings should live in `.env`.
 | `VIDEO_TRANSLATE_PORT` | `7860` | Agent UI port. |
 | `VIDEO_TRANSLATE_DOWNLOAD_DIR` | `YoutubeDownloads` | Download/media directory used by the Agent UI. |
 | `VIDEO_TRANSLATE_CACHE_DIR` | `models` in Agent child processes | Local model cache root for PaddleOCR/faster-whisper. |
+| `VIDEO_TRANSLATE_OCR_DEVICE` | `auto` | Global OCR device used when config/CLI passes `device=auto`. Use `gpu:0` on a single-GPU Windows machine. |
 | `HF_HOME` | `${VIDEO_TRANSLATE_CACHE_DIR}/huggingface` | Optional Hugging Face cache override. |
 | `PADDLE_HOME` | `${VIDEO_TRANSLATE_CACHE_DIR}/paddle` | Optional Paddle cache override. |
 | `PADDLE_PDX_CACHE_HOME` | `${VIDEO_TRANSLATE_CACHE_DIR}/paddlex` | Optional PaddleX model cache override. |

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,16 +45,38 @@ def _load_paddle_ocr(lang: str, device: str = "auto"):
 
 
 def _resolve_device(device: str, paddle) -> str:
-    normalized = (device or "auto").strip().lower()
+    normalized = _configured_device(device)
     has_cuda = bool(paddle.device.is_compiled_with_cuda())
     if normalized == "auto":
-        return "gpu:1" if has_cuda else "cpu"
+        return "gpu:0" if has_cuda else "cpu"
+    if normalized == "gpu":
+        normalized = "gpu:0"
     if normalized.startswith("gpu") and not has_cuda:
         raise RuntimeError(
             "当前环境安装的是 CPU 版 paddlepaddle，无法使用 GPU。"
             "请先安装匹配 CUDA 的 paddlepaddle-gpu，或把 ocr.device 改为 cpu/auto。"
         )
+    if normalized.startswith("gpu:") and has_cuda:
+        device_id = _parse_gpu_device_id(normalized)
+        device_count = int(paddle.device.cuda.device_count())
+        if device_id >= device_count:
+            raise RuntimeError(f"当前只检测到 {device_count} 张 GPU，不能使用 {normalized}。请改为 gpu:0、gpu 或 auto。")
     return normalized
+
+
+def _parse_gpu_device_id(device: str) -> int:
+    try:
+        return int(device.split(":", 1)[1])
+    except (IndexError, ValueError) as exc:
+        raise ValueError(f"GPU 设备格式错误: {device}，应类似 gpu:0") from exc
+
+
+def _configured_device(device: str) -> str:
+    normalized = (device or "auto").strip().lower()
+    if normalized != "auto":
+        return normalized
+    env_device = os.environ.get("VIDEO_TRANSLATE_OCR_DEVICE", "").strip().lower()
+    return env_device or normalized
 
 
 def extract_video_ocr(

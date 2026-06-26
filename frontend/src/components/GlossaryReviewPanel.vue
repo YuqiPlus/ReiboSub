@@ -17,7 +17,6 @@
         <label>操作</label>
         <div class="toolbar">
           <button class="secondary" :disabled="loading" @click="$emit('load-glossary')">{{ loading ? '加载中' : '加载' }}</button>
-          <button :disabled="loading" @click="$emit('save-glossary-review')">保存审核</button>
         </div>
       </div>
     </div>

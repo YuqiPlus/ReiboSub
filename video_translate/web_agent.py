@@ -128,6 +128,7 @@ class AgentSession:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "cancellable": self.status in {"running", "waiting"},
+            "retryable": self.status == "failed",
         }
 
 
@@ -440,6 +441,22 @@ def answer_agent_session(session_id: str, answer: dict[str, Any]) -> AgentSessio
     return session
 
 
+def retry_agent_session(session_id: str) -> AgentSession:
+    session = get_agent_session(session_id)
+    if not session:
+        raise KeyError("agent session not found")
+    with _LOCK:
+        if session.status != "failed":
+            raise RuntimeError("agent session is not failed")
+        session.status = "running"
+        session.error = ""
+        session.question = {}
+        session.logs.append(f"agent_retry: {session.phase}")
+        session.updated_at = time.time()
+    _run_agent_async(session_id, _agent_retry_current_phase)
+    return session
+
+
 def cancel_agent_session(session_id: str) -> AgentSession | None:
     session = get_agent_session(session_id)
     if not session:
@@ -539,6 +556,40 @@ def _agent_continue(session: AgentSession, answer: dict[str, Any]) -> None:
     raise RuntimeError(f"未知 Agent 回答: {action}")
 
 
+def _agent_retry_current_phase(session: AgentSession) -> None:
+    phase = session.phase
+    if phase in {"created", "probe"}:
+        _agent_start(session)
+        return
+    if phase in {"confirm_subtitle", "download_subtitle"}:
+        _agent_use_recommended_subtitle(session)
+        return
+    if phase in {"download_anchor_subtitle", "download_video_for_hybrid", "hybrid_anchor_ocr"}:
+        _agent_run_hybrid_anchor_ocr(session)
+        return
+    if phase == "generate_glossary":
+        source_srt = str(session.result.get("source_srt") or "")
+        if not source_srt:
+            _agent_use_recommended_subtitle(session)
+            return
+        _agent_generate_glossary_review(session, source_srt)
+        return
+    if phase == "translate":
+        _agent_translate_after_glossary(session, use_glossary=bool(session.result.get("glossary_path")))
+        return
+    if phase == "ocr_full":
+        _agent_run_ocr(session)
+        return
+    if phase in {"download_video_for_asr", "audio_asr"}:
+        _agent_run_asr(session)
+        return
+    if phase == "diagnose_ocr_asr":
+        plan = session.result.get("agent_plan") or {}
+        _agent_continue_route_without_subtitle(session.id, plan)
+        return
+    raise RuntimeError(f"当前阶段不支持重试: {phase}")
+
+
 def _agent_use_recommended_subtitle(session: AgentSession) -> None:
     result = session.result
     probe = result.get("probe") or {}
@@ -557,24 +608,33 @@ def _agent_use_recommended_subtitle(session: AgentSession) -> None:
         return
     if plan.get("needs_source_correction"):
         _agent_log(session.id, "source_correction_suggested")
+    _agent_generate_glossary_review(session, source_srt)
+
+
+def _agent_generate_glossary_review(session: AgentSession, source_srt: str) -> None:
     _agent_set_phase(session.id, "generate_glossary")
+    is_hybrid = session.result.get("source_kind") == "hybrid_anchor_ocr"
     glossary_job = generate_glossary_job(
         {
             "source_srt": source_srt,
             "extra_hint": str(session.payload.get("extra_hint") or ""),
+            "source_language": "korean" if is_hybrid else "",
             "out": str(_agent_glossary_path(session)),
         }
     )
     glossary_result = _wait_for_job(glossary_job, session_id=session.id)
     glossary_path = str(glossary_result.get("glossary_path") or "")
     _agent_update_result(session.id, {"glossary_path": glossary_path, "generate_glossary": glossary_result})
+    message = "Glossary 草稿已生成。审核人名、昵称和专有词后继续翻译。"
+    if is_hybrid:
+        message = "Hybrid 源字幕已生成：时间轴来自英文人工字幕，原文优先使用韩文 OCR。审核 glossary 后继续翻译。"
     _agent_wait(
         session.id,
         "review_glossary",
         {
             "kind": "review_glossary",
             "title": "请审核 Glossary",
-            "message": "Glossary 草稿已生成。审核人名、昵称和专有词后继续翻译。",
+            "message": message,
             "glossary_path": glossary_path,
             "options": [
                 {"action": "continue_after_glossary", "label": "我已审核，继续翻译"},
@@ -656,7 +716,6 @@ def _agent_run_hybrid_anchor_ocr(session: AgentSession) -> None:
     plan = result.get("agent_plan") or {}
     selected = plan.get("selected_subtitle") or {}
     url = str(probe.get("normalized_url") or result.get("normalized_url") or session.payload.get("url") or "")
-    extra_hint = str(session.payload.get("extra_hint") or "")
 
     _agent_set_phase(session.id, "download_anchor_subtitle")
     subtitle_result = _wait_for_job(
@@ -692,32 +751,7 @@ def _agent_run_hybrid_anchor_ocr(session: AgentSession) -> None:
         },
     )
 
-    _agent_set_phase(session.id, "generate_glossary")
-    glossary_job = generate_glossary_job(
-        {
-            "source_srt": source_srt,
-            "extra_hint": extra_hint,
-            "source_language": "korean",
-            "out": str(_agent_glossary_path(session)),
-        }
-    )
-    glossary_result = _wait_for_job(glossary_job, session_id=session.id)
-    glossary_path = str(glossary_result.get("glossary_path") or "")
-    _agent_update_result(session.id, {"glossary_path": glossary_path, "generate_glossary": glossary_result})
-    _agent_wait(
-        session.id,
-        "review_glossary",
-        {
-            "kind": "review_glossary",
-            "title": "请审核 Glossary",
-            "message": "Hybrid 源字幕已生成：时间轴来自英文人工字幕，原文优先使用韩文 OCR。审核 glossary 后继续翻译。",
-            "glossary_path": glossary_path,
-            "options": [
-                {"action": "continue_after_glossary", "label": "我已审核，继续翻译"},
-                {"action": "skip_glossary", "label": "跳过 glossary 直接翻译"},
-            ],
-        },
-    )
+    _agent_generate_glossary_review(session, source_srt)
 
 
 def _agent_run_asr(session: AgentSession) -> None:
@@ -1913,6 +1947,8 @@ def _run_command(job_id: str, args: list[str]) -> None:
 def _child_process_env() -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     cache_root = Path(env.get("VIDEO_TRANSLATE_CACHE_DIR") or ROOT / "models").expanduser()
     if not cache_root.is_absolute():
         cache_root = ROOT / cache_root
@@ -2147,6 +2183,9 @@ class AgentHandler(BaseHTTPRequestHandler):
             elif self.path.startswith("/api/agent/") and self.path.rstrip("/").endswith("/answer"):
                 session_id = self.path.rstrip("/").split("/")[-2]
                 self._send_json(answer_agent_session(session_id, payload).to_dict())
+            elif self.path.startswith("/api/agent/") and self.path.rstrip("/").endswith("/retry"):
+                session_id = self.path.rstrip("/").split("/")[-2]
+                self._send_json(retry_agent_session(session_id).to_dict())
             elif self.path.startswith("/api/agent/") and self.path.rstrip("/").endswith("/cancel"):
                 session_id = self.path.rstrip("/").split("/")[-2]
                 session = cancel_agent_session(session_id)

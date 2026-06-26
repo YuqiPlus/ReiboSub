@@ -128,7 +128,7 @@ def test_agent_session_hybrid_downloads_anchor_video_and_generates_glossary(monk
     monkeypatch.setattr(web_agent, "hybrid_anchor_ocr_job", lambda payload: calls.append(f"hybrid:{payload['anchor_srt']}:{payload['input_video']}") or done_job("hybrid", {"source_srt": str(hybrid), "debug_json": str(tmp_path / "hybrid.debug.json")}))
     def fake_generate_glossary(payload):
         calls.append(f"glossary:{payload['source_srt']}:{payload.get('out', '')}")
-        assert payload["out"].endswith(f"agent_jobs/{session.id}/glossary.draft.yaml")
+        assert Path(payload["out"]).parts[-3:] == ("agent_jobs", session.id, "glossary.draft.yaml")
         return done_job("glossary", {"glossary_path": str(glossary), "content": "characters: []\n"})
 
     monkeypatch.setattr(web_agent, "generate_glossary_job", fake_generate_glossary)
@@ -214,7 +214,7 @@ def test_agent_session_downloads_generates_glossary_then_waits(monkeypatch, tmp_
 
     def fake_glossary(payload):
         calls.append(f"glossary:{payload['source_srt']}:{payload.get('out', '')}")
-        assert payload["out"].endswith(f"agent_jobs/{session.id}/glossary.draft.yaml")
+        assert Path(payload["out"]).parts[-3:] == ("agent_jobs", session.id, "glossary.draft.yaml")
         return done_job("glossary", {"glossary_path": str(glossary), "content": "characters: []\n"})
 
     monkeypatch.setattr(web_agent, "download_subtitle_job", fake_download)
@@ -228,6 +228,44 @@ def test_agent_session_downloads_generates_glossary_then_waits(monkeypatch, tmp_
     assert snapshot["result"]["source_srt"] == str(source)
     assert snapshot["result"]["glossary_path"] == str(glossary)
     assert calls == [f"download:ko:manual", f"glossary:{source}:{web_agent.JOB_DIR / session.id / 'glossary.draft.yaml'}"]
+
+
+def test_retry_failed_agent_regenerates_glossary_from_existing_source(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    source = tmp_path / "demo.ko.srt"
+    glossary = tmp_path / "draft.yaml"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
+    glossary.write_text("characters: []\n", encoding="utf-8")
+    calls: list[str] = []
+    session = web_agent.AgentSession(
+        id="agent1",
+        status="failed",
+        phase="generate_glossary",
+        payload={"extra_hint": "节目名参考"},
+        result={"source_srt": str(source)},
+        error="previous failure",
+    )
+    with web_agent._LOCK:
+        web_agent._AGENT_SESSIONS[session.id] = session
+
+    def done_job(name, result):
+        return web_agent.Job(id=name, name=name, status="done", result=result)
+
+    def fake_generate_glossary(payload):
+        calls.append(f"glossary:{payload['source_srt']}:{payload.get('extra_hint', '')}")
+        return done_job("glossary", {"glossary_path": str(glossary), "content": "characters: []\n"})
+
+    monkeypatch.setattr(web_agent, "generate_glossary_job", fake_generate_glossary)
+
+    retried = web_agent.retry_agent_session(session.id)
+    assert retried.status == "running"
+    snapshot = _wait_agent_phase(session.id, "review_glossary")
+
+    assert snapshot["status"] == "waiting"
+    assert snapshot["error"] == ""
+    assert snapshot["question"]["kind"] == "review_glossary"
+    assert snapshot["result"]["glossary_path"] == str(glossary)
+    assert calls == [f"glossary:{source}:节目名参考"]
 
 
 def test_agent_translate_after_glossary_exposes_sidecar_paths(monkeypatch, tmp_path: Path):
@@ -911,6 +949,8 @@ def test_child_process_env_sets_model_cache_without_proxy(monkeypatch, tmp_path:
     env = web_agent._child_process_env()
 
     assert env["PYTHONUNBUFFERED"] == "1"
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    assert env["PYTHONUTF8"] == "1"
     assert env["VIDEO_TRANSLATE_CACHE_DIR"] == str(tmp_path / "models")
     assert env["HF_HOME"] == str(tmp_path / "models" / "huggingface")
     assert "HTTP_PROXY" not in env

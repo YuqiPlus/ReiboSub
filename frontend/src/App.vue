@@ -23,6 +23,7 @@
               @start-agent="startAgent"
               @answer-agent="answerAgent"
               @cancel-agent="cancelAgent"
+              @retry-agent="retryAgent"
               @open-glossary="openGlossaryFromAgent"
             />
           </div>
@@ -276,6 +277,18 @@ async function cancelAgent() {
     await loadJobs()
   } catch (error) {
     setStatus(agentStatus, `中断失败：${error.message}`, 'bad')
+  }
+}
+
+async function retryAgent() {
+  if (!agentSession.value?.id) return
+  setStatus(agentStatus, '正在重试当前 Agent 阶段...', '')
+  try {
+    const session = await api(`/api/agent/${agentSession.value.id}/retry`, {})
+    agentSession.value = session
+    scheduleAgentPoll(session.id, 500)
+  } catch (error) {
+    setStatus(agentStatus, `重试失败：${error.message}`, 'bad')
   }
 }
 

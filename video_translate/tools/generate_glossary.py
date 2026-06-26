@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -599,6 +600,7 @@ def _unique_ints(values: list[int]) -> list[int]:
 
 
 def main(argv=None):
+    _configure_stdout()
     parser = argparse.ArgumentParser(description="Generate a draft glossary YAML from downloaded subtitle text using an LLM.")
     parser.add_argument("source_srt", type=Path, help="Downloaded .srt subtitle file")
     parser.add_argument("--out", type=Path, required=True, help="Output draft glossary YAML path")
@@ -625,6 +627,13 @@ def main(argv=None):
         fill_suggestions=args.fill_suggestions,
     )
     print(f"draft_glossary: {out}")
+
+
+def _configure_stdout() -> None:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass
 
 
 if __name__ == "__main__":
