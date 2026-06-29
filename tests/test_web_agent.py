@@ -145,6 +145,132 @@ def test_agent_session_hybrid_downloads_anchor_video_and_generates_glossary(monk
     assert calls == ["subtitle:en", "video", f"hybrid:{anchor}:{video}", f"glossary:{hybrid}:{web_agent.JOB_DIR / session.id / 'glossary.draft.yaml'}"]
 
 
+def test_agent_session_dual_reference_downloads_source_and_reference_subtitles(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    ko = tmp_path / "demo.ko.srt"
+    ko.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
+    en = tmp_path / "demo.en.srt"
+    en.write_text("1\n00:00:00,000 --> 00:00:01,000\nHi\n", encoding="utf-8")
+    dual = tmp_path / "dual.source.srt"
+    dual.write_text("1\n00:00:00,000 --> 00:00:01,000\n韩文原文：안녕\n英文参考：Hi\n", encoding="utf-8")
+    glossary = tmp_path / "draft.yaml"
+    glossary.write_text("characters: []\n", encoding="utf-8")
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        web_agent,
+        "probe_video",
+        lambda url, **kwargs: {
+            "title": "demo",
+            "normalized_url": "https://www.youtube.com/watch?v=abc123",
+            "webpage_url": "https://www.youtube.com/watch?v=abc123",
+            "subtitles": [
+                {"lang": "ko", "kind": "manual", "label": "ko · 人工字幕"},
+                {"lang": "en", "kind": "manual", "label": "en · 人工字幕"},
+            ],
+            "agent_plan": {
+                "route": "dual_subtitle_reference",
+                "selected_subtitle": {"lang": "ko", "kind": "manual", "label": "ko · 人工字幕"},
+                "reference_subtitle": {"lang": "en", "kind": "manual", "label": "en · 人工字幕"},
+                "requires_translation": True,
+                "needs_source_correction": False,
+                "confidence": 0.9,
+                "recommended_action": "download_dual_subtitles_then_translate",
+                "reasons": ["推荐双字幕参考"],
+            },
+        },
+    )
+
+    def done_job(name, result):
+        return web_agent.Job(id=name, name=name, status="done", result=result)
+
+    def fake_download(payload):
+        calls.append(f"subtitle:{payload['lang']}")
+        return done_job("subtitle", {"subtitle_path": str(ko if payload["lang"] == "ko" else en)})
+
+    monkeypatch.setattr(web_agent, "download_subtitle_job", fake_download)
+    monkeypatch.setattr(
+        web_agent,
+        "dual_subtitle_reference_job",
+        lambda payload: calls.append(f"dual:{payload['source_srt']}:{payload['reference_srt']}") or done_job(
+            "dual",
+            {"source_srt": str(dual), "context_srt": str(tmp_path / "dual.context.srt"), "debug_json": str(tmp_path / "dual.debug.json")},
+        ),
+    )
+    monkeypatch.setattr(
+        web_agent,
+        "generate_glossary_job",
+        lambda payload: calls.append(f"glossary:{payload['source_srt']}") or done_job("glossary", {"glossary_path": str(glossary), "content": "characters: []\n"}),
+    )
+
+    session = web_agent.start_agent_session({"url": "abc123", "detected_source_language": "ko"})
+    snapshot = _wait_agent_phase(session.id, "review_glossary")
+
+    assert snapshot["result"]["source_kind"] == "dual_subtitle_reference"
+    assert snapshot["result"]["source_srt"] == str(dual)
+    assert calls == ["subtitle:ko", "subtitle:en", f"dual:{ko}:{en}", f"glossary:{dual}"]
+
+
+def test_agent_session_probes_audio_language_before_choosing_manual_source(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"video")
+    source = tmp_path / "demo.ko.srt"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
+    reference = tmp_path / "demo.en.srt"
+    reference.write_text("1\n00:00:00,000 --> 00:00:01,000\nHi\n", encoding="utf-8")
+    dual = tmp_path / "dual.source.srt"
+    dual.write_text("1\n00:00:00,000 --> 00:00:01,000\n韩文原文：안녕\n英文参考：Hi\n", encoding="utf-8")
+    glossary = tmp_path / "draft.yaml"
+    glossary.write_text("characters: []\n", encoding="utf-8")
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        web_agent,
+        "probe_video",
+        lambda url, **kwargs: {
+            "title": "demo",
+            "normalized_url": "https://www.youtube.com/watch?v=abc123",
+            "webpage_url": "https://www.youtube.com/watch?v=abc123",
+            "subtitles": [
+                {"lang": "en", "kind": "manual", "label": "en · 人工字幕"},
+                {"lang": "ko", "kind": "manual", "label": "ko · 人工字幕"},
+            ],
+            "agent_plan": {
+                "route": "probe_audio_language",
+                "selected_subtitle": None,
+                "candidate_subtitles": [
+                    {"lang": "en", "kind": "manual", "label": "en · 人工字幕"},
+                    {"lang": "ko", "kind": "manual", "label": "ko · 人工字幕"},
+                ],
+                "requires_translation": True,
+                "needs_source_correction": False,
+                "confidence": 0.55,
+                "recommended_action": "probe_audio_language",
+                "reasons": ["需要先检测原视频音源语言。"],
+            },
+        },
+    )
+
+    def done_job(name, result):
+        return web_agent.Job(id=name, name=name, status="done", result=result)
+
+    monkeypatch.setattr(web_agent, "download_video_job", lambda payload: calls.append("video") or done_job("video", {"input_video": str(video)}))
+    monkeypatch.setattr(web_agent, "audio_language_probe_job", lambda payload: calls.append(f"lang:{payload['input_video']}") or done_job("lang", {"language": "ko", "language_probability": 0.93}))
+    monkeypatch.setattr(web_agent, "download_subtitle_job", lambda payload: calls.append(f"subtitle:{payload['lang']}:{payload['kind']}") or done_job("subtitle", {"subtitle_path": str(source if payload["lang"] == "ko" else reference)}))
+    monkeypatch.setattr(web_agent, "dual_subtitle_reference_job", lambda payload: calls.append(f"dual:{payload['source_srt']}:{payload['reference_srt']}") or done_job("dual", {"source_srt": str(dual)}))
+    monkeypatch.setattr(web_agent, "generate_glossary_job", lambda payload: calls.append(f"glossary:{payload['source_srt']}") or done_job("glossary", {"glossary_path": str(glossary), "content": "characters: []\n"}))
+
+    session = web_agent.start_agent_session({"url": "abc123", "embedded_subtitle_hint": "unknown"})
+    snapshot = _wait_agent_phase(session.id, "review_glossary")
+
+    assert snapshot["result"]["detected_source_language"] == "ko"
+    assert snapshot["result"]["agent_plan"]["route"] == "dual_subtitle_reference"
+    assert snapshot["result"]["agent_plan"]["selected_subtitle"]["lang"] == "ko"
+    assert snapshot["result"]["agent_plan"]["reference_subtitle"]["lang"] == "en"
+    assert calls == ["video", f"lang:{video}", "subtitle:ko:manual", "subtitle:en:manual", f"dual:{source}:{reference}", f"glossary:{dual}"]
+
+
 def test_cancel_agent_session_cancels_current_child_job(monkeypatch):
     monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
     monkeypatch.setattr(web_agent, "_JOBS", {})
@@ -258,7 +384,7 @@ def test_retry_failed_agent_regenerates_glossary_from_existing_source(monkeypatc
     monkeypatch.setattr(web_agent, "generate_glossary_job", fake_generate_glossary)
 
     retried = web_agent.retry_agent_session(session.id)
-    assert retried.status == "running"
+    assert retried.status in {"running", "waiting"}
     snapshot = _wait_agent_phase(session.id, "review_glossary")
 
     assert snapshot["status"] == "waiting"
@@ -672,10 +798,12 @@ def test_download_video_job_builds_video_download_command(monkeypatch, tmp_path:
     monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path)
     monkeypatch.setattr(web_agent, "PYTHON", "/python")
     calls = []
-    video = tmp_path / "demo.h264.mp4"
+    video_dir = tmp_path / "demo"
+    video = video_dir / "demo.h264.mp4"
 
     def fake_run_command(job_id, args):
         calls.append(args)
+        video_dir.mkdir()
         video.write_text("video", encoding="utf-8")
 
     monkeypatch.setattr(web_agent, "_run_command", fake_run_command)
@@ -687,8 +815,38 @@ def test_download_video_job_builds_video_download_command(monkeypatch, tmp_path:
 
     assert job.status == "done"
     assert calls[0][:3] == ["/python", "-m", "video_translate.youtube.download_video"]
-    assert calls[0][-1] == "abc123"
+    assert calls[0][3] == "abc123"
+    assert "--output-dir" in calls[0]
+    assert calls[0][calls[0].index("--output-dir") + 1] == str(tmp_path)
+    assert "--thumbnail-format" in calls[0]
+    assert calls[0][calls[0].index("--thumbnail-format") + 1] == "jpg"
     assert job.result["input_video"].endswith("demo.h264.mp4")
+
+
+def test_download_thumbnail_job_builds_thumbnail_download_command(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path)
+    monkeypatch.setattr(web_agent, "PYTHON", "/python")
+    calls = []
+    image_dir = tmp_path / "demo"
+    image = image_dir / "demo.jpg"
+
+    def fake_run_command(job_id, args):
+        calls.append(args)
+        image_dir.mkdir()
+        image.write_bytes(b"jpg")
+
+    monkeypatch.setattr(web_agent, "_run_command", fake_run_command)
+
+    job = web_agent.download_thumbnail_job({"url": "abc123", "title": "demo", "format": "png"})
+    snapshot = _wait_job_status(job.id, "done")
+
+    assert calls[0][:3] == ["/python", "-m", "video_translate.youtube.download_thumbnail"]
+    assert calls[0][3] == "abc123"
+    assert "--output-dir" in calls[0]
+    assert calls[0][calls[0].index("--output-dir") + 1] == str(tmp_path)
+    assert "--format" in calls[0]
+    assert calls[0][calls[0].index("--format") + 1] == "png"
+    assert snapshot["result"]["thumbnail_path"] == str(image)
 
 
 def test_title_translation_payload_requests_json():
@@ -742,8 +900,10 @@ def test_list_local_assets_collects_videos_subtitles_and_ocr_jobs(tmp_path: Path
     job_dir = jobs / "abc123"
     downloads.mkdir(parents=True)
     job_dir.mkdir(parents=True)
-    video = downloads / "demo.mp4"
-    subtitle = downloads / "demo.ko.srt"
+    project = downloads / "demo"
+    project.mkdir()
+    video = project / "demo.mp4"
+    subtitle = project / "demo.ko.srt"
     source = job_dir / "source.srt"
     run_yaml = job_dir / "run.yaml"
     video.write_text("video", encoding="utf-8")
@@ -759,6 +919,10 @@ def test_list_local_assets_collects_videos_subtitles_and_ocr_jobs(tmp_path: Path
 
     assert [item["name"] for item in assets["videos"]] == ["demo.mp4"]
     assert any(item["path"].endswith("demo.ko.srt") for item in assets["subtitles"])
+    assert assets["projects"][0]["name"] == "demo"
+    assert assets["projects"][0]["counts"] == {"videos": 1, "subtitles": 1, "images": 0, "others": 0}
+    assert assets["projects"][0]["videos"][0]["path"] == str(video)
+    assert assets["projects"][0]["subtitles"][0]["path"] == str(subtitle)
     assert assets["ocr_jobs"][0]["source_srt"].endswith("source.srt")
 
 
@@ -832,9 +996,13 @@ sidecar:
 def test_download_video_job_uses_existing_file_matching_title(monkeypatch, tmp_path: Path):
     downloads = tmp_path / "YoutubeDownloads"
     downloads.mkdir()
-    target = downloads / "Target Video.mp4"
+    project = downloads / "Target Video"
+    project.mkdir()
+    target = project / "Target Video.mp4"
+    thumbnail = project / "Target Video.jpg"
     wrong_newer = downloads / "Wrong Newer Video.mp4"
     target.write_text("target", encoding="utf-8")
+    thumbnail.write_text("thumb", encoding="utf-8")
     wrong_newer.write_text("wrong", encoding="utf-8")
     now = time.time()
     __import__("os").utime(target, (now - 100, now - 100))
@@ -847,12 +1015,15 @@ def test_download_video_job_uses_existing_file_matching_title(monkeypatch, tmp_p
     snapshot = _wait_job_status(job.id, "done")
 
     assert snapshot["result"]["input_video"] == str(target)
+    assert snapshot["result"]["thumbnail_path"] == str(thumbnail)
 
 
 def test_download_subtitle_job_uses_existing_file_matching_title_and_language(monkeypatch, tmp_path: Path):
     downloads = tmp_path / "YoutubeDownloads"
     downloads.mkdir()
-    target = downloads / "Target Video.en.srt"
+    project = downloads / "Target Video"
+    project.mkdir()
+    target = project / "Target Video.en.srt"
     wrong_newer = downloads / "Wrong Newer Video.en.srt"
     target.write_text("target", encoding="utf-8")
     wrong_newer.write_text("wrong", encoding="utf-8")

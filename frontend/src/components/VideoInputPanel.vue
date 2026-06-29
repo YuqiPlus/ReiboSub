@@ -22,7 +22,18 @@
     </div>
     <div class="toolbar">
       <button class="secondary" @click="$emit('download-video')">下载视频</button>
+      <button class="secondary" @click="$emit('download-thumbnail')">下载封面</button>
       <button class="warning" @click="$emit('ocr-full')">下载视频并 OCR 翻译</button>
+    </div>
+    <div class="mode-row">
+      <label for="thumbnailFormat">封面格式</label>
+      <select id="thumbnailFormat" :value="thumbnailFormat" @change="$emit('update:thumbnailFormat', $event.target.value)">
+        <option value="jpg">JPG</option>
+        <option value="png">PNG</option>
+        <option value="webp">WebP</option>
+        <option value="source">原始格式</option>
+      </select>
+      <span class="muted">默认 JPG；选择原始格式时保留 YouTube 返回的 webp/jpg/png</span>
     </div>
     <div class="mode-row">
       <label for="ocrTranslationMode">OCR 翻译处理模式</label>
@@ -41,10 +52,11 @@
 defineProps({
   url: { type: String, default: '' },
   ocrTranslationMode: { type: String, default: 'standard_cleanup' },
+  thumbnailFormat: { type: String, default: 'jpg' },
   embeddedSubtitleHint: { type: String, default: 'unknown' },
   probing: { type: Boolean, default: false },
   status: { type: String, default: '' },
   statusClass: { type: String, default: '' },
 })
-defineEmits(['update:url', 'update:ocrTranslationMode', 'update:embeddedSubtitleHint', 'probe', 'download-video', 'ocr-full'])
+defineEmits(['update:url', 'update:ocrTranslationMode', 'update:embeddedSubtitleHint', 'update:thumbnailFormat', 'probe', 'download-video', 'download-thumbnail', 'ocr-full'])
 </script>

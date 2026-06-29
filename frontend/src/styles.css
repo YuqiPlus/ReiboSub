@@ -551,6 +551,31 @@ select { min-height: 36px; border: 1px solid var(--line); border-radius: 7px; ba
   font-size: 13px;
 }
 .agent-selected span { color: var(--muted); }
+.agent-candidates {
+  display: grid;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255,255,255,.82);
+  font-size: 13px;
+}
+.agent-candidates > span { color: var(--muted); }
+.candidate-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+.candidate-list b {
+  max-width: 100%;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: var(--teal-soft);
+  color: var(--teal);
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
 .reason-list {
   margin: 0;
   padding-left: 18px;
@@ -713,6 +738,18 @@ aside, .task-drawer {
 .asset-item { display: grid; gap: 6px; padding: 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--soft); min-width: 0; }
 .asset-name { font-size: 13px; font-weight: 680; overflow-wrap: anywhere; }
 .asset-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.project-list { display: grid; gap: 10px; }
+.project-card { border: 1px solid var(--line); border-radius: 10px; background: #fff; overflow: hidden; }
+.project-card summary { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 12px; cursor: pointer; list-style: none; background: linear-gradient(180deg, #f8fbf7, #ffffff); }
+.project-card summary::-webkit-details-marker { display: none; }
+.project-title { font-size: 14px; font-weight: 760; color: var(--ink); overflow-wrap: anywhere; }
+.project-counts { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; color: var(--muted); font-size: 12px; }
+.project-counts span { border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px; background: var(--soft); white-space: nowrap; }
+.project-body { display: grid; grid-template-columns: minmax(120px, 160px) minmax(0, 1fr) minmax(0, 1fr); gap: 12px; padding: 12px; border-top: 1px solid var(--line); }
+.project-cover { display: grid; align-content: start; gap: 8px; }
+.project-cover img { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); background: var(--soft); }
+.project-column { min-width: 0; }
+.asset-subtitle { font-size: 12px; font-weight: 760; color: var(--muted); margin-bottom: 8px; }
 .tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--line); margin-bottom: 12px; }
 .tab { min-height: 34px; padding: 6px 10px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: var(--muted); }
 .tab:hover { background: var(--soft); color: var(--ink); }
@@ -744,7 +781,9 @@ aside, .task-drawer {
   .side-brand { display: none; }
   .nav-item { min-width: 132px; grid-template-columns: 24px minmax(0, 1fr); }
   .nav-badge { display: none; }
-  .url-row, .agent-start, .agent-command, .agent-context-strip, .agent-rail, .grid2, .title-tools, .review-edit, .summary-grid, .asset-grid, .context-line, .candidate-line, .path-row { grid-template-columns: 1fr; }
+  .url-row, .agent-start, .agent-command, .agent-context-strip, .agent-rail, .grid2, .title-tools, .review-edit, .summary-grid, .asset-grid, .project-body, .context-line, .candidate-line, .path-row { grid-template-columns: 1fr; }
+  .project-card summary { grid-template-columns: 1fr; }
+  .project-counts { justify-content: flex-start; }
   .agent-hero { flex-direction: column; }
   .toolbar { align-items: stretch; }
   .toolbar button { flex: 1 1 auto; }

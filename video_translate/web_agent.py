@@ -27,6 +27,7 @@ from video_translate.agent_planner import build_agent_plan
 from video_translate.cache import cuda_library_dirs, prepend_library_path
 from video_translate.env import load_dotenv
 from video_translate.llm_config import load_llm_task_config
+from video_translate.subtitle.dual_reference import write_dual_reference_outputs
 from video_translate.subtitle.srt import read_srt
 from video_translate.subtitle.sidecar import SidecarConfig, copy_sidecar_subtitles
 from video_translate.translate.volcengine import (
@@ -64,6 +65,11 @@ _HYBRID_TRANSLATION_PROMPT = """本次源字幕是 hybrid 格式：时间轴来�
 OCR 里的说话人姓名、屏幕姓名牌、频道水印或固定画面标签，默认不是台词内容；不要把它们用逗号接进句子。
 如果确实需要保留说话人，请使用“姓名：台词”格式；不要使用“姓名，台词”格式。
 输出时不要保留“韩文OCR：”“英文参考：”这些标签。
+"""
+_DUAL_REFERENCE_TRANSLATION_PROMPT = """本次源字幕是 dual reference 格式：时间轴和主文本来自作者上传的原语言人工字幕，文本中可能同时包含“韩文原文”和“英文参考”。
+必须优先依据“韩文原文”的韩文原文翻译，英文参考只用于理解上下文、补足省略、判断专名和语气。
+如果韩文原文和英文参考冲突，必须以韩文原文为准。
+输出时不要保留“韩文原文：”“英文参考：”这些标签。
 """
 
 
@@ -509,27 +515,7 @@ def _agent_start(session: AgentSession) -> None:
             _agent_log(session.id, f"title_translation_skipped: {exc}")
     plan = probe.get("agent_plan") or {}
     _agent_update_result(session.id, {"agent_plan": plan})
-    selected = plan.get("selected_subtitle") if isinstance(plan, dict) else None
-    if selected:
-        route = str(plan.get("route") or "")
-        confidence = float(plan.get("confidence") or 0)
-        if route in {"download_target_subtitle", "translate_source_subtitle"} and confidence >= 0.85:
-            _agent_log(session.id, "agent_auto_use_recommended_subtitle")
-            _agent_use_recommended_subtitle(session)
-            return
-        _agent_wait(
-            session.id,
-            "confirm_subtitle",
-            {
-                "kind": "confirm_subtitle",
-                "title": "确认字幕源",
-                "message": _agent_subtitle_question_message(plan),
-                "selected_subtitle": selected,
-                "options": _agent_confirm_options(plan),
-            },
-        )
-        return
-    _agent_continue_route_without_subtitle(session.id, plan)
+    _agent_handle_plan(session, plan)
 
 
 def _agent_continue(session: AgentSession, answer: dict[str, Any]) -> None:
@@ -542,6 +528,9 @@ def _agent_continue(session: AgentSession, answer: dict[str, Any]) -> None:
         return
     if action == "run_asr":
         _agent_run_asr(session)
+        return
+    if action == "probe_audio_language":
+        _agent_probe_audio_language(session)
         return
     if session.phase == "confirm_subtitle" and action == "use_recommended":
         plan = session.result.get("agent_plan") or {}
@@ -564,6 +553,9 @@ def _agent_retry_current_phase(session: AgentSession) -> None:
     if phase in {"confirm_subtitle", "download_subtitle"}:
         _agent_use_recommended_subtitle(session)
         return
+    if phase in {"download_reference_subtitle", "dual_subtitle_reference"}:
+        _agent_run_dual_subtitle_reference(session)
+        return
     if phase in {"download_anchor_subtitle", "download_video_for_hybrid", "hybrid_anchor_ocr"}:
         _agent_run_hybrid_anchor_ocr(session)
         return
@@ -583,6 +575,9 @@ def _agent_retry_current_phase(session: AgentSession) -> None:
     if phase in {"download_video_for_asr", "audio_asr"}:
         _agent_run_asr(session)
         return
+    if phase in {"probe_audio_language", "download_video_for_audio_probe"}:
+        _agent_probe_audio_language(session)
+        return
     if phase == "diagnose_ocr_asr":
         plan = session.result.get("agent_plan") or {}
         _agent_continue_route_without_subtitle(session.id, plan)
@@ -590,10 +585,38 @@ def _agent_retry_current_phase(session: AgentSession) -> None:
     raise RuntimeError(f"当前阶段不支持重试: {phase}")
 
 
+def _agent_handle_plan(session: AgentSession, plan: dict[str, Any]) -> None:
+    selected = plan.get("selected_subtitle") if isinstance(plan, dict) else None
+    if selected:
+        route = str(plan.get("route") or "")
+        confidence = float(plan.get("confidence") or 0)
+        if route in {"download_target_subtitle", "translate_source_subtitle", "dual_subtitle_reference"} and confidence >= 0.85:
+            _agent_log(session.id, "agent_auto_use_recommended_subtitle")
+            _agent_use_recommended_subtitle(session)
+            return
+        _agent_wait(
+            session.id,
+            "confirm_subtitle",
+            {
+                "kind": "confirm_subtitle",
+                "title": "确认字幕源",
+                "message": _agent_subtitle_question_message(plan),
+                "selected_subtitle": selected,
+                "candidate_subtitles": plan.get("candidate_subtitles") or [],
+                "options": _agent_confirm_options(plan),
+            },
+        )
+        return
+    _agent_continue_route_without_subtitle(session.id, plan)
+
+
 def _agent_use_recommended_subtitle(session: AgentSession) -> None:
     result = session.result
     probe = result.get("probe") or {}
     plan = result.get("agent_plan") or {}
+    if str(plan.get("route") or "") == "dual_subtitle_reference":
+        _agent_run_dual_subtitle_reference(session)
+        return
     selected = plan.get("selected_subtitle") or {}
     url = str(probe.get("normalized_url") or result.get("normalized_url") or session.payload.get("url") or "")
     _agent_set_phase(session.id, "download_subtitle")
@@ -614,11 +637,12 @@ def _agent_use_recommended_subtitle(session: AgentSession) -> None:
 def _agent_generate_glossary_review(session: AgentSession, source_srt: str) -> None:
     _agent_set_phase(session.id, "generate_glossary")
     is_hybrid = session.result.get("source_kind") == "hybrid_anchor_ocr"
+    is_dual_reference = session.result.get("source_kind") == "dual_subtitle_reference"
     glossary_job = generate_glossary_job(
         {
             "source_srt": source_srt,
             "extra_hint": str(session.payload.get("extra_hint") or ""),
-            "source_language": "korean" if is_hybrid else "",
+            "source_language": "korean" if is_hybrid or is_dual_reference else "",
             "out": str(_agent_glossary_path(session)),
         }
     )
@@ -628,6 +652,8 @@ def _agent_generate_glossary_review(session: AgentSession, source_srt: str) -> N
     message = "Glossary 草稿已生成。审核人名、昵称和专有词后继续翻译。"
     if is_hybrid:
         message = "Hybrid 源字幕已生成：时间轴来自英文人工字幕，原文优先使用韩文 OCR。审核 glossary 后继续翻译。"
+    if is_dual_reference:
+        message = "双字幕参考源已生成：韩文人工字幕为主，英文人工字幕只作参考。审核 glossary 后继续翻译。"
     _agent_wait(
         session.id,
         "review_glossary",
@@ -650,6 +676,8 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
     extra_prompt = ""
     if session.result.get("source_kind") == "hybrid_anchor_ocr":
         extra_prompt = _HYBRID_TRANSLATION_PROMPT
+    if session.result.get("source_kind") == "dual_subtitle_reference":
+        extra_prompt = _DUAL_REFERENCE_TRANSLATION_PROMPT
     _agent_set_phase(session.id, "translate")
     job = translate_subtitle_job(
         {
@@ -669,6 +697,11 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
 
 def _agent_continue_route_without_subtitle(session_id: str, plan: dict[str, Any]) -> None:
     route = str((plan or {}).get("route") or "")
+    if route == "probe_audio_language":
+        session = get_agent_session(session_id)
+        if session:
+            _agent_probe_audio_language(session)
+        return
     if route == "ocr":
         session = get_agent_session(session_id)
         if session:
@@ -686,13 +719,49 @@ def _agent_continue_route_without_subtitle(session_id: str, plan: dict[str, Any]
             "kind": "diagnose_ocr_asr",
             "title": "需要选择 OCR 或 ASR",
             "message": "没有可用字幕且不确定是否有内嵌字幕。第一版 Agent 先暂停，请选择路线。",
+            "candidate_subtitles": (plan or {}).get("candidate_subtitles") or [],
             "options": [
+                {"action": "probe_audio_language", "label": "先检测音源语言"},
                 {"action": "run_ocr", "label": "使用 OCR"},
                 {"action": "run_asr", "label": "使用 ASR"},
                 {"action": "manual_mode", "label": "转到手动模式"},
             ],
         },
     )
+
+
+def _agent_probe_audio_language(session: AgentSession) -> None:
+    result = session.result
+    probe = result.get("probe") or {}
+    url = str(probe.get("normalized_url") or result.get("normalized_url") or session.payload.get("url") or "")
+    input_video = str(result.get("input_video") or "")
+    if not input_video:
+        _agent_set_phase(session.id, "download_video_for_audio_probe")
+        video_result = _wait_for_job(download_video_job({"url": url, "title": probe.get("title") or ""}), session_id=session.id)
+        input_video = str(video_result.get("input_video") or "")
+        _agent_update_result(session.id, {"input_video": input_video, "download_video": video_result})
+
+    _agent_set_phase(session.id, "probe_audio_language")
+    language_result = _wait_for_job(audio_language_probe_job({"input_video": input_video}), session_id=session.id)
+    detected = str(language_result.get("language") or "")
+    probability = float(language_result.get("language_probability") or 0)
+    _agent_update_result(
+        session.id,
+        {
+            "audio_language_probe": language_result,
+            "detected_source_language": detected,
+            "detected_source_language_confidence": probability,
+        },
+    )
+    _agent_log(session.id, f"agent_tool_result: audio_language={detected or 'unknown'} confidence={probability:.2f}")
+    plan = build_agent_plan(
+        list(probe.get("subtitles") or []),
+        target_language=str(session.payload.get("target_language") or "zh"),
+        detected_source_language=detected,
+        embedded_subtitle_hint=str(session.payload.get("embedded_subtitle_hint") or "unknown"),
+    )
+    _agent_update_result(session.id, {"agent_plan": plan})
+    _agent_handle_plan(session, plan)
 
 
 def _agent_run_ocr(session: AgentSession) -> None:
@@ -754,6 +823,56 @@ def _agent_run_hybrid_anchor_ocr(session: AgentSession) -> None:
     _agent_generate_glossary_review(session, source_srt)
 
 
+def _agent_run_dual_subtitle_reference(session: AgentSession) -> None:
+    result = session.result
+    probe = result.get("probe") or {}
+    plan = result.get("agent_plan") or {}
+    selected = plan.get("selected_subtitle") or {}
+    reference = plan.get("reference_subtitle") or {}
+    if not reference:
+        _agent_use_recommended_subtitle(session)
+        return
+    url = str(probe.get("normalized_url") or result.get("normalized_url") or session.payload.get("url") or "")
+
+    _agent_set_phase(session.id, "download_subtitle")
+    source_result = _wait_for_job(
+        download_subtitle_job({"url": url, "lang": selected.get("lang"), "kind": selected.get("kind"), "title": probe.get("title") or ""}),
+        session_id=session.id,
+    )
+    source_srt = str(source_result.get("subtitle_path") or "")
+    _agent_update_result(session.id, {"primary_subtitle_srt": source_srt, "download_subtitle": source_result})
+
+    _agent_set_phase(session.id, "download_reference_subtitle")
+    reference_result = _wait_for_job(
+        download_subtitle_job({"url": url, "lang": reference.get("lang"), "kind": reference.get("kind"), "title": probe.get("title") or ""}),
+        session_id=session.id,
+    )
+    reference_srt = str(reference_result.get("subtitle_path") or "")
+    _agent_update_result(session.id, {"reference_subtitle_srt": reference_srt, "download_reference_subtitle": reference_result})
+
+    _agent_set_phase(session.id, "dual_subtitle_reference")
+    dual_result = _wait_for_job(
+        dual_subtitle_reference_job(
+            {
+                "source_srt": source_srt,
+                "reference_srt": reference_srt,
+                "title": probe.get("title") or "",
+            }
+        ),
+        session_id=session.id,
+    )
+    dual_source = str(dual_result.get("source_srt") or "")
+    _agent_update_result(
+        session.id,
+        {
+            "source_srt": dual_source,
+            "source_kind": "dual_subtitle_reference",
+            "dual_subtitle_reference": dual_result,
+        },
+    )
+    _agent_generate_glossary_review(session, dual_source)
+
+
 def _agent_run_asr(session: AgentSession) -> None:
     _agent_set_phase(session.id, "download_video_for_asr")
     url = str(session.result.get("normalized_url") or session.payload.get("url") or "")
@@ -808,8 +927,12 @@ def _agent_subtitle_question_message(plan: dict[str, Any]) -> str:
         return "检测到目标语言字幕，建议直接下载。"
     if route == "hybrid_anchor_ocr":
         return "检测到英文人工字幕，且你确认画面有内嵌字幕。建议使用英文人工字幕定轴，再用韩文 OCR 补足原文精度。"
+    if route == "dual_subtitle_reference":
+        return "检测到原声人工字幕和英文人工字幕。建议以原声字幕为主，英文字幕只作为 glossary 和翻译参考。"
     if route == "translate_auto_subtitle":
         return "检测到原声自动字幕，建议下载后先纠错再翻译。"
+    if route == "probe_audio_language":
+        return "检测到作者上传字幕，但还不知道原视频音源语言。建议先用音频样本检测原声语言，再选择字幕源。"
     return "检测到原声作者字幕，建议下载后生成 glossary 并翻译。"
 
 
@@ -822,11 +945,25 @@ def _agent_confirm_options(plan: dict[str, Any]) -> list[dict[str, str]]:
             {"action": "run_ocr", "label": "整片 OCR（慢）"},
             {"action": "run_asr", "label": "音频 ASR"},
         ]
+    if route == "dual_subtitle_reference":
+        return [
+            {"action": "use_recommended", "label": "韩文主字幕 + 英文参考（推荐）"},
+            {"action": "manual_mode", "label": "转到手动模式"},
+            {"action": "run_ocr", "label": "改用 OCR"},
+            {"action": "run_asr", "label": "改用 ASR"},
+        ]
     if route == "translate_fallback_subtitle":
         return [
             {"action": "use_recommended", "label": "使用中转字幕翻译（快）"},
             {"action": "manual_mode", "label": "转到手动模式"},
             {"action": "run_ocr", "label": "改用整片 OCR（慢）"},
+            {"action": "run_asr", "label": "改用 ASR"},
+        ]
+    if route == "probe_audio_language":
+        return [
+            {"action": "probe_audio_language", "label": "先检测音源语言"},
+            {"action": "manual_mode", "label": "转到手动模式"},
+            {"action": "run_ocr", "label": "改用 OCR"},
             {"action": "run_asr", "label": "改用 ASR"},
         ]
     return [
@@ -1128,10 +1265,21 @@ def _copy_source_sidecar_for_run_config(run_config: Path, source_srt: Path) -> d
 def download_video_job(payload: dict[str, Any]) -> Job:
     url = _required_str(payload, "url")
     title = str(payload.get("title") or "").strip()
+    thumbnail_format = str(payload.get("thumbnail_format") or "jpg").strip().lower()
     before = _snapshot_video_files(DOWNLOAD_DIR)
 
     def target(job_id: str) -> dict[str, Any]:
-        _run_command(job_id, _module_command("video_translate.youtube.download_video", url, "--output-dir", DOWNLOAD_DIR))
+        _run_command(
+            job_id,
+            _module_command(
+                "video_translate.youtube.download_video",
+                url,
+                "--output-dir",
+                DOWNLOAD_DIR,
+                "--thumbnail-format",
+                thumbnail_format,
+            ),
+        )
         videos = _changed_video_files(DOWNLOAD_DIR, before)
         if not videos:
             videos = _matching_video_files(DOWNLOAD_DIR, title)
@@ -1139,9 +1287,43 @@ def download_video_job(payload: dict[str, Any]) -> Job:
             videos = _newest_video_files(DOWNLOAD_DIR, limit=3)
         if not videos:
             raise RuntimeError(f"视频下载完成后没有找到匹配文件: title={title or '<unknown>'}")
-        return {"video_paths": [str(path) for path in videos], "input_video": str(videos[0]) if videos else ""}
+        thumbnail = _matching_thumbnail_file(videos[0]) if videos else None
+        result = {"video_paths": [str(path) for path in videos], "input_video": str(videos[0]) if videos else ""}
+        if thumbnail:
+            result["thumbnail_path"] = str(thumbnail)
+        return result
 
     return start_job("下载视频", target)
+
+
+def download_thumbnail_job(payload: dict[str, Any]) -> Job:
+    url = _required_str(payload, "url")
+    title = str(payload.get("title") or "").strip()
+    image_format = str(payload.get("format") or payload.get("thumbnail_format") or "jpg").strip().lower()
+    before = _snapshot_image_files(DOWNLOAD_DIR)
+
+    def target(job_id: str) -> dict[str, Any]:
+        _run_command(
+            job_id,
+            _module_command(
+                "video_translate.youtube.download_thumbnail",
+                url,
+                "--output-dir",
+                DOWNLOAD_DIR,
+                "--format",
+                image_format,
+            ),
+        )
+        images = _changed_image_files(DOWNLOAD_DIR, before)
+        if not images:
+            images = _matching_image_files(DOWNLOAD_DIR, title)
+        if not images and not title:
+            images = _newest_image_files(DOWNLOAD_DIR, limit=3)
+        if not images:
+            raise RuntimeError(f"封面下载完成后没有找到匹配文件: title={title or '<unknown>'}")
+        return {"thumbnail_paths": [str(path) for path in images], "thumbnail_path": str(images[0])}
+
+    return start_job("下载封面", target)
 
 
 def ocr_full_job(payload: dict[str, Any]) -> Job:
@@ -1270,6 +1452,96 @@ def hybrid_anchor_ocr_job(payload: dict[str, Any]) -> Job:
         return result
 
     return start_job(f"英文定轴 + 韩文 OCR {job_slug}", target)
+
+
+def dual_subtitle_reference_job(payload: dict[str, Any]) -> Job:
+    source_srt = _resolve_project_path(_required_str(payload, "source_srt"))
+    reference_srt = _resolve_project_path(_required_str(payload, "reference_srt"))
+    _ensure_under_root(source_srt)
+    _ensure_under_root(reference_srt)
+    if not source_srt.exists():
+        raise FileNotFoundError(f"主字幕文件不存在: {source_srt}")
+    if not reference_srt.exists():
+        raise FileNotFoundError(f"参考字幕文件不存在: {reference_srt}")
+    job_slug = _safe_slug(payload.get("title") or source_srt.stem)[:80]
+    min_overlap = float(payload.get("min_overlap_seconds") or 0.10)
+
+    def target(job_id: str) -> dict[str, Any]:
+        out_dir = JOB_DIR / job_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        config_path = out_dir / "run.yaml"
+        config = {
+            "mode": "dual_subtitle_reference",
+            "source_subtitle": str(source_srt),
+            "reference_subtitle": str(reference_srt),
+            "source_srt": str(out_dir / "dual.source.srt"),
+            "context_srt": str(out_dir / "dual.context.srt"),
+            "output_dir": str(out_dir),
+            "dual_reference": {"min_overlap_seconds": min_overlap},
+            "sidecar": {"enabled": True, "copy_source": False, "copy_translated": True, "source_suffix": ".source", "translated_suffix": ".zh"},
+        }
+        config_path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        _append_log(job_id, f"source_subtitle: {source_srt}")
+        _append_log(job_id, f"reference_subtitle: {reference_srt}")
+        _append_log(job_id, f"config: {config_path}")
+        result_paths = write_dual_reference_outputs(
+            read_srt(source_srt),
+            read_srt(reference_srt),
+            out_dir,
+            min_overlap_seconds=min_overlap,
+        )
+        return {name: str(path) for name, path in result_paths.items()}
+
+    return start_job(f"韩文主字幕 + 英文参考 {job_slug}", target)
+
+
+def audio_language_probe_job(payload: dict[str, Any]) -> Job:
+    input_video = _resolve_project_path(_required_str(payload, "input_video"))
+    _ensure_under_root(input_video)
+    if not input_video.exists():
+        raise FileNotFoundError(f"视频文件不存在: {input_video}")
+    model_size = str(payload.get("model_size") or os.environ.get("ASR_PROBE_MODEL_SIZE") or os.environ.get("ASR_MODEL_SIZE") or "large-v3").strip()
+    device = str(payload.get("device") or os.environ.get("ASR_DEVICE") or "cuda").strip()
+    compute_type = str(payload.get("compute_type") or os.environ.get("ASR_COMPUTE_TYPE") or "float16").strip()
+    job_slug = _safe_slug(input_video.stem)[:80]
+
+    def target(job_id: str) -> dict[str, Any]:
+        out_dir = JOB_DIR / job_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        json_out = out_dir / "audio_language.json"
+        _append_log(job_id, f"input_video: {input_video}")
+        _append_log(job_id, f"json_out: {json_out}")
+        _run_command(
+            job_id,
+            [
+                *_module_command(
+                    "video_translate.tools.transcribe_audio",
+                    input_video,
+                ),
+                "--out",
+                str(out_dir / "probe.srt"),
+                "--model-size",
+                model_size,
+                "--language",
+                "auto",
+                "--device",
+                device,
+                "--compute-type",
+                compute_type,
+                "--detect-language-only",
+                "--json-out",
+                str(json_out),
+            ],
+        )
+        data = json.loads(json_out.read_text(encoding="utf-8")) if json_out.exists() else {}
+        return {
+            "input_video": str(input_video),
+            "language": str(data.get("language") or "unknown"),
+            "language_probability": float(data.get("language_probability") or 0),
+            "json_path": str(json_out),
+        }
+
+    return start_job(f"音源语言检测 {job_slug}", target)
 
 
 def audio_local_video_job(payload: dict[str, Any]) -> Job:
@@ -1469,7 +1741,7 @@ def read_glossary_items(payload: dict[str, Any]) -> dict[str, Any]:
     data = _load_yaml_text(text, path)
     source_srt = _source_srt_from_glossary_text(text, path)
     cue_texts = _cue_texts_by_id(source_srt)
-    english_reference_texts = _hybrid_english_references_by_id(source_srt)
+    english_reference_texts = _english_references_by_id(source_srt)
     return {
         "path": str(path),
         "items": _glossary_items(
@@ -1550,16 +1822,16 @@ def _cue_texts_by_id(path: Path | None) -> dict[int, str]:
         return {}
 
 
-def _hybrid_english_references_by_id(source_srt: Path | None) -> dict[int, str]:
+def _english_references_by_id(source_srt: Path | None) -> dict[int, str]:
     if source_srt is None:
         return {}
-    context_srt = source_srt.with_name("hybrid.context.srt")
+    context_srt = _reference_context_srt(source_srt)
     if not context_srt.exists():
         return {}
     result: dict[int, str] = {}
     try:
         for cue in read_srt(context_srt):
-            text = _extract_hybrid_english_reference(cue.text)
+            text = _extract_english_reference(cue.text)
             if text:
                 result[cue.index] = text
     except Exception:
@@ -1567,7 +1839,13 @@ def _hybrid_english_references_by_id(source_srt: Path | None) -> dict[int, str]:
     return result
 
 
-def _extract_hybrid_english_reference(text: str) -> str:
+def _reference_context_srt(source_srt: Path) -> Path:
+    if source_srt.name.startswith("dual."):
+        return source_srt.with_name("dual.context.srt")
+    return source_srt.with_name("hybrid.context.srt")
+
+
+def _extract_english_reference(text: str) -> str:
     marker = "英文参考："
     if marker not in text:
         return ""
@@ -1821,9 +2099,12 @@ def _katakana_to_hiragana(text: str) -> str:
 
 
 def list_local_assets() -> dict[str, Any]:
+    videos = _asset_entries(_iter_video_files(DOWNLOAD_DIR), kind="video")
+    subtitles = _asset_entries(_iter_subtitle_files(), kind="subtitle")
     return {
-        "videos": _asset_entries(_iter_video_files(DOWNLOAD_DIR), kind="video"),
-        "subtitles": _asset_entries(_iter_subtitle_files(), kind="subtitle"),
+        "videos": videos,
+        "subtitles": subtitles,
+        "projects": _download_project_entries(DOWNLOAD_DIR),
         "ocr_jobs": _ocr_job_entries(),
     }
 
@@ -1831,7 +2112,7 @@ def list_local_assets() -> dict[str, Any]:
 def _iter_video_files(directory: Path) -> list[Path]:
     files: list[Path] = []
     for pattern in ["*.mp4", "*.mkv", "*.webm", "*.mov", "*.m4v"]:
-        files.extend(path for path in directory.glob(pattern) if _is_real_file(path))
+        files.extend(path for path in directory.rglob(pattern) if _is_real_file(path))
     return sorted(set(files), key=lambda path: path.stat().st_mtime, reverse=True)
 
 
@@ -1859,6 +2140,44 @@ def _asset_entry(path: Path, *, kind: str) -> dict[str, Any]:
         "modified_label": time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime)),
         "role": _subtitle_role(path) if kind == "subtitle" else "video",
     }
+
+
+def _download_project_entries(directory: Path, limit: int = 80) -> list[dict[str, Any]]:
+    if not directory.exists():
+        return []
+    projects: list[dict[str, Any]] = []
+    for project_dir in sorted([path for path in directory.iterdir() if path.is_dir()], key=lambda path: path.stat().st_mtime, reverse=True):
+        files = [path for path in project_dir.iterdir() if _is_real_file(path)]
+        if not files:
+            continue
+        videos = _asset_entries([path for path in files if path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}], kind="video", limit=50)
+        subtitles = _asset_entries([path for path in files if path.suffix.lower() in {".srt", ".vtt", ".ass", ".ssa", ".bcc"}], kind="subtitle", limit=80)
+        images = _asset_entries([path for path in files if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}], kind="image", limit=20)
+        others = _asset_entries([path for path in files if path.suffix.lower() not in {
+            ".mp4", ".mkv", ".webm", ".mov", ".m4v",
+            ".srt", ".vtt", ".ass", ".ssa", ".bcc",
+            ".jpg", ".jpeg", ".png", ".webp",
+        }], kind="file", limit=20)
+        newest = max((path.stat().st_mtime for path in files), default=project_dir.stat().st_mtime)
+        projects.append(
+            {
+                "name": project_dir.name,
+                "path": str(project_dir),
+                "modified_at": newest,
+                "modified_label": time.strftime("%Y-%m-%d %H:%M", time.localtime(newest)),
+                "videos": videos,
+                "subtitles": subtitles,
+                "images": images,
+                "others": others,
+                "counts": {
+                    "videos": len(videos),
+                    "subtitles": len(subtitles),
+                    "images": len(images),
+                    "others": len(others),
+                },
+            }
+        )
+    return sorted(projects, key=lambda item: item["modified_at"], reverse=True)[:limit]
 
 
 def _ocr_job_entries(limit: int = 80) -> list[dict[str, Any]]:
@@ -1963,12 +2282,12 @@ def _child_process_env() -> dict[str, str]:
 
 def _snapshot_files(directory: Path, pattern: str) -> dict[Path, float]:
     directory.mkdir(parents=True, exist_ok=True)
-    return {path: path.stat().st_mtime for path in directory.glob(pattern) if path.is_file()}
+    return {path: path.stat().st_mtime for path in _iter_pattern_files(directory, pattern) if path.is_file()}
 
 
 def _changed_files(directory: Path, pattern: str, before: dict[Path, float]) -> list[Path]:
     changed: list[Path] = []
-    for path in directory.glob(pattern):
+    for path in _iter_pattern_files(directory, pattern):
         if not path.is_file():
             continue
         mtime = path.stat().st_mtime
@@ -1978,13 +2297,26 @@ def _changed_files(directory: Path, pattern: str, before: dict[Path, float]) -> 
 
 
 def _newest_files(directory: Path, pattern: str, *, limit: int) -> list[Path]:
-    files = [path for path in directory.glob(pattern) if path.is_file()]
+    files = [path for path in _iter_pattern_files(directory, pattern) if path.is_file()]
     return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
+
+
+def _iter_pattern_files(directory: Path, pattern: str) -> list[Path]:
+    if pattern.startswith("**/") or "/" in pattern:
+        return list(directory.glob(pattern))
+    return list(directory.rglob(pattern))
 
 
 def _snapshot_video_files(directory: Path) -> dict[Path, float]:
     result: dict[Path, float] = {}
     for pattern in ["*.mp4", "*.mkv", "*.webm", "*.mov", "*.m4v"]:
+        result.update(_snapshot_files(directory, pattern))
+    return result
+
+
+def _snapshot_image_files(directory: Path) -> dict[Path, float]:
+    result: dict[Path, float] = {}
+    for pattern in ["*.jpg", "*.jpeg", "*.png", "*.webp"]:
         result.update(_snapshot_files(directory, pattern))
     return result
 
@@ -1996,6 +2328,13 @@ def _changed_video_files(directory: Path, before: dict[Path, float]) -> list[Pat
     return sorted(set(changed), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
+def _changed_image_files(directory: Path, before: dict[Path, float]) -> list[Path]:
+    changed: list[Path] = []
+    for pattern in ["*.jpg", "*.jpeg", "*.png", "*.webp"]:
+        changed.extend(_changed_files(directory, pattern, before))
+    return sorted(set(changed), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
 def _newest_video_files(directory: Path, *, limit: int) -> list[Path]:
     files: list[Path] = []
     for pattern in ["*.mp4", "*.mkv", "*.webm", "*.mov", "*.m4v"]:
@@ -2003,8 +2342,27 @@ def _newest_video_files(directory: Path, *, limit: int) -> list[Path]:
     return sorted(set(files), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
 
 
+def _newest_image_files(directory: Path, *, limit: int) -> list[Path]:
+    files: list[Path] = []
+    for pattern in ["*.jpg", "*.jpeg", "*.png", "*.webp"]:
+        files.extend(_newest_files(directory, pattern, limit=20))
+    return sorted(set(files), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
+
+
 def _matching_video_files(directory: Path, title: str) -> list[Path]:
     return _matching_media_files(directory, ["*.mp4", "*.mkv", "*.webm", "*.mov", "*.m4v"], title)
+
+
+def _matching_image_files(directory: Path, title: str) -> list[Path]:
+    return _matching_media_files(directory, ["*.jpg", "*.jpeg", "*.png", "*.webp"], title)
+
+
+def _matching_thumbnail_file(video_path: Path) -> Path | None:
+    for suffix in [".jpg", ".jpeg", ".png", ".webp"]:
+        candidate = video_path.with_suffix(suffix)
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
 
 
 def _matching_subtitle_files(directory: Path, title: str, lang: str) -> list[Path]:
@@ -2026,7 +2384,7 @@ def _matching_media_files(directory: Path, patterns: list[str], title: str) -> l
     title_key = _filename_match_key(title)
     candidates: list[Path] = []
     for pattern in patterns:
-        candidates.extend(path for path in directory.glob(pattern) if path.is_file() and not path.name.startswith("._"))
+        candidates.extend(path for path in directory.rglob(pattern) if path.is_file() and not path.name.startswith("._"))
     if not candidates:
         return []
 
@@ -2158,6 +2516,16 @@ class AgentHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/assets":
             self._send_json(list_local_assets())
             return
+        if parsed.path == "/api/file":
+            query = parse_qs(parsed.query)
+            raw_path = (query.get("path") or [""])[0]
+            file_path = _resolve_project_path(raw_path)
+            _ensure_under_root(file_path)
+            if not file_path.is_file():
+                self._send_json({"error": "file not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            self._send_file(file_path)
+            return
         asset = _frontend_asset_path(parsed.path)
         if asset:
             self._send_file(asset)
@@ -2208,6 +2576,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send_json(download_subtitle_job(payload).to_dict())
             elif self.path == "/api/jobs/download-video":
                 self._send_json(download_video_job(payload).to_dict())
+            elif self.path == "/api/jobs/download-thumbnail":
+                self._send_json(download_thumbnail_job(payload).to_dict())
             elif self.path == "/api/jobs/generate-glossary":
                 self._send_json(generate_glossary_job(payload).to_dict())
             elif self.path == "/api/jobs/translate-subtitle":
@@ -2275,9 +2645,9 @@ class AgentHandler(BaseHTTPRequestHandler):
 
 def _list_known_files(kind: str) -> list[str]:
     patterns = {
-        "srt": ["YoutubeDownloads/*.srt", "outputs/**/*.srt"],
+        "srt": ["YoutubeDownloads/**/*.srt", "outputs/**/*.srt"],
         "glossary": ["configs/glossaries/*.yaml", "configs/glossaries/*.yml", "configs/glossaries/*.json"],
-    }.get(kind, ["YoutubeDownloads/*.srt"])
+    }.get(kind, ["YoutubeDownloads/**/*.srt"])
     files: list[Path] = []
     for pattern in patterns:
         files.extend(ROOT.glob(pattern))

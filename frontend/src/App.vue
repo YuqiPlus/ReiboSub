@@ -33,11 +33,13 @@
               v-model:url="url"
               v-model:ocr-translation-mode="ocrTranslationMode"
               v-model:embedded-subtitle-hint="embeddedSubtitleHint"
+              v-model:thumbnail-format="thumbnailFormat"
               :probing="probing"
               :status="probeStatus.text"
               :status-class="probeStatus.class"
               @probe="probeVideo"
               @download-video="downloadVideo"
+              @download-thumbnail="downloadThumbnail"
               @ocr-full="runOcrFull"
             />
 
@@ -160,6 +162,7 @@ const glossaryLoading = ref(false)
 const subtitleTranslationMode = ref('translate_only')
 const subtitleConvertFormat = ref('bcc')
 const ocrTranslationMode = ref('standard_cleanup')
+const thumbnailFormat = ref('jpg')
 const embeddedSubtitleHint = ref('unknown')
 const localVideo = ref('')
 const audioLanguage = ref('auto')
@@ -170,7 +173,7 @@ const agentSession = ref(null)
 const agentStarting = ref(false)
 let agentPollTimer = null
 
-const assets = reactive({ videos: [], subtitles: [], ocr_jobs: [] })
+const assets = reactive({ videos: [], subtitles: [], projects: [], ocr_jobs: [] })
 const jobs = reactive({})
 const pollTimers = new Map()
 
@@ -391,7 +394,25 @@ async function downloadVideo() {
     return
   }
   try {
-    const job = await api('/api/jobs/download-video', { url: value })
+    const job = await api('/api/jobs/download-video', { url: value, thumbnail_format: thumbnailFormat.value })
+    watchJob(job)
+  } catch (error) {
+    setStatus(probeStatus, error.message, 'bad')
+  }
+}
+
+async function downloadThumbnail() {
+  const value = (probe.value?.webpage_url || url.value).trim()
+  if (!value) {
+    setStatus(probeStatus, '先输入视频链接或 ID。', 'bad')
+    return
+  }
+  try {
+    const job = await api('/api/jobs/download-thumbnail', {
+      url: value,
+      title: probe.value?.title || titleBox.value || '',
+      format: thumbnailFormat.value,
+    })
     watchJob(job)
   } catch (error) {
     setStatus(probeStatus, error.message, 'bad')
@@ -592,8 +613,9 @@ async function loadAssets() {
     const result = await getJson('/api/assets')
     assets.videos = result.videos || []
     assets.subtitles = result.subtitles || []
+    assets.projects = result.projects || []
     assets.ocr_jobs = result.ocr_jobs || []
-    setStatus(assetStatus, `已扫描：${assets.videos.length} 个视频，${assets.subtitles.length} 个字幕。`, 'ok')
+    setStatus(assetStatus, `已扫描：${assets.projects.length} 个项目，${assets.videos.length} 个视频，${assets.subtitles.length} 个字幕。`, 'ok')
   } catch (error) {
     setStatus(assetStatus, error.message, 'bad')
   }

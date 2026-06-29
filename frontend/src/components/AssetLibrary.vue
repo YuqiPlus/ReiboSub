@@ -34,24 +34,58 @@
       </select>
       <span class="muted">识别人声生成 source.srt，之后可用下方字幕翻译模式继续翻译</span>
     </div>
-    <div class="asset-grid" style="margin-top:12px">
-      <div>
-        <div class="section-title"><h3>已下载视频</h3><span class="badge">{{ assets.videos.length }}</span></div>
-        <AssetList :items="assets.videos" empty-text="暂无文件。">
-          <template #actions="{ item }">
-            <button class="secondary mini" @click="$emit('use-video', item.path)">选为视频</button>
-            <button class="warning mini" @click="$emit('use-video-ocr', item.path)">OCR</button>
-          </template>
-        </AssetList>
+    <div style="margin-top:12px">
+      <div class="section-title">
+        <h3>视频项目</h3>
+        <span class="badge">{{ projects.length }}</span>
       </div>
-      <div>
-        <div class="section-title"><h3>已有字幕</h3><span class="badge">{{ assets.subtitles.length }}</span></div>
-        <AssetList :items="assets.subtitles" empty-text="暂无文件。">
-          <template #actions="{ item }">
-            <button class="secondary mini" @click="$emit('use-subtitle', item.path)">设为源字幕</button>
-            <button class="ghost mini" @click="copyPath(item.path)">复制路径</button>
-          </template>
-        </AssetList>
+      <div v-if="!projects.length" class="asset-list empty">暂无文件。</div>
+      <div v-else class="project-list">
+        <details v-for="project in projects" :key="project.path" class="project-card" open>
+          <summary>
+            <div>
+              <div class="project-title">{{ project.name }}</div>
+              <div class="muted path">{{ project.path }}</div>
+            </div>
+            <div class="project-counts">
+              <span>{{ project.counts?.videos || 0 }} 视频</span>
+              <span>{{ project.counts?.subtitles || 0 }} 字幕</span>
+              <span v-if="project.counts?.images">{{ project.counts.images }} 封面</span>
+            </div>
+          </summary>
+          <div class="project-body">
+            <div v-if="project.images?.length" class="project-cover">
+              <img :src="fileUrl(project.images[0].path)" alt="" />
+              <button class="ghost mini" @click="copyPath(project.images[0].path)">复制封面路径</button>
+            </div>
+            <div class="project-column">
+              <div class="asset-subtitle">视频</div>
+              <AssetList :items="project.videos || []" empty-text="无视频。">
+                <template #actions="{ item }">
+                  <button class="secondary mini" @click="$emit('use-video', item.path)">选为视频</button>
+                  <button class="warning mini" @click="$emit('use-video-ocr', item.path)">OCR</button>
+                </template>
+              </AssetList>
+            </div>
+            <div class="project-column">
+              <div class="asset-subtitle">字幕</div>
+              <AssetList :items="project.subtitles || []" empty-text="无字幕。">
+                <template #actions="{ item }">
+                  <button class="secondary mini" @click="$emit('use-subtitle', item.path)">设为源字幕</button>
+                  <button class="ghost mini" @click="copyPath(item.path)">复制路径</button>
+                </template>
+              </AssetList>
+            </div>
+            <div v-if="project.others?.length" class="project-column">
+              <div class="asset-subtitle">其他文件</div>
+              <AssetList :items="project.others" empty-text="无其他文件。">
+                <template #actions="{ item }">
+                  <button class="ghost mini" @click="copyPath(item.path)">复制路径</button>
+                </template>
+              </AssetList>
+            </div>
+          </div>
+        </details>
       </div>
     </div>
     <div style="margin-top:12px">
@@ -69,8 +103,9 @@
 
 <script setup>
 import AssetList from './AssetList.vue'
+import { computed } from 'vue'
 
-defineProps({
+const props = defineProps({
   localVideo: { type: String, default: '' },
   audioLanguage: { type: String, default: 'auto' },
   audioModelSize: { type: String, default: 'large-v3' },
@@ -85,5 +120,11 @@ defineEmits([
 
 function copyPath(path) {
   navigator.clipboard?.writeText(path)
+}
+
+const projects = computed(() => props.assets.projects || [])
+
+function fileUrl(path) {
+  return `/api/file?path=${encodeURIComponent(path)}`
 }
 </script>
