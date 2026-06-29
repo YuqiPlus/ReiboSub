@@ -53,9 +53,10 @@ def build_subtitle_options(
     output_path.mkdir(parents=True, exist_ok=True)
 
     ydl_opts = {
-        "outtmpl": str(output_path / "%(title)s.%(ext)s"),
+        "outtmpl": str(output_path / "%(title)s" / "%(title)s.%(ext)s"),
         "noplaylist": True,
         "skip_download": True,
+        "overwrites": True,
         "writesubtitles": bool(manual_subtitles),
         "writeautomaticsub": bool(auto_subtitles),
         "subtitleslangs": parse_subtitle_languages(subtitle_languages),
