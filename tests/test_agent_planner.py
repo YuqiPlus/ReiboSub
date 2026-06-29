@@ -25,9 +25,34 @@ def test_agent_plan_uses_source_language_manual_subtitle_when_no_chinese():
 
     plan = build_agent_plan(captions, target_language="zh", detected_source_language="ko")
 
+    assert plan["route"] == "dual_subtitle_reference"
+    assert plan["selected_subtitle"]["lang"] == "ko"
+    assert plan["reference_subtitle"]["lang"] == "en"
+    assert plan["requires_translation"] is True
+
+
+def test_agent_plan_uses_source_language_manual_subtitle_without_english_reference():
+    captions = [{"lang": "ko", "kind": "manual"}]
+
+    plan = build_agent_plan(captions, target_language="zh", detected_source_language="ko")
+
     assert plan["route"] == "translate_source_subtitle"
     assert plan["selected_subtitle"]["lang"] == "ko"
-    assert plan["requires_translation"] is True
+    assert plan["reference_subtitle"] is None
+
+
+def test_agent_plan_probes_audio_language_before_english_fallback_when_source_unknown():
+    captions = [
+        {"lang": "en", "kind": "manual", "label": "en · 人工字幕"},
+        {"lang": "ko", "kind": "manual", "label": "ko · 人工字幕"},
+    ]
+
+    plan = build_agent_plan(captions, target_language="zh", embedded_subtitle_hint="unknown")
+
+    assert plan["route"] == "probe_audio_language"
+    assert plan["selected_subtitle"] is None
+    assert plan["recommended_action"] == "probe_audio_language"
+    assert [item["lang"] for item in plan["candidate_subtitles"]] == ["en", "ko"]
 
 
 def test_agent_plan_does_not_recommend_target_language_auto_subtitle():

@@ -27,9 +27,21 @@ def build_agent_plan(
             )
 
     source_language = detected_source_language.strip().lower()
+    english_manual = _find_caption(normalized, "en", kind="manual")
     if source_language:
         manual_source = _find_caption(normalized, source_language, kind="manual")
         if manual_source:
+            if english_manual and not _language_matches(manual_source.get("lang_key", ""), _language_key("en")):
+                return _plan(
+                    route="dual_subtitle_reference",
+                    selected_subtitle=manual_source,
+                    reference_subtitle=english_manual,
+                    requires_translation=True,
+                    needs_source_correction=False,
+                    confidence=0.9,
+                    recommended_action="download_dual_subtitles_then_translate",
+                    reasons=["检测到原声语言人工字幕和英文人工字幕；推荐以原文字幕为主，英文字幕只作为理解和 glossary 审核参考。"],
+                )
             return _plan(
                 route="translate_source_subtitle",
                 selected_subtitle=manual_source,
@@ -40,7 +52,6 @@ def build_agent_plan(
                 reasons=["没有目标语言字幕，检测到原声语言的作者字幕，适合作为翻译源。"],
             )
     hint = _normalize_embedded_subtitle_hint(embedded_subtitle_hint)
-    english_manual = _find_caption(normalized, "en", kind="manual")
     if english_manual and hint == "yes":
         return _plan(
             route="hybrid_anchor_ocr",
@@ -50,6 +61,19 @@ def build_agent_plan(
             confidence=0.82,
             recommended_action="download_anchor_subtitle_then_hybrid_ocr",
             reasons=["检测到英文人工字幕，且用户确认画面有内嵌字幕；推荐用英文时间轴定轴，并用韩文 OCR 提升翻译精度。"],
+        )
+
+    manual_candidates = [item for item in normalized if item.get("kind") == "manual"]
+    if manual_candidates and not source_language:
+        return _plan(
+            route="probe_audio_language",
+            selected_subtitle=None,
+            requires_translation=True,
+            needs_source_correction=False,
+            confidence=0.55,
+            recommended_action="probe_audio_language",
+            reasons=["检测到作者上传字幕，但还不知道原视频音源语言；需要先探测音源语言，再选择最合适的字幕源。"],
+            candidate_subtitles=manual_candidates,
         )
 
     english = english_manual
@@ -104,10 +128,14 @@ def _plan(
     confidence: float,
     recommended_action: str,
     reasons: list[str],
+    candidate_subtitles: list[dict[str, Any]] | None = None,
+    reference_subtitle: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "route": route,
         "selected_subtitle": selected_subtitle,
+        "reference_subtitle": reference_subtitle,
+        "candidate_subtitles": candidate_subtitles or [],
         "requires_translation": requires_translation,
         "needs_source_correction": needs_source_correction,
         "confidence": confidence,

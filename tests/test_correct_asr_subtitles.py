@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import requests
 
@@ -90,7 +91,7 @@ def test_correct_asr_subtitles_splits_batch_after_timeout(monkeypatch, tmp_path:
     assert "교정4" in text
 
 
-def test_correct_asr_subtitles_defaults_to_lite_model(monkeypatch, tmp_path: Path):
+def test_correct_asr_subtitles_uses_configured_task_model(monkeypatch, tmp_path: Path):
     source = tmp_path / "source.srt"
     source.write_text("1\n00:00:00,000 --> 00:00:01,000\n릴 짱\n", encoding="utf-8")
     out = tmp_path / "source.corrected.srt"
@@ -100,15 +101,21 @@ def test_correct_asr_subtitles_defaults_to_lite_model(monkeypatch, tmp_path: Pat
         seen_models.append(payload["model"])
         return {1: "렐짱"}
 
-    monkeypatch.setenv("ARK_API_KEY", "key")
-    monkeypatch.setenv("ARK_MODEL", "doubao-seed-2.0-pro")
-    monkeypatch.delenv("ASR_CORRECTION_MODEL", raising=False)
     monkeypatch.setattr(correct_asr, "_load_dotenv", lambda _path: None)
     monkeypatch.setattr(correct_asr, "_request_correction_mapping", fake_request)
+    monkeypatch.setattr(
+        correct_asr,
+        "load_llm_task_config",
+        lambda *args, **kwargs: SimpleNamespace(
+            model="configured-asr-lite",
+            base_url="https://example.test/v1",
+            api_key="key",
+        ),
+    )
 
     correct_asr.correct_asr_srt(source, out)
 
-    assert seen_models == ["doubao-seed-2.0-lite"]
+    assert seen_models == ["configured-asr-lite"]
 
 
 def test_correct_asr_subtitles_allows_model_override(monkeypatch, tmp_path: Path):

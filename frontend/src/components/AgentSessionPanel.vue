@@ -66,9 +66,25 @@
             <h3>{{ routeLabel }}</h3>
           </div>
           <p v-if="agentPlan.reasons?.length">{{ agentPlan.reasons[0] }}</p>
+          <div v-if="detectedLanguage" class="agent-selected">
+            <span>音源语言</span>
+            <b>{{ detectedLanguage }}</b>
+          </div>
           <div v-if="agentPlan.selected_subtitle" class="agent-selected">
             <span>推荐字幕</span>
             <b>{{ agentPlan.selected_subtitle.label || agentPlan.selected_subtitle.lang }}</b>
+          </div>
+          <div v-if="agentPlan.reference_subtitle" class="agent-selected">
+            <span>参考字幕</span>
+            <b>{{ agentPlan.reference_subtitle.label || agentPlan.reference_subtitle.lang }}</b>
+          </div>
+          <div v-if="candidateSubtitles.length" class="agent-candidates">
+            <span>人工字幕候选</span>
+            <div class="candidate-list">
+              <b v-for="item in candidateSubtitles" :key="`${item.kind}-${item.lang}`">
+                {{ item.label || `${item.lang} · ${item.kind}` }}
+              </b>
+            </div>
           </div>
         </div>
 
@@ -79,6 +95,14 @@
           <div v-if="session.question.selected_subtitle" class="agent-selected">
             <span>字幕</span>
             <b>{{ session.question.selected_subtitle.label || session.question.selected_subtitle.lang }}</b>
+          </div>
+          <div v-if="session.question.candidate_subtitles?.length" class="agent-candidates">
+            <span>可选字幕</span>
+            <div class="candidate-list">
+              <b v-for="item in session.question.candidate_subtitles" :key="`${item.kind}-${item.lang}`">
+                {{ item.label || `${item.lang} · ${item.kind}` }}
+              </b>
+            </div>
           </div>
           <div v-if="session.question.glossary_path" class="agent-selected">
             <span>Glossary</span>
@@ -150,8 +174,12 @@ defineEmits([
 
 const phaseOrder = [
   ['probe', '检测'],
+  ['download_video_for_audio_probe', '视频'],
+  ['probe_audio_language', '音源'],
   ['confirm_subtitle', '决策'],
   ['download_subtitle', '取源'],
+  ['download_reference_subtitle', '参考'],
+  ['dual_subtitle_reference', '融合'],
   ['download_anchor_subtitle', '取源'],
   ['download_video_for_hybrid', '视频'],
   ['hybrid_anchor_ocr', '还原'],
@@ -178,8 +206,12 @@ const phaseLabel = computed(() => {
   const labels = {
     created: '等待启动',
     probe: '检测视频和字幕',
+    download_video_for_audio_probe: '下载视频用于音源检测',
+    probe_audio_language: '检测音源语言',
     confirm_subtitle: '等待确认字幕源',
     download_subtitle: '下载字幕',
+    download_reference_subtitle: '下载参考字幕',
+    dual_subtitle_reference: '韩文主字幕 + 英文参考',
     generate_glossary: '生成 Glossary',
     review_glossary: '等待 Glossary 审核',
     translate: '翻译字幕',
@@ -195,6 +227,14 @@ const phaseLabel = computed(() => {
 })
 
 const agentPlan = computed(() => props.session?.result?.agent_plan || null)
+const candidateSubtitles = computed(() => agentPlan.value?.candidate_subtitles || props.session?.question?.candidate_subtitles || [])
+const detectedLanguage = computed(() => {
+  const result = props.session?.result || {}
+  if (!result.detected_source_language) return ''
+  const confidence = result.detected_source_language_confidence
+  if (confidence === undefined || confidence === null || confidence === '') return result.detected_source_language
+  return `${result.detected_source_language} · ${(Number(confidence) * 100).toFixed(0)}%`
+})
 
 const routeLabel = computed(() => {
   const route = agentPlan.value?.route || ''
@@ -203,7 +243,9 @@ const routeLabel = computed(() => {
     translate_source_subtitle: '原声字幕翻译',
     translate_auto_subtitle: '自动字幕纠错翻译',
     translate_fallback_subtitle: '中转字幕翻译',
+    dual_subtitle_reference: '韩文主字幕 + 英文参考',
     hybrid_anchor_ocr: '英文定轴 + 韩文 OCR',
+    probe_audio_language: '先检测音源语言',
     ocr: 'OCR 翻译',
     asr: 'ASR 翻译',
     diagnose_ocr_asr: '等待路线诊断',
@@ -215,7 +257,7 @@ const steps = computed(() => {
   const phase = props.session?.phase || 'created'
   const currentIndex = Math.max(0, phaseOrder.findIndex(([id]) => id === phase))
   return phaseOrder
-    .filter(([id]) => !['download_anchor_subtitle', 'download_subtitle', 'download_video_for_hybrid', 'audio_asr', 'ocr_full'].includes(id) || id === phase)
+    .filter(([id]) => !['download_anchor_subtitle', 'download_subtitle', 'download_reference_subtitle', 'dual_subtitle_reference', 'download_video_for_hybrid', 'audio_asr', 'ocr_full'].includes(id) || id === phase)
     .slice(0, 7)
     .map(([id, label], index) => {
       const orderIndex = phaseOrder.findIndex(([stepId]) => stepId === id)

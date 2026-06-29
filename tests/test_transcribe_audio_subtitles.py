@@ -101,6 +101,31 @@ def test_transcribe_audio_to_srt_configures_model_cache(monkeypatch, tmp_path: P
     assert out.exists()
 
 
+def test_detect_audio_language_returns_whisper_language_metadata(monkeypatch, tmp_path: Path):
+    video = tmp_path / "video.mp4"
+    video.write_text("video", encoding="utf-8")
+    captured = {}
+
+    class FakeWhisperModel:
+        def __init__(self, model_size, *, device, compute_type):
+            captured["model_size"] = model_size
+            captured["device"] = device
+            captured["compute_type"] = compute_type
+
+        def transcribe(self, media, **kwargs):
+            captured["media"] = media
+            captured["kwargs"] = kwargs
+            return iter(()), SimpleNamespace(language="ko", language_probability=0.91)
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=FakeWhisperModel))
+
+    result = audio_asr.detect_audio_language(video, model_size="large-v3", device="cpu", compute_type="int8")
+
+    assert result == {"language": "ko", "language_probability": 0.91}
+    assert captured["kwargs"]["language"] is None
+    assert captured["kwargs"]["word_timestamps"] is False
+
+
 def test_ensure_cuda_library_path_reexecs_when_path_changes(monkeypatch, tmp_path: Path):
     lib_dir = tmp_path / "nvidia" / "cublas" / "lib"
     lib_dir.mkdir(parents=True)

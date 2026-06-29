@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -63,6 +64,41 @@ def transcribe_audio_to_srt(
     print(f"detected_language: {detected}", flush=True)
     print(f"source_srt: {out_srt}", flush=True)
     return out_srt
+
+
+def detect_audio_language(
+    input_media: Path,
+    *,
+    model_size: str = DEFAULT_MODEL_SIZE,
+    device: str = DEFAULT_DEVICE,
+    compute_type: str = DEFAULT_COMPUTE_TYPE,
+    vad_filter: bool = True,
+) -> dict[str, Any]:
+    input_media = input_media.expanduser().resolve()
+    if not input_media.exists():
+        raise FileNotFoundError(f"媒体文件不存在: {input_media}")
+
+    configure_model_cache()
+    ensure_cuda_library_path_ready(device)
+
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError("缺少 faster-whisper，请先在环境中安装：pip install faster-whisper") from exc
+
+    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    _segments, info = model.transcribe(
+        str(input_media),
+        language=None,
+        vad_filter=vad_filter,
+        word_timestamps=False,
+    )
+    language = str(getattr(info, "language", "") or "unknown")
+    probability = float(getattr(info, "language_probability", 0.0) or 0.0)
+    result = {"language": language, "language_probability": probability}
+    print(f"detected_language: {language}", flush=True)
+    print(f"language_probability: {probability:.4f}", flush=True)
+    return result
 
 
 def ensure_cuda_library_path_ready(device: str) -> None:
@@ -131,9 +167,24 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--language", default=DEFAULT_LANGUAGE)
     parser.add_argument("--device", default=DEFAULT_DEVICE)
     parser.add_argument("--compute-type", default=DEFAULT_COMPUTE_TYPE)
+    parser.add_argument("--detect-language-only", action="store_true")
+    parser.add_argument("--json-out", type=Path, default=None)
     parser.add_argument("--no-vad", action="store_true")
     parser.add_argument("--no-word-timestamps", action="store_true")
     args = parser.parse_args(argv)
+    if args.detect_language_only:
+        result = detect_audio_language(
+            args.input_media,
+            model_size=args.model_size,
+            device=args.device,
+            compute_type=args.compute_type,
+            vad_filter=not args.no_vad,
+        )
+        if args.json_out:
+            args.json_out.parent.mkdir(parents=True, exist_ok=True)
+            args.json_out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"language_json: {args.json_out}", flush=True)
+        return
     transcribe_audio_to_srt(
         args.input_media,
         args.out,
