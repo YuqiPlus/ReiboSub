@@ -4,6 +4,8 @@ models/
 .env.backup.*
 configs/run.yaml
 configs/llm.yaml
+configs/llm.providers.*.yaml
+!configs/llm.providers.*.example.yaml
 outputs/
 frontend/node_modules/
 frontend/dist/

@@ -1,0 +1,13 @@
+# Copy this file to configs/llm.providers.volcano.yaml.
+# Keep secrets in .env, not here.
+
+provider: volcengine
+base_url: https://ark.cn-beijing.volces.com/api/coding/v3
+api_key_env: VOLCANO_API_KEY
+
+models:
+  default: doubao-seed-2.0-pro
+  pro: doubao-seed-2.0-pro
+  lite: doubao-seed-2.0-lite
+  code: doubao-seed-2.0-code
+  minimax: minimax-m2.7

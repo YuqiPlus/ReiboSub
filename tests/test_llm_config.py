@@ -6,7 +6,17 @@ from video_translate.llm_config import LLMTaskConfig, load_llm_task_config
 
 
 def _clear_llm_env(monkeypatch):
-    for name in ["LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL", "ARK_API_KEY", "ARK_BASE_URL", "ARK_MODEL", "ASR_CORRECTION_MODEL"]:
+    for name in [
+        "LLM_API_KEY",
+        "LLM_BASE_URL",
+        "LLM_MODEL",
+        "ARK_API_KEY",
+        "ARK_BASE_URL",
+        "ARK_MODEL",
+        "ASR_CORRECTION_MODEL",
+        "QIANWEN_API_KEY",
+        "VOLCANO_API_KEY",
+    ]:
         monkeypatch.delenv(name, raising=False)
 
 
@@ -147,4 +157,105 @@ tasks:
     assert task == LLMTaskConfig(
         model="doubao-seed-2.0-pro",
         fallback_models=("doubao-seed-2.0-lite", "minimax-m2.7"),
+    )
+
+
+def test_load_llm_task_config_resolves_active_provider_profile_roles(tmp_path: Path, monkeypatch):
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    (config_dir / "llm.yaml").write_text(
+        """
+active_provider: qianwen
+tasks:
+  title_translation:
+    model_role: lite
+  subtitle_translation:
+    model_role: pro
+    fallback_roles:
+      - lite
+""",
+        encoding="utf-8",
+    )
+    (config_dir / "llm.providers.qianwen.yaml").write_text(
+        """
+provider: qianwen
+base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+api_key_env: QIANWEN_API_KEY
+models:
+  default: qwen-plus
+  pro: qwen-max
+  lite: qwen-turbo
+""",
+        encoding="utf-8",
+    )
+    (config_dir / "llm.providers.volcano.yaml").write_text(
+        """
+provider: volcengine
+base_url: https://ark.cn-beijing.volces.com/api/coding/v3
+api_key_env: VOLCANO_API_KEY
+models:
+  default: doubao-seed-2.0-pro
+  pro: doubao-seed-2.0-pro
+  lite: doubao-seed-2.0-lite
+""",
+        encoding="utf-8",
+    )
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("QIANWEN_API_KEY", "qianwen-key")
+    monkeypatch.setenv("VOLCANO_API_KEY", "volcano-key")
+
+    title = load_llm_task_config("title_translation", root=tmp_path)
+    subtitles = load_llm_task_config("subtitle_translation", root=tmp_path)
+
+    assert title == LLMTaskConfig(
+        model="qwen-turbo",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        api_key="qianwen-key",
+        provider="qianwen",
+    )
+    assert subtitles == LLMTaskConfig(
+        model="qwen-max",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        api_key="qianwen-key",
+        provider="qianwen",
+        fallback_models=("qwen-turbo",),
+    )
+
+
+def test_load_llm_task_config_switches_provider_by_active_provider_only(tmp_path: Path, monkeypatch):
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    (config_dir / "llm.yaml").write_text(
+        """
+active_provider: volcano
+tasks:
+  subtitle_translation:
+    model_role: pro
+    fallback_roles:
+      - lite
+""",
+        encoding="utf-8",
+    )
+    (config_dir / "llm.providers.volcano.yaml").write_text(
+        """
+provider: volcengine
+base_url: https://ark.cn-beijing.volces.com/api/coding/v3
+api_key_env: VOLCANO_API_KEY
+models:
+  pro: doubao-seed-2.0-pro
+  lite: doubao-seed-2.0-lite
+""",
+        encoding="utf-8",
+    )
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("VOLCANO_API_KEY", "volcano-key")
+
+    task = load_llm_task_config("subtitle_translation", root=tmp_path)
+
+    assert task == LLMTaskConfig(
+        model="doubao-seed-2.0-pro",
+        base_url="https://ark.cn-beijing.volces.com/api/coding/v3",
+        api_key="volcano-key",
+        provider="volcengine",
+        fallback_models=("doubao-seed-2.0-lite",),
     )

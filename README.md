@@ -29,17 +29,20 @@ Copy the environment template:
 cp .env.example .env
 ```
 
-Edit `.env` and at least fill the LLM settings. This example uses
-Volcengine Ark, which exposes an OpenAI-compatible chat-completions API:
+Edit `.env` and at least fill one provider API key. Then copy the matching LLM
+provider profile. This example enables Qianwen:
 
 ```text
-LLM_API_KEY=your_openai_compatible_api_key
-LLM_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
-LLM_MODEL=doubao-seed-2.0-pro
+QIANWEN_API_KEY=your_qianwen_api_key
 ```
 
-For another provider, keep the `LLM_*` variable names and replace the API key,
-base URL, and model name.
+```bash
+cp configs/llm.example.yaml configs/llm.yaml
+cp configs/llm.providers.qianwen.example.yaml configs/llm.providers.qianwen.yaml
+```
+
+To switch providers later, edit only `active_provider` in `configs/llm.yaml`
+after preparing the matching provider profile.
 
 If YouTube needs a proxy on your network, set it explicitly:
 
@@ -153,6 +156,8 @@ Copy the example files:
 cp .env.example .env
 cp configs/run.example.yaml configs/run.yaml
 cp configs/llm.example.yaml configs/llm.yaml
+cp configs/llm.providers.qianwen.example.yaml configs/llm.providers.qianwen.yaml
+cp configs/llm.providers.volcano.example.yaml configs/llm.providers.volcano.yaml
 ```
 
 On Windows PowerShell:
@@ -161,18 +166,20 @@ On Windows PowerShell:
 copy .env.example .env
 copy configs\run.example.yaml configs\run.yaml
 copy configs\llm.example.yaml configs\llm.yaml
+copy configs\llm.providers.qianwen.example.yaml configs\llm.providers.qianwen.yaml
+copy configs\llm.providers.volcano.example.yaml configs\llm.providers.volcano.yaml
 ```
 
-Edit `.env`. The template uses Volcengine Ark as the example provider:
+Edit `.env` and set the key for the provider selected by
+`configs/llm.yaml active_provider`:
 
 ```text
-LLM_API_KEY=your_openai_compatible_api_key
-LLM_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
-LLM_MODEL=doubao-seed-2.0-pro
+QIANWEN_API_KEY=your_qianwen_api_key
+VOLCANO_API_KEY=your_volcano_api_key
 ```
 
-For a different OpenAI-compatible provider, change only the values. Keep the
-`LLM_*` names.
+Concrete model names and base URLs live in `configs/llm.providers.<name>.yaml`.
+The active provider and per-task model roles live in `configs/llm.yaml`.
 
 Do not commit `.env`. It is ignored by Git.
 
@@ -182,9 +189,11 @@ Most machine-specific settings should live in `.env`.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `LLM_API_KEY` | empty | API key for an OpenAI-compatible chat/completions provider. Required for title translation, glossary, ASR correction, hybrid reconstruction, and subtitle translation. |
-| `LLM_BASE_URL` | `https://ark.cn-beijing.volces.com/api/coding/v3` in `.env.example` | OpenAI-compatible endpoint base URL. |
-| `LLM_MODEL` | `doubao-seed-2.0-pro` in `.env.example` | Global default model. A task-specific model in `configs/llm.yaml` overrides it. |
+| `QIANWEN_API_KEY` | empty | API key used when `active_provider: qianwen`. |
+| `VOLCANO_API_KEY` | empty | API key used when `active_provider: volcano`. |
+| `LLM_API_KEY` | empty | Legacy/global fallback API key. New setups usually use provider-specific key env vars. |
+| `LLM_BASE_URL` | empty | Legacy/global fallback base URL. Provider profiles usually define this instead. |
+| `LLM_MODEL` | empty | Legacy/global fallback model. `configs/llm.yaml` task roles usually define model selection instead. |
 | `LLM_REQUEST_TIMEOUT` | `240` | HTTP timeout in seconds for LLM calls. Increase this for long subtitle batches. |
 | `LLM_REQUEST_RETRIES` | `3` | Retry count for LLM requests. |
 | `ASR_CORRECTION_MODEL` | empty | Optional override for ASR source-text correction. |
@@ -204,7 +213,8 @@ Proxy note: generic `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` are removed
 from Agent child processes so local OCR/ASR/LLM work does not accidentally go
 through a YouTube proxy. Use `YTDLP_PROXY` for YouTube only.
 
-Task-specific model choices live in `configs/llm.yaml`.
+LLM task routing lives in `configs/llm.yaml`; provider details live in
+`configs/llm.providers.<name>.yaml`.
 
 Model selection order:
 
@@ -212,13 +222,18 @@ Model selection order:
 explicit --model
 > task-specific env var, e.g. ASR_CORRECTION_MODEL
 > configs/llm.yaml tasks.<task>.model
+> configs/llm.yaml tasks.<task>.model_role resolved through active provider
 > .env global default LLM_MODEL
 > configs/llm.yaml defaults.model
+> active provider models.default
 ```
 
-In practice, put your strong default model in `.env` as `LLM_MODEL`. Then put
-cheaper/faster models in `configs/llm.yaml` only for small tasks such as title
-translation, ASR correction, or hybrid source reconstruction.
+In practice, keep `configs/llm.yaml` provider-neutral by using model roles such
+as `pro` and `lite`. Then switch between Qianwen and Volcengine by changing only:
+
+```yaml
+active_provider: qianwen
+```
 
 Older local installs that still use `ARK_API_KEY`, `ARK_BASE_URL`,
 `ARK_MODEL`, `ARK_REQUEST_TIMEOUT`, or `ARK_REQUEST_RETRIES` remain compatible,
