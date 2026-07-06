@@ -14,7 +14,7 @@
         <input
           id="subtitleEditorPath"
           :value="subtitlePath"
-          placeholder="/path/to/Video_Translate/YoutubeDownloads/.../xxx.zh.srt"
+          placeholder="YoutubeDownloads/example/example.zh.srt"
           @input="$emit('update:subtitlePath', $event.target.value)"
           @keydown.enter.prevent="$emit('load-subtitle')"
         />

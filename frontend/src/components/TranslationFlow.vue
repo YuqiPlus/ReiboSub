@@ -11,7 +11,7 @@
     <div class="grid2">
       <div>
         <label for="sourceSrt">源字幕路径</label>
-        <input id="sourceSrt" :value="sourceSrt" placeholder="/path/to/Video_Translate/YoutubeDownloads/xxx.source.srt" @input="$emit('update:sourceSrt', $event.target.value)" />
+        <input id="sourceSrt" :value="sourceSrt" placeholder="YoutubeDownloads/example/example.source.srt" @input="$emit('update:sourceSrt', $event.target.value)" />
       </div>
       <div>
         <label for="glossaryPath">Glossary 路径</label>
