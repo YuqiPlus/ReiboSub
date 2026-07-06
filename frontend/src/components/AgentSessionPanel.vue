@@ -36,11 +36,154 @@
             <button type="button" :class="{ active: embeddedSubtitleHint === 'no' }" @click="$emit('update:embeddedSubtitleHint', 'no')">没有</button>
           </div>
         </div>
+        <div class="agent-setting">
+          <span>音源语言</span>
+          <select :value="sourceLanguage" @change="$emit('update:sourceLanguage', $event.target.value)">
+            <option value="auto">自动</option>
+            <option value="korean">韩语</option>
+            <option value="japanese">日语</option>
+            <option value="english">英语</option>
+            <option value="chinese">中文</option>
+          </select>
+        </div>
+        <div class="agent-setting">
+          <span>OCR 字幕</span>
+          <select :value="ocrLanguage" @change="$emit('update:ocrLanguage', $event.target.value)">
+            <option value="auto">跟随音源</option>
+            <option value="korean">韩语</option>
+            <option value="japanese">日语</option>
+            <option value="english">英语</option>
+            <option value="chinese">中文：只提取</option>
+          </select>
+        </div>
+        <div v-if="showOcrControls" class="agent-setting">
+          <span>OCR 模式</span>
+          <div class="segmented">
+            <button type="button" :class="{ active: ocrScope !== 'smart_full' }" @click="setOcrMode('limited')">限定区域</button>
+            <button type="button" :class="{ active: ocrScope === 'smart_full' }" @click="setOcrMode('smart_full')">全屏辅助</button>
+          </div>
+        </div>
+        <div v-if="showOcrControls" class="agent-setting">
+          <span>裁剪预设</span>
+          <div class="segmented">
+            <button type="button" :class="{ active: isCropPreset(0.58) }" @click="applyCropPreset(0.58)">底部</button>
+            <button type="button" :class="{ active: isCropPreset(0.38) }" @click="applyCropPreset(0.38)">中下</button>
+          </div>
+        </div>
+
+        <div v-if="showOcrControls" class="agent-setting">
+          <span>原文精修</span>
+          <div class="segmented">
+            <button type="button" :class="{ active: ocrRefinementMode === 'none' }" @click="$emit('update:ocrRefinementMode', 'none')">关闭</button>
+            <button type="button" :class="{ active: ocrRefinementMode === 'llm_boxes' }" @click="$emit('update:ocrRefinementMode', 'llm_boxes')">新版</button>
+          </div>
+        </div>
         <div class="agent-hint-field">
           <label for="agentHint">任务提示</label>
           <textarea id="agentHint" class="compact-textarea" :value="extraHint" placeholder="人名、节目名、固定译法" @input="$emit('update:extraHint', $event.target.value)" />
         </div>
       </div>
+
+      <div v-if="showOcrControls" class="agent-ocr-workbench">
+        <OcrCropControls
+          title="OCR 裁剪预览"
+          :input-video="inputVideo"
+          :ocr-scope="ocrScope"
+          :ocr-crop-top-ratio="ocrCropTopRatio"
+          :ocr-crop-bottom-ratio="ocrCropBottomRatio"
+          :ocr-crop-left-ratio="ocrCropLeftRatio"
+          :ocr-crop-right-ratio="ocrCropRightRatio"
+          @update:ocr-crop-top-ratio="$emit('update:ocrCropTopRatio', $event)"
+          @update:ocr-crop-bottom-ratio="$emit('update:ocrCropBottomRatio', $event)"
+          @update:ocr-crop-left-ratio="$emit('update:ocrCropLeftRatio', $event)"
+          @update:ocr-crop-right-ratio="$emit('update:ocrCropRightRatio', $event)"
+        />
+      </div>
+    </div>
+
+    <div v-if="sessions.length" class="agent-session-strip">
+      <div class="section-title">
+        <h3>Agent 任务</h3>
+        <span class="badge">{{ sessions.length }}</span>
+      </div>
+      <div class="agent-session-list">
+        <div
+          v-for="item in sessions"
+          :key="item.id"
+          class="agent-session-card"
+          :class="{ active: item.id === session?.id, waiting: item.status === 'waiting', failed: item.status === 'failed' }"
+        >
+          <button class="agent-session-main" type="button" @click="$emit('select-agent', item.id)">
+            <b>{{ itemLabel(item) }}</b>
+            <span>{{ item.id }} · {{ sessionPhaseLabel(item.phase) }} · {{ sessionStatusLabel(item.status) }}</span>
+          </button>
+          <button v-if="item.result?.glossary_path" class="secondary mini" type="button" @click="$emit('open-glossary', { path: item.result.glossary_path, sessionId: item.id })">
+            审核 Glossary
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="tasks.length" class="agent-session-strip">
+      <div class="section-title">
+        <h3>视频任务</h3>
+        <span class="badge">{{ activeTasks.length }} 未完成</span>
+      </div>
+      <div v-if="activeTasks.length" class="agent-task-list">
+        <article v-for="task in activeTasks" :key="task.id" class="agent-task-card">
+          <div class="agent-task-head">
+            <div>
+              <b>{{ task.title || task.url || task.id }}</b>
+              <span>{{ taskStageLabel(task.current_stage) }} · {{ task.id }}</span>
+            </div>
+            <div class="agent-task-head-actions">
+              <button class="secondary mini" type="button" @click="$emit('continue-task', task.id)">继续</button>
+              <button class="secondary mini" type="button" @click="$emit('complete-task', task)">完成流程</button>
+              <button class="danger secondary mini" type="button" @click="$emit('delete-task', task)">删除任务</button>
+            </div>
+          </div>
+          <div class="agent-task-stages">
+            <div v-for="stage in task.stage_items || []" :key="stage.id" class="agent-task-stage" :class="stage.status || 'pending'">
+              <span>{{ stage.label }}</span>
+              <b>{{ stageStatusLabel(stage.status) }}</b>
+              <div class="agent-task-actions">
+                <button v-if="stage.id === 'glossary' && stage.glossary_path" class="secondary mini" type="button" @click="$emit('open-glossary', stage.glossary_path)">审核</button>
+                <button v-if="canRerun(stage)" class="secondary mini" type="button" @click="$emit('rerun-task', { taskId: task.id, stage: stage.id })">重跑</button>
+              </div>
+            </div>
+          </div>
+        </article>
+      </div>
+      <div v-else class="empty">没有未完成流程。</div>
+
+      <details v-if="completedTasks.length" class="completed-task-panel">
+        <summary><span>已完成流程</span><span class="badge">{{ completedTasks.length }}</span></summary>
+        <div class="agent-task-list">
+          <article v-for="task in completedTasks" :key="task.id" class="agent-task-card completed">
+            <div class="agent-task-head">
+              <div>
+                <b>{{ task.title || task.url || task.id }}</b>
+                <span>{{ taskStageLabel(task.current_stage) }} · {{ completedLabel(task) }} · {{ task.id }}</span>
+              </div>
+              <div class="agent-task-head-actions">
+                <button class="secondary mini" type="button" @click="$emit('reopen-task', task)">恢复</button>
+                <button class="secondary mini" type="button" @click="$emit('continue-task', task.id)">继续</button>
+                <button class="danger secondary mini" type="button" @click="$emit('delete-task', task)">删除任务</button>
+              </div>
+            </div>
+            <div class="agent-task-stages">
+              <div v-for="stage in task.stage_items || []" :key="stage.id" class="agent-task-stage" :class="stage.status || 'pending'">
+                <span>{{ stage.label }}</span>
+                <b>{{ stageStatusLabel(stage.status) }}</b>
+                <div class="agent-task-actions">
+                  <button v-if="stage.id === 'glossary' && stage.glossary_path" class="secondary mini" type="button" @click="$emit('open-glossary', stage.glossary_path)">审核</button>
+                  <button v-if="canRerun(stage)" class="secondary mini" type="button" @click="$emit('rerun-task', { taskId: task.id, stage: stage.id })">重跑</button>
+                </div>
+              </div>
+            </div>
+          </article>
+        </div>
+      </details>
     </div>
 
     <div v-if="status" class="status agent-status" :class="statusClass">{{ status }}</div>
@@ -108,16 +251,21 @@
             <span>Glossary</span>
             <b>{{ session.question.glossary_path }}</b>
           </div>
+          <div v-if="session.question.reusable_ocr" class="agent-selected">
+            <span>可复用 OCR</span>
+            <b>{{ session.question.reusable_ocr.source_srt }}</b>
+            <small>{{ reuseLabel(session.question.reusable_ocr) }}</small>
+          </div>
           <div class="toolbar">
             <button
               v-for="option in session.question.options || []"
               :key="option.action"
-              :class="{ secondary: option.action !== 'use_recommended' && option.action !== 'continue_after_glossary' }"
+              :class="{ secondary: !primaryActions.includes(option.action) }"
               @click="$emit('answer-agent', option.action)"
             >
               {{ option.label }}
             </button>
-            <button v-if="session.question.glossary_path" class="secondary" @click="$emit('open-glossary', session.question.glossary_path)">打开 Glossary 审核</button>
+            <button v-if="session.question.glossary_path" class="secondary" @click="$emit('open-glossary', { path: session.question.glossary_path, sessionId: session.id })">打开 Glossary 审核</button>
           </div>
         </div>
       </div>
@@ -150,33 +298,77 @@
 
 <script setup>
 import { computed } from 'vue'
+import OcrCropControls from './OcrCropControls.vue'
 
 const props = defineProps({
   url: { type: String, default: '' },
   embeddedSubtitleHint: { type: String, default: 'unknown' },
+  sourceLanguage: { type: String, default: 'auto' },
+  ocrLanguage: { type: String, default: 'auto' },
+  ocrScope: { type: String, default: 'bottom' },
+  inputVideo: { type: String, default: '' },
+  ocrCropTopRatio: { type: Number, default: 0.58 },
+  ocrCropBottomRatio: { type: Number, default: 0 },
+  ocrCropLeftRatio: { type: Number, default: 0 },
+  ocrCropRightRatio: { type: Number, default: 0 },
+  ocrRefinementMode: { type: String, default: 'none' },
   extraHint: { type: String, default: '' },
   session: { type: Object, default: null },
+  sessions: { type: Array, default: () => [] },
+  tasks: { type: Array, default: () => [] },
   starting: { type: Boolean, default: false },
   status: { type: String, default: '' },
   statusClass: { type: String, default: '' },
 })
 
-defineEmits([
+const emit = defineEmits([
   'update:url',
   'update:embeddedSubtitleHint',
+  'update:sourceLanguage',
+  'update:ocrLanguage',
+  'update:ocrScope',
+  'update:ocrCropTopRatio',
+  'update:ocrCropBottomRatio',
+  'update:ocrCropLeftRatio',
+  'update:ocrCropRightRatio',
+  'update:ocrRefinementMode',
   'update:extraHint',
   'start-agent',
   'answer-agent',
   'cancel-agent',
   'retry-agent',
+  'select-agent',
+  'continue-task',
+  'rerun-task',
+  'complete-task',
+  'reopen-task',
+  'delete-task',
   'open-glossary',
 ])
+
+function setOcrMode(mode) {
+  emit('update:ocrScope', mode === 'smart_full' ? 'smart_full' : 'bottom')
+}
+
+function applyCropPreset(topRatio) {
+  emit('update:ocrCropTopRatio', topRatio)
+  emit('update:ocrCropBottomRatio', 0)
+}
+
+function isCropPreset(topRatio) {
+  return Math.abs(Number(props.ocrCropTopRatio || 0) - topRatio) < 0.005
+}
+
+const activeTasks = computed(() => props.tasks.filter((task) => !task.is_completed))
+const completedTasks = computed(() => props.tasks.filter((task) => task.is_completed))
+const showOcrControls = computed(() => Boolean(props.inputVideo || props.session))
 
 const phaseOrder = [
   ['probe', '检测'],
   ['download_video_for_audio_probe', '视频'],
   ['probe_audio_language', '音源'],
   ['confirm_subtitle', '决策'],
+  ['confirm_hybrid_ocr_settings', '调框'],
   ['download_subtitle', '取源'],
   ['download_reference_subtitle', '参考'],
   ['dual_subtitle_reference', '融合'],
@@ -184,6 +376,7 @@ const phaseOrder = [
   ['download_video_for_hybrid', '视频'],
   ['hybrid_anchor_ocr', '还原'],
   ['ocr_full', 'OCR'],
+  ['confirm_ocr_reuse', '复用'],
   ['audio_asr', 'ASR'],
   ['generate_glossary', '术语'],
   ['review_glossary', '审核'],
@@ -203,12 +396,19 @@ const statusLabel = computed(() => {
 
 const phaseLabel = computed(() => {
   const phase = props.session?.phase || ''
+  return sessionPhaseLabel(phase)
+})
+
+function sessionPhaseLabel(phase) {
   const labels = {
     created: '等待启动',
     probe: '检测视频和字幕',
     download_video_for_audio_probe: '下载视频用于音源检测',
+    download_video_for_preview: '下载视频用于预览',
     probe_audio_language: '检测音源语言',
     confirm_subtitle: '等待确认字幕源',
+    confirm_hybrid_ocr_settings: '等待确认 OCR 范围',
+    confirm_ocr_reuse: '等待确认是否复用 OCR',
     download_subtitle: '下载字幕',
     download_reference_subtitle: '下载参考字幕',
     dual_subtitle_reference: '韩文主字幕 + 英文参考',
@@ -224,7 +424,65 @@ const phaseLabel = computed(() => {
     done: '完成',
   }
   return labels[phase] || phase || '未开始'
-})
+}
+
+const primaryActions = ['use_recommended', 'start_hybrid_anchor_ocr', 'continue_after_glossary', 'use_cached_ocr', 'download_video_for_preview', 'run_ocr', 'run_asr', 'probe_audio_language']
+
+function sessionStatusLabel(status) {
+  const labels = {
+    running: '运行中',
+    waiting: '等待审核/确认',
+    done: '完成',
+    failed: '失败',
+    cancelled: '已中断',
+  }
+  return labels[status] || status || '未知'
+}
+
+function completedLabel(task) {
+  if (!task?.completed_at) return '已完成'
+  return new Date(task.completed_at * 1000).toLocaleString()
+}
+
+function itemLabel(item) {
+  const title = item.result?.probe?.title || item.payload?.url || 'Agent 任务'
+  return String(title).slice(0, 42)
+}
+
+function reuseLabel(item) {
+  const matchedBy = item.matched_by === 'url' ? '标准链接匹配' : '标题兼容匹配'
+  return `${matchedBy} · ${item.job_id || '历史任务'}`
+}
+
+function taskStageLabel(stage) {
+  const labels = {
+    created: '刚创建',
+    probe_done: '已检测',
+    ocr_done: 'OCR 已完成',
+    glossary_review: '等待 glossary 审核',
+    done: '已完成',
+    ocr_failed: 'OCR 失败',
+    glossary_failed: 'Glossary 失败',
+    translate_failed: '翻译失败',
+  }
+  return labels[stage] || stage || '未开始'
+}
+
+function stageStatusLabel(status) {
+  const labels = {
+    pending: '未开始',
+    done: '完成',
+    waiting_review: '待审核',
+    failed: '失败',
+    invalidated: '已失效',
+    rerunning: '重跑中',
+  }
+  return labels[status] || status || '未开始'
+}
+
+function canRerun(stage) {
+  return stage.can_rerun !== false && ['ocr', 'glossary', 'translate'].includes(stage.id) && ['done', 'waiting_review', 'failed', 'invalidated'].includes(stage.status)
+}
 
 const agentPlan = computed(() => props.session?.result?.agent_plan || null)
 const candidateSubtitles = computed(() => agentPlan.value?.candidate_subtitles || props.session?.question?.candidate_subtitles || [])

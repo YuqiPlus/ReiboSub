@@ -14,6 +14,7 @@
         <div class="toolbar">
           <button class="warning" @click="$emit('local-ocr')">用本地视频 OCR 翻译</button>
           <button class="secondary" @click="$emit('local-audio')">音频识别字幕</button>
+          <button class="secondary" @click="$emit('register-local-project')">登记为视频项目</button>
         </div>
       </div>
     </div>
@@ -45,18 +46,26 @@
           <summary>
             <div>
               <div class="project-title">{{ project.name }}</div>
+              <div class="project-meta">
+                <span class="badge">{{ sourceLabel(project.source_type) }}</span>
+                <button v-if="project.source_url" class="ghost mini" type="button" @click.prevent="copyPath(project.source_url)">复制链接</button>
+                <button v-if="project.manifest_path" class="ghost mini" type="button" @click.prevent="copyPath(project.manifest_path)">复制配置</button>
+              </div>
+              <div v-if="project.source_url" class="muted path">{{ project.normalized_url || project.source_url }}</div>
               <div class="muted path">{{ project.path }}</div>
             </div>
             <div class="project-counts">
               <span>{{ project.counts?.videos || 0 }} 视频</span>
               <span>{{ project.counts?.subtitles || 0 }} 字幕</span>
               <span v-if="project.counts?.images">{{ project.counts.images }} 封面</span>
+              <button class="secondary mini" type="button" @click.prevent="$emit('use-project', project)">继续处理</button>
+              <button class="danger secondary mini" type="button" @click.prevent="$emit('delete-project', project)">删除目录</button>
             </div>
           </summary>
           <div class="project-body">
-            <div v-if="project.images?.length" class="project-cover">
-              <img :src="fileUrl(project.images[0].path)" alt="" />
-              <button class="ghost mini" @click="copyPath(project.images[0].path)">复制封面路径</button>
+            <div v-if="projectCover(project)" class="project-cover">
+              <img :src="fileUrl(projectCover(project))" alt="" />
+              <button class="ghost mini" @click="copyPath(projectCover(project))">复制封面路径</button>
             </div>
             <div class="project-column">
               <div class="asset-subtitle">视频</div>
@@ -72,6 +81,7 @@
               <AssetList :items="project.subtitles || []" empty-text="无字幕。">
                 <template #actions="{ item }">
                   <button class="secondary mini" @click="$emit('use-subtitle', item.path)">设为源字幕</button>
+                  <button class="warning mini" @click="$emit('edit-subtitle', item.path)">精修</button>
                   <button class="ghost mini" @click="copyPath(item.path)">复制路径</button>
                 </template>
               </AssetList>
@@ -93,17 +103,23 @@
       <AssetList :items="assets.ocr_jobs" empty-text="暂无文件。">
         <template #actions="{ item }">
           <button v-if="item.source_srt" class="secondary mini" @click="$emit('use-subtitle', item.source_srt)">使用 source.srt</button>
+          <button v-if="item.source_srt" class="warning mini" @click="$emit('edit-subtitle', item.source_srt)">精修 source</button>
+          <button v-if="item.translated_srt" class="warning mini" @click="$emit('edit-subtitle', item.translated_srt)">精修 zh</button>
           <button v-if="item.translated_srt" class="ghost mini" @click="copyPath(item.translated_srt)">复制 zh.srt</button>
         </template>
       </AssetList>
     </div>
+    <Teleport to="body">
+      <div v-if="copyStatus" class="copy-toast" :class="copyStatusClass">{{ copyStatus }}</div>
+    </Teleport>
     <div class="status" :class="statusClass">{{ status }}</div>
   </section>
 </template>
 
 <script setup>
 import AssetList from './AssetList.vue'
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
+import { copyText } from '../clipboard.js'
 
 const props = defineProps({
   localVideo: { type: String, default: '' },
@@ -113,16 +129,33 @@ const props = defineProps({
   status: { type: String, default: '' },
   statusClass: { type: String, default: '' },
 })
+const copyStatus = ref('')
+
 defineEmits([
   'update:localVideo', 'update:audioLanguage', 'update:audioModelSize',
-  'refresh', 'local-ocr', 'local-audio', 'use-video', 'use-video-ocr', 'use-subtitle',
+  'refresh', 'local-ocr', 'local-audio', 'register-local-project', 'use-project', 'use-video', 'use-video-ocr', 'use-subtitle',
+  'edit-subtitle', 'delete-project',
 ])
 
-function copyPath(path) {
-  navigator.clipboard?.writeText(path)
+async function copyPath(path) {
+  const ok = await copyText(path)
+  copyStatus.value = ok ? '已复制。' : '复制失败，请手动选择文本。'
+  window.setTimeout(() => {
+    copyStatus.value = ''
+  }, 1600)
+}
+
+function sourceLabel(sourceType) {
+  if (sourceType === 'youtube') return 'YouTube'
+  if (sourceType === 'local') return '本地视频'
+  return '未登记来源'
 }
 
 const projects = computed(() => props.assets.projects || [])
+
+function projectCover(project) {
+  return project?.thumbnail || project?.images?.[0]?.path || ''
+}
 
 function fileUrl(path) {
   return `/api/file?path=${encodeURIComponent(path)}`

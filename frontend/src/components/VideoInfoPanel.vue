@@ -8,6 +8,9 @@
     <div v-if="!probe" class="empty">还没有检测结果。</div>
     <div v-else class="stack">
       <div class="info-block">
+        <div v-if="thumbnailPath" class="probe-cover">
+          <img :src="fileUrl(thumbnailPath)" alt="" />
+        </div>
         <div class="video-title">{{ probe.title || '未识别标题' }}</div>
         <div class="muted path">{{ probe.webpage_url }}</div>
         <div v-if="probe.normalized_url && probe.normalized_url !== probe.webpage_url" class="muted path">标准链接：{{ probe.normalized_url }}</div>
@@ -15,6 +18,20 @@
           <div class="metric"><b>{{ probe.subtitles?.length || 0 }}</b><span>字幕轨道</span></div>
           <div class="metric"><b>{{ manualCount }}</b><span>人工字幕</span></div>
           <div class="metric"><b>{{ autoCount }}</b><span>自动字幕</span></div>
+        </div>
+      </div>
+
+      <div v-if="existingProject" class="agent-card">
+        <div class="agent-card-head">
+          <div>
+            <h3>已找到本地项目</h3>
+            <p>{{ existingProject.name }}</p>
+          </div>
+          <span class="badge">{{ existingProject.source_type === 'youtube' ? 'YouTube' : '本地' }}</span>
+        </div>
+        <div class="muted path">{{ existingProject.path }}</div>
+        <div class="toolbar">
+          <button class="secondary" @click="$emit('use-project', existingProject)">载入项目继续处理</button>
         </div>
       </div>
 
@@ -81,7 +98,7 @@ const props = defineProps({
   titleStatusClass: { type: String, default: '' },
 })
 
-const emit = defineEmits(['update:titleBox', 'download-subtitle', 'copy-title', 'append-title-hint', 'agent-ocr-full', 'agent-download-video'])
+const emit = defineEmits(['update:titleBox', 'download-subtitle', 'copy-title', 'append-title-hint', 'agent-ocr-full', 'agent-download-video', 'use-project'])
 
 const coreLanguagePrefixes = ['zh', 'en', 'ko', 'ja']
 
@@ -89,6 +106,8 @@ const subtitles = computed(() => props.probe?.subtitles || [])
 const manualCount = computed(() => subtitles.value.filter((item) => item.kind === 'manual').length)
 const autoCount = computed(() => subtitles.value.filter((item) => item.kind === 'auto').length)
 const agentPlan = computed(() => props.probe?.agent_plan || null)
+const existingProject = computed(() => props.probe?.existing_project || null)
+const thumbnailPath = computed(() => props.probe?.thumbnail_path || existingProject.value?.thumbnail || '')
 const recommendationLabel = computed(() => {
   if (!props.probe) return ''
   if (props.probe.recommendation === 'manual') return '优先用人工字幕'
@@ -130,4 +149,9 @@ function score(item) {
 function downloadSubtitle(item) {
   emit('download-subtitle', item)
 }
+
+function fileUrl(path) {
+  return `/api/file?path=${encodeURIComponent(path)}`
+}
 </script>
+

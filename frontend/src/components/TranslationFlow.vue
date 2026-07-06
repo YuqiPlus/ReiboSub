@@ -20,6 +20,18 @@
     </div>
 
     <div class="mode-row">
+      <label for="subtitleSourceLanguage">源字幕语言</label>
+      <select id="subtitleSourceLanguage" :value="sourceLanguage" @change="$emit('update:sourceLanguage', $event.target.value)">
+        <option value="auto">自动</option>
+        <option value="korean">韩语</option>
+        <option value="japanese">日语</option>
+        <option value="english">英语</option>
+        <option value="chinese">中文</option>
+      </select>
+      <span class="muted">影响 glossary 生成和 ASR 原文纠错；普通翻译会保留原时间轴。</span>
+    </div>
+
+    <div class="mode-row">
       <label for="subtitleTranslationMode">翻译处理模式</label>
       <select id="subtitleTranslationMode" :value="subtitleTranslationMode" @change="$emit('update:subtitleTranslationMode', $event.target.value)">
         <option value="translate_only">锁定时间轴：只翻译文本</option>
@@ -66,13 +78,14 @@ defineProps({
   glossaryPath: { type: String, default: '' },
   extraHint: { type: String, default: '' },
   subtitleTranslationMode: { type: String, default: 'translate_only' },
+  sourceLanguage: { type: String, default: 'auto' },
   subtitleConvertFormat: { type: String, default: 'vtt' },
   status: { type: String, default: '' },
   statusClass: { type: String, default: '' },
 })
 
 defineEmits([
-  'update:sourceSrt', 'update:glossaryPath', 'update:extraHint', 'update:subtitleTranslationMode', 'update:subtitleConvertFormat',
+  'update:sourceSrt', 'update:glossaryPath', 'update:extraHint', 'update:subtitleTranslationMode', 'update:subtitleConvertFormat', 'update:sourceLanguage',
   'correct-asr', 'generate-glossary', 'load-glossary', 'translate-subtitle', 'convert-subtitle',
 ])
 </script>

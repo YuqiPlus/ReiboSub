@@ -1,7 +1,7 @@
 <template>
   <header class="topbar">
     <div>
-      <div class="eyebrow">{{ eyebrow }}</div>
+      <div v-if="eyebrow" class="eyebrow">{{ eyebrow }}</div>
       <h1>{{ title }}</h1>
       <p>{{ description }}</p>
     </div>
@@ -15,7 +15,7 @@
 
 <script setup>
 defineProps({
-  eyebrow: { type: String, default: '/path/to/Video_Translate' },
+  eyebrow: { type: String, default: '' },
   title: { type: String, default: 'Video Translate Agent' },
   description: { type: String, default: '下载、提取、纠错、术语审核和字幕翻译工作台。' },
   metrics: { type: Object, default: () => ({ videos: 0, subtitles: 0, jobs: 0 }) },
