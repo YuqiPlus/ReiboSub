@@ -13,6 +13,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .vscode/
+docs/superpowers/plans/
 
 # Local downloaded media and generated subtitle/video artifacts
 YoutubeDownloads/
