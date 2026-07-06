@@ -1,6 +1,7 @@
 from video_translate.models import SubtitleCue
 from video_translate.translate.volcengine import cleanup_residual_fragment_cues
 from video_translate.translate.volcengine import dedupe_adjacent_translated_cues
+from video_translate.translate.volcengine import dedupe_exact_adjacent_translated_cues
 from video_translate.translate.volcengine import _is_llm_cleanup_candidate_pair
 
 
@@ -18,6 +19,23 @@ def test_dedupe_adjacent_translated_cues_keeps_more_complete_text() -> None:
     assert merged[0].end == 63.023
     assert merged[0].text == "这是我们《黄金乐园》的7款钥匙扣哦"
     assert merged[0].index == 1
+    assert merged[1].index == 2
+
+
+def test_exact_adjacent_translated_duplicates_merge_even_in_locked_timing_mode() -> None:
+    cues = [
+        SubtitleCue(55, 245.912, 247.207, "简单对台词的禧主&小昱"),
+        SubtitleCue(56, 247.247, 247.541, "简单对台词的禧主&小昱"),
+        SubtitleCue(57, 247.581, 249.182, "简单对台词的禧主&小昱"),
+        SubtitleCue(58, 250.000, 251.000, "下一句"),
+    ]
+
+    merged = dedupe_exact_adjacent_translated_cues(cues, max_gap_seconds=0.12)
+
+    assert len(merged) == 2
+    assert merged[0].start == 245.912
+    assert merged[0].end == 249.182
+    assert merged[0].text == "简单对台词的禧主&小昱"
     assert merged[1].index == 2
 
 
@@ -289,3 +307,29 @@ def test_cleanup_payload_tells_llm_to_preserve_intentional_short_repetition() ->
     assert "不要因为字幕短" in content
     assert "故意重复" in content
     assert "不确定" in content
+
+
+def test_strip_plain_sentence_periods_removes_only_low_value_final_periods() -> None:
+    from video_translate.translate.volcengine import strip_plain_sentence_periods
+
+    cues = [
+        SubtitleCue(1, 0.0, 1.0, "这是普通陈述句。"),
+        SubtitleCue(2, 1.0, 2.0, "真的可以吗？"),
+        SubtitleCue(3, 2.0, 3.0, "太好了！"),
+        SubtitleCue(4, 3.0, 4.0, "先这样吧……"),
+        SubtitleCue(5, 4.0, 5.0, "第一行。\n第二行。"),
+        SubtitleCue(6, 5.0, 6.0, "她说“你好。”"),
+        SubtitleCue(7, 6.0, 7.0, "版本 1.0。"),
+    ]
+
+    cleaned = strip_plain_sentence_periods(cues)
+
+    assert [cue.text for cue in cleaned] == [
+        "这是普通陈述句",
+        "真的可以吗？",
+        "太好了！",
+        "先这样吧……",
+        "第一行\n第二行",
+        "她说“你好”",
+        "版本 1.0",
+    ]

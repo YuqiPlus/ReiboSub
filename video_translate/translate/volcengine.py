@@ -182,6 +182,8 @@ def translate_srt_with_volcengine(
             source_max_gap_seconds=max(dedupe_max_gap_seconds, llm_cleanup_max_gap_seconds, 3.5),
         )
 
+    translated = dedupe_exact_adjacent_translated_cues(translated, max_gap_seconds=0.20)
+
     if retime_translated:
         translated = retime_translated_cues_for_readability(
             translated,
@@ -195,6 +197,8 @@ def translate_srt_with_volcengine(
         glossary=glossary,
     )
 
+    translated = strip_plain_sentence_periods(translated)
+
     write_srt(translated, out_srt)
     return out_srt
 
@@ -202,6 +206,49 @@ def translate_srt_with_volcengine(
 
 _HANGUL_RE = re.compile(r"[\uac00-\ud7a3\u3130-\u318f]")
 _HAN_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+_TRAILING_CLOSERS = "”\"’'」』）》】）]}"
+_PLAIN_SENTENCE_PERIODS = {"。", "."}
+
+
+def strip_plain_sentence_periods(cues: list[SubtitleCue]) -> list[SubtitleCue]:
+    return [
+        SubtitleCue(
+            cue.index,
+            cue.start,
+            cue.end,
+            _strip_plain_sentence_periods_from_text(cue.text),
+            cue.source_track_id,
+        )
+        for cue in cues
+    ]
+
+
+def _strip_plain_sentence_periods_from_text(text: str) -> str:
+    return "\n".join(_strip_plain_sentence_period_from_line(line) for line in str(text or "").split("\n"))
+
+
+def _strip_plain_sentence_period_from_line(line: str) -> str:
+    if not line:
+        return line
+    right_ws = line[len(line.rstrip()):]
+    core = line.rstrip()
+    if not core:
+        return line
+    closers = ""
+    while core and core[-1] in _TRAILING_CLOSERS:
+        closers = core[-1] + closers
+        core = core[:-1].rstrip()
+    if not core or core[-1] not in _PLAIN_SENTENCE_PERIODS:
+        return line
+    if _ends_with_ellipsis(core):
+        return line
+    return core[:-1].rstrip() + closers + right_ws
+
+
+def _ends_with_ellipsis(text: str) -> bool:
+    return text.endswith("……") or text.endswith("...") or text.endswith("…")
 
 
 def cleanup_residual_fragment_cues(
@@ -653,6 +700,31 @@ def dedupe_adjacent_translated_cues(
     for index, cue in enumerate(merged, start=1):
         cue.index = index
     return merged
+
+
+def dedupe_exact_adjacent_translated_cues(cues: list[SubtitleCue], *, max_gap_seconds: float = 0.20) -> list[SubtitleCue]:
+    merged: list[SubtitleCue] = []
+    for cue in cues:
+        cleaned = _copy_cue(cue)
+        cleaned.text = _clean_repeated_translation(cleaned.text)
+        if merged and _should_merge_exact_duplicate(merged[-1], cleaned, max_gap_seconds):
+            previous = merged[-1]
+            previous.end = max(previous.end, cleaned.end)
+            previous.text = _choose_merged_translation(previous.text, cleaned.text)
+            continue
+        merged.append(cleaned)
+    for index, cue in enumerate(merged, start=1):
+        cue.index = index
+    return merged
+
+
+def _should_merge_exact_duplicate(left: SubtitleCue, right: SubtitleCue, max_gap_seconds: float) -> bool:
+    gap = right.start - left.end
+    if gap < -0.20 or gap > max_gap_seconds:
+        return False
+    left_key = comparable_text(left.text)
+    right_key = comparable_text(right.text)
+    return bool(left_key and right_key and left_key == right_key)
 
 
 def _matching_source_cue(source_cues: list[SubtitleCue], cue: SubtitleCue) -> SubtitleCue | None:

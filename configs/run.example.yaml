@@ -48,7 +48,7 @@ subtitle:
   enforce_no_overlap: true
 
 translation:
-  provider: "volcengine"
+  provider: "openai-compatible"
   batch_size: 40
   # 不建议把 API Key 写在这里。放到 .env 的 LLM_API_KEY。
   model: null

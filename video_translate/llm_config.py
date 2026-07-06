@@ -10,7 +10,6 @@ import yaml
 
 DEFAULT_PROVIDER = "openai-compatible"
 DEFAULT_CONFIG_PATH = Path("configs") / "llm.yaml"
-DEFAULT_PROVIDER_CONFIG_TEMPLATE = "llm.providers.{provider}.yaml"
 
 
 @dataclass(frozen=True)
@@ -26,19 +25,21 @@ def load_llm_task_config(task: str, *, root: Path | None = None, explicit_model:
     root = root or Path(__file__).resolve().parent.parent
     config_path = root / DEFAULT_CONFIG_PATH
     data = _load_config(config_path)
-    provider_profile = _load_active_provider_profile(root, data)
     defaults = data.get("defaults") if isinstance(data.get("defaults"), dict) else {}
     tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
     task_config = tasks.get(task) if isinstance(tasks.get(task), dict) else {}
     env_model_name = str(task_config.get("env_model") or "").strip()
-    env_base_url_name = str(task_config.get("env_base_url") or "").strip()
+    env_base_url_name = str(
+        task_config.get("env_base_url")
+        or defaults.get("env_base_url")
+        or ""
+    ).strip()
     env_api_key_name = str(
         task_config.get("env_api_key")
         or defaults.get("env_api_key")
-        or provider_profile.get("api_key_env")
         or ""
     ).strip()
-    models = provider_profile.get("models") if isinstance(provider_profile.get("models"), dict) else {}
+    models = defaults.get("models") if isinstance(defaults.get("models"), dict) else {}
     model_role = _clean(task_config.get("model_role"))
     fallback_roles = _clean_list(task_config.get("fallback_roles"))
 
@@ -59,7 +60,6 @@ def load_llm_task_config(task: str, *, root: Path | None = None, explicit_model:
         or _env("LLM_BASE_URL")
         or _env("ARK_BASE_URL")
         or _clean(defaults.get("base_url"))
-        or _clean(provider_profile.get("base_url"))
     )
     api_key = (
         _env(env_api_key_name)
@@ -69,7 +69,6 @@ def load_llm_task_config(task: str, *, root: Path | None = None, explicit_model:
     provider = (
         _clean(task_config.get("provider"))
         or _clean(defaults.get("provider"))
-        or _clean(provider_profile.get("provider"))
         or DEFAULT_PROVIDER
     )
     fallback_models = _clean_list(task_config.get("fallback_models") or defaults.get("fallback_models"))
@@ -77,13 +76,6 @@ def load_llm_task_config(task: str, *, root: Path | None = None, explicit_model:
     fallback_models = [item for item in fallback_models if item]
     return LLMTaskConfig(model=model, base_url=base_url, api_key=api_key, provider=provider, fallback_models=tuple(fallback_models))
 
-
-def _load_active_provider_profile(root: Path, data: dict[str, Any]) -> dict[str, Any]:
-    provider_name = _clean(data.get("active_provider"))
-    if not provider_name:
-        return {}
-    profile_path = root / "configs" / DEFAULT_PROVIDER_CONFIG_TEMPLATE.format(provider=provider_name)
-    return _load_config(profile_path)
 
 
 def _load_config(path: Path) -> dict[str, Any]:

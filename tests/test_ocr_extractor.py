@@ -52,3 +52,61 @@ def test_resolve_device_explicit_value_overrides_env(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("VIDEO_TRANSLATE_OCR_DEVICE", "cpu")
 
     assert _resolve_device("gpu:0", _FakePaddle(has_cuda=True, count=1)) == "gpu:0"
+
+
+class _FakeOCR:
+    def __init__(self, items):
+        self.items = items
+        self.seen_shapes = []
+
+    def predict(self, image, **kwargs):
+        self.seen_shapes.append(tuple(image.shape[:2]))
+        return [{
+            "rec_texts": [item[0] for item in self.items],
+            "rec_scores": [item[1] for item in self.items],
+            "rec_polys": [item[2] for item in self.items],
+        }]
+
+
+def test_ocr_frame_applies_horizontal_bottom_crop_and_restores_coordinates():
+    import numpy as np
+    from video_translate.ocr.extractor import ExtractConfig, _ocr_frame
+
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    fake = _FakeOCR([("자막", 0.9, [(10, 4), (60, 4), (60, 20), (10, 20)])])
+
+    boxes = list(_ocr_frame(fake, frame, 1.0, 3, ExtractConfig(bottom_ratio=0.40, crop_left_ratio=0.10, crop_right_ratio=0.20, scan_full_frame=False)))
+
+    assert fake.seen_shapes == [(40, 140)]
+    assert boxes[0].bbox == (30.0, 64.0, 80.0, 80.0)
+    assert boxes[0].region == "bottom"
+
+
+def test_ocr_frame_filters_small_bottom_edge_noise_by_default():
+    import numpy as np
+    from video_translate.ocr.extractor import ExtractConfig, _ocr_frame
+
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    fake = _FakeOCR([
+        ("LOGO", 0.95, [(176, 24), (196, 24), (196, 36), (176, 36)]),
+        ("정상 자막입니다", 0.95, [(60, 8), (150, 8), (150, 28), (60, 28)]),
+    ])
+
+    boxes = list(_ocr_frame(fake, frame, 1.0, 3, ExtractConfig(bottom_ratio=0.40)))
+
+    assert [box.text for box in boxes] == ["정상 자막입니다"]
+
+
+
+def test_ocr_frame_applies_vertical_crop_and_restores_coordinates():
+    import numpy as np
+    from video_translate.ocr.extractor import ExtractConfig, _ocr_frame
+
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    fake = _FakeOCR([("상단 자막", 0.9, [(10, 4), (80, 4), (80, 18), (10, 18)])])
+
+    boxes = list(_ocr_frame(fake, frame, 2.0, 4, ExtractConfig(crop_top_ratio=0.25, crop_bottom_ratio=0.30, crop_left_ratio=0.10, crop_right_ratio=0.20)))
+
+    assert fake.seen_shapes == [(45, 140)]
+    assert boxes[0].bbox == (30.0, 29.0, 100.0, 43.0)
+    assert boxes[0].region == "bottom"

@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Callable, Any
 
+from video_translate.languages import normalize_source_language
 from video_translate.models import OCRBox, SubtitleCue
 from video_translate.llm_config import load_llm_task_config
 from video_translate.ocr.extractor import ExtractConfig, _finish_ocr_progress, _format_duration, _load_cv2, _load_paddle_ocr, _ocr_frame
@@ -21,6 +22,11 @@ DEFAULT_RECONSTRUCT_BATCH_SIZE = 25
 ReconstructFn = Callable[[list[SubtitleCue]], dict[int, str]]
 
 
+def _source_language_label(source_language: str) -> str:
+    labels = {"korean": "韩文", "japanese": "日文", "english": "英文", "chinese": "中文", "auto": "原文"}
+    return labels.get(normalize_source_language(source_language or "auto"), "原文")
+
+
 def extract_hybrid_ocr_source(
     video_path: Path,
     anchor_cues: list[SubtitleCue],
@@ -29,11 +35,16 @@ def extract_hybrid_ocr_source(
     lang: str = "korean",
     sample_fps: float = 2.0,
     bottom_ratio: float = 0.42,
+    crop_top_ratio: float | None = None,
+    crop_bottom_ratio: float = 0.0,
+    crop_left_ratio: float = 0.0,
+    crop_right_ratio: float = 0.0,
     scan_full_frame: bool = False,
     device: str = "auto",
     anchor_padding_seconds: float = DEFAULT_ANCHOR_PADDING_SECONDS,
     ocr_window_seconds: float = DEFAULT_OCR_WINDOW_SECONDS,
     reconstruct_korean: bool = False,
+    source_language: str = "korean",
 ) -> dict[str, Path]:
     boxes = extract_ocr_boxes_for_anchor_cues(
         video_path,
@@ -41,6 +52,10 @@ def extract_hybrid_ocr_source(
         lang=lang,
         sample_fps=sample_fps,
         bottom_ratio=bottom_ratio,
+        crop_top_ratio=crop_top_ratio,
+        crop_bottom_ratio=crop_bottom_ratio,
+        crop_left_ratio=crop_left_ratio,
+        crop_right_ratio=crop_right_ratio,
         scan_full_frame=scan_full_frame,
         device=device,
         anchor_padding_seconds=max(anchor_padding_seconds, ocr_window_seconds),
@@ -51,6 +66,7 @@ def extract_hybrid_ocr_source(
         out_dir,
         anchor_padding_seconds=ocr_window_seconds,
         reconstruct_korean=reconstruct_korean,
+        source_language=source_language,
     )
     boxes_path = out_dir / "hybrid.ocr_boxes.json"
     boxes_path.write_text(json.dumps([box.to_dict() for box in boxes], ensure_ascii=False, indent=2), encoding="utf-8")
@@ -65,6 +81,10 @@ def extract_ocr_boxes_for_anchor_cues(
     lang: str = "korean",
     sample_fps: float = 2.0,
     bottom_ratio: float = 0.42,
+    crop_top_ratio: float | None = None,
+    crop_bottom_ratio: float = 0.0,
+    crop_left_ratio: float = 0.0,
+    crop_right_ratio: float = 0.0,
     scan_full_frame: bool = False,
     device: str = "auto",
     anchor_padding_seconds: float = DEFAULT_ANCHOR_PADDING_SECONDS,
@@ -87,6 +107,10 @@ def extract_ocr_boxes_for_anchor_cues(
     config = ExtractConfig(
         sample_fps=sample_fps,
         bottom_ratio=bottom_ratio,
+        crop_top_ratio=crop_top_ratio,
+        crop_bottom_ratio=crop_bottom_ratio,
+        crop_left_ratio=crop_left_ratio,
+        crop_right_ratio=crop_right_ratio,
         scan_full_frame=scan_full_frame,
         device=device,
     )
@@ -112,8 +136,10 @@ def build_hybrid_source_cues(
     *,
     anchor_padding_seconds: float = DEFAULT_OCR_WINDOW_SECONDS,
     timing: CueTimingConfig | None = None,
+    source_language: str = "korean",
 ) -> tuple[list[SubtitleCue], list[dict[str, object]]]:
     timing = timing or CueTimingConfig(snapshot_min_confidence=0.50)
+    source_label = _source_language_label(source_language)
     hybrid: list[SubtitleCue] = []
     debug: list[dict[str, object]] = []
     for index, anchor in enumerate(anchor_cues, start=1):
@@ -125,7 +151,7 @@ def build_hybrid_source_cues(
         ]
         text, confidence = _choose_text_for_anchor(cue_boxes, timing)
         if text:
-            source_text = f"韩文OCR候选：{text}\n英文参考：{anchor.text.strip()}"
+            source_text = f"{source_label}OCR候选：{text}\n英文参考：{anchor.text.strip()}"
             mode = "ocr_context_with_english_reference"
         else:
             source_text = f"英文参考：{anchor.text.strip()}"
@@ -145,7 +171,8 @@ def build_hybrid_source_cues(
                 "start": anchor.start,
                 "end": anchor.end,
                 "anchor_text": anchor.text,
-                "korean_ocr": text,
+                "source_ocr": text,
+                "source_language": normalize_source_language(source_language or "korean"),
                 "confidence": confidence,
                 "mode": mode,
                 "box_count": len(cue_boxes),
@@ -162,12 +189,14 @@ def write_hybrid_outputs(
     anchor_padding_seconds: float = DEFAULT_OCR_WINDOW_SECONDS,
     reconstruct_korean: bool = False,
     reconstruct_fn: Callable[..., dict[int, str]] | None = None,
+    source_language: str = "korean",
 ) -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     context_cues, debug = build_hybrid_source_cues(
         anchor_cues,
         ocr_boxes,
         anchor_padding_seconds=anchor_padding_seconds,
+        source_language=source_language,
     )
     context_srt = out_dir / "hybrid.context.srt"
     source_srt = out_dir / "hybrid.source.srt"
@@ -176,7 +205,7 @@ def write_hybrid_outputs(
     source_cues = context_cues
     if reconstruct_korean:
         reconstruct = reconstruct_fn or reconstruct_korean_cues_with_llm
-        mapping = reconstruct(context_cues)
+        mapping = reconstruct(context_cues, source_language=source_language)
         source_cues = []
         for cue, item in zip(context_cues, debug):
             korean = str(mapping.get(cue.index) or "").strip()
@@ -204,6 +233,7 @@ def write_hybrid_outputs(
 def reconstruct_korean_cues_with_llm(
     context_cues: list[SubtitleCue],
     *,
+    source_language: str = "korean",
     model: str | None = None,
     base_url: str | None = None,
     batch_size: int = DEFAULT_RECONSTRUCT_BATCH_SIZE,
@@ -282,7 +312,7 @@ def _request_reconstruction_batch(
         return result
 
 
-def build_reconstruction_payload(cues: list[SubtitleCue], model: str) -> dict[str, Any]:
+def build_reconstruction_payload(cues: list[SubtitleCue], model: str, *, source_language: str = "korean") -> dict[str, Any]:
     items = [
         {
             "id": cue.index,
@@ -291,25 +321,26 @@ def build_reconstruction_payload(cues: list[SubtitleCue], model: str) -> dict[st
         }
         for cue in cues
     ]
+    source_label = _source_language_label(source_language)
     user = {
-        "task": "根据英文人工字幕的时间轴和画面 OCR 候选，还原每条字幕应对应的韩文原句。",
+        "task": f"根据英文人工字幕的时间轴和画面 OCR 候选，还原每条字幕应对应的{source_label}原句。",
         "rules": [
             "每条输出必须保持同一个 id，不得合并、拆分、删除或新增条目。",
-            "英文参考的时间轴可信，最终韩文原句必须对应该英文参考的语义。",
-            "韩文 OCR 候选可能有错字、漏字、串到前后句或时间错位；请结合英文参考纠正。",
-            "韩文 OCR 候选可能包含说话人姓名、屏幕姓名牌、频道水印或固定画面标签；这些默认不是台词内容。",
+            f"英文参考的时间轴可信，最终{source_label}原句必须对应该英文参考的语义。",
+            f"{source_label} OCR 候选可能有错字、漏字、串到前后句或时间错位；请结合英文参考纠正。",
+            f"{source_label} OCR 候选可能包含说话人姓名、屏幕姓名牌、频道水印或固定画面标签；这些默认不是台词内容。",
             "除非英文参考明确包含称呼或说话人信息，否则不要把说话人姓名并入韩文原句。",
             "如果必须保留说话人标签，请使用“说话人: 台词”格式，不要用逗号把说话人和台词连成一句。",
-            "如果 OCR 候选与英文参考明显不对应，可以参考前后条目判断；仍无法判断时，可按英文参考回译成自然韩文，但不要编造专有名词。",
-            "只输出韩文原句，不要中文，不要解释，不要保留“韩文OCR候选/英文参考”标签。",
+            f"如果 OCR 候选与英文参考明显不对应，可以参考前后条目判断；仍无法判断时，可按英文参考回译成自然{source_label}，但不要编造专有名词。",
+            f"只输出{source_label}原句，不要中文，不要解释，不要保留“{source_label}OCR候选/英文参考”标签。",
         ],
-        "output_schema": [{"id": 1, "ko": "韩文原句，可为空"}],
+        "output_schema": [{"id": 1, "text": f"{source_label}原句，可为空"}],
         "items": items,
     }
     return {
         "model": model,
         "messages": [
-            {"role": "system", "content": "你是韩语字幕校对助手。只输出 JSON 数组，不要 Markdown，不要解释。"},
+            {"role": "system", "content": f"你是{source_label}字幕校对助手。只输出 JSON 数组，不要 Markdown，不要解释。"},
             {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
         ],
         "temperature": 0.1,

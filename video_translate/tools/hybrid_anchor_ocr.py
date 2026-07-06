@@ -13,8 +13,13 @@ def main(argv=None) -> None:
     parser.add_argument("anchor_srt", type=Path, help="Trusted uploaded subtitle SRT whose timing will be preserved")
     parser.add_argument("--out-dir", type=Path, required=True, help="Output directory")
     parser.add_argument("--lang", default="korean", help="PaddleOCR language, default: korean")
+    parser.add_argument("--source-language", default="korean", help="Logical source language for labels/prompts, e.g. korean or japanese")
     parser.add_argument("--sample-fps", type=float, default=2.0)
     parser.add_argument("--bottom-ratio", type=float, default=0.42)
+    parser.add_argument("--crop-top-ratio", type=float, default=None)
+    parser.add_argument("--crop-bottom-ratio", type=float, default=0.0)
+    parser.add_argument("--crop-left-ratio", type=float, default=0.0)
+    parser.add_argument("--crop-right-ratio", type=float, default=0.0)
     parser.add_argument("--scan-full-frame", action="store_true")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--anchor-padding-seconds", type=float, default=0.15)
@@ -36,11 +41,16 @@ def main(argv=None) -> None:
         lang=args.lang,
         sample_fps=args.sample_fps,
         bottom_ratio=args.bottom_ratio,
+        crop_top_ratio=args.crop_top_ratio,
+        crop_bottom_ratio=args.crop_bottom_ratio,
+        crop_left_ratio=args.crop_left_ratio,
+        crop_right_ratio=args.crop_right_ratio,
         scan_full_frame=args.scan_full_frame,
         device=args.device,
         anchor_padding_seconds=args.anchor_padding_seconds,
         ocr_window_seconds=args.ocr_window_seconds,
         reconstruct_korean=args.reconstruct_korean,
+        source_language=args.source_language,
     )
     for key, path in result.items():
         print(f"{key}: {path}")

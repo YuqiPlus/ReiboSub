@@ -40,7 +40,12 @@ def extract_subtitles_from_video(
     lang: str,
     sample_fps: float = 3.0,
     bottom_ratio: float = 0.42,
+    crop_top_ratio: float | None = None,
+    crop_bottom_ratio: float = 0.0,
+    crop_left_ratio: float = 0.0,
+    crop_right_ratio: float = 0.0,
     scan_full_frame: bool = False,
+    auto_trim_side_noise: bool = True,
     device: str = "auto",
     ignored_texts: list[str] | None = None,
     ignored_contains: list[str] | None = None,
@@ -56,10 +61,18 @@ def extract_subtitles_from_video(
         config=ExtractConfig(
             sample_fps=sample_fps,
             bottom_ratio=bottom_ratio,
+            crop_top_ratio=crop_top_ratio,
+            crop_bottom_ratio=crop_bottom_ratio,
+            crop_left_ratio=crop_left_ratio,
+            crop_right_ratio=crop_right_ratio,
             scan_full_frame=scan_full_frame,
+            auto_trim_side_noise=auto_trim_side_noise,
             device=device,
         ),
     )
+    boxes_path = out_dir / "ocr_boxes.json"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    boxes_path.write_text(json.dumps([box.to_dict() for box in boxes], ensure_ascii=False, indent=2), encoding="utf-8")
     tracks = build_text_tracks(boxes)
     classify_tracks(
         tracks,
@@ -70,7 +83,9 @@ def extract_subtitles_from_video(
             ignored_patterns=tuple(ignored_patterns or []),
         ),
     )
-    return write_extraction_outputs(tracks, out_dir, cue_timing=timing)
+    outputs = write_extraction_outputs(tracks, out_dir, cue_timing=timing)
+    outputs["ocr_boxes"] = boxes_path
+    return outputs
 
 
 def merge_ocr_samples(
@@ -97,7 +112,9 @@ def merge_ocr_samples(
             ignored_patterns=tuple(ignored_patterns or []),
         ),
     )
-    return write_extraction_outputs(tracks, out_dir, cue_timing=timing)
+    outputs = write_extraction_outputs(tracks, out_dir, cue_timing=timing)
+    outputs["ocr_boxes"] = ocr_json_path
+    return outputs
 
 
 def reprocess_tracks_json(

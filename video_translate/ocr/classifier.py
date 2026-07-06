@@ -20,6 +20,10 @@ class ClassificationConfig:
     stable_position_tolerance: float = 24.0
     grouped_stable_position_tolerance: float = 120.0
     bottom_region_threshold: float = 0.52
+    fallback_region_min_y: float = 0.18
+    fallback_overlap_tolerance_seconds: float = 0.20
+    fallback_min_width_ratio: float = 0.12
+    fallback_min_aspect_ratio: float = 2.2
     min_main_subtitle_confidence: float = 0.45
     min_subtitle_duration: float = 0.45
     ignored_texts: tuple[str, ...] = ()
@@ -34,6 +38,7 @@ def classify_tracks(tracks: list[TextTrack], config: ClassificationConfig | None
     _mark_known_overlays(tracks)
     _mark_grouped_persistent_overlays(tracks, config)
     _mark_short_noise(tracks, config)
+    _promote_non_bottom_fallback_subtitles(tracks, config)
     return tracks
 
 
@@ -53,7 +58,7 @@ def classify_track(track: TextTrack, config: ClassificationConfig) -> tuple[Trac
     normalized_center_y = center_y / frame_height if frame_height else 0.0
 
     if (
-        normalized_center_y >= config.bottom_region_threshold
+        _is_bottom_subtitle_candidate(track, normalized_center_y, config)
         and track.average_confidence >= config.min_main_subtitle_confidence
     ):
         return TrackKind.MAIN_SUBTITLE, "bottom_region_temporal_track"
@@ -135,6 +140,65 @@ def _mark_short_noise(tracks: list[TextTrack], config: ClassificationConfig) -> 
             track.reason = "short_junk_text"
 
 
+def _promote_non_bottom_fallback_subtitles(tracks: list[TextTrack], config: ClassificationConfig) -> None:
+    bottom_tracks = [track for track in tracks if track.kind == TrackKind.MAIN_SUBTITLE]
+    for track in tracks:
+        if track.kind != TrackKind.SECONDARY_CAPTION:
+            continue
+        if track.average_confidence < config.min_main_subtitle_confidence:
+            continue
+        if track.duration < config.min_subtitle_duration and track.sample_count < 2:
+            continue
+        if _normalized_center_y(track) < config.fallback_region_min_y:
+            continue
+        if _is_narrow_non_bottom_visual_text(track, config):
+            track.reason = "non_bottom_narrow_visual_text"
+            continue
+        if _overlaps_any(track, bottom_tracks, config.fallback_overlap_tolerance_seconds):
+            track.reason = "non_bottom_suppressed_by_bottom_subtitle"
+            continue
+        track.kind = TrackKind.MAIN_SUBTITLE
+        track.reason = "non_bottom_fallback_without_bottom_overlap"
+
+
+def _overlaps_any(track: TextTrack, others: list[TextTrack], tolerance: float) -> bool:
+    for other in others:
+        if other is track:
+            continue
+        if track.start <= other.end + tolerance and other.start <= track.end + tolerance:
+            return True
+    return False
+
+
+def _normalized_center_y(track: TextTrack) -> float:
+    bbox = track.average_bbox
+    center_y = (bbox[1] + bbox[3]) / 2
+    frame_height = _estimate_frame_height(track)
+    return center_y / frame_height if frame_height else 0.0
+
+
+def _is_narrow_non_bottom_visual_text(track: TextTrack, config: ClassificationConfig) -> bool:
+    regions = {str(box.region or "") for box in track.boxes}
+    if regions & {"bottom", "full_lower"}:
+        return False
+    bbox = track.average_bbox
+    width = max(0.0, bbox[2] - bbox[0])
+    height = max(1.0, bbox[3] - bbox[1])
+    frame_width = _estimate_frame_width(track)
+    width_ratio = width / frame_width if frame_width else 0.0
+    aspect_ratio = width / height
+    return width_ratio < config.fallback_min_width_ratio and aspect_ratio < config.fallback_min_aspect_ratio
+
+
+def _is_bottom_subtitle_candidate(track: TextTrack, normalized_center_y: float, config: ClassificationConfig) -> bool:
+    regions = {str(box.region or "") for box in track.boxes}
+    if "bottom" in regions:
+        return True
+    if regions & {"full_top", "full_middle"}:
+        return False
+    return normalized_center_y >= config.bottom_region_threshold
+
+
 def _is_short_noise(track: TextTrack, config: ClassificationConfig) -> bool:
     key = comparable_text(track.text)
     if not key:
@@ -191,3 +255,14 @@ def _estimate_frame_height(track: TextTrack) -> float:
     if max_y <= 1440:
         return 1440.0
     return 2160.0
+
+
+def _estimate_frame_width(track: TextTrack) -> float:
+    max_x = max((box.bbox[2] for box in track.boxes), default=1920.0)
+    if max_x <= 1280:
+        return 1280.0
+    if max_x <= 1920:
+        return 1920.0
+    if max_x <= 2560:
+        return 2560.0
+    return 3840.0

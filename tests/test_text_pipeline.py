@@ -28,6 +28,50 @@ def test_persistent_overlay_is_filtered() -> None:
     assert kinds["안녕하세요"] == TrackKind.MAIN_SUBTITLE
 
 
+def test_non_bottom_caption_is_promoted_when_no_bottom_subtitle() -> None:
+    boxes = [
+        OCRBox("위쪽 자막", (520, 410, 1180, 470), 0.94, 1.0, 30, "full_middle"),
+        OCRBox("위쪽 자막", (522, 412, 1178, 472), 0.93, 1.33, 40, "full_middle"),
+    ]
+
+    tracks = build_text_tracks(boxes)
+    classify_tracks(tracks, ClassificationConfig(video_duration=30.0))
+
+    assert tracks[0].kind == TrackKind.MAIN_SUBTITLE
+    assert tracks[0].reason == "non_bottom_fallback_without_bottom_overlap"
+
+
+def test_narrow_vertical_non_bottom_text_is_not_promoted() -> None:
+    boxes = [
+        OCRBox("최고가매입", (628, 343, 656, 469), 0.98, 10.67, 320, "full_middle"),
+        OCRBox("최고가매입", (634, 347, 658, 470), 0.94, 11.01, 330, "full_middle"),
+    ]
+
+    tracks = build_text_tracks(boxes)
+    classify_tracks(tracks, ClassificationConfig(video_duration=600.0))
+
+    assert tracks[0].kind != TrackKind.MAIN_SUBTITLE
+    assert tracks[0].reason == "non_bottom_narrow_visual_text"
+
+
+def test_non_bottom_caption_is_suppressed_when_bottom_subtitle_exists() -> None:
+    boxes = [
+        OCRBox("화면 글자", (520, 410, 1180, 470), 0.94, 1.0, 30, "full_middle"),
+        OCRBox("화면 글자", (522, 412, 1178, 472), 0.93, 1.33, 40, "full_middle"),
+        OCRBox("아래 자막", (520, 900, 1180, 960), 0.95, 1.0, 30, "bottom"),
+        OCRBox("아래 자막", (522, 902, 1178, 962), 0.95, 1.33, 40, "bottom"),
+    ]
+
+    tracks = build_text_tracks(boxes)
+    classify_tracks(tracks, ClassificationConfig(video_duration=30.0))
+    kinds = {track.text: track.kind for track in tracks}
+    reasons = {track.text: track.reason for track in tracks}
+
+    assert kinds["아래 자막"] == TrackKind.MAIN_SUBTITLE
+    assert kinds["화면 글자"] == TrackKind.SECONDARY_CAPTION
+    assert reasons["화면 글자"] == "non_bottom_suppressed_by_bottom_subtitle"
+
+
 def test_srt_roundtrip(tmp_path: Path) -> None:
     path = tmp_path / "sample.srt"
     write_srt([SubtitleCue(1, 1.25, 3.5, "안녕하세요")], path)

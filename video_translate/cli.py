@@ -22,6 +22,10 @@ def main(argv: list[str] | None = None) -> None:
     extract.add_argument("--out", type=Path, default=Path("outputs"))
     extract.add_argument("--sample-fps", type=float, default=3.0)
     extract.add_argument("--bottom-ratio", type=float, default=0.42)
+    extract.add_argument("--crop-top-ratio", type=float, default=None)
+    extract.add_argument("--crop-bottom-ratio", type=float, default=0.0)
+    extract.add_argument("--crop-left-ratio", type=float, default=0.0)
+    extract.add_argument("--crop-right-ratio", type=float, default=0.0)
     extract.add_argument("--scan-full-frame", action="store_true")
     extract.add_argument("--device", default="auto", help="auto、cpu、gpu 或 gpu:0")
     extract.add_argument("--ignore-text", action="append", default=[])
@@ -86,6 +90,10 @@ def main(argv: list[str] | None = None) -> None:
             lang=args.lang,
             sample_fps=args.sample_fps,
             bottom_ratio=args.bottom_ratio,
+            crop_top_ratio=args.crop_top_ratio,
+            crop_bottom_ratio=args.crop_bottom_ratio,
+            crop_left_ratio=args.crop_left_ratio,
+            crop_right_ratio=args.crop_right_ratio,
             scan_full_frame=args.scan_full_frame,
             device=args.device,
             ignored_texts=args.ignore_text,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from video_translate.languages import normalize_source_language
 from video_translate.models import SubtitleCue
 from video_translate.subtitle.srt import write_srt
 
@@ -10,19 +11,26 @@ from video_translate.subtitle.srt import write_srt
 DEFAULT_MIN_OVERLAP_SECONDS = 0.10
 
 
+def _source_language_label(source_language: str) -> str:
+    labels = {"korean": "韩文", "japanese": "日文", "english": "英文", "chinese": "中文", "auto": "原文"}
+    return labels.get(normalize_source_language(source_language or "auto"), "原文")
+
+
 def build_dual_reference_cues(
     source_cues: list[SubtitleCue],
     reference_cues: list[SubtitleCue],
     *,
     min_overlap_seconds: float = DEFAULT_MIN_OVERLAP_SECONDS,
+    source_language: str = "korean",
 ) -> tuple[list[SubtitleCue], list[dict[str, object]]]:
+    source_label = _source_language_label(source_language)
     dual_cues: list[SubtitleCue] = []
     debug: list[dict[str, object]] = []
     for source in source_cues:
         reference, overlap = _best_reference_cue(source, reference_cues, min_overlap_seconds=min_overlap_seconds)
         source_text = source.text.strip()
         reference_text = reference.text.strip() if reference else ""
-        text = f"韩文原文：{source_text}"
+        text = f"{source_label}原文：{source_text}"
         if reference_text:
             text += f"\n英文参考：{reference_text}"
         dual_cues.append(
@@ -54,12 +62,14 @@ def write_dual_reference_outputs(
     out_dir: Path,
     *,
     min_overlap_seconds: float = DEFAULT_MIN_OVERLAP_SECONDS,
+    source_language: str = "korean",
 ) -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     dual_cues, debug = build_dual_reference_cues(
         source_cues,
         reference_cues,
         min_overlap_seconds=min_overlap_seconds,
+        source_language=source_language,
     )
     source_srt = out_dir / "dual.source.srt"
     context_srt = out_dir / "dual.context.srt"

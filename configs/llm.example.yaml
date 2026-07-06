@@ -1,13 +1,24 @@
 # Copy this file to configs/llm.yaml.
-# This file only selects the active provider and task model roles.
-# Provider-specific base URLs, API-key env names, and concrete model names live in:
-#   configs/llm.providers.qianwen.example.yaml
-#   configs/llm.providers.volcano.example.yaml
+# Generic OpenAI-compatible LLM configuration.
 #
-# To switch provider later, change only active_provider after preparing the
-# matching configs/llm.providers.<name>.yaml file and API key env var.
+# This project does not require provider-specific profile files. To switch from
+# Doubao/Volcengine to another provider, change only these generic fields:
+#   defaults.base_url
+#   defaults.models.*
+#   LLM_API_KEY in .env
+#
+# The example values below use Volcengine Ark / Doubao model IDs.
 
-active_provider: qianwen
+defaults:
+  provider: openai-compatible
+  base_url: https://ark.cn-beijing.volces.com/api/coding/v3
+  api_key_env: LLM_API_KEY
+  models:
+    default: doubao-seed-2.0-pro
+    pro: doubao-seed-2.0-pro
+    lite: doubao-seed-2.0-lite
+    code: doubao-seed-2.0-code
+    minimax: minimax-m2.7
 
 tasks:
   # Small and frequent tasks usually work well with a faster/cheaper model.
@@ -28,4 +39,10 @@ tasks:
     env_model: ASR_CORRECTION_MODEL
 
   hybrid_source_reconstruction:
+    model_role: lite
+
+  ocr_source_refinement:
+    model_role: lite
+
+  ocr_source_cleanup:
     model_role: lite

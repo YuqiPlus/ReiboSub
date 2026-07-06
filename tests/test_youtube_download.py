@@ -71,6 +71,25 @@ def test_build_subtitle_options_can_download_auto_only(tmp_path):
     assert opts["writeautomaticsub"] is True
 
 
+def test_video_quality_accepts_best_and_resolution_caps():
+    module = _load_video_module()
+
+    assert module.DEFAULT_QUALITY == "1080p"
+    assert module.parse_quality("best") is None
+    assert module.parse_quality("2160p") == 2160
+    assert module.parse_quality("1080") == 1080
+
+
+def test_video_download_best_attempts_use_highest_available_selector():
+    module = _load_video_module()
+
+    attempts = module.download_attempts(module.parse_quality("best"))
+
+    assert [name for name, _, _ in attempts] == ["best", "best-small-chunks", "best-fallback"]
+    assert "height<=" not in attempts[0][1]
+    assert "bestvideo" in attempts[0][1]
+
+
 def test_video_download_main_uses_cli_url(monkeypatch):
     module = _load_video_module()
     calls = []
@@ -188,7 +207,90 @@ def test_video_download_template_uses_project_folder(monkeypatch, tmp_path):
     assert captured["outtmpl"] == str(tmp_path / "%(title)s" / "%(title)s.%(ext)s")
     assert ".h264." not in captured["outtmpl"]
     assert "vcodec^=avc1" in captured["format"]
+    assert "height<=1080" in captured["format"]
     assert captured["http_chunk_size"] == module.DEFAULT_HTTP_CHUNK_SIZE
+
+
+def test_best_video_download_uses_archive_template_and_preserves_primary(monkeypatch, tmp_path):
+    module = _load_video_module()
+    video_dir = tmp_path / "Demo Video"
+    video_dir.mkdir()
+    primary = video_dir / "Demo Video.mp4"
+    primary.write_text("primary", encoding="utf-8")
+    archive_tmp = video_dir / "Demo Video.best.mp4"
+    calls = []
+
+    class FakeYoutubeDL:
+        def __init__(self, opts):
+            self.opts = opts
+            calls.append(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {"title": "Demo Video", "thumbnail": ""}
+
+        def download(self, urls):
+            archive_tmp.write_text("archive", encoding="utf-8")
+
+    monkeypatch.setattr(module.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(module, "video_codec", lambda path: "av1" if path.name.startswith("Demo Video.best") else "h264")
+    monkeypatch.setattr(module.shutil, "which", lambda name: None)
+
+    downloaded = module.download_video("abc123", quality="best", output_dir=tmp_path)
+
+    archive = video_dir / "Demo Video.best.av1.mp4"
+    assert downloaded == [archive]
+    assert primary.read_text(encoding="utf-8") == "primary"
+    assert archive.read_text(encoding="utf-8") == "archive"
+    assert calls[0]["outtmpl"] == str(tmp_path / "%(title)s" / "%(title)s.best.%(ext)s")
+
+
+def test_video_download_still_downloads_thumbnail_after_max_downloads_reached(monkeypatch, tmp_path):
+    module = _load_video_module()
+    video_dir = tmp_path / "Demo Video"
+    video = video_dir / "Demo Video.mp4"
+    requests_seen = {}
+
+    class FakeYoutubeDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {"title": "Demo Video", "thumbnail": "https://img.youtube.com/demo.jpg"}
+
+        def download(self, urls):
+            video_dir.mkdir()
+            video.write_text("video", encoding="utf-8")
+            raise module.MaxDownloadsReached()
+
+    def fake_get(url, *, timeout, proxies):
+        requests_seen["url"] = url
+        return SimpleNamespace(
+            headers={"Content-Type": "image/jpeg"},
+            content=_image_bytes("JPEG"),
+            raise_for_status=lambda: None,
+        )
+
+    monkeypatch.setattr(module.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(module.requests, "get", fake_get)
+    monkeypatch.setattr(module.shutil, "which", lambda name: None)
+
+    downloaded = module.download_video("abc123", output_dir=tmp_path)
+
+    assert downloaded == [video]
+    assert requests_seen["url"] == "https://img.youtube.com/demo.jpg"
+    assert (video_dir / "Demo Video.jpg").exists()
 
 
 def test_video_download_downloads_thumbnail_with_video_stem(monkeypatch, tmp_path):
@@ -235,6 +337,66 @@ def test_video_download_downloads_thumbnail_with_video_stem(monkeypatch, tmp_pat
     with Image.open(thumbnail) as image:
         assert image.format == "JPEG"
     assert requests_seen["url"] == "https://img.youtube.com/demo.jpg"
+
+
+def test_video_download_matches_yt_dlp_sanitized_pipe_title(tmp_path):
+    module = _load_video_module()
+    video_dir = tmp_path / "A ｜ B"
+    video_dir.mkdir()
+    video = video_dir / "A ｜ B.mp4"
+    video.write_bytes(b"video")
+
+    assert module.matching_video_files(tmp_path, "A | B") == [video]
+
+
+def test_video_download_ignores_macos_resource_fork_files(tmp_path):
+    module = _load_video_module()
+    video_dir = tmp_path / "Demo Video"
+    video_dir.mkdir()
+    resource = video_dir / "._Demo Video.mp4"
+    video = video_dir / "Demo Video.mp4"
+    resource.write_bytes(b"resource")
+    video.write_bytes(b"video")
+
+    assert resource not in module.snapshot_video_files(tmp_path)
+    assert module.matching_video_files(tmp_path, "Demo Video") == [video]
+
+
+def test_capped_h264_download_replaces_existing_non_h264_video(monkeypatch, tmp_path):
+    module = _load_video_module()
+    video_dir = tmp_path / "Demo Video"
+    video_dir.mkdir()
+    video = video_dir / "Demo Video.mp4"
+    video.write_text("old-av1", encoding="utf-8")
+    calls = []
+
+    class FakeYoutubeDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {"title": "Demo Video", "thumbnail": ""}
+
+        def download(self, urls):
+            calls.append(list(urls))
+            video_dir.mkdir(exist_ok=True)
+            video.write_text("new-h264", encoding="utf-8")
+
+    monkeypatch.setattr(module.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(module, "video_codec", lambda path: "av1")
+    monkeypatch.setattr(module.shutil, "which", lambda name: None)
+
+    downloaded = module.download_video("abc123", quality="1080p", output_dir=tmp_path)
+
+    assert calls == [["https://www.youtube.com/watch?v=abc123"]]
+    assert downloaded == [video]
+    assert video.read_text(encoding="utf-8") == "new-h264"
 
 
 def test_video_download_matches_existing_video_inside_project_folder(monkeypatch, tmp_path):

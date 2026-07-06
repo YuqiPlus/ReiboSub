@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 import json
 import mimetypes
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -20,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
+import requests
 import yaml
 import yt_dlp
 
@@ -27,8 +30,22 @@ from video_translate.agent_planner import build_agent_plan
 from video_translate.cache import cuda_library_dirs, prepend_library_path
 from video_translate.env import load_dotenv
 from video_translate.llm_config import load_llm_task_config
+from video_translate.languages import (
+    asr_language_for_source,
+    normalize_source_language,
+    ocr_language_for_source,
+    youtube_language_for_source,
+)
+from video_translate.models import SubtitleCue
+from video_translate.project_manifest import (
+    PROJECT_MANIFEST_NAME,
+    infer_project_manifest,
+    update_local_project_manifest,
+    update_youtube_project_manifest,
+    update_youtube_project_metadata,
+)
 from video_translate.subtitle.dual_reference import write_dual_reference_outputs
-from video_translate.subtitle.srt import read_srt
+from video_translate.subtitle.srt import read_srt, write_srt
 from video_translate.subtitle.sidecar import SidecarConfig, copy_sidecar_subtitles
 from video_translate.translate.volcengine import (
     DEFAULT_BASE_URL,
@@ -37,6 +54,8 @@ from video_translate.translate.volcengine import (
     _parse_json_content,
     _request_translation,
 )
+from video_translate.utils.timecode import format_srt_time, parse_srt_time
+from video_translate.youtube.download_video import convert_thumbnail_bytes, thumbnail_extension, thumbnail_url_from_info
 from video_translate.youtube_url import normalize_youtube_url
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -54,6 +73,7 @@ def _rooted_dir(env_name: str, default: Path) -> Path:
 DOWNLOAD_DIR = _rooted_dir("VIDEO_TRANSLATE_DOWNLOAD_DIR", ROOT / "YoutubeDownloads")
 GLOSSARY_DIR = _rooted_dir("VIDEO_TRANSLATE_GLOSSARY_DIR", ROOT / "configs" / "glossaries")
 JOB_DIR = _rooted_dir("VIDEO_TRANSLATE_JOB_DIR", ROOT / "outputs" / "agent_jobs")
+TASK_DIR = _rooted_dir("VIDEO_TRANSLATE_TASK_DIR", ROOT / "outputs" / "agent_tasks")
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 DEFAULT_PROXY = os.environ.get("YTDLP_PROXY", "").strip()
 DEFAULT_HOST = os.environ.get("VIDEO_TRANSLATE_HOST", "0.0.0.0").strip() or "0.0.0.0"
@@ -71,6 +91,21 @@ _DUAL_REFERENCE_TRANSLATION_PROMPT = """本次源字幕是 dual reference 格式
 如果韩文原文和英文参考冲突，必须以韩文原文为准。
 输出时不要保留“韩文原文：”“英文参考：”这些标签。
 """
+
+
+def _source_language_label(source_language: str) -> str:
+    labels = {"korean": "韩文", "japanese": "日文", "english": "英文", "chinese": "中文", "auto": "原文"}
+    return labels.get(normalize_source_language(source_language or "auto"), "原文")
+
+
+def _hybrid_translation_prompt(source_language: str) -> str:
+    label = _source_language_label(source_language)
+    return _HYBRID_TRANSLATION_PROMPT.replace("韩文OCR", f"{label}OCR").replace("韩文原文", f"{label}原文")
+
+
+def _dual_reference_translation_prompt(source_language: str) -> str:
+    label = _source_language_label(source_language)
+    return _DUAL_REFERENCE_TRANSLATION_PROMPT.replace("韩文原文", f"{label}原文")
 
 
 def _module_command(module: str, *args: object) -> list[str]:
@@ -147,6 +182,7 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     GLOSSARY_DIR.mkdir(parents=True, exist_ok=True)
     JOB_DIR.mkdir(parents=True, exist_ok=True)
+    TASK_DIR.mkdir(parents=True, exist_ok=True)
     server = ThreadingHTTPServer((host, port), AgentHandler)
     print(f"Video Translate Agent UI listening on {host}:{port}", flush=True)
     for url in _browse_urls(host, port):
@@ -233,21 +269,29 @@ def probe_video(
         recommendation = "manual"
     elif auto:
         recommendation = "auto"
+    planner_source_language = _planner_source_language(detected_source_language)
     agent_plan = build_agent_plan(
         subtitles,
         target_language=target_language,
-        detected_source_language=detected_source_language,
+        detected_source_language=planner_source_language,
         embedded_subtitle_hint=embedded_subtitle_hint,
     )
+    title = str(info.get("title") or "")
+    existing_project = _find_or_bind_youtube_project(normalized_url, title)
+    thumbnail_path = _ensure_probe_thumbnail(normalized_url, title, info, proxy=proxy)
+    if thumbnail_path:
+        existing_project = _find_or_bind_youtube_project(normalized_url, title)
     return {
         "id": info.get("id"),
-        "title": info.get("title") or "",
+        "title": title,
         "duration": info.get("duration"),
         "webpage_url": normalized_url,
         "normalized_url": normalized_url,
         "subtitles": subtitles,
         "recommendation": recommendation,
         "agent_plan": agent_plan,
+        "existing_project": existing_project,
+        "thumbnail_path": str(thumbnail_path) if thumbnail_path else "",
     }
 
 
@@ -415,7 +459,10 @@ def list_jobs() -> list[dict[str, Any]]:
 
 
 def start_agent_session(payload: dict[str, Any]) -> AgentSession:
-    session = AgentSession(id=uuid.uuid4().hex[:12], payload=dict(payload))
+    normalized_payload = dict(payload)
+    normalized_payload["source_language"] = normalize_source_language(normalized_payload.get("source_language") or "auto")
+    normalized_payload["ocr_language"] = normalize_source_language(normalized_payload.get("ocr_language") or "auto")
+    session = AgentSession(id=uuid.uuid4().hex[:12], payload=normalized_payload)
     with _LOCK:
         _AGENT_SESSIONS[session.id] = session
     _run_agent_async(session.id, _agent_start)
@@ -431,6 +478,169 @@ def list_agent_sessions() -> list[dict[str, Any]]:
     with _LOCK:
         sessions = sorted(_AGENT_SESSIONS.values(), key=lambda item: item.created_at, reverse=True)
         return [session.to_dict() for session in sessions]
+
+
+def list_agent_tasks() -> list[dict[str, Any]]:
+    TASK_DIR.mkdir(parents=True, exist_ok=True)
+    _import_legacy_agent_jobs()
+    tasks = [_task_to_dict(path) for path in TASK_DIR.glob("*/task.yaml")]
+    tasks = [task for task in tasks if task]
+    return sorted(tasks, key=lambda item: float(item.get("updated_at") or 0), reverse=True)
+
+
+def get_agent_task(task_id: str) -> dict[str, Any] | None:
+    path = _task_yaml_path(task_id)
+    if not path.exists():
+        return None
+    return _task_to_dict(path)
+
+
+def continue_agent_task(task_id: str) -> AgentSession:
+    task = _read_task(task_id)
+    session = _agent_session_from_task(task)
+    stage = str(task.get("current_stage") or "")
+    if stage in {"glossary_review", "translate_failed"} and _task_stage_path(task, "glossary", "glossary_path"):
+        _run_agent_async(session.id, lambda item: _agent_translate_after_glossary(item, use_glossary=True))
+    elif _task_stage_path(task, "ocr", "source_srt"):
+        _run_agent_async(session.id, lambda item: _agent_generate_glossary_review(item, str(item.result.get("source_srt") or "")))
+    else:
+        _run_agent_async(session.id, _agent_start)
+    return session
+
+
+def continue_agent_after_glossary_review(glossary_path: str) -> AgentSession:
+    path = _resolve_project_path(glossary_path)
+    _ensure_under_root(path)
+    waiting_session_id = _find_waiting_glossary_session(path)
+    if waiting_session_id:
+        return answer_agent_session(waiting_session_id, {"action": "continue_after_glossary"})
+    task = _find_agent_task_by_glossary_path(path)
+    if not task:
+        raise KeyError("agent task not found for glossary")
+    task_id = str(task.get("id") or "").strip()
+    if not task_id:
+        raise KeyError("agent task not found for glossary")
+    if _task_stage_path(task, "glossary", "glossary_path"):
+        _invalidate_task_after(task_id, "translate")
+        task = _read_task(task_id)
+        session = _agent_session_from_task(task)
+        _run_agent_async(session.id, lambda item: _agent_translate_after_glossary(item, use_glossary=True))
+        return session
+    return continue_agent_task(task_id)
+
+
+def _find_waiting_glossary_session(glossary_path: Path) -> str:
+    target = glossary_path.resolve()
+    with _LOCK:
+        sessions = sorted(_AGENT_SESSIONS.values(), key=lambda item: item.updated_at, reverse=True)
+        for session in sessions:
+            if session.status != "waiting" or session.phase != "review_glossary":
+                continue
+            for value in (
+                session.result.get("glossary_path"),
+                session.question.get("glossary_path") if isinstance(session.question, dict) else "",
+            ):
+                if _same_existing_path(value, target):
+                    return session.id
+    return ""
+
+
+def _find_agent_task_by_glossary_path(glossary_path: Path) -> dict[str, Any] | None:
+    target = glossary_path.resolve()
+    TASK_DIR.mkdir(parents=True, exist_ok=True)
+    for task_yaml in sorted(TASK_DIR.glob("*/task.yaml"), key=lambda item: item.stat().st_mtime, reverse=True):
+        task = _task_to_dict(task_yaml)
+        if not task:
+            continue
+        for stage in ("glossary", "translate"):
+            value = _task_stage_value(task, stage, "glossary_path")
+            if _same_existing_path(value, target):
+                return task
+    return None
+
+
+def _same_existing_path(value: Any, target: Path) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    try:
+        return Path(raw).expanduser().resolve() == target
+    except OSError:
+        return False
+
+
+def rerun_agent_task_stage(task_id: str, stage: str) -> AgentSession:
+    task = _read_task(task_id)
+    stage = str(stage or "").strip()
+    session = _agent_session_from_task(task)
+    if stage == "ocr":
+        _invalidate_task_after(task_id, "ocr")
+        _run_agent_async(session.id, lambda item: _agent_run_ocr(item, force=True))
+    elif stage == "glossary":
+        source_srt = str(session.result.get("source_srt") or "")
+        if not source_srt:
+            raise RuntimeError("没有可用于重新生成 glossary 的 OCR 原文")
+        _invalidate_task_after(task_id, "glossary")
+        _run_agent_async(session.id, lambda item: _agent_generate_glossary_review(item, source_srt))
+    elif stage == "translate":
+        if not session.result.get("glossary_path"):
+            raise RuntimeError("没有 glossary，不能重新翻译")
+        _invalidate_task_after(task_id, "translate")
+        _run_agent_async(session.id, lambda item: _agent_translate_after_glossary(item, use_glossary=True))
+    else:
+        raise ValueError(f"未知可重跑阶段: {stage}")
+    return session
+
+
+def delete_agent_task(task_id: str) -> dict[str, Any]:
+    safe_task_id = Path(task_id).name
+    task_dir = _task_yaml_path(safe_task_id).parent
+    _ensure_task_dir(task_dir)
+    if not task_dir.exists():
+        raise KeyError("agent task not found")
+    _mark_task_deleted(safe_task_id)
+    shutil.rmtree(task_dir)
+    with _LOCK:
+        for session in _AGENT_SESSIONS.values():
+            if str(session.result.get("task_id") or "") == safe_task_id:
+                session.result["task_deleted"] = True
+                session.updated_at = time.time()
+    return {"deleted": True, "task_id": safe_task_id, "path": str(task_dir)}
+
+
+def complete_agent_task(task_id: str) -> dict[str, Any]:
+    data = _read_task(task_id)
+    data["workflow_status"] = "completed"
+    data["completed_at"] = time.time()
+    _write_task_file(_task_yaml_path(task_id), data)
+    return {"completed": True, "task_id": Path(str(task_id)).name, "workflow_status": "completed"}
+
+
+def reopen_agent_task(task_id: str) -> dict[str, Any]:
+    data = _read_task(task_id)
+    data["workflow_status"] = "active"
+    data.pop("completed_at", None)
+    _write_task_file(_task_yaml_path(task_id), data)
+    return {"reopened": True, "task_id": Path(str(task_id)).name, "workflow_status": "active"}
+
+
+def delete_download_project(payload: dict[str, Any]) -> dict[str, Any]:
+    project_dir = _resolve_project_path(_required_str(payload, "path"))
+    _ensure_download_project_dir(project_dir)
+    name = project_dir.name
+    shutil.rmtree(project_dir)
+    return {"deleted": True, "name": name, "path": str(project_dir)}
+
+
+def register_local_project(payload: dict[str, Any]) -> dict[str, Any]:
+    input_video = _resolve_project_path(_required_str(payload, "input_video"))
+    _ensure_under_root(input_video)
+    if not input_video.exists() or not input_video.is_file():
+        raise FileNotFoundError(f"视频文件不存在: {input_video}")
+    title = str(payload.get("title") or input_video.stem).strip()
+    manifest = update_local_project_manifest(input_video, download_dir=DOWNLOAD_DIR, title=title)
+    project = _download_project_entry(Path(str(manifest["project_dir"])))
+    return {"project": project, "manifest": manifest, "project_dir": manifest["project_dir"]}
 
 
 def answer_agent_session(session_id: str, answer: dict[str, Any]) -> AgentSession:
@@ -499,18 +709,40 @@ def _agent_start(session: AgentSession) -> None:
     url = _required_str(payload, "url")
     _agent_log(session.id, "agent_start")
     _agent_set_phase(session.id, "probe")
+    configured_source_language = _session_source_language(session)
+    detected_source_language = str(payload.get("detected_source_language") or "")
+    if configured_source_language != "auto" and not detected_source_language:
+        detected_source_language = youtube_language_for_source(configured_source_language)
     probe = probe_video(
         url,
         target_language=str(payload.get("target_language") or "zh"),
-        detected_source_language=str(payload.get("detected_source_language") or ""),
+        detected_source_language=detected_source_language,
         embedded_subtitle_hint=str(payload.get("embedded_subtitle_hint") or "unknown"),
     )
     _agent_update_result(session.id, {"probe": probe, "normalized_url": probe.get("normalized_url")})
     title = str(probe.get("title") or "")
+    task = _ensure_agent_task(
+        normalized_url=str(probe.get("normalized_url") or ""),
+        title=title,
+        payload=payload,
+    )
+    _agent_update_result(session.id, {"task_id": task["id"], "task_dir": task["task_dir"]})
+    _update_task_stage(
+        task["id"],
+        "probe",
+        "done",
+        current_stage="probe_done",
+        title=title,
+        normalized_url=probe.get("normalized_url"),
+        webpage_url=probe.get("webpage_url"),
+        subtitles=probe.get("subtitles") or [],
+        agent_plan=probe.get("agent_plan") or {},
+    )
     if title and bool(payload.get("translate_title", False)):
         try:
             translated = translate_title_text(title)
             _agent_update_result(session.id, {"zh_title": translated.get("zh_title", "")})
+            _update_task_fields(task["id"], {"zh_title": translated.get("zh_title", "")})
         except Exception as exc:
             _agent_log(session.id, f"title_translation_skipped: {exc}")
     plan = probe.get("agent_plan") or {}
@@ -519,12 +751,25 @@ def _agent_start(session: AgentSession) -> None:
 
 
 def _agent_continue(session: AgentSession, answer: dict[str, Any]) -> None:
+    _agent_update_ocr_settings_from_answer(session, answer)
     action = str(answer.get("action") or "")
     if action == "manual_mode":
         _agent_done(session.id, {"next_view": "new-task"})
         return
+    if action == "use_cached_ocr":
+        cached = session.result.get("reusable_ocr") if isinstance(session.result.get("reusable_ocr"), dict) else {}
+        if not cached:
+            raise RuntimeError("没有可复用 OCR 结果")
+        _agent_use_cached_ocr(session, cached)
+        return
+    if action == "rerun_ocr":
+        _agent_run_ocr(session, force=True)
+        return
     if action == "run_ocr":
         _agent_run_ocr(session)
+        return
+    if action == "download_video_for_preview":
+        _agent_download_video_for_preview(session)
         return
     if action == "run_asr":
         _agent_run_asr(session)
@@ -535,14 +780,132 @@ def _agent_continue(session: AgentSession, answer: dict[str, Any]) -> None:
     if session.phase == "confirm_subtitle" and action == "use_recommended":
         plan = session.result.get("agent_plan") or {}
         if str(plan.get("route") or "") == "hybrid_anchor_ocr":
-            _agent_run_hybrid_anchor_ocr(session)
+            _agent_prepare_hybrid_ocr_settings(session)
             return
         _agent_use_recommended_subtitle(session)
+        return
+    if session.phase == "confirm_hybrid_ocr_settings" and action == "start_hybrid_anchor_ocr":
+        _agent_run_hybrid_anchor_ocr(session)
         return
     if session.phase == "review_glossary" and action in {"continue_after_glossary", "skip_glossary"}:
         _agent_translate_after_glossary(session, use_glossary=action != "skip_glossary")
         return
     raise RuntimeError(f"未知 Agent 回答: {action}")
+
+
+def _session_source_language(session: AgentSession) -> str:
+    configured = normalize_source_language(session.payload.get("source_language") or "auto")
+    if configured != "auto":
+        return configured
+    for value in (
+        session.result.get("detected_source_language"),
+        session.payload.get("detected_source_language"),
+    ):
+        if not value:
+            continue
+        try:
+            detected = normalize_source_language(value)
+        except ValueError:
+            detected = normalize_source_language(_planner_source_language(value))
+        if detected != "auto":
+            return detected
+    return "auto"
+
+
+
+def _session_ocr_language(session: AgentSession) -> str:
+    configured = normalize_source_language(session.payload.get("ocr_language") or "auto")
+    if configured != "auto":
+        return configured
+    return _session_source_language(session)
+
+
+def _planner_source_language(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return youtube_language_for_source(raw)
+    except ValueError:
+        return raw.lower()
+
+
+def _agent_update_ocr_settings_from_answer(session: AgentSession, answer: dict[str, Any]) -> None:
+    updates: dict[str, Any] = {}
+    if "ocr_scope" in answer:
+        updates["ocr_scope"] = _normalize_ocr_scope(answer.get("ocr_scope"))
+    scope = str(updates.get("ocr_scope") or session.payload.get("ocr_scope") or "bottom")
+    if "ocr_crop_top_ratio" in answer:
+        updates["ocr_crop_top_ratio"] = _normalize_ocr_crop_top_ratio(answer.get("ocr_crop_top_ratio"), scope)
+    if "ocr_crop_bottom_ratio" in answer:
+        updates["ocr_crop_bottom_ratio"] = _normalize_ocr_vertical_crop_ratio(answer.get("ocr_crop_bottom_ratio"))
+    if "ocr_crop_left_ratio" in answer:
+        updates["ocr_crop_left_ratio"] = _normalize_ocr_crop_ratio(answer.get("ocr_crop_left_ratio"))
+    if "ocr_crop_right_ratio" in answer:
+        updates["ocr_crop_right_ratio"] = _normalize_ocr_crop_ratio(answer.get("ocr_crop_right_ratio"))
+    if "source_language" in answer:
+        updates["source_language"] = normalize_source_language(answer.get("source_language") or "auto")
+    if "ocr_language" in answer:
+        updates["ocr_language"] = normalize_source_language(answer.get("ocr_language") or "auto")
+    if not updates:
+        return
+    with _LOCK:
+        current = _AGENT_SESSIONS.get(session.id)
+        if current:
+            current.payload.update(updates)
+            current.updated_at = time.time()
+            session.payload.update(updates)
+
+
+def _agent_prepare_hybrid_ocr_settings(session: AgentSession) -> None:
+    result = session.result
+    probe = result.get("probe") or {}
+    plan = result.get("agent_plan") or {}
+    selected = plan.get("selected_subtitle") or {}
+    url = str(probe.get("normalized_url") or result.get("normalized_url") or session.payload.get("url") or "")
+
+    anchor_srt = str(result.get("anchor_srt") or "")
+    if not anchor_srt or not Path(anchor_srt).exists():
+        _agent_set_phase(session.id, "download_anchor_subtitle")
+        subtitle_result = _wait_for_job(
+            download_subtitle_job({"url": url, "lang": selected.get("lang"), "kind": selected.get("kind"), "title": probe.get("title") or ""}),
+            session_id=session.id,
+        )
+        anchor_srt = str(subtitle_result.get("subtitle_path") or "")
+        _agent_update_result(session.id, {"anchor_srt": anchor_srt, "download_subtitle": subtitle_result})
+
+    input_video = str(result.get("input_video") or "")
+    if not input_video or not Path(input_video).exists():
+        _agent_set_phase(session.id, "download_video_for_hybrid")
+        video_result = _wait_for_job(download_video_job({"url": url, "title": probe.get("title") or ""}), session_id=session.id)
+        input_video = str(video_result.get("input_video") or "")
+        _agent_update_result(session.id, {"input_video": input_video, "download_video": video_result})
+
+    _agent_confirm_hybrid_ocr_settings(get_agent_session(session.id) or session)
+
+
+def _agent_confirm_hybrid_ocr_settings(session: AgentSession) -> None:
+    scope = _normalize_ocr_scope(session.payload.get("ocr_scope") or "bottom")
+    _agent_wait(
+        session.id,
+        "confirm_hybrid_ocr_settings",
+        {
+            "kind": "confirm_hybrid_ocr_settings",
+            "title": "确认原声 OCR 范围",
+            "message": "英文人工字幕只负责时间轴。开始原声 OCR 前，请先用上方 OCR 模式、裁剪预设和抽帧预览确认绿色区域；调好后再点开始。",
+            "ocr_settings": {
+                "ocr_scope": scope,
+                "ocr_crop_top_ratio": _normalize_ocr_crop_top_ratio(session.payload.get("ocr_crop_top_ratio"), scope),
+                "ocr_crop_bottom_ratio": _normalize_ocr_vertical_crop_ratio(session.payload.get("ocr_crop_bottom_ratio")),
+                "ocr_crop_left_ratio": _normalize_ocr_crop_ratio(session.payload.get("ocr_crop_left_ratio")),
+                "ocr_crop_right_ratio": _normalize_ocr_crop_ratio(session.payload.get("ocr_crop_right_ratio")),
+            },
+            "options": [
+                {"action": "start_hybrid_anchor_ocr", "label": "开始英文定轴 + 原声 OCR"},
+                {"action": "manual_mode", "label": "转到手动模式"},
+            ],
+        },
+    )
 
 
 def _agent_retry_current_phase(session: AgentSession) -> None:
@@ -555,6 +918,9 @@ def _agent_retry_current_phase(session: AgentSession) -> None:
         return
     if phase in {"download_reference_subtitle", "dual_subtitle_reference"}:
         _agent_run_dual_subtitle_reference(session)
+        return
+    if phase == "confirm_hybrid_ocr_settings":
+        _agent_confirm_hybrid_ocr_settings(session)
         return
     if phase in {"download_anchor_subtitle", "download_video_for_hybrid", "hybrid_anchor_ocr"}:
         _agent_run_hybrid_anchor_ocr(session)
@@ -638,22 +1004,39 @@ def _agent_generate_glossary_review(session: AgentSession, source_srt: str) -> N
     _agent_set_phase(session.id, "generate_glossary")
     is_hybrid = session.result.get("source_kind") == "hybrid_anchor_ocr"
     is_dual_reference = session.result.get("source_kind") == "dual_subtitle_reference"
+    is_ocr = session.result.get("source_kind") == "ocr"
+    is_asr = session.result.get("source_kind") == "asr"
     glossary_job = generate_glossary_job(
         {
             "source_srt": source_srt,
             "extra_hint": str(session.payload.get("extra_hint") or ""),
-            "source_language": "korean" if is_hybrid or is_dual_reference else "",
+            "source_language": _agent_source_language_for_glossary(session, is_hybrid or is_dual_reference or is_ocr or is_asr),
             "out": str(_agent_glossary_path(session)),
         }
     )
     glossary_result = _wait_for_job(glossary_job, session_id=session.id)
     glossary_path = str(glossary_result.get("glossary_path") or "")
     _agent_update_result(session.id, {"glossary_path": glossary_path, "generate_glossary": glossary_result})
+    task_id = str(session.result.get("task_id") or "")
+    if task_id:
+        _update_task_stage(
+            task_id,
+            "glossary",
+            "waiting_review",
+            current_stage="glossary_review",
+            glossary_path=glossary_path,
+            source_srt=source_srt,
+            job_result=glossary_result,
+        )
     message = "Glossary 草稿已生成。审核人名、昵称和专有词后继续翻译。"
     if is_hybrid:
-        message = "Hybrid 源字幕已生成：时间轴来自英文人工字幕，原文优先使用韩文 OCR。审核 glossary 后继续翻译。"
+        message = "Hybrid 源字幕已生成：时间轴来自英文人工字幕，原文优先使用原声 OCR。审核 glossary 后继续翻译。"
     if is_dual_reference:
-        message = "双字幕参考源已生成：韩文人工字幕为主，英文人工字幕只作参考。审核 glossary 后继续翻译。"
+        message = "双字幕参考源已生成：原声人工字幕为主，英文人工字幕只作参考。审核 glossary 后继续翻译。"
+    if is_ocr:
+        message = "OCR 原文字幕已生成。请审核 glossary，尤其是人名、昵称和音译词，然后继续翻译。"
+    if is_asr:
+        message = "ASR 原文字幕已生成。请审核 glossary，尤其是人名、昵称和同音误识别词，然后继续翻译。"
     _agent_wait(
         session.id,
         "review_glossary",
@@ -670,14 +1053,24 @@ def _agent_generate_glossary_review(session: AgentSession, source_srt: str) -> N
     )
 
 
+def _agent_source_language_for_glossary(session: AgentSession, prefer_source: bool) -> str:
+    ocr_language = _session_ocr_language(session)
+    if ocr_language != "auto":
+        return ocr_language
+    source_language = _session_source_language(session)
+    if source_language != "auto":
+        return source_language
+    return "korean" if prefer_source else ""
+
+
 def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool) -> None:
     source_srt = str(session.result.get("source_srt") or "")
     glossary_path = str(session.result.get("glossary_path") or "") if use_glossary else ""
     extra_prompt = ""
     if session.result.get("source_kind") == "hybrid_anchor_ocr":
-        extra_prompt = _HYBRID_TRANSLATION_PROMPT
+        extra_prompt = _hybrid_translation_prompt(_session_source_language(session))
     if session.result.get("source_kind") == "dual_subtitle_reference":
-        extra_prompt = _DUAL_REFERENCE_TRANSLATION_PROMPT
+        extra_prompt = _dual_reference_translation_prompt(_session_source_language(session))
     _agent_set_phase(session.id, "translate")
     job = translate_subtitle_job(
         {
@@ -688,47 +1081,96 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
         }
     )
     translated = _wait_for_job(job, session_id=session.id)
+    if translated.get("translated_srt"):
+        materialized = _materialize_task_artifact(session, str(translated.get("translated_srt")), "zh.srt")
+        if materialized:
+            translated["translated_srt"] = materialized
+    translated.update(
+        {name: str(path) for name, path in _copy_agent_translated_sidecar(session, source_srt, str(translated.get("translated_srt") or "")).items()}
+    )
     done_result = {"translate_subtitle": translated, "translated_srt": translated.get("translated_srt")}
     for key in ("translated_sidecar", "source_sidecar"):
         if translated.get(key):
             done_result[key] = translated.get(key)
+    task_id = str(session.result.get("task_id") or "")
+    if task_id:
+        _update_task_stage(
+            task_id,
+            "translate",
+            "done",
+            current_stage="done",
+            translated_srt=translated.get("translated_srt"),
+            translated_sidecar=translated.get("translated_sidecar"),
+            glossary_path=glossary_path,
+            source_srt=source_srt,
+            job_result=translated,
+        )
     _agent_done(session.id, done_result)
 
 
 def _agent_continue_route_without_subtitle(session_id: str, plan: dict[str, Any]) -> None:
     route = str((plan or {}).get("route") or "")
-    if route == "probe_audio_language":
-        session = get_agent_session(session_id)
-        if session:
-            _agent_probe_audio_language(session)
-        return
     if route == "ocr":
-        session = get_agent_session(session_id)
-        if session:
-            _agent_run_ocr(session)
-        return
-    if route == "asr":
-        session = get_agent_session(session_id)
-        if session:
-            _agent_run_asr(session)
-        return
+        message = "Agent 判断这个视频更适合 OCR，但会先暂停。请确认是复用/重新 OCR，还是改用 ASR 或手动模式。"
+    elif route == "asr":
+        message = "Agent 判断这个视频更适合 ASR，但会先暂停。请确认使用 ASR，还是改用 OCR 或手动模式。"
+    elif route == "probe_audio_language":
+        message = "还不确定原视频音源语言。可以先检测音源，也可以直接选择 OCR 或 ASR。"
+    else:
+        message = "没有可用字幕且不确定是否有内嵌字幕。请先选择处理路线。"
     _agent_wait(
         session_id,
         "diagnose_ocr_asr",
         {
             "kind": "diagnose_ocr_asr",
-            "title": "需要选择 OCR 或 ASR",
-            "message": "没有可用字幕且不确定是否有内嵌字幕。第一版 Agent 先暂停，请选择路线。",
+            "title": "选择处理方式",
+            "message": message,
             "candidate_subtitles": (plan or {}).get("candidate_subtitles") or [],
-            "options": [
-                {"action": "probe_audio_language", "label": "先检测音源语言"},
-                {"action": "run_ocr", "label": "使用 OCR"},
-                {"action": "run_asr", "label": "使用 ASR"},
-                {"action": "manual_mode", "label": "转到手动模式"},
-            ],
+            "recommended_route": route,
+            "options": _agent_ocr_asr_options(route),
         },
     )
 
+
+def _agent_ocr_asr_options(route: str) -> list[dict[str, str]]:
+    if route == "asr":
+        return [
+            {"action": "download_video_for_preview", "label": "下载视频并抽帧预览"},
+            {"action": "run_asr", "label": "使用 ASR（推荐）"},
+            {"action": "run_ocr", "label": "改用 OCR"},
+            {"action": "probe_audio_language", "label": "先检测音源语言"},
+            {"action": "manual_mode", "label": "转到手动模式"},
+        ]
+    if route == "probe_audio_language":
+        return [
+            {"action": "download_video_for_preview", "label": "下载视频并抽帧预览"},
+            {"action": "probe_audio_language", "label": "先检测音源语言（推荐）"},
+            {"action": "run_ocr", "label": "使用 OCR"},
+            {"action": "run_asr", "label": "使用 ASR"},
+            {"action": "manual_mode", "label": "转到手动模式"},
+        ]
+    return [
+        {"action": "download_video_for_preview", "label": "下载视频并抽帧预览"},
+        {"action": "run_ocr", "label": "使用 OCR（推荐）"},
+        {"action": "run_asr", "label": "改用 ASR"},
+        {"action": "probe_audio_language", "label": "先检测音源语言"},
+        {"action": "manual_mode", "label": "转到手动模式"},
+    ]
+
+
+
+def _agent_download_video_for_preview(session: AgentSession) -> None:
+    result = session.result
+    probe = result.get("probe") or {}
+    plan = result.get("agent_plan") or {}
+    url = str(probe.get("normalized_url") or result.get("normalized_url") or session.payload.get("url") or "")
+    input_video = str(result.get("input_video") or "")
+    if not input_video:
+        _agent_set_phase(session.id, "download_video_for_preview")
+        video_result = _wait_for_job(download_video_job({"url": url, "title": probe.get("title") or ""}), session_id=session.id)
+        input_video = str(video_result.get("input_video") or "")
+        _agent_update_result(session.id, {"input_video": input_video, "download_video_for_preview": video_result})
+    _agent_continue_route_without_subtitle(session.id, plan)
 
 def _agent_probe_audio_language(session: AgentSession) -> None:
     result = session.result
@@ -764,19 +1206,177 @@ def _agent_probe_audio_language(session: AgentSession) -> None:
     _agent_handle_plan(session, plan)
 
 
-def _agent_run_ocr(session: AgentSession) -> None:
+def _agent_run_ocr(session: AgentSession, *, force: bool = False) -> None:
     _agent_set_phase(session.id, "ocr_full")
     url = str(session.result.get("normalized_url") or session.payload.get("url") or "")
-    job = ocr_full_job(
+    title = str((session.result.get("probe") or {}).get("title") or "")
+    translation_mode = str(session.payload.get("ocr_translation_mode") or "standard_cleanup")
+    ocr_scope = _normalize_ocr_scope(session.payload.get("ocr_scope"))
+    ocr_refinement_mode = _normalize_ocr_refinement_mode(session.payload.get("ocr_refinement_mode"))
+    ocr_crop_top_ratio = _normalize_ocr_crop_top_ratio(session.payload.get("ocr_crop_top_ratio"), ocr_scope)
+    ocr_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(session.payload.get("ocr_crop_bottom_ratio"))
+    ocr_crop_left_ratio = _normalize_ocr_crop_ratio(session.payload.get("ocr_crop_left_ratio"))
+    ocr_crop_right_ratio = _normalize_ocr_crop_ratio(session.payload.get("ocr_crop_right_ratio"))
+    source_language = _session_source_language(session)
+    ocr_language = _session_ocr_language(session)
+    cache_language = ocr_language if ocr_language != "auto" else source_language
+    if not force:
+        cached = _find_reusable_ocr_result(
+            url=url,
+            title=title,
+            translation_mode=translation_mode,
+            ocr_scope=ocr_scope,
+            ocr_refinement_mode=ocr_refinement_mode,
+            ocr_crop_top_ratio=ocr_crop_top_ratio,
+            ocr_crop_bottom_ratio=ocr_crop_bottom_ratio,
+            ocr_crop_left_ratio=ocr_crop_left_ratio,
+            ocr_crop_right_ratio=ocr_crop_right_ratio,
+            source_language=cache_language,
+            exclude_session_id=session.id,
+        )
+        if cached:
+            _agent_update_result(session.id, {"reusable_ocr": cached})
+            _agent_wait(
+                session.id,
+                "confirm_ocr_reuse",
+                {
+                    "kind": "confirm_ocr_reuse",
+                    "title": "检测到已有 OCR 原文",
+                    "message": "这个视频之前已经成功生成过 OCR 原文字幕，可以直接从 glossary 继续，避免重新跑 OCR。",
+                    "reusable_ocr": cached,
+                    "options": [
+                        {"action": "use_cached_ocr", "label": "复用 OCR，继续生成 glossary"},
+                        {"action": "rerun_ocr", "label": "重新 OCR"},
+                    ],
+                },
+            )
+            return
+    job = ocr_extract_job(
         {
             "url": url,
-            "title": (session.result.get("probe") or {}).get("title") or "",
+            "title": title,
             "extra_hint": str(session.payload.get("extra_hint") or ""),
-            "translation_mode": str(session.payload.get("ocr_translation_mode") or "standard_cleanup"),
+            "translation_mode": translation_mode,
+            "ocr_scope": ocr_scope,
+            "ocr_refinement_mode": ocr_refinement_mode,
+            "ocr_crop_top_ratio": ocr_crop_top_ratio,
+            "ocr_crop_bottom_ratio": ocr_crop_bottom_ratio,
+            "ocr_crop_left_ratio": ocr_crop_left_ratio,
+            "ocr_crop_right_ratio": ocr_crop_right_ratio,
+            "source_language": source_language,
+            "ocr_language": ocr_language,
         }
     )
     result = _wait_for_job(job, session_id=session.id)
-    _agent_done(session.id, {"ocr": result, "source_srt": result.get("source_srt"), "translated_srt": result.get("translated_srt")})
+    source_srt = str(result.get("source_srt") or "")
+    source_srt = _materialize_task_artifact(session, source_srt, "source.srt") or source_srt
+    _agent_update_result(
+        session.id,
+        {
+            "ocr": result,
+            "source_srt": source_srt,
+            "source_kind": "ocr",
+            "input_video": result.get("input_video"),
+        },
+    )
+    task_id = str(session.result.get("task_id") or "")
+    if task_id:
+        _update_task_stage(
+            task_id,
+            "ocr",
+            "done",
+            current_stage="ocr_done",
+            source_srt=source_srt,
+            input_video=result.get("input_video"),
+            output_dir=result.get("output_dir"),
+            ocr_scope=ocr_scope,
+            ocr_refinement_mode=ocr_refinement_mode,
+            ocr_crop_top_ratio=ocr_crop_top_ratio,
+            ocr_crop_bottom_ratio=ocr_crop_bottom_ratio,
+            ocr_crop_left_ratio=ocr_crop_left_ratio,
+            ocr_crop_right_ratio=ocr_crop_right_ratio,
+            source_language=source_language,
+            ocr_language=ocr_language,
+            job_result=result,
+            reused=False,
+        )
+    if _agent_should_finish_ocr_without_translation(session):
+        _agent_finish_ocr_without_translation(session, source_srt)
+        return
+    _agent_generate_glossary_review(session, source_srt)
+
+
+def _agent_use_cached_ocr(session: AgentSession, cached: dict[str, Any]) -> None:
+    source_srt = str(cached.get("source_srt") or "")
+    if not source_srt or not Path(source_srt).exists():
+        raise RuntimeError(f"可复用 OCR 原文不存在: {source_srt or '<empty>'}")
+    source_srt = _materialize_task_artifact(session, source_srt, "source.srt") or source_srt
+    _agent_log(session.id, f"agent_reuse_ocr: {source_srt}")
+    _agent_update_result(
+        session.id,
+        {
+            "ocr": cached,
+            "source_srt": source_srt,
+            "source_kind": "ocr",
+            "input_video": cached.get("input_video"),
+            "reused_ocr": True,
+        },
+    )
+    task_id = str(session.result.get("task_id") or "")
+    if task_id:
+        _update_task_stage(
+            task_id,
+            "ocr",
+            "done",
+            current_stage="ocr_done",
+            source_srt=source_srt,
+            input_video=cached.get("input_video"),
+            output_dir=cached.get("output_dir"),
+            ocr_scope=cached.get("ocr_scope"),
+            ocr_refinement_mode=cached.get("ocr_refinement_mode"),
+            ocr_crop_top_ratio=cached.get("ocr_crop_top_ratio"),
+            ocr_crop_bottom_ratio=cached.get("ocr_crop_bottom_ratio"),
+            ocr_crop_left_ratio=cached.get("ocr_crop_left_ratio"),
+            ocr_crop_right_ratio=cached.get("ocr_crop_right_ratio"),
+            source_language=cached.get("source_language") or _session_source_language(session),
+            job_result=cached,
+            reused=True,
+        )
+    if _agent_should_finish_ocr_without_translation(session):
+        _agent_finish_ocr_without_translation(session, source_srt)
+        return
+    _agent_generate_glossary_review(session, source_srt)
+
+
+
+def _agent_should_finish_ocr_without_translation(session: AgentSession) -> bool:
+    return _session_ocr_language(session) == "chinese"
+
+
+def _agent_finish_ocr_without_translation(session: AgentSession, source_srt: str) -> None:
+    zh_srt = _materialize_task_artifact(session, source_srt, "zh.srt") or source_srt
+    copied = _copy_agent_translated_sidecar(session, source_srt, zh_srt)
+    done_result: dict[str, Any] = {
+        "translated_srt": zh_srt,
+        "subtitle_path": zh_srt,
+        "message": "中文内嵌字幕已 OCR 提取完成，未进入 glossary/翻译。",
+    }
+    for key in ("translated_sidecar", "source_sidecar"):
+        if copied.get(key):
+            done_result[key] = str(copied[key])
+    task_id = str(session.result.get("task_id") or "")
+    if task_id:
+        _update_task_stage(
+            task_id,
+            "translate",
+            "done",
+            current_stage="done",
+            translated_srt=zh_srt,
+            translated_sidecar=done_result.get("translated_sidecar"),
+            source_srt=source_srt,
+            job_result={"mode": "ocr_extract_only", **done_result},
+        )
+    _agent_done(session.id, done_result)
 
 
 def _agent_run_hybrid_anchor_ocr(session: AgentSession) -> None:
@@ -786,18 +1386,11 @@ def _agent_run_hybrid_anchor_ocr(session: AgentSession) -> None:
     selected = plan.get("selected_subtitle") or {}
     url = str(probe.get("normalized_url") or result.get("normalized_url") or session.payload.get("url") or "")
 
-    _agent_set_phase(session.id, "download_anchor_subtitle")
-    subtitle_result = _wait_for_job(
-        download_subtitle_job({"url": url, "lang": selected.get("lang"), "kind": selected.get("kind"), "title": probe.get("title") or ""}),
-        session_id=session.id,
-    )
-    anchor_srt = str(subtitle_result.get("subtitle_path") or "")
-    _agent_update_result(session.id, {"anchor_srt": anchor_srt, "download_subtitle": subtitle_result})
-
-    _agent_set_phase(session.id, "download_video_for_hybrid")
-    video_result = _wait_for_job(download_video_job({"url": url, "title": probe.get("title") or ""}), session_id=session.id)
-    input_video = str(video_result.get("input_video") or "")
-    _agent_update_result(session.id, {"input_video": input_video, "download_video": video_result})
+    anchor_srt = str(result.get("anchor_srt") or "")
+    input_video = str(result.get("input_video") or "")
+    if not anchor_srt or not Path(anchor_srt).exists() or not input_video or not Path(input_video).exists():
+        _agent_prepare_hybrid_ocr_settings(session)
+        return
 
     _agent_set_phase(session.id, "hybrid_anchor_ocr")
     hybrid_result = _wait_for_job(
@@ -806,6 +1399,13 @@ def _agent_run_hybrid_anchor_ocr(session: AgentSession) -> None:
                 "input_video": input_video,
                 "anchor_srt": anchor_srt,
                 "title": probe.get("title") or "",
+                "ocr_scope": str(session.payload.get("ocr_scope") or "bottom"),
+                "ocr_crop_top_ratio": _normalize_ocr_crop_top_ratio(session.payload.get("ocr_crop_top_ratio"), str(session.payload.get("ocr_scope") or "bottom")),
+                "ocr_crop_bottom_ratio": _normalize_ocr_crop_ratio(session.payload.get("ocr_crop_bottom_ratio")),
+                "ocr_crop_left_ratio": _normalize_ocr_crop_ratio(session.payload.get("ocr_crop_left_ratio")),
+                "ocr_crop_right_ratio": _normalize_ocr_crop_ratio(session.payload.get("ocr_crop_right_ratio")),
+                "source_language": _session_source_language(session),
+                "ocr_language": _session_ocr_language(session),
             }
         ),
         session_id=session.id,
@@ -857,6 +1457,7 @@ def _agent_run_dual_subtitle_reference(session: AgentSession) -> None:
                 "source_srt": source_srt,
                 "reference_srt": reference_srt,
                 "title": probe.get("title") or "",
+                "source_language": _session_source_language(session),
             }
         ),
         session_id=session.id,
@@ -882,10 +1483,33 @@ def _agent_run_asr(session: AgentSession) -> None:
     _agent_update_result(session.id, {"input_video": input_video, "download_video": video_result})
     _agent_set_phase(session.id, "audio_asr")
     asr_result = _wait_for_job(
-        audio_local_video_job({"input_video": input_video, "language": "auto", "model_size": "large-v3"}),
+        audio_local_video_job({"input_video": input_video, "source_language": _session_source_language(session), "language": asr_language_for_source(_session_source_language(session)), "model_size": "large-v3"}),
         session_id=session.id,
     )
-    _agent_done(session.id, {"asr": asr_result, "source_srt": asr_result.get("source_srt"), "input_video": input_video})
+    source_srt = str(asr_result.get("source_srt") or "")
+    source_srt = _materialize_task_artifact(session, source_srt, "source.srt") or source_srt
+    _agent_update_result(
+        session.id,
+        {
+            "asr": asr_result,
+            "source_srt": source_srt,
+            "source_kind": "asr",
+            "input_video": input_video,
+        },
+    )
+    task_id = str(session.result.get("task_id") or "")
+    if task_id:
+        _update_task_stage(
+            task_id,
+            "asr",
+            "done",
+            current_stage="asr_done",
+            source_srt=source_srt,
+            input_video=input_video,
+            output_dir=asr_result.get("output_dir"),
+            job_result=asr_result,
+        )
+    _agent_generate_glossary_review(session, source_srt)
 
 
 def _wait_for_job(job: Job, timeout: float | None = None, *, session_id: str = "") -> dict[str, Any]:
@@ -926,7 +1550,7 @@ def _agent_subtitle_question_message(plan: dict[str, Any]) -> str:
     if route == "download_target_subtitle":
         return "检测到目标语言字幕，建议直接下载。"
     if route == "hybrid_anchor_ocr":
-        return "检测到英文人工字幕，且你确认画面有内嵌字幕。建议使用英文人工字幕定轴，再用韩文 OCR 补足原文精度。"
+        return "检测到英文人工字幕，且你确认画面有内嵌字幕。建议使用英文人工字幕定轴，再用原声 OCR 补足原文精度。"
     if route == "dual_subtitle_reference":
         return "检测到原声人工字幕和英文人工字幕。建议以原声字幕为主，英文字幕只作为 glossary 和翻译参考。"
     if route == "translate_auto_subtitle":
@@ -940,14 +1564,14 @@ def _agent_confirm_options(plan: dict[str, Any]) -> list[dict[str, str]]:
     route = str(plan.get("route") or "")
     if route == "hybrid_anchor_ocr":
         return [
-            {"action": "use_recommended", "label": "英文定轴 + 韩文 OCR（推荐，较慢但更准）"},
+            {"action": "use_recommended", "label": "英文定轴 + 原声 OCR（推荐，较慢但更准）"},
             {"action": "manual_mode", "label": "转到手动模式"},
             {"action": "run_ocr", "label": "整片 OCR（慢）"},
             {"action": "run_asr", "label": "音频 ASR"},
         ]
     if route == "dual_subtitle_reference":
         return [
-            {"action": "use_recommended", "label": "韩文主字幕 + 英文参考（推荐）"},
+            {"action": "use_recommended", "label": "原声主字幕 + 英文参考（推荐）"},
             {"action": "manual_mode", "label": "转到手动模式"},
             {"action": "run_ocr", "label": "改用 OCR"},
             {"action": "run_asr", "label": "改用 ASR"},
@@ -992,7 +1616,559 @@ def _agent_workspace(session: AgentSession) -> Path:
 
 
 def _agent_glossary_path(session: AgentSession) -> Path:
+    task_dir = str(session.result.get("task_dir") or "")
+    if task_dir:
+        path = Path(task_dir).expanduser().resolve()
+        _ensure_under_root(path)
+        path.mkdir(parents=True, exist_ok=True)
+        return path / "glossary.draft.yaml"
     return _agent_workspace(session) / "glossary.draft.yaml"
+
+
+def _ensure_agent_task(*, normalized_url: str, title: str, payload: dict[str, Any]) -> dict[str, Any]:
+    TASK_DIR.mkdir(parents=True, exist_ok=True)
+    normalized = normalize_youtube_url(normalized_url)
+    video_key = _youtube_task_key(normalized)
+    existing = _find_task_dir(video_key)
+    task_dir = existing or (TASK_DIR / f"{video_key}_{_safe_slug(title)[:64]}").resolve()
+    task_dir.mkdir(parents=True, exist_ok=True)
+    path = task_dir / "task.yaml"
+    now = time.time()
+    data = _read_task_file(path) if path.exists() else {}
+    data.update(
+        {
+            "id": task_dir.name,
+            "video_key": video_key,
+            "url": normalized,
+            "title": title or data.get("title") or "",
+            "task_dir": str(task_dir),
+            "payload": {**(data.get("payload") if isinstance(data.get("payload"), dict) else {}), **dict(payload)},
+            "created_at": data.get("created_at") or now,
+            "updated_at": now,
+        }
+    )
+    data.setdefault("current_stage", "created")
+    data.setdefault("stages", {})
+    _write_task_file(path, data)
+    return data
+
+
+def _import_legacy_agent_jobs() -> None:
+    if not JOB_DIR.exists():
+        return
+    deleted_task_ids = _deleted_task_ids()
+    existing_glossaries = {
+        str(_task_stage_value(_read_task_file(path), "glossary", "glossary_path") or "")
+        for path in TASK_DIR.glob("*/task.yaml")
+    }
+    for glossary in sorted(JOB_DIR.glob("*/glossary.draft.yaml"), key=lambda p: p.stat().st_mtime, reverse=True):
+        legacy_task_id = f"legacy_{glossary.parent.name}"
+        if legacy_task_id in deleted_task_ids:
+            continue
+        if str(glossary) in existing_glossaries:
+            continue
+        text_head = "\n".join(glossary.read_text(encoding="utf-8", errors="ignore").splitlines()[:8])
+        match = re.search(r"^#\s*source_srt:\s*(.+)$", text_head, re.MULTILINE)
+        source_srt = Path(match.group(1).strip()).expanduser().resolve() if match else None
+        if not source_srt or not source_srt.exists():
+            continue
+        source_run = source_srt.parent / "run.yaml"
+        input_video = ""
+        title = source_srt.parent.name
+        if source_run.exists():
+            try:
+                run_config = yaml.safe_load(source_run.read_text(encoding="utf-8")) or {}
+            except Exception:
+                run_config = {}
+            if isinstance(run_config, dict):
+                input_video = str(run_config.get("input_video") or "")
+                if input_video:
+                    title = Path(input_video).stem
+        task_dir = TASK_DIR / legacy_task_id
+        if (task_dir / "task.yaml").exists():
+            continue
+        now = time.time()
+        data = {
+            "id": task_dir.name,
+            "video_key": task_dir.name,
+            "url": "",
+            "title": title,
+            "task_dir": str(task_dir),
+            "payload": {},
+            "current_stage": "glossary_review",
+            "created_at": min(source_srt.stat().st_mtime, glossary.stat().st_mtime),
+            "updated_at": now,
+            "stages": {
+                "ocr": {
+                    "status": "done",
+                    "source_srt": str(source_srt),
+                    "input_video": input_video,
+                    "can_rerun": False,
+                    "updated_at": source_srt.stat().st_mtime,
+                },
+                "glossary": {
+                    "status": "waiting_review",
+                    "source_srt": str(source_srt),
+                    "glossary_path": str(glossary),
+                    "updated_at": glossary.stat().st_mtime,
+                },
+            },
+        }
+        _write_task_file(task_dir / "task.yaml", data)
+
+
+def _agent_session_from_task(task: dict[str, Any]) -> AgentSession:
+    payload = dict(task.get("payload") if isinstance(task.get("payload"), dict) else {})
+    payload["url"] = task.get("url") or payload.get("url") or ""
+    session = AgentSession(id=uuid.uuid4().hex[:12], payload=payload)
+    result = {
+        "task_id": task.get("id"),
+        "task_dir": task.get("task_dir"),
+        "normalized_url": task.get("url"),
+        "probe": {
+            "title": task.get("title") or "",
+            "normalized_url": task.get("url") or "",
+            "webpage_url": task.get("url") or "",
+            "subtitles": _task_stage_value(task, "probe", "subtitles") or [],
+        },
+        "agent_plan": _task_stage_value(task, "probe", "agent_plan") or {},
+    }
+    source_srt = _task_stage_path(task, "ocr", "source_srt") or _task_stage_path(task, "glossary", "source_srt")
+    input_video = _task_stage_path(task, "ocr", "input_video")
+    glossary_path = _task_stage_path(task, "glossary", "glossary_path")
+    translated_srt = _task_stage_path(task, "translate", "translated_srt")
+    translated_sidecar = _task_stage_path(task, "translate", "translated_sidecar")
+    if source_srt:
+        result.update({"source_srt": source_srt, "source_kind": "ocr"})
+    if input_video:
+        result["input_video"] = input_video
+    if glossary_path:
+        result["glossary_path"] = glossary_path
+    if translated_srt:
+        result["translated_srt"] = translated_srt
+    if translated_sidecar:
+        result["translated_sidecar"] = translated_sidecar
+    with _LOCK:
+        session.result.update(result)
+        _AGENT_SESSIONS[session.id] = session
+    return session
+
+
+def _read_task(task_id: str) -> dict[str, Any]:
+    path = _task_yaml_path(task_id)
+    if not path.exists():
+        raise KeyError("agent task not found")
+    return _read_task_file(path)
+
+
+def _task_yaml_path(task_id: str) -> Path:
+    safe = Path(str(task_id)).name
+    return (TASK_DIR / safe / "task.yaml").resolve()
+
+
+def _deleted_tasks_path() -> Path:
+    return (TASK_DIR / ".deleted_task_ids.yaml").resolve()
+
+
+def _deleted_task_ids() -> set[str]:
+    path = _deleted_tasks_path()
+    if not path.exists():
+        return set()
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or []
+    except Exception:
+        return set()
+    if isinstance(data, list):
+        return {str(item) for item in data if str(item).strip()}
+    return set()
+
+
+def _mark_task_deleted(task_id: str) -> None:
+    TASK_DIR.mkdir(parents=True, exist_ok=True)
+    deleted = _deleted_task_ids()
+    deleted.add(Path(str(task_id)).name)
+    _deleted_tasks_path().write_text(yaml.safe_dump(sorted(deleted), allow_unicode=True), encoding="utf-8")
+
+
+def _ensure_task_dir(path: Path) -> None:
+    resolved = path.resolve()
+    if not _is_relative_to(resolved, TASK_DIR) or resolved == TASK_DIR.resolve() or resolved.parent != TASK_DIR.resolve():
+        raise ValueError(f"任务目录不在允许范围内: {path}")
+
+
+def _ensure_download_project_dir(path: Path) -> None:
+    resolved = path.resolve()
+    download_root = DOWNLOAD_DIR.resolve()
+    if resolved == download_root or resolved.parent != download_root or not _is_relative_to(resolved, download_root):
+        raise ValueError(f"只能删除下载目录下的单个视频项目文件夹: {path}")
+    if not resolved.exists() or not resolved.is_dir():
+        raise FileNotFoundError(f"视频项目目录不存在: {path}")
+    if resolved.is_symlink():
+        raise ValueError(f"不允许删除软链接目录: {path}")
+
+
+def _task_to_dict(path: Path) -> dict[str, Any]:
+    data = _read_task_file(path)
+    data["id"] = data.get("id") or path.parent.name
+    data["task_dir"] = data.get("task_dir") or str(path.parent)
+    workflow_status = str(data.get("workflow_status") or "").strip()
+    if not workflow_status:
+        workflow_status = "completed" if str(data.get("current_stage") or "") == "done" else "active"
+    data["workflow_status"] = workflow_status
+    data["is_completed"] = workflow_status == "completed"
+    data["stage_items"] = _task_stage_items(data)
+    return data
+
+
+def _read_task_file(path: Path) -> dict[str, Any]:
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_task_file(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data["updated_at"] = time.time()
+    tmp = path.with_suffix(".yaml.tmp")
+    tmp.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _update_task_fields(task_id: str, values: dict[str, Any]) -> None:
+    if not task_id:
+        return
+    path = _task_yaml_path(task_id)
+    if not path.exists():
+        return
+    data = _read_task_file(path)
+    data.update(values)
+    _write_task_file(path, data)
+
+
+def _update_task_stage(task_id: str, stage: str, status: str, *, current_stage: str | None = None, **values: Any) -> None:
+    if not task_id:
+        return
+    path = _task_yaml_path(task_id)
+    if not path.exists():
+        return
+    data = _read_task_file(path)
+    stages = data.setdefault("stages", {})
+    if not isinstance(stages, dict):
+        stages = {}
+        data["stages"] = stages
+    item = stages.setdefault(stage, {})
+    if not isinstance(item, dict):
+        item = {}
+        stages[stage] = item
+    item.update({key: _task_serializable(value) for key, value in values.items() if value is not None and value != ""})
+    item["status"] = status
+    item["updated_at"] = time.time()
+    if current_stage:
+        data["current_stage"] = current_stage
+        if current_stage == "done":
+            data["workflow_status"] = "completed"
+            data.setdefault("completed_at", time.time())
+        elif data.get("workflow_status") == "completed":
+            data["workflow_status"] = "active"
+            data.pop("completed_at", None)
+    _write_task_file(path, data)
+
+
+def _invalidate_task_after(task_id: str, stage: str) -> None:
+    order = ["ocr", "glossary", "translate"]
+    if stage not in order:
+        return
+    path = _task_yaml_path(task_id)
+    if not path.exists():
+        return
+    data = _read_task_file(path)
+    stages = data.get("stages") if isinstance(data.get("stages"), dict) else {}
+    for name in order[order.index(stage):]:
+        item = stages.get(name)
+        if isinstance(item, dict):
+            item["status"] = "invalidated" if name != stage else "rerunning"
+            item["updated_at"] = time.time()
+    data["current_stage"] = f"{stage}_rerun"
+    data["workflow_status"] = "active"
+    data.pop("completed_at", None)
+    _write_task_file(path, data)
+
+
+def _materialize_task_artifact(session: AgentSession, source: str, filename: str) -> str:
+    task_dir = str(session.result.get("task_dir") or "")
+    if not task_dir or not source:
+        return ""
+    src = Path(source).expanduser().resolve()
+    if not src.exists():
+        return ""
+    dst_dir = Path(task_dir).expanduser().resolve()
+    _ensure_under_root(dst_dir)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / filename
+    if src != dst:
+        shutil.copy2(src, dst)
+    return str(dst)
+
+
+def _copy_agent_translated_sidecar(session: AgentSession, source_srt: str, translated_srt: str) -> dict[str, Path]:
+    translated = Path(str(translated_srt or "")).expanduser()
+    if not translated.exists():
+        return {}
+    input_video = _agent_input_video_path(session)
+    if not input_video:
+        return {}
+    source = Path(str(source_srt or "")).expanduser()
+    copied = copy_sidecar_subtitles(
+        input_video,
+        source_srt=source if source.exists() else None,
+        translated_srt=translated,
+        config=SidecarConfig(enabled=True, copy_source=False, copy_translated=True, source_suffix=".source", translated_suffix=".zh"),
+    )
+    return copied
+
+
+def _agent_input_video_path(session: AgentSession) -> Path | None:
+    raw = str(session.result.get("input_video") or "").strip()
+    if raw:
+        path = Path(raw).expanduser().resolve()
+        if path.exists():
+            return path
+    task_id = str(session.result.get("task_id") or "").strip()
+    if not task_id:
+        return None
+    try:
+        task = _read_task(task_id)
+    except Exception:
+        return None
+    for stage in ("ocr", "glossary", "translate"):
+        raw = str(_task_stage_value(task, stage, "input_video") or "").strip()
+        if not raw:
+            continue
+        path = Path(raw).expanduser().resolve()
+        if path.exists():
+            return path
+    return None
+
+
+def _task_stage_value(task: dict[str, Any], stage: str, key: str) -> Any:
+    stages = task.get("stages") if isinstance(task.get("stages"), dict) else {}
+    item = stages.get(stage) if isinstance(stages.get(stage), dict) else {}
+    return item.get(key)
+
+
+def _task_stage_path(task: dict[str, Any], stage: str, key: str) -> str:
+    value = str(_task_stage_value(task, stage, key) or "").strip()
+    return value if value and Path(value).exists() else ""
+
+
+def _task_stage_items(task: dict[str, Any]) -> list[dict[str, Any]]:
+    labels = {"probe": "检测", "ocr": "OCR 原文", "glossary": "Glossary", "translate": "翻译"}
+    stages = task.get("stages") if isinstance(task.get("stages"), dict) else {}
+    return [{"id": key, "label": label, **(stages.get(key) if isinstance(stages.get(key), dict) else {"status": "pending"})} for key, label in labels.items()]
+
+
+def _task_serializable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _task_serializable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_task_serializable(item) for item in value]
+    return value
+
+
+def _youtube_task_key(normalized_url: str) -> str:
+    parsed = urlparse(normalized_url)
+    video_id = ""
+    if parsed.netloc.endswith("youtu.be"):
+        video_id = parsed.path.strip("/").split("/")[0]
+    else:
+        video_id = (parse_qs(parsed.query).get("v") or [""])[0]
+    return _safe_slug(video_id or normalized_url)[:80]
+
+
+def _find_task_dir(video_key: str) -> Path | None:
+    exact = TASK_DIR / video_key
+    if exact.exists():
+        return exact
+    matches = sorted(TASK_DIR.glob(f"{video_key}_*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return matches[0] if matches else None
+
+
+def _find_reusable_ocr_result(
+    *,
+    url: str,
+    title: str,
+    translation_mode: str,
+    ocr_scope: str = "bottom",
+    ocr_refinement_mode: str = "none",
+    ocr_crop_top_ratio: float | None = None,
+    ocr_crop_bottom_ratio: float = 0.0,
+    ocr_crop_left_ratio: float = 0.0,
+    ocr_crop_right_ratio: float = 0.0,
+    source_language: str = "auto",
+    exclude_session_id: str = "",
+) -> dict[str, Any] | None:
+    normalized_url = normalize_youtube_url(url) if str(url or "").strip() else ""
+    title_key = _filename_match_key(title)
+    mode = _normalize_ocr_translation_mode(translation_mode)
+    scope = _normalize_ocr_scope(ocr_scope)
+    refinement_mode = _normalize_ocr_refinement_mode(ocr_refinement_mode)
+    crop_top_ratio = _normalize_ocr_crop_top_ratio(ocr_crop_top_ratio, scope)
+    crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(ocr_crop_bottom_ratio)
+    crop_left_ratio = _normalize_ocr_crop_ratio(ocr_crop_left_ratio)
+    crop_right_ratio = _normalize_ocr_crop_ratio(ocr_crop_right_ratio)
+    normalized_source_language = normalize_source_language(source_language or "auto")
+    candidates: list[dict[str, Any]] = []
+    candidates.extend(_reusable_ocr_from_tasks(normalized_url=normalized_url, title_key=title_key, mode=mode, scope=scope, refinement_mode=refinement_mode, crop_top_ratio=crop_top_ratio, crop_bottom_ratio=crop_bottom_ratio, crop_left_ratio=crop_left_ratio, crop_right_ratio=crop_right_ratio, source_language=normalized_source_language, exclude_session_id=exclude_session_id))
+    if not JOB_DIR.exists():
+        return sorted(candidates, key=lambda item: float(item.get("created_at") or 0), reverse=True)[0] if candidates else None
+    for run_yaml in JOB_DIR.glob("*/run.yaml"):
+        job_dir = run_yaml.parent
+        if exclude_session_id and job_dir.name == exclude_session_id:
+            continue
+        try:
+            config = yaml.safe_load(run_yaml.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        if not isinstance(config, dict):
+            continue
+        if str(config.get("mode") or "") not in {"extract", "full"}:
+            continue
+        source_srt = _resolve_cached_source_srt(job_dir, config)
+        if not source_srt or not source_srt.exists() or source_srt.stat().st_size <= 0:
+            continue
+        cache = config.get("agent_cache") if isinstance(config.get("agent_cache"), dict) else {}
+        cached_url = str(cache.get("normalized_url") or "").strip()
+        cached_mode = str(cache.get("ocr_translation_mode") or "").strip()
+        cached_scope = str(cache.get("ocr_scope") or "bottom").strip()
+        cached_refinement_mode = str(cache.get("ocr_refinement_mode") or "none").strip()
+        cached_crop_top_ratio = _normalize_ocr_crop_top_ratio(cache.get("ocr_crop_top_ratio"), cached_scope)
+        cached_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(cache.get("ocr_crop_bottom_ratio"))
+        cached_crop_left_ratio = _normalize_ocr_crop_ratio(cache.get("ocr_crop_left_ratio"))
+        cached_crop_right_ratio = _normalize_ocr_crop_ratio(cache.get("ocr_crop_right_ratio"))
+        cached_source_language = normalize_source_language(cache.get("source_language") or config.get("source_language") or "auto")
+        if normalized_source_language != "auto" and cached_source_language != normalized_source_language:
+            continue
+        input_video = Path(str(config.get("input_video") or ""))
+        exact_url_match = bool(normalized_url and cached_url == normalized_url)
+        title_match = _cached_ocr_title_matches(input_video, title_key)
+        if exact_url_match:
+            if cached_mode and cached_mode != mode:
+                continue
+            if _normalize_ocr_scope(cached_scope) != scope:
+                continue
+            if _normalize_ocr_refinement_mode(cached_refinement_mode) != refinement_mode:
+                continue
+        elif not title_match:
+            continue
+        if (
+            cached_crop_top_ratio != crop_top_ratio
+            or cached_crop_bottom_ratio != crop_bottom_ratio
+            or cached_crop_left_ratio != crop_left_ratio
+            or cached_crop_right_ratio != crop_right_ratio
+        ):
+            continue
+        candidates.append(
+            {
+                "source_srt": str(source_srt),
+                "input_video": str(input_video) if str(input_video) else "",
+                "output_dir": str(job_dir),
+                "job_id": job_dir.name,
+                "matched_by": "url" if exact_url_match else "title",
+                "created_at": run_yaml.stat().st_mtime,
+                "ocr_translation_mode": cached_mode or mode,
+                "ocr_scope": _normalize_ocr_scope(cached_scope),
+                "ocr_refinement_mode": _normalize_ocr_refinement_mode(cached_refinement_mode),
+                "ocr_crop_top_ratio": cached_crop_top_ratio,
+                "ocr_crop_bottom_ratio": cached_crop_bottom_ratio,
+                "ocr_crop_left_ratio": cached_crop_left_ratio,
+                "ocr_crop_right_ratio": cached_crop_right_ratio,
+                "source_language": cached_source_language,
+            }
+        )
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda item: float(item.get("created_at") or 0), reverse=True)[0]
+
+
+def _reusable_ocr_from_tasks(*, normalized_url: str, title_key: str, mode: str, scope: str, refinement_mode: str, crop_top_ratio: float, crop_bottom_ratio: float, crop_left_ratio: float, crop_right_ratio: float, source_language: str, exclude_session_id: str) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    if not TASK_DIR.exists():
+        return results
+    for task_yaml in TASK_DIR.glob("*/task.yaml"):
+        task = _read_task_file(task_yaml)
+        if exclude_session_id and task.get("id") == exclude_session_id:
+            continue
+        source_srt = _task_stage_path(task, "ocr", "source_srt")
+        if not source_srt:
+            continue
+        source_path = Path(source_srt)
+        if not source_path.exists() or source_path.stat().st_size <= 1:
+            continue
+        task_url = str(task.get("url") or "")
+        task_title_key = _filename_match_key(str(task.get("title") or ""))
+        exact_url_match = bool(normalized_url and task_url == normalized_url)
+        title_match = bool(title_key and task_title_key and (title_key in task_title_key or task_title_key in title_key or SequenceMatcher(None, title_key, task_title_key).ratio() >= 0.86))
+        if not exact_url_match and not title_match:
+            continue
+        cached_scope = _normalize_ocr_scope(_task_stage_value(task, "ocr", "ocr_scope") or "bottom")
+        if cached_scope != scope:
+            continue
+        cached_refinement_mode = _normalize_ocr_refinement_mode(_task_stage_value(task, "ocr", "ocr_refinement_mode") or "none")
+        if cached_refinement_mode != refinement_mode:
+            continue
+        cached_crop_top_ratio = _normalize_ocr_crop_top_ratio(_task_stage_value(task, "ocr", "ocr_crop_top_ratio"), cached_scope)
+        cached_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(_task_stage_value(task, "ocr", "ocr_crop_bottom_ratio"))
+        cached_crop_left_ratio = _normalize_ocr_crop_ratio(_task_stage_value(task, "ocr", "ocr_crop_left_ratio"))
+        cached_crop_right_ratio = _normalize_ocr_crop_ratio(_task_stage_value(task, "ocr", "ocr_crop_right_ratio"))
+        cached_source_language = normalize_source_language(_task_stage_value(task, "ocr", "source_language") or "auto")
+        if source_language != "auto" and cached_source_language != source_language:
+            continue
+        if (
+            cached_crop_top_ratio != crop_top_ratio
+            or cached_crop_bottom_ratio != crop_bottom_ratio
+            or cached_crop_left_ratio != crop_left_ratio
+            or cached_crop_right_ratio != crop_right_ratio
+        ):
+            continue
+        results.append(
+            {
+                "source_srt": source_srt,
+                "input_video": _task_stage_value(task, "ocr", "input_video") or "",
+                "output_dir": str(task_yaml.parent),
+                "job_id": str(task.get("id") or task_yaml.parent.name),
+                "matched_by": "url" if exact_url_match else "title",
+                "created_at": float(_task_stage_value(task, "ocr", "updated_at") or task.get("updated_at") or task_yaml.stat().st_mtime),
+                "ocr_translation_mode": mode,
+                "ocr_scope": cached_scope,
+                "ocr_refinement_mode": cached_refinement_mode,
+                "ocr_crop_top_ratio": cached_crop_top_ratio,
+                "ocr_crop_bottom_ratio": cached_crop_bottom_ratio,
+                "ocr_crop_left_ratio": cached_crop_left_ratio,
+                "ocr_crop_right_ratio": cached_crop_right_ratio,
+                "source_language": cached_source_language,
+            }
+        )
+    return results
+
+
+def _resolve_cached_source_srt(job_dir: Path, config: dict[str, Any]) -> Path | None:
+    raw = str(config.get("source_srt") or "").strip()
+    if raw:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = (ROOT / path).resolve()
+        return path
+    fallback = job_dir / "source.srt"
+    return fallback if fallback.exists() else None
+
+
+def _cached_ocr_title_matches(input_video: Path, title_key: str) -> bool:
+    if not title_key:
+        return False
+    text = " ".join(part for part in [input_video.stem, input_video.parent.name] if part)
+    key = _filename_match_key(text)
+    return bool(key and (title_key in key or key in title_key or SequenceMatcher(None, title_key, key).ratio() >= 0.86))
 
 
 def _agent_update_result(session_id: str, values: dict[str, Any]) -> None:
@@ -1039,15 +2215,35 @@ def _agent_done(session_id: str, values: dict[str, Any]) -> None:
 
 
 def _agent_fail(session_id: str, exc: Exception) -> None:
+    task_id = ""
+    phase = ""
     with _LOCK:
         session = _AGENT_SESSIONS.get(session_id)
         if not session:
             return
+        task_id = str(session.result.get("task_id") or "")
+        phase = session.phase
         session.status = "failed"
         session.error = str(exc)
         session.question = {}
         session.logs.append(f"agent_failed: {exc}")
         session.updated_at = time.time()
+    if task_id:
+        stage = _task_stage_for_phase(phase)
+        if stage:
+            _update_task_stage(task_id, stage, "failed", current_stage=f"{stage}_failed", error=str(exc))
+
+
+def _task_stage_for_phase(phase: str) -> str:
+    if phase in {"ocr_full", "confirm_ocr_reuse"}:
+        return "ocr"
+    if phase in {"generate_glossary", "review_glossary"}:
+        return "glossary"
+    if phase == "translate":
+        return "translate"
+    if phase == "probe":
+        return "probe"
+    return ""
 
 
 def _append_log(job_id: str, line: str) -> None:
@@ -1080,7 +2276,13 @@ def download_subtitle_job(payload: dict[str, Any]) -> Job:
             changed = _newest_files(DOWNLOAD_DIR, "*.srt", limit=3)
         if not changed:
             raise RuntimeError(f"字幕下载完成后没有找到匹配文件: title={title or '<unknown>'}, lang={lang}")
-        return {"subtitle_paths": [str(path) for path in changed], "subtitle_path": str(changed[0]) if changed else ""}
+        manifest = update_youtube_project_metadata(changed[0].parent, source_url=url, title=title or changed[0].parent.name)
+        return {
+            "subtitle_paths": [str(path) for path in changed],
+            "subtitle_path": str(changed[0]) if changed else "",
+            "project_dir": str(Path(str(manifest["project_dir"]))),
+            "project_manifest": str(Path(str(manifest["project_dir"])) / PROJECT_MANIFEST_NAME),
+        }
 
     return start_job(f"下载字幕 {lang} {kind}", target)
 
@@ -1266,6 +2468,8 @@ def download_video_job(payload: dict[str, Any]) -> Job:
     url = _required_str(payload, "url")
     title = str(payload.get("title") or "").strip()
     thumbnail_format = str(payload.get("thumbnail_format") or "jpg").strip().lower()
+    quality = str(payload.get("quality") or "1080p").strip() or "1080p"
+    archive_quality = quality.strip().lower() in {"best", "highest", "max", "最高", "archive", "best_archive", "best-archive"}
     before = _snapshot_video_files(DOWNLOAD_DIR)
 
     def target(job_id: str) -> dict[str, Any]:
@@ -1276,6 +2480,8 @@ def download_video_job(payload: dict[str, Any]) -> Job:
                 url,
                 "--output-dir",
                 DOWNLOAD_DIR,
+                "--quality",
+                quality,
                 "--thumbnail-format",
                 thumbnail_format,
             ),
@@ -1288,7 +2494,45 @@ def download_video_job(payload: dict[str, Any]) -> Job:
         if not videos:
             raise RuntimeError(f"视频下载完成后没有找到匹配文件: title={title or '<unknown>'}")
         thumbnail = _matching_thumbnail_file(videos[0]) if videos else None
-        result = {"video_paths": [str(path) for path in videos], "input_video": str(videos[0]) if videos else ""}
+        if not thumbnail:
+            before_images = _snapshot_image_files(DOWNLOAD_DIR)
+            _run_command(
+                job_id,
+                _module_command(
+                    "video_translate.youtube.download_thumbnail",
+                    url,
+                    "--output-dir",
+                    DOWNLOAD_DIR,
+                    "--format",
+                    thumbnail_format,
+                ),
+            )
+            images = _changed_image_files(DOWNLOAD_DIR, before_images)
+            if not images:
+                images = _matching_image_files(DOWNLOAD_DIR, title or videos[0].parent.name)
+            thumbnail = images[0] if images else _matching_thumbnail_file(videos[0])
+        if archive_quality:
+            project_dir = videos[0].parent
+            primary_candidates = [
+                path for path in _matching_video_files(DOWNLOAD_DIR, title or project_dir.name)
+                if path.parent == project_dir and ".best" not in path.stem
+            ]
+            manifest = update_youtube_project_metadata(
+                project_dir,
+                source_url=url,
+                title=title or project_dir.name,
+                primary_video=primary_candidates[0] if primary_candidates else None,
+                thumbnail_path=thumbnail,
+            )
+        else:
+            manifest = update_youtube_project_manifest(videos[0], source_url=url, title=title or videos[0].parent.name, thumbnail_path=thumbnail)
+        result = {
+            "video_paths": [str(path) for path in videos],
+            "input_video": str(videos[0]) if videos else "",
+            "project_dir": str(Path(str(manifest["project_dir"]))),
+            "project_manifest": str(Path(str(manifest["project_dir"])) / PROJECT_MANIFEST_NAME),
+            "project": _download_project_entry(Path(str(manifest["project_dir"]))),
+        }
         if thumbnail:
             result["thumbnail_path"] = str(thumbnail)
         return result
@@ -1321,15 +2565,50 @@ def download_thumbnail_job(payload: dict[str, Any]) -> Job:
             images = _newest_image_files(DOWNLOAD_DIR, limit=3)
         if not images:
             raise RuntimeError(f"封面下载完成后没有找到匹配文件: title={title or '<unknown>'}")
-        return {"thumbnail_paths": [str(path) for path in images], "thumbnail_path": str(images[0])}
+        manifest = update_youtube_project_metadata(images[0].parent, source_url=url, title=title or images[0].parent.name, thumbnail_path=images[0])
+        return {
+            "thumbnail_paths": [str(path) for path in images],
+            "thumbnail_path": str(images[0]),
+            "project_dir": str(Path(str(manifest["project_dir"]))),
+            "project_manifest": str(Path(str(manifest["project_dir"])) / PROJECT_MANIFEST_NAME),
+        }
 
     return start_job("下载封面", target)
 
 
+
+def _materialize_chinese_ocr_output(input_video: Path, out_dir: Path) -> dict[str, str]:
+    source_srt = out_dir / "source.srt"
+    zh_srt = out_dir / "zh.srt"
+    if not source_srt.exists():
+        return {"translated_srt": ""}
+    if source_srt != zh_srt:
+        shutil.copy2(source_srt, zh_srt)
+    copied = copy_sidecar_subtitles(
+        input_video,
+        source_srt=source_srt,
+        translated_srt=zh_srt,
+        config=SidecarConfig(enabled=True, copy_source=True, copy_translated=True, source_suffix=".source", translated_suffix=".zh"),
+    )
+    result = {"translated_srt": str(zh_srt), "subtitle_path": str(zh_srt)}
+    result.update({name: str(path) for name, path in copied.items()})
+    return result
+
+
 def ocr_full_job(payload: dict[str, Any]) -> Job:
     url = _required_str(payload, "url")
+    title = str(payload.get("title") or "").strip()
     extra_hint = str(payload.get("extra_hint") or "")
     translation_mode = _normalize_ocr_translation_mode(payload.get("translation_mode"), bool(payload.get("preserve_timing", False)))
+    ocr_scope = _normalize_ocr_scope(payload.get("ocr_scope"))
+    ocr_refinement_mode = _normalize_ocr_refinement_mode(payload.get("ocr_refinement_mode"))
+    ocr_crop_top_ratio = _normalize_ocr_crop_top_ratio(payload.get("ocr_crop_top_ratio"), ocr_scope)
+    ocr_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(payload.get("ocr_crop_bottom_ratio"))
+    ocr_crop_left_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_left_ratio"))
+    ocr_crop_right_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_right_ratio"))
+    source_language = normalize_source_language(payload.get("source_language") or "auto")
+    ocr_language = normalize_source_language(payload.get("ocr_language") or "auto")
+    config_source_language = ocr_language if ocr_language != "auto" else source_language
     job_slug = _safe_slug(payload.get("title") or "ocr_task")[:80]
 
     def target(job_id: str) -> dict[str, Any]:
@@ -1337,22 +2616,115 @@ def ocr_full_job(payload: dict[str, Any]) -> Job:
         out_dir.mkdir(parents=True, exist_ok=True)
         before_videos = _snapshot_video_files(DOWNLOAD_DIR)
         _append_log(job_id, "download_video_start")
-        _run_command(job_id, _module_command("video_translate.youtube.download_video", url, "--output-dir", DOWNLOAD_DIR))
-        videos = _changed_video_files(DOWNLOAD_DIR, before_videos)
+        _run_command(job_id, _module_command("video_translate.youtube.download_video", url, "--output-dir", DOWNLOAD_DIR, "--quality", "1080p"))
+        videos = _downloaded_video_candidates(DOWNLOAD_DIR, before_videos, title, newest_limit=1)
         if not videos:
-            videos = _newest_video_files(DOWNLOAD_DIR, limit=1)
-        if not videos:
-            raise RuntimeError("视频下载完成后没有找到 mp4/mkv/webm 文件")
+            missing_title = title or "<unknown>"
+            raise RuntimeError(f"视频下载完成后没有找到匹配文件: title={missing_title}")
         input_video = videos[0]
+        thumbnail = _matching_thumbnail_file(input_video)
+        manifest = update_youtube_project_manifest(input_video, source_url=url, title=title or input_video.parent.name, thumbnail_path=thumbnail)
         _append_log(job_id, f"input_video: {input_video}")
         config_path = out_dir / "run.yaml"
-        config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode)
+        config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode, ocr_scope=ocr_scope, ocr_refinement_mode=ocr_refinement_mode, ocr_crop_top_ratio=ocr_crop_top_ratio, ocr_crop_bottom_ratio=ocr_crop_bottom_ratio, ocr_crop_left_ratio=ocr_crop_left_ratio, ocr_crop_right_ratio=ocr_crop_right_ratio, source_language=config_source_language)
+        if config_source_language == "chinese":
+            config["mode"] = "extract"
+            config["sidecar"]["copy_translated"] = False
+        config["agent_cache"] = {
+            "kind": "youtube_ocr",
+            "normalized_url": normalize_youtube_url(url),
+            "ocr_translation_mode": translation_mode,
+            "ocr_scope": ocr_scope,
+            "ocr_refinement_mode": ocr_refinement_mode,
+            "ocr_crop_top_ratio": ocr_crop_top_ratio,
+            "ocr_crop_bottom_ratio": ocr_crop_bottom_ratio,
+            "ocr_crop_left_ratio": ocr_crop_left_ratio,
+            "ocr_crop_right_ratio": ocr_crop_right_ratio,
+            "source_language": config_source_language,
+            "ocr_language": ocr_language,
+        }
         config_path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
         _append_log(job_id, f"config: {config_path}")
         _run_command(job_id, [PYTHON, str(ROOT / "run_from_config.py"), str(config_path)])
-        return {"input_video": str(input_video), "output_dir": str(out_dir), "source_srt": str(out_dir / "source.srt"), "translated_srt": str(out_dir / "zh.srt")}
+        result = {
+            "input_video": str(input_video),
+            "output_dir": str(out_dir),
+            "source_srt": str(out_dir / "source.srt"),
+            "translated_srt": str(out_dir / "zh.srt"),
+            "project_dir": str(Path(str(manifest["project_dir"]))),
+            "project_manifest": str(Path(str(manifest["project_dir"])) / PROJECT_MANIFEST_NAME),
+            "source_language": config_source_language,
+            "ocr_language": ocr_language,
+        }
+        if config_source_language == "chinese":
+            result.update(_materialize_chinese_ocr_output(input_video, out_dir))
+        return result
 
     return start_job(f"OCR 全流程 {job_slug}", target)
+
+
+def ocr_extract_job(payload: dict[str, Any]) -> Job:
+    url = _required_str(payload, "url")
+    title = str(payload.get("title") or "").strip()
+    extra_hint = str(payload.get("extra_hint") or "")
+    translation_mode = _normalize_ocr_translation_mode(payload.get("translation_mode"), bool(payload.get("preserve_timing", False)))
+    ocr_scope = _normalize_ocr_scope(payload.get("ocr_scope"))
+    ocr_refinement_mode = _normalize_ocr_refinement_mode(payload.get("ocr_refinement_mode"))
+    ocr_crop_top_ratio = _normalize_ocr_crop_top_ratio(payload.get("ocr_crop_top_ratio"), ocr_scope)
+    ocr_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(payload.get("ocr_crop_bottom_ratio"))
+    ocr_crop_left_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_left_ratio"))
+    ocr_crop_right_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_right_ratio"))
+    source_language = normalize_source_language(payload.get("source_language") or "auto")
+    ocr_language = normalize_source_language(payload.get("ocr_language") or "auto")
+    config_source_language = ocr_language if ocr_language != "auto" else source_language
+    job_slug = _safe_slug(payload.get("title") or "ocr_task")[:80]
+
+    def target(job_id: str) -> dict[str, Any]:
+        out_dir = JOB_DIR / job_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        before_videos = _snapshot_video_files(DOWNLOAD_DIR)
+        _append_log(job_id, "download_video_start")
+        _run_command(job_id, _module_command("video_translate.youtube.download_video", url, "--output-dir", DOWNLOAD_DIR, "--quality", "1080p"))
+        videos = _downloaded_video_candidates(DOWNLOAD_DIR, before_videos, title, newest_limit=1)
+        if not videos:
+            missing_title = title or "<unknown>"
+            raise RuntimeError(f"视频下载完成后没有找到匹配文件: title={missing_title}")
+        input_video = videos[0]
+        thumbnail = _matching_thumbnail_file(input_video)
+        manifest = update_youtube_project_manifest(input_video, source_url=url, title=title or input_video.parent.name, thumbnail_path=thumbnail)
+        _append_log(job_id, f"input_video: {input_video}")
+        config_path = out_dir / "run.yaml"
+        config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode, ocr_scope=ocr_scope, ocr_refinement_mode=ocr_refinement_mode, ocr_crop_top_ratio=ocr_crop_top_ratio, ocr_crop_bottom_ratio=ocr_crop_bottom_ratio, ocr_crop_left_ratio=ocr_crop_left_ratio, ocr_crop_right_ratio=ocr_crop_right_ratio, source_language=config_source_language)
+        config["mode"] = "extract"
+        config["sidecar"]["copy_translated"] = False
+        config["agent_cache"] = {
+            "kind": "youtube_ocr",
+            "normalized_url": normalize_youtube_url(url),
+            "ocr_translation_mode": translation_mode,
+            "ocr_scope": ocr_scope,
+            "ocr_refinement_mode": ocr_refinement_mode,
+            "ocr_crop_top_ratio": ocr_crop_top_ratio,
+            "ocr_crop_bottom_ratio": ocr_crop_bottom_ratio,
+            "ocr_crop_left_ratio": ocr_crop_left_ratio,
+            "ocr_crop_right_ratio": ocr_crop_right_ratio,
+            "source_language": config_source_language,
+            "ocr_language": ocr_language,
+        }
+        config_path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        _append_log(job_id, f"config: {config_path}")
+        _run_command(job_id, [PYTHON, str(ROOT / "run_from_config.py"), str(config_path)])
+        return {
+            "input_video": str(input_video),
+            "output_dir": str(out_dir),
+            "source_srt": str(out_dir / "source.srt"),
+            "subtitle_path": str(out_dir / "source.srt"),
+            "project_dir": str(Path(str(manifest["project_dir"]))),
+            "project_manifest": str(Path(str(manifest["project_dir"])) / PROJECT_MANIFEST_NAME),
+            "source_language": config_source_language,
+            "ocr_language": ocr_language,
+        }
+
+    return start_job(f"OCR 提取 {job_slug}", target)
 
 
 def ocr_local_video_job(payload: dict[str, Any]) -> Job:
@@ -1362,18 +2734,43 @@ def ocr_local_video_job(payload: dict[str, Any]) -> Job:
         raise FileNotFoundError(f"视频文件不存在: {input_video}")
     extra_hint = str(payload.get("extra_hint") or "")
     translation_mode = _normalize_ocr_translation_mode(payload.get("translation_mode"), bool(payload.get("preserve_timing", False)))
+    ocr_scope = _normalize_ocr_scope(payload.get("ocr_scope"))
+    ocr_refinement_mode = _normalize_ocr_refinement_mode(payload.get("ocr_refinement_mode"))
+    ocr_crop_top_ratio = _normalize_ocr_crop_top_ratio(payload.get("ocr_crop_top_ratio"), ocr_scope)
+    ocr_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(payload.get("ocr_crop_bottom_ratio"))
+    ocr_crop_left_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_left_ratio"))
+    ocr_crop_right_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_right_ratio"))
+    source_language = normalize_source_language(payload.get("source_language") or "auto")
+    ocr_language = normalize_source_language(payload.get("ocr_language") or "auto")
+    config_source_language = ocr_language if ocr_language != "auto" else source_language
     job_slug = _safe_slug(input_video.stem)[:80]
 
     def target(job_id: str) -> dict[str, Any]:
         out_dir = JOB_DIR / job_id
         out_dir.mkdir(parents=True, exist_ok=True)
         config_path = out_dir / "run.yaml"
-        config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode)
+        config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode, ocr_scope=ocr_scope, ocr_refinement_mode=ocr_refinement_mode, ocr_crop_top_ratio=ocr_crop_top_ratio, ocr_crop_bottom_ratio=ocr_crop_bottom_ratio, ocr_crop_left_ratio=ocr_crop_left_ratio, ocr_crop_right_ratio=ocr_crop_right_ratio, source_language=config_source_language)
+        if config_source_language == "chinese":
+            config["mode"] = "extract"
+            config["sidecar"]["copy_translated"] = False
         config_path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
         _append_log(job_id, f"input_video: {input_video}")
         _append_log(job_id, f"config: {config_path}")
         _run_command(job_id, [PYTHON, str(ROOT / "run_from_config.py"), str(config_path)])
-        return {"input_video": str(input_video), "output_dir": str(out_dir), "source_srt": str(out_dir / "source.srt"), "translated_srt": str(out_dir / "zh.srt")}
+        manifest = update_local_project_manifest(input_video, download_dir=DOWNLOAD_DIR, title=input_video.stem)
+        result = {
+            "input_video": str(input_video),
+            "output_dir": str(out_dir),
+            "source_srt": str(out_dir / "source.srt"),
+            "translated_srt": str(out_dir / "zh.srt"),
+            "project_dir": str(Path(str(manifest["project_dir"]))),
+            "project_manifest": str(Path(str(manifest["project_dir"])) / PROJECT_MANIFEST_NAME),
+            "source_language": config_source_language,
+            "ocr_language": ocr_language,
+        }
+        if config_source_language == "chinese":
+            result.update(_materialize_chinese_ocr_output(input_video, out_dir))
+        return result
 
     return start_job(f"本地视频 OCR {job_slug}", target)
 
@@ -1387,9 +2784,22 @@ def hybrid_anchor_ocr_job(payload: dict[str, Any]) -> Job:
         raise FileNotFoundError(f"视频文件不存在: {input_video}")
     if not anchor_srt.exists():
         raise FileNotFoundError(f"字幕文件不存在: {anchor_srt}")
-    lang = str(payload.get("lang") or "korean").strip()
+    source_language = normalize_source_language(payload.get("source_language") or "auto")
+    ocr_language = normalize_source_language(payload.get("ocr_language") or "auto")
+    if source_language == "auto":
+        source_language = "korean"
+    if ocr_language == "auto":
+        ocr_language = source_language
+    lang = str(payload.get("lang") or ocr_language_for_source(ocr_language)).strip()
     sample_fps = str(payload.get("sample_fps") or "2.0")
-    bottom_ratio = str(payload.get("bottom_ratio") or "0.42")
+    ocr_scope = _normalize_ocr_scope(payload.get("ocr_scope"))
+    ocr_settings = _ocr_scope_settings(ocr_scope)
+    bottom_ratio = str(payload.get("bottom_ratio") or ocr_settings["bottom_ratio"])
+    ocr_crop_top_ratio = _normalize_ocr_crop_top_ratio(payload.get("ocr_crop_top_ratio"), ocr_scope)
+    ocr_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(payload.get("ocr_crop_bottom_ratio"))
+    ocr_crop_left_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_left_ratio"))
+    ocr_crop_right_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_right_ratio"))
+    scan_full_frame = bool(payload.get("scan_full_frame", ocr_settings["scan_full_frame"]))
     device = str(payload.get("device") or "auto")
     job_slug = _safe_slug(payload.get("title") or input_video.stem)[:80]
 
@@ -1403,10 +2813,16 @@ def hybrid_anchor_ocr_job(payload: dict[str, Any]) -> Job:
             "anchor_srt": str(anchor_srt),
             "source_srt": str(out_dir / "hybrid.source.srt"),
             "output_dir": str(out_dir),
+            "source_language": ocr_language,
             "hybrid": {
                 "lang": lang,
                 "sample_fps": sample_fps,
                 "bottom_ratio": bottom_ratio,
+                "crop_top_ratio": ocr_crop_top_ratio,
+                "crop_bottom_ratio": ocr_crop_bottom_ratio,
+                "crop_left_ratio": ocr_crop_left_ratio,
+                "crop_right_ratio": ocr_crop_right_ratio,
+                "scan_full_frame": scan_full_frame,
                 "device": device,
             },
             "sidecar": {"enabled": True, "copy_source": True, "copy_translated": True, "source_suffix": ".source", "translated_suffix": ".zh"},
@@ -1415,9 +2831,7 @@ def hybrid_anchor_ocr_job(payload: dict[str, Any]) -> Job:
         _append_log(job_id, f"input_video: {input_video}")
         _append_log(job_id, f"anchor_srt: {anchor_srt}")
         _append_log(job_id, f"config: {config_path}")
-        _run_command(
-            job_id,
-            [
+        args = [
                 *_module_command(
                     "video_translate.tools.hybrid_anchor_ocr",
                     input_video,
@@ -1427,17 +2841,29 @@ def hybrid_anchor_ocr_job(payload: dict[str, Any]) -> Job:
                 str(out_dir),
                 "--lang",
                 lang,
+                "--source-language",
+                ocr_language,
                 "--sample-fps",
                 sample_fps,
                 "--bottom-ratio",
                 bottom_ratio,
+                "--crop-top-ratio",
+                str(ocr_crop_top_ratio),
+                "--crop-bottom-ratio",
+                str(ocr_crop_bottom_ratio),
+                "--crop-left-ratio",
+                str(ocr_crop_left_ratio),
+                "--crop-right-ratio",
+                str(ocr_crop_right_ratio),
                 "--device",
                 device,
                 "--ocr-window-seconds",
                 str(payload.get("ocr_window_seconds") or "1.20"),
                 "--reconstruct-korean",
-            ],
-        )
+        ]
+        if scan_full_frame:
+            args.append("--scan-full-frame")
+        _run_command(job_id, args)
         source_srt = out_dir / "hybrid.source.srt"
         result = {
             "input_video": str(input_video),
@@ -1451,7 +2877,7 @@ def hybrid_anchor_ocr_job(payload: dict[str, Any]) -> Job:
         result.update({name: str(path) for name, path in _copy_source_sidecar_for_run_config(config_path, source_srt).items()})
         return result
 
-    return start_job(f"英文定轴 + 韩文 OCR {job_slug}", target)
+    return start_job(f"英文定轴 + 原声 OCR {job_slug}", target)
 
 
 def dual_subtitle_reference_job(payload: dict[str, Any]) -> Job:
@@ -1465,6 +2891,9 @@ def dual_subtitle_reference_job(payload: dict[str, Any]) -> Job:
         raise FileNotFoundError(f"参考字幕文件不存在: {reference_srt}")
     job_slug = _safe_slug(payload.get("title") or source_srt.stem)[:80]
     min_overlap = float(payload.get("min_overlap_seconds") or 0.10)
+    source_language = normalize_source_language(payload.get("source_language") or "korean")
+    if source_language == "auto":
+        source_language = "korean"
 
     def target(job_id: str) -> dict[str, Any]:
         out_dir = JOB_DIR / job_id
@@ -1477,6 +2906,7 @@ def dual_subtitle_reference_job(payload: dict[str, Any]) -> Job:
             "source_srt": str(out_dir / "dual.source.srt"),
             "context_srt": str(out_dir / "dual.context.srt"),
             "output_dir": str(out_dir),
+            "source_language": source_language,
             "dual_reference": {"min_overlap_seconds": min_overlap},
             "sidecar": {"enabled": True, "copy_source": False, "copy_translated": True, "source_suffix": ".source", "translated_suffix": ".zh"},
         }
@@ -1489,11 +2919,208 @@ def dual_subtitle_reference_job(payload: dict[str, Any]) -> Job:
             read_srt(reference_srt),
             out_dir,
             min_overlap_seconds=min_overlap,
+            source_language=source_language,
         )
         return {name: str(path) for name, path in result_paths.items()}
 
-    return start_job(f"韩文主字幕 + 英文参考 {job_slug}", target)
+    return start_job(f"原声主字幕 + 英文参考 {job_slug}", target)
 
+
+
+def video_overlay_job(payload: dict[str, Any]) -> Job:
+    input_video = _resolve_project_path(_required_str(payload, "input_video"))
+    _ensure_under_root(input_video)
+    if not input_video.exists():
+        raise FileNotFoundError(f"视频文件不存在: {input_video}")
+    layers = _normalize_overlay_layers(payload.get("layers") or [])
+    if not layers:
+        raise ValueError("至少启用一层贴图。")
+    output_value = str(payload.get("out") or "").strip()
+    if output_value:
+        output_video = _resolve_project_path(output_value)
+        _ensure_under_root(output_video)
+    else:
+        output_video = _unique_overlay_output_path(input_video)
+    job_slug = _safe_slug(input_video.stem)[:80]
+
+    def target(job_id: str) -> dict[str, Any]:
+        out_dir = JOB_DIR / job_id
+        asset_dir = out_dir / "overlay_assets"
+        asset_dir.mkdir(parents=True, exist_ok=True)
+        video_width, video_height = _video_dimensions(input_video)
+        prepared_layers = []
+        for index, layer in enumerate(layers, start=1):
+            image_path = _save_overlay_image(layer, asset_dir, index)
+            width_px = max(1, int(round(video_width * float(layer["width"]))))
+            x_px = max(0, min(video_width - 1, int(round(video_width * float(layer["x"])))) )
+            y_px = max(0, min(video_height - 1, int(round(video_height * float(layer["y"])))) )
+            prepared_layers.append({**layer, "image_path": image_path, "width_px": width_px, "x_px": x_px, "y_px": y_px})
+        output_video.parent.mkdir(parents=True, exist_ok=True)
+        args = _build_video_overlay_command(input_video, output_video, prepared_layers)
+        _run_command(job_id, args)
+        return {
+            "input_video": str(input_video),
+            "output_video": str(output_video),
+            "layers": [
+                {
+                    "kind": layer["kind"],
+                    "image_path": str(layer["image_path"]),
+                    "x": layer["x"],
+                    "y": layer["y"],
+                    "width": layer["width"],
+                    "opacity": layer["opacity"],
+                    "remove_background": layer["remove_background"],
+                }
+                for layer in prepared_layers
+            ],
+        }
+
+    return start_job(f"视频贴图处理 {job_slug}", target)
+
+
+def _normalize_overlay_layers(raw_layers: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_layers, list):
+        raise ValueError("layers 必须是数组。")
+    layers: list[dict[str, Any]] = []
+    for raw in raw_layers:
+        if not isinstance(raw, dict) or raw.get("enabled") is False:
+            continue
+        image_data_url = str(raw.get("image_data_url") or raw.get("image") or "").strip()
+        if not image_data_url:
+            continue
+        kind = str(raw.get("kind") or "overlay").strip() or "overlay"
+        layers.append(
+            {
+                "kind": kind,
+                "image_data_url": image_data_url,
+                "x": _clamp_float(raw.get("x"), 0.0, 0.98, 0.72),
+                "y": _clamp_float(raw.get("y"), 0.0, 0.98, 0.08),
+                "width": _clamp_float(raw.get("width"), 0.02, 0.90, 0.18),
+                "opacity": _clamp_float(raw.get("opacity"), 0.0, 1.0, 1.0),
+                "remove_background": bool(raw.get("remove_background", False)),
+            }
+        )
+    return layers
+
+
+def _clamp_float(value: Any, minimum: float, maximum: float, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _unique_overlay_output_path(input_video: Path) -> Path:
+    base = input_video.with_name(f"{input_video.stem}.overlay.mp4")
+    if not base.exists():
+        return base
+    for index in range(2, 1000):
+        candidate = input_video.with_name(f"{input_video.stem}.overlay-{index}.mp4")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError("无法生成不冲突的输出视频文件名。")
+
+
+def _save_overlay_image(layer: dict[str, Any], asset_dir: Path, index: int) -> Path:
+    from PIL import Image
+    import io
+
+    raw = str(layer["image_data_url"])
+    if raw.startswith("data:"):
+        raw = raw.split(",", 1)[1]
+    try:
+        data = base64.b64decode(raw)
+    except Exception as exc:
+        raise ValueError(f"贴图 {index} 不是有效的 base64 图片。") from exc
+    image = Image.open(io.BytesIO(data)).convert("RGBA")
+    if bool(layer.get("remove_background")):
+        image = _remove_image_background(image)
+    out = asset_dir / f"{index:02d}_{_safe_slug(layer.get('kind'))}.png"
+    image.save(out, "PNG")
+    return out
+
+
+def _remove_image_background(image):
+    from PIL import ImageChops
+
+    rgba = image.convert("RGBA")
+    width, height = rgba.size
+    border_pixels = []
+    for x in range(width):
+        border_pixels.append(rgba.getpixel((x, 0)))
+        border_pixels.append(rgba.getpixel((x, height - 1)))
+    for y in range(height):
+        border_pixels.append(rgba.getpixel((0, y)))
+        border_pixels.append(rgba.getpixel((width - 1, y)))
+    key = tuple(sorted(channel)[len(channel) // 2] for channel in zip(*border_pixels))[:3]
+    pixels = rgba.load()
+    threshold = 38
+    soft = 18
+    for y in range(height):
+        for x in range(width):
+            r, g, b, a = pixels[x, y]
+            distance = ((r - key[0]) ** 2 + (g - key[1]) ** 2 + (b - key[2]) ** 2) ** 0.5
+            if distance <= threshold:
+                pixels[x, y] = (r, g, b, 0)
+            elif distance <= threshold + soft:
+                next_alpha = int(a * ((distance - threshold) / soft))
+                pixels[x, y] = (r, g, b, next_alpha)
+    return rgba
+
+
+def _video_dimensions(video_path: Path) -> tuple[int, int]:
+    cv2 = _load_cv2_for_preview()
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"无法打开视频: {video_path}")
+    try:
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    finally:
+        capture.release()
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"无法读取视频尺寸: {video_path}")
+    return width, height
+
+
+def _build_video_overlay_command(input_video: Path, output_video: Path, layers: list[dict[str, Any]]) -> list[str]:
+    args = ["ffmpeg", "-y", "-i", str(input_video)]
+    for layer in layers:
+        args.extend(["-i", str(layer["image_path"])])
+    filter_parts: list[str] = []
+    current = "[0:v]"
+    for index, layer in enumerate(layers, start=1):
+        overlay_label = f"ov{index}"
+        output_label = f"v{index}"
+        opacity = float(layer["opacity"])
+        width_px = int(layer["width_px"])
+        x_px = int(layer["x_px"])
+        y_px = int(layer["y_px"])
+        filter_parts.append(f"[{index}:v]format=rgba,scale={width_px}:-1,colorchannelmixer=aa={opacity:.4f}[{overlay_label}]")
+        filter_parts.append(f"{current}[{overlay_label}]overlay={x_px}:{y_px}[{output_label}]")
+        current = f"[{output_label}]"
+    filter_complex = ";".join(filter_parts)
+    args.extend([
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        current,
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "18",
+        "-preset",
+        "medium",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(output_video),
+    ])
+    return args
 
 def audio_language_probe_job(payload: dict[str, Any]) -> Job:
     input_video = _resolve_project_path(_required_str(payload, "input_video"))
@@ -1549,7 +3176,8 @@ def audio_local_video_job(payload: dict[str, Any]) -> Job:
     _ensure_under_root(input_video)
     if not input_video.exists():
         raise FileNotFoundError(f"视频文件不存在: {input_video}")
-    language = str(payload.get("language") or "auto").strip()
+    source_language = normalize_source_language(payload.get("source_language") or "auto")
+    language = str(payload.get("language") or asr_language_for_source(source_language)).strip()
     model_size = str(payload.get("model_size") or "large-v3").strip()
     device = str(payload.get("device") or "cuda").strip()
     compute_type = str(payload.get("compute_type") or "float16").strip()
@@ -1565,6 +3193,7 @@ def audio_local_video_job(payload: dict[str, Any]) -> Job:
             "input_video": str(input_video),
             "source_srt": str(source_srt),
             "output_dir": str(out_dir),
+            "source_language": source_language,
             "audio": {
                 "provider": "faster-whisper",
                 "model_size": model_size,
@@ -1601,7 +3230,15 @@ def audio_local_video_job(payload: dict[str, Any]) -> Job:
             source_srt=source_srt,
             config=SidecarConfig(enabled=True, copy_source=True, copy_translated=False, source_suffix=".source", translated_suffix=".zh"),
         )
-        result = {"input_video": str(input_video), "output_dir": str(out_dir), "source_srt": str(source_srt), "subtitle_path": str(source_srt)}
+        manifest = update_local_project_manifest(input_video, download_dir=DOWNLOAD_DIR, title=input_video.stem)
+        result = {
+            "input_video": str(input_video),
+            "output_dir": str(out_dir),
+            "source_srt": str(source_srt),
+            "subtitle_path": str(source_srt),
+            "project_dir": str(Path(str(manifest["project_dir"]))),
+            "project_manifest": str(Path(str(manifest["project_dir"])) / PROJECT_MANIFEST_NAME),
+        }
         result.update({name: str(path) for name, path in copied.items()})
         return result
 
@@ -1615,8 +3252,22 @@ def _ocr_config(
     extra_hint: str,
     translation_mode: str = "standard_cleanup",
     preserve_timing: bool = False,
+    ocr_scope: str = "bottom",
+    ocr_refinement_mode: str = "none",
+    ocr_crop_top_ratio: float | None = None,
+    ocr_crop_bottom_ratio: float = 0.0,
+    ocr_crop_left_ratio: float = 0.0,
+    ocr_crop_right_ratio: float = 0.0,
+    source_language: str = "korean",
 ) -> dict[str, Any]:
     translation_mode = _normalize_ocr_translation_mode(translation_mode, preserve_timing)
+    ocr_settings = _ocr_scope_settings(ocr_scope)
+    ocr_refinement_mode = _normalize_ocr_refinement_mode(ocr_refinement_mode)
+    crop_top_ratio = _normalize_ocr_crop_top_ratio(ocr_crop_top_ratio, ocr_scope)
+    crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(ocr_crop_bottom_ratio)
+    crop_left_ratio = _normalize_ocr_crop_ratio(ocr_crop_left_ratio)
+    crop_right_ratio = _normalize_ocr_crop_ratio(ocr_crop_right_ratio)
+    normalized_source_language = normalize_source_language(source_language or "korean")
     prompt = """
 严格遵守 glossary 中的人名、角色名、节目名和固定术语。
 字幕要自然、简洁、口语化，适合 1-2 行外挂字幕显示。
@@ -1631,15 +3282,69 @@ def _ocr_config(
         "input_video": str(input_video),
         "source_srt": str(output_dir / "source.srt"),
         "output_dir": str(output_dir),
-        "source_language": "korean",
+        "source_language": normalized_source_language,
         "target_language": "简体中文",
         "glossary": "",
-        "ocr": {"device": "auto", "sample_fps": 3.0, "bottom_ratio": 0.42, "scan_full_frame": False},
+        "ocr": {"device": "auto", "sample_fps": 3.0, **ocr_settings, "crop_top_ratio": crop_top_ratio, "crop_bottom_ratio": crop_bottom_ratio, "crop_left_ratio": crop_left_ratio, "crop_right_ratio": crop_right_ratio, "auto_trim_side_noise": True},
+        "ocr_refinement": {"mode": ocr_refinement_mode, "batch_size": 12, "window_padding_seconds": 0.50, "max_boxes_per_frame": 16},
+        "source_cleanup": {"mode": "llm_context", "batch_size": 18, "overlap": 3},
         "filters": {"ignored_texts": ["Disney+", "디즈니+"], "ignored_contains": [], "ignored_patterns": ["disn[e3][yp]?\\+?"]},
         "subtitle": {"merge_gap_seconds": 0.85, "same_text_similarity": 0.88, "merge_same_start_seconds": 0.16, "merge_short_fragment_gap_seconds": 0.50, "short_fragment_max_chars": 14, "short_fragment_similarity": 0.55, "snapshot_similarity": 0.72, "snapshot_max_gap_seconds": None, "snapshot_min_confidence": 0.50, "end_padding_seconds": 0.35, "sample_end_extension_ratio": 0.75, "min_duration_seconds": 0.60, "max_next_overlap_seconds": 0.04, "enforce_no_overlap": True},
         "translation": translation,
         "sidecar": {"enabled": True, "copy_source": True, "copy_translated": True, "source_suffix": ".source", "translated_suffix": ".zh"},
     }
+
+
+OCR_SCOPE_SETTINGS = {
+    "bottom": {"bottom_ratio": 0.42, "scan_full_frame": False},
+    "expanded": {"bottom_ratio": 0.62, "scan_full_frame": False},
+    "smart_full": {"bottom_ratio": 0.42, "scan_full_frame": True},
+}
+
+
+def _normalize_ocr_scope(value: Any) -> str:
+    scope = str(value or "bottom").strip()
+    if scope not in OCR_SCOPE_SETTINGS:
+        raise ValueError(f"未知 OCR 扫描范围: {scope}")
+    return scope
+
+
+def _ocr_scope_settings(scope: Any) -> dict[str, Any]:
+    normalized = _normalize_ocr_scope(scope)
+    return dict(OCR_SCOPE_SETTINGS[normalized])
+
+
+
+
+def _normalize_ocr_crop_top_ratio(value: Any, scope: Any = "bottom") -> float:
+    if value is None or value == "":
+        settings = _ocr_scope_settings(scope)
+        return round(max(0.0, min(0.95, 1 - float(settings.get("bottom_ratio", 0.42)))), 4)
+    return _normalize_ocr_vertical_crop_ratio(value)
+
+def _normalize_ocr_vertical_crop_ratio(value: Any) -> float:
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return round(max(0.0, min(0.95, ratio)), 4)
+
+def _normalize_ocr_crop_ratio(value: Any) -> float:
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return round(max(0.0, min(0.45, ratio)), 4)
+
+
+OCR_REFINEMENT_MODES = {"none", "llm_boxes"}
+
+
+def _normalize_ocr_refinement_mode(value: Any) -> str:
+    mode = str(value or "none").strip()
+    if mode not in OCR_REFINEMENT_MODES:
+        raise ValueError(f"未知 OCR 原文精修模式: {mode}")
+    return mode
 
 
 OCR_TRANSLATION_MODES = {
@@ -1734,6 +3439,91 @@ def write_text_file(payload: dict[str, Any]) -> dict[str, Any]:
     return {"path": str(path), "saved": True}
 
 
+def read_subtitle_file(payload: dict[str, Any]) -> dict[str, Any]:
+    path = _resolve_project_path(_required_str(payload, "path"))
+    _ensure_readable_subtitle_path(path)
+    cues = read_srt(path)
+    return {
+        "path": str(path),
+        "count": len(cues),
+        "cues": [_subtitle_cue_to_editor_dict(cue) for cue in cues],
+    }
+
+
+def write_subtitle_file(payload: dict[str, Any]) -> dict[str, Any]:
+    source = _resolve_project_path(_required_str(payload, "path"))
+    _ensure_readable_subtitle_path(source)
+    output_value = str(payload.get("out") or "").strip()
+    if output_value:
+        output = _resolve_project_path(output_value)
+    elif bool(payload.get("overwrite", False)):
+        output = source
+    else:
+        output = source.with_name(f"{source.stem}.edited.srt")
+    _ensure_writable_subtitle_path(output)
+
+    raw_cues = payload.get("cues")
+    if not isinstance(raw_cues, list):
+        raise ValueError("缺少字幕条目: cues")
+    cues: list[SubtitleCue] = []
+    for item in raw_cues:
+        if not isinstance(item, dict) or item.get("deleted"):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        start = _subtitle_time_value(item.get("start_time", item.get("start")))
+        end = _subtitle_time_value(item.get("end_time", item.get("end")))
+        if end <= start:
+            raise ValueError(f"字幕结束时间必须大于开始时间: {text[:30]}")
+        cues.append(SubtitleCue(index=len(cues) + 1, start=start, end=end, text=text))
+
+    write_srt(cues, output)
+    return {
+        "path": str(output),
+        "saved": True,
+        "count": len(cues),
+        "cues": [_subtitle_cue_to_editor_dict(cue) for cue in cues],
+    }
+
+
+def _subtitle_cue_to_editor_dict(cue: SubtitleCue) -> dict[str, Any]:
+    return {
+        "index": cue.index,
+        "start": cue.start,
+        "end": cue.end,
+        "start_time": format_srt_time(cue.start),
+        "end_time": format_srt_time(cue.end),
+        "text": cue.text,
+    }
+
+
+def _subtitle_time_value(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("字幕时间不能为空")
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return float(text)
+    return parse_srt_time(text)
+
+
+def _ensure_readable_subtitle_path(path: Path) -> None:
+    _ensure_under_root(path)
+    if path.suffix.lower() != ".srt":
+        raise ValueError("字幕编辑器只支持读取 .srt 文件")
+    if not path.is_file():
+        raise FileNotFoundError(f"字幕文件不存在: {path}")
+
+
+def _ensure_writable_subtitle_path(path: Path) -> None:
+    _ensure_under_root(path)
+    if path.suffix.lower() != ".srt":
+        raise ValueError("字幕编辑器只允许保存 .srt 文件")
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
 def read_glossary_items(payload: dict[str, Any]) -> dict[str, Any]:
     path = _resolve_project_path(_required_str(payload, "path"))
     _ensure_under_root(path)
@@ -1782,9 +3572,9 @@ def write_glossary_items(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _ensure_writable_glossary_path(path: Path) -> None:
-    if _is_relative_to(path, GLOSSARY_DIR) or _is_relative_to(path, JOB_DIR):
+    if _is_relative_to(path, GLOSSARY_DIR) or _is_relative_to(path, JOB_DIR) or _is_relative_to(path, TASK_DIR):
         return
-    raise ValueError("UI 只允许保存 configs/glossaries 或 outputs/agent_jobs 下的 glossary 文件")
+    raise ValueError("UI 只允许保存 configs/glossaries、outputs/agent_jobs 或 outputs/agent_tasks 下的 glossary 文件")
 
 
 def _load_yaml_file(path: Path) -> dict[str, Any]:
@@ -2145,39 +3935,155 @@ def _asset_entry(path: Path, *, kind: str) -> dict[str, Any]:
 def _download_project_entries(directory: Path, limit: int = 80) -> list[dict[str, Any]]:
     if not directory.exists():
         return []
-    projects: list[dict[str, Any]] = []
-    for project_dir in sorted([path for path in directory.iterdir() if path.is_dir()], key=lambda path: path.stat().st_mtime, reverse=True):
-        files = [path for path in project_dir.iterdir() if _is_real_file(path)]
-        if not files:
-            continue
-        videos = _asset_entries([path for path in files if path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}], kind="video", limit=50)
-        subtitles = _asset_entries([path for path in files if path.suffix.lower() in {".srt", ".vtt", ".ass", ".ssa", ".bcc"}], kind="subtitle", limit=80)
-        images = _asset_entries([path for path in files if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}], kind="image", limit=20)
-        others = _asset_entries([path for path in files if path.suffix.lower() not in {
-            ".mp4", ".mkv", ".webm", ".mov", ".m4v",
-            ".srt", ".vtt", ".ass", ".ssa", ".bcc",
-            ".jpg", ".jpeg", ".png", ".webp",
-        }], kind="file", limit=20)
-        newest = max((path.stat().st_mtime for path in files), default=project_dir.stat().st_mtime)
-        projects.append(
-            {
-                "name": project_dir.name,
-                "path": str(project_dir),
-                "modified_at": newest,
-                "modified_label": time.strftime("%Y-%m-%d %H:%M", time.localtime(newest)),
-                "videos": videos,
-                "subtitles": subtitles,
-                "images": images,
-                "others": others,
-                "counts": {
-                    "videos": len(videos),
-                    "subtitles": len(subtitles),
-                    "images": len(images),
-                    "others": len(others),
-                },
-            }
-        )
+    projects = [_download_project_entry(path) for path in directory.iterdir() if path.is_dir()]
+    projects = [project for project in projects if project]
     return sorted(projects, key=lambda item: item["modified_at"], reverse=True)[:limit]
+
+
+def _download_project_entry(project_dir: Path) -> dict[str, Any]:
+    project_dir = Path(project_dir).resolve()
+    _backfill_project_manifest_from_tasks(project_dir)
+    manifest = infer_project_manifest(project_dir)
+    files = [path for path in project_dir.iterdir() if _is_real_file(path) and path.name != PROJECT_MANIFEST_NAME] if project_dir.exists() else []
+    primary_video = Path(str(manifest.get("primary_video") or "")).expanduser()
+    if str(primary_video) and primary_video.exists() and primary_video.is_file() and primary_video not in files:
+        files.insert(0, primary_video.resolve())
+    thumbnail = Path(str(manifest.get("thumbnail") or "")).expanduser()
+    if str(thumbnail) and thumbnail.exists() and thumbnail.is_file() and thumbnail not in files:
+        files.append(thumbnail.resolve())
+    if not files and not manifest:
+        return {}
+    videos = _asset_entries([path for path in files if path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}], kind="video", limit=50)
+    subtitles = _asset_entries([path for path in files if path.suffix.lower() in {".srt", ".vtt", ".ass", ".ssa", ".bcc"}], kind="subtitle", limit=80)
+    images = _asset_entries([path for path in files if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}], kind="image", limit=20)
+    others = _asset_entries([path for path in files if path.suffix.lower() not in {
+        ".mp4", ".mkv", ".webm", ".mov", ".m4v",
+        ".srt", ".vtt", ".ass", ".ssa", ".bcc",
+        ".jpg", ".jpeg", ".png", ".webp",
+    }], kind="file", limit=20)
+    newest = max((path.stat().st_mtime for path in files if path.exists()), default=project_dir.stat().st_mtime if project_dir.exists() else time.time())
+    manifest_updated = float(manifest.get("updated_at") or 0)
+    newest = max(newest, manifest_updated)
+    return {
+        "name": str(manifest.get("title") or project_dir.name),
+        "path": str(project_dir),
+        "project_id": str(manifest.get("project_id") or project_dir.name),
+        "source_type": str(manifest.get("source_type") or "unknown"),
+        "source_url": str(manifest.get("source_url") or ""),
+        "normalized_url": str(manifest.get("normalized_url") or ""),
+        "video_id": str(manifest.get("video_id") or ""),
+        "primary_video": str(manifest.get("primary_video") or (videos[0]["path"] if videos else "")),
+        "thumbnail": str(manifest.get("thumbnail") or (images[0]["path"] if images else "")),
+        "manifest_path": str(project_dir / PROJECT_MANIFEST_NAME),
+        "manifest": manifest,
+        "modified_at": newest,
+        "modified_label": time.strftime("%Y-%m-%d %H:%M", time.localtime(newest)),
+        "videos": videos,
+        "subtitles": subtitles,
+        "images": images,
+        "others": others,
+        "counts": {
+            "videos": len(videos),
+            "subtitles": len(subtitles),
+            "images": len(images),
+            "others": len(others),
+        },
+    }
+
+
+def _ensure_probe_thumbnail(normalized_url: str, title: str, info: dict[str, Any], *, proxy: str | None = DEFAULT_PROXY) -> Path | None:
+    title = title or str(info.get("title") or "") or "youtube_video"
+    project_dir = _youtube_project_dir_for_title(title)
+    project_dir.mkdir(parents=True, exist_ok=True)
+    existing = _matching_project_thumbnail(project_dir, title)
+    if existing:
+        update_youtube_project_metadata(project_dir, source_url=normalized_url, title=title, thumbnail_path=existing)
+        return existing
+    thumbnail_url = thumbnail_url_from_info(info)
+    if not thumbnail_url:
+        update_youtube_project_metadata(project_dir, source_url=normalized_url, title=title)
+        return None
+    try:
+        response = requests.get(thumbnail_url, timeout=30, proxies={"http": proxy, "https": proxy} if proxy else None)
+        response.raise_for_status()
+    except Exception as exc:
+        print(f"thumbnail_probe_skip: {type(exc).__name__}: {exc}", flush=True)
+        update_youtube_project_metadata(project_dir, source_url=normalized_url, title=title)
+        return None
+    extension = thumbnail_extension(thumbnail_url, response.headers.get("Content-Type", ""), image_format="jpg")
+    thumbnail_path = project_dir / f"{_filesystem_safe_title(title)}{extension}"
+    thumbnail_path.write_bytes(convert_thumbnail_bytes(response.content, image_format="jpg"))
+    update_youtube_project_metadata(project_dir, source_url=normalized_url, title=title, thumbnail_path=thumbnail_path)
+    return thumbnail_path
+
+
+def _youtube_project_dir_for_title(title: str) -> Path:
+    matches = _matching_media_files(DOWNLOAD_DIR, ["*.mp4", "*.mkv", "*.webm", "*.mov", "*.m4v", "*.jpg", "*.jpeg", "*.png", "*.webp", "*.srt"], title)
+    if matches:
+        return matches[0].parent
+    return DOWNLOAD_DIR / _filesystem_safe_title(title)
+
+
+def _matching_project_thumbnail(project_dir: Path, title: str) -> Path | None:
+    if not project_dir.exists():
+        return None
+    image_files = [path for path in project_dir.iterdir() if _is_real_file(path) and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
+    if not image_files:
+        return None
+    exact = [path for path in image_files if _filename_match_key(path.stem) == _filename_match_key(title)]
+    return sorted(exact or image_files, key=lambda path: path.stat().st_mtime, reverse=True)[0]
+
+
+def _filesystem_safe_title(title: str) -> str:
+    safe = str(title or "youtube_video").strip()
+    safe = safe.replace("/", "／").replace("\\", "＼")
+    safe = re.sub(r"[\x00-\x1f]", " ", safe)
+    safe = " ".join(safe.split())
+    return safe[:180] or "youtube_video"
+
+
+def _find_or_bind_youtube_project(normalized_url: str, title: str) -> dict[str, Any]:
+    if not DOWNLOAD_DIR.exists():
+        return {}
+    normalized_url = normalize_youtube_url(normalized_url) if normalized_url else ""
+    for project_dir in sorted([path for path in DOWNLOAD_DIR.iterdir() if path.is_dir()], key=lambda path: path.stat().st_mtime, reverse=True):
+        manifest = infer_project_manifest(project_dir)
+        if normalized_url and str(manifest.get("normalized_url") or "") == normalized_url:
+            return _download_project_entry(project_dir)
+    matches = _matching_video_files(DOWNLOAD_DIR, title)
+    if matches:
+        video = matches[0]
+        update_youtube_project_manifest(
+            video,
+            source_url=normalized_url,
+            title=title or video.parent.name,
+            thumbnail_path=_matching_thumbnail_file(video),
+        )
+        return _download_project_entry(video.parent)
+    return {}
+
+
+def _backfill_project_manifest_from_tasks(project_dir: Path) -> None:
+    if (project_dir / PROJECT_MANIFEST_NAME).exists() or not TASK_DIR.exists():
+        return
+    for task_yaml in sorted(TASK_DIR.glob("*/task.yaml"), key=lambda path: path.stat().st_mtime, reverse=True):
+        task = _read_task_file(task_yaml)
+        url = str(task.get("url") or "").strip()
+        if not url:
+            continue
+        input_video_raw = str(_task_stage_value(task, "ocr", "input_video") or "").strip()
+        if not input_video_raw:
+            continue
+        input_video = Path(input_video_raw).expanduser()
+        if not input_video.exists() or not _is_relative_to(input_video.resolve(), project_dir):
+            continue
+        update_youtube_project_manifest(
+            input_video,
+            source_url=url,
+            title=str(task.get("title") or project_dir.name),
+            thumbnail_path=_matching_thumbnail_file(input_video),
+        )
+        return
 
 
 def _ocr_job_entries(limit: int = 80) -> list[dict[str, Any]]:
@@ -2282,13 +4188,13 @@ def _child_process_env() -> dict[str, str]:
 
 def _snapshot_files(directory: Path, pattern: str) -> dict[Path, float]:
     directory.mkdir(parents=True, exist_ok=True)
-    return {path: path.stat().st_mtime for path in _iter_pattern_files(directory, pattern) if path.is_file()}
+    return {path: path.stat().st_mtime for path in _iter_pattern_files(directory, pattern) if _is_real_file(path)}
 
 
 def _changed_files(directory: Path, pattern: str, before: dict[Path, float]) -> list[Path]:
     changed: list[Path] = []
     for path in _iter_pattern_files(directory, pattern):
-        if not path.is_file():
+        if not _is_real_file(path):
             continue
         mtime = path.stat().st_mtime
         if path not in before or mtime > before[path] + 0.001:
@@ -2297,7 +4203,7 @@ def _changed_files(directory: Path, pattern: str, before: dict[Path, float]) -> 
 
 
 def _newest_files(directory: Path, pattern: str, *, limit: int) -> list[Path]:
-    files = [path for path in _iter_pattern_files(directory, pattern) if path.is_file()]
+    files = [path for path in _iter_pattern_files(directory, pattern) if _is_real_file(path)]
     return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
 
 
@@ -2319,6 +4225,16 @@ def _snapshot_image_files(directory: Path) -> dict[Path, float]:
     for pattern in ["*.jpg", "*.jpeg", "*.png", "*.webp"]:
         result.update(_snapshot_files(directory, pattern))
     return result
+
+
+def _downloaded_video_candidates(directory: Path, before: dict[Path, float], title: str, *, newest_limit: int) -> list[Path]:
+    videos = _matching_video_files(directory, title) if str(title or "").strip() else []
+    if videos:
+        return videos
+    videos = _changed_video_files(directory, before)
+    if videos:
+        return videos
+    return _newest_video_files(directory, limit=newest_limit)
 
 
 def _changed_video_files(directory: Path, before: dict[Path, float]) -> list[Path]:
@@ -2420,6 +4336,110 @@ def _filename_match_key(value: str) -> str:
     return "".join(char for char in normalized if char.isalnum())
 
 
+
+def ocr_preview_frame(payload: dict[str, Any]) -> dict[str, Any]:
+    input_video = _resolve_project_path(_required_str(payload, "input_video"))
+    _ensure_under_root(input_video)
+    if not input_video.exists():
+        raise FileNotFoundError(f"视频文件不存在: {input_video}")
+    time_seconds = _optional_float_value(payload.get("time_seconds"))
+    cv2 = _load_cv2_for_preview()
+    capture = cv2.VideoCapture(str(input_video))
+    if not capture.isOpened():
+        raise RuntimeError(f"无法打开视频: {input_video}")
+    try:
+        fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        duration = frame_count / fps if frame_count else None
+        if time_seconds is None:
+            time_seconds = duration / 2 if duration else 0.0
+        frame_index = max(0, int(time_seconds * fps))
+        if frame_count:
+            frame_index = min(frame_index, max(0, frame_count - 1))
+        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, frame = capture.read()
+        if not ok and frame_index != 0:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = capture.read()
+            frame_index = 0
+            time_seconds = 0.0
+        if not ok:
+            raise RuntimeError(f"无法读取视频帧: {input_video}")
+    finally:
+        capture.release()
+    ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 86])
+    if not ok:
+        raise RuntimeError("视频帧编码失败")
+    height, width = frame.shape[:2]
+    rect = _ocr_crop_preview_rect(
+        width,
+        height,
+        ocr_scope=str(payload.get("ocr_scope") or "bottom"),
+        crop_top_ratio=payload.get("ocr_crop_top_ratio"),
+        crop_bottom_ratio=payload.get("ocr_crop_bottom_ratio"),
+        crop_left_ratio=payload.get("ocr_crop_left_ratio"),
+        crop_right_ratio=payload.get("ocr_crop_right_ratio"),
+    )
+    image_base64 = base64.b64encode(encoded.tobytes()).decode("ascii")
+    return {
+        "input_video": str(input_video),
+        "time_seconds": frame_index / fps if fps else float(time_seconds or 0),
+        "duration_seconds": duration,
+        "width": width,
+        "height": height,
+        "crop_rect": rect,
+        "image_data_url": f"data:image/jpeg;base64,{image_base64}",
+    }
+
+
+def _load_cv2_for_preview():
+    try:
+        import cv2  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("缺少 opencv-python，无法抽帧预览。") from exc
+    return cv2
+
+
+def _optional_float_value(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
+def _ocr_crop_preview_rect(
+    width: int,
+    height: int,
+    *,
+    ocr_scope: str = "bottom",
+    crop_top_ratio: Any = None,
+    crop_bottom_ratio: Any = 0.0,
+    crop_left_ratio: Any = 0.0,
+    crop_right_ratio: Any = 0.0,
+) -> dict[str, Any]:
+    top_ratio = _normalize_ocr_crop_top_ratio(crop_top_ratio, ocr_scope)
+    bottom_ratio = _normalize_ocr_vertical_crop_ratio(crop_bottom_ratio)
+    left_ratio = _normalize_ocr_crop_ratio(crop_left_ratio)
+    right_ratio = _normalize_ocr_crop_ratio(crop_right_ratio)
+    left = round(width * left_ratio)
+    top = round(height * top_ratio)
+    right = round(width * (1 - right_ratio))
+    bottom = round(height * (1 - bottom_ratio))
+    if right <= left:
+        left, right = 0, width
+        left_ratio, right_ratio = 0.0, 0.0
+    if bottom <= top:
+        top_ratio = _normalize_ocr_crop_top_ratio(None, ocr_scope)
+        bottom_ratio = 0.0
+        top = round(height * top_ratio)
+        bottom = height
+    return {
+        "left": left,
+        "top": top,
+        "width": max(0, right - left),
+        "height": max(0, bottom - top),
+        "ratios": {"top": top_ratio, "bottom": bottom_ratio, "left": left_ratio, "right": right_ratio},
+    }
+
 def _required_str(payload: dict[str, Any], name: str) -> str:
     value = str(payload.get(name) or "").strip()
     if not value:
@@ -2442,7 +4462,7 @@ def _ensure_under_root(path: Path) -> None:
 
 def _allowed_path_roots() -> list[Path]:
     roots: list[Path] = []
-    for path in [ROOT, DOWNLOAD_DIR, JOB_DIR, GLOSSARY_DIR]:
+    for path in [ROOT, DOWNLOAD_DIR, JOB_DIR, TASK_DIR, GLOSSARY_DIR]:
         resolved = path.resolve()
         if resolved not in roots:
             roots.append(resolved)
@@ -2481,6 +4501,11 @@ def _quote_arg(value: str) -> str:
     return repr(value)
 
 
+def _api_path_segment(path: str, index: int) -> str:
+    parts = urlparse(path).path.rstrip("/").split("/")
+    return unquote(parts[index])
+
+
 class AgentHandler(BaseHTTPRequestHandler):
     server_version = "VideoTranslateAgent/0.1"
 
@@ -2488,6 +4513,17 @@ class AgentHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/agent":
             self._send_json({"sessions": list_agent_sessions()})
+            return
+        if parsed.path == "/api/agent-tasks":
+            self._send_json({"tasks": list_agent_tasks()})
+            return
+        if parsed.path.startswith("/api/agent-tasks/"):
+            task_id = _api_path_segment(parsed.path, -1)
+            task = get_agent_task(task_id)
+            if not task:
+                self._send_json({"error": "agent task not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            self._send_json(task)
             return
         if parsed.path.startswith("/api/agent/"):
             session_id = parsed.path.rstrip("/").rsplit("/", 1)[-1]
@@ -2548,6 +4584,23 @@ class AgentHandler(BaseHTTPRequestHandler):
             payload = self._read_json()
             if self.path == "/api/agent/start":
                 self._send_json(start_agent_session(payload).to_dict())
+            elif self.path == "/api/agent/continue-glossary":
+                self._send_json(continue_agent_after_glossary_review(_required_str(payload, "glossary_path")).to_dict())
+            elif self.path.startswith("/api/agent-tasks/") and self.path.rstrip("/").endswith("/delete"):
+                task_id = _api_path_segment(self.path, -2)
+                self._send_json(delete_agent_task(task_id))
+            elif self.path.startswith("/api/agent-tasks/") and self.path.rstrip("/").endswith("/complete"):
+                task_id = _api_path_segment(self.path, -2)
+                self._send_json(complete_agent_task(task_id))
+            elif self.path.startswith("/api/agent-tasks/") and self.path.rstrip("/").endswith("/reopen"):
+                task_id = _api_path_segment(self.path, -2)
+                self._send_json(reopen_agent_task(task_id))
+            elif self.path.startswith("/api/agent-tasks/") and self.path.rstrip("/").endswith("/continue"):
+                task_id = _api_path_segment(self.path, -2)
+                self._send_json(continue_agent_task(task_id).to_dict())
+            elif self.path.startswith("/api/agent-tasks/") and self.path.rstrip("/").endswith("/rerun"):
+                task_id = _api_path_segment(self.path, -2)
+                self._send_json(rerun_agent_task_stage(task_id, str(payload.get("stage") or "")).to_dict())
             elif self.path.startswith("/api/agent/") and self.path.rstrip("/").endswith("/answer"):
                 session_id = self.path.rstrip("/").split("/")[-2]
                 self._send_json(answer_agent_session(session_id, payload).to_dict())
@@ -2562,11 +4615,15 @@ class AgentHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(session.to_dict())
             elif self.path == "/api/probe":
+                source_language = normalize_source_language(payload.get("source_language") or "auto")
+                detected_source_language = str(payload.get("detected_source_language") or "")
+                if source_language != "auto" and not detected_source_language:
+                    detected_source_language = youtube_language_for_source(source_language)
                 data = probe_video(
                     _required_str(payload, "url"),
                     proxy=str(payload.get("proxy") or DEFAULT_PROXY) or None,
                     target_language=str(payload.get("target_language") or "zh"),
-                    detected_source_language=str(payload.get("detected_source_language") or ""),
+                    detected_source_language=detected_source_language,
                     embedded_subtitle_hint=str(payload.get("embedded_subtitle_hint") or "unknown"),
                 )
                 self._send_json(data)
@@ -2594,6 +4651,18 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send_json(hybrid_anchor_ocr_job(payload).to_dict())
             elif self.path == "/api/jobs/audio-local":
                 self._send_json(audio_local_video_job(payload).to_dict())
+            elif self.path == "/api/jobs/video-overlay":
+                self._send_json(video_overlay_job(payload).to_dict())
+            elif self.path == "/api/ocr-preview-frame":
+                self._send_json(ocr_preview_frame(payload))
+            elif self.path == "/api/assets/delete-project":
+                self._send_json(delete_download_project(payload))
+            elif self.path == "/api/assets/register-local-project":
+                self._send_json(register_local_project(payload))
+            elif self.path == "/api/subtitle/read":
+                self._send_json(read_subtitle_file(payload))
+            elif self.path == "/api/subtitle/write":
+                self._send_json(write_subtitle_file(payload))
             elif self.path == "/api/read-text":
                 self._send_json(read_text_file(payload))
             elif self.path == "/api/write-text":

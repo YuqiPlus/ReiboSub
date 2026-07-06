@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import shutil
 
+from video_translate.ocr.llm_refine import (
+    OCRRefinementConfig,
+    SourceCleanupConfig,
+    cleanup_ocr_source_with_llm,
+    refine_ocr_source_with_llm,
+)
+from video_translate.languages import normalize_source_language, ocr_language_for_source
 from video_translate.pipeline import CueTimingConfig, extract_subtitles_from_video
 from video_translate.subtitle.sidecar import SidecarConfig, copy_sidecar_subtitles
 from video_translate.translate.volcengine import translate_srt_with_volcengine
@@ -27,14 +35,19 @@ def run_config(config_path: Path) -> None:
     if mode in {"full", "extract"}:
         input_video = _resolve_path(root, config["input_video"])
         ocr = config.get("ocr", {}) or {}
-        source_language = str(config.get("source_language", "korean"))
+        source_language = normalize_source_language(config.get("source_language", "korean"))
         outputs = extract_subtitles_from_video(
             input_video,
             output_dir,
-            lang=source_language,
+            lang=ocr_language_for_source(source_language),
             sample_fps=float(ocr.get("sample_fps", 3.0)),
             bottom_ratio=float(ocr.get("bottom_ratio", 0.42)),
+            crop_top_ratio=_optional_float(ocr.get("crop_top_ratio")),
+            crop_bottom_ratio=float(ocr.get("crop_bottom_ratio", 0.0)),
+            crop_left_ratio=float(ocr.get("crop_left_ratio", 0.0)),
+            crop_right_ratio=float(ocr.get("crop_right_ratio", 0.0)),
             scan_full_frame=bool(ocr.get("scan_full_frame", False)),
+            auto_trim_side_noise=bool(ocr.get("auto_trim_side_noise", True)),
             device=str(ocr.get("device", "auto")),
             ignored_texts=ignored_texts,
             ignored_contains=ignored_contains,
@@ -42,12 +55,50 @@ def run_config(config_path: Path) -> None:
             cue_timing=cue_timing,
         )
         source_srt = outputs["source_srt"]
+        refinement = config.get("ocr_refinement", {}) or {}
+        if str(refinement.get("mode") or "none") == "llm_boxes":
+            machine_srt = output_dir / "source.machine.srt"
+            refined_srt = output_dir / "source.refined.srt"
+            shutil.copyfile(source_srt, machine_srt)
+            refine_ocr_source_with_llm(
+                machine_srt,
+                outputs["ocr_boxes"],
+                refined_srt,
+                model=refinement.get("model"),
+                base_url=refinement.get("base_url"),
+                config=OCRRefinementConfig(
+                    batch_size=int(refinement.get("batch_size", 12)),
+                    window_padding_seconds=float(refinement.get("window_padding_seconds", 0.50)),
+                    max_boxes_per_frame=int(refinement.get("max_boxes_per_frame", 16)),
+                ),
+            )
+            shutil.copyfile(refined_srt, source_srt)
+            print(f"machine_source_srt: {machine_srt}")
+            print(f"refined_source_srt: {refined_srt}")
+        source_cleanup = config.get("source_cleanup", {}) or {}
+        if str(source_cleanup.get("mode") or "none") == "llm_context":
+            cleanup_input_srt = output_dir / "source.before_cleanup.srt"
+            cleaned_srt = output_dir / "source.cleaned.srt"
+            shutil.copyfile(source_srt, cleanup_input_srt)
+            cleanup_ocr_source_with_llm(
+                cleanup_input_srt,
+                cleaned_srt,
+                model=source_cleanup.get("model"),
+                base_url=source_cleanup.get("base_url"),
+                config=SourceCleanupConfig(
+                    batch_size=int(source_cleanup.get("batch_size", 18)),
+                    overlap=int(source_cleanup.get("overlap", 3)),
+                ),
+            )
+            shutil.copyfile(cleaned_srt, source_srt)
+            print(f"pre_cleanup_source_srt: {cleanup_input_srt}")
+            print(f"cleaned_source_srt: {cleaned_srt}")
         print(f"source_srt: {source_srt}")
 
     if mode in {"full", "translate"}:
         translation = config.get("translation", {}) or {}
-        provider = str(translation.get("provider", "volcengine")).lower()
-        if provider != "volcengine":
+        provider = str(translation.get("provider", "openai-compatible")).lower().replace("_", "-")
+        if provider not in {"openai-compatible", "volcengine"}:
             raise ValueError(f"暂不支持翻译 provider: {provider}")
         zh_srt = output_dir / "zh.srt"
         translate_srt_with_volcengine(
@@ -96,6 +147,12 @@ def run_config(config_path: Path) -> None:
         for name, path in copied.items():
             print(f"{name}: {path}")
 
+
+
+def _optional_float(value) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
 
 def _load_yaml(path: Path) -> dict[str, Any]:
     import yaml

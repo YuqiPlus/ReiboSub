@@ -8,14 +8,21 @@ from typing import Iterable
 
 from video_translate.cache import configure_model_cache
 from video_translate.models import OCRBox
+from video_translate.utils.text import normalize_ocr_text, text_similarity
 
 
 @dataclass(slots=True)
 class ExtractConfig:
     sample_fps: float = 3.0
     bottom_ratio: float = 0.42
+    crop_top_ratio: float | None = None
+    crop_bottom_ratio: float = 0.0
+    crop_left_ratio: float = 0.0
+    crop_right_ratio: float = 0.0
     min_confidence: float = 0.45
     scan_full_frame: bool = False
+    auto_trim_side_noise: bool = True
+    suppress_full_frame_duplicates: bool = True
     device: str = "auto"
 
 
@@ -164,33 +171,172 @@ def _format_duration(seconds: float | None) -> str:
 
 def _ocr_frame(ocr, frame, time_seconds: float, frame_index: int, config: ExtractConfig) -> Iterable[OCRBox]:
     height, width = frame.shape[:2]
-    regions: list[tuple[str, int, object]] = []
-    bottom_y = int(height * (1 - config.bottom_ratio))
-    regions.append(("bottom", bottom_y, frame[bottom_y:height, 0:width]))
-    if config.scan_full_frame:
-        regions.append(("full", 0, frame))
-
-    for region_name, offset_y, image in regions:
-        result = ocr.predict(
-            image,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
+    top_y, bottom_y = _vertical_crop_bounds(height, config)
+    left_x, right_x = _horizontal_crop_bounds(width, config.crop_left_ratio, config.crop_right_ratio)
+    bottom_boxes = list(
+        _ocr_region(
+            ocr,
+            frame[top_y:bottom_y, left_x:right_x],
+            time_seconds,
+            frame_index,
+            config,
+            "bottom",
+            left_x,
+            top_y,
+            height,
+            width,
         )
-        for text, confidence, raw_points in _iter_ocr_items(result):
-            confidence = float(confidence)
-            if confidence < config.min_confidence:
+    )
+    for box in bottom_boxes:
+        yield box
+
+    if config.scan_full_frame:
+        full_boxes = _ocr_region(ocr, frame, time_seconds, frame_index, config, "full", 0, 0, height, width)
+        for box in full_boxes:
+            if config.suppress_full_frame_duplicates and _duplicates_bottom_box(box, bottom_boxes):
                 continue
-            xs = [float(point[0]) for point in raw_points]
-            ys = [float(point[1]) + offset_y for point in raw_points]
-            yield OCRBox(
-                text=str(text),
-                bbox=(min(xs), min(ys), max(xs), max(ys)),
-                confidence=confidence,
-                time=time_seconds,
-                frame_index=frame_index,
-                region=region_name,
-            )
+            yield box
+
+
+def _ocr_region(
+    ocr,
+    image,
+    time_seconds: float,
+    frame_index: int,
+    config: ExtractConfig,
+    region_name: str,
+    offset_x: int,
+    offset_y: int,
+    frame_height: int,
+    frame_width: int,
+) -> Iterable[OCRBox]:
+    result = ocr.predict(
+        image,
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+    )
+    for text, confidence, raw_points in _iter_ocr_items(result):
+        confidence = float(confidence)
+        if confidence < config.min_confidence:
+            continue
+        xs = [float(point[0]) + offset_x for point in raw_points]
+        ys = [float(point[1]) + offset_y for point in raw_points]
+        bbox = (min(xs), min(ys), max(xs), max(ys))
+        if region_name == "bottom" and config.auto_trim_side_noise and _looks_like_bottom_side_noise(bbox, str(text), frame_width, frame_height):
+            continue
+        yield OCRBox(
+            text=str(text),
+            bbox=bbox,
+            confidence=confidence,
+            time=time_seconds,
+            frame_index=frame_index,
+            region=_position_region(region_name, bbox, frame_height),
+        )
+
+
+
+
+def _vertical_crop_bounds(height: int, config: ExtractConfig) -> tuple[int, int]:
+    if config.crop_top_ratio is None:
+        top_ratio = 1 - _clamp_crop_ratio(config.bottom_ratio)
+        bottom_ratio = 0.0
+    else:
+        top_ratio = _clamp_vertical_crop_ratio(config.crop_top_ratio)
+        bottom_ratio = _clamp_vertical_crop_ratio(config.crop_bottom_ratio)
+    top_y = int(height * top_ratio)
+    bottom_y = int(height * (1 - bottom_ratio))
+    if bottom_y <= top_y:
+        return int(height * (1 - _clamp_crop_ratio(config.bottom_ratio))), height
+    return top_y, bottom_y
+
+def _horizontal_crop_bounds(width: int, left_ratio: float, right_ratio: float) -> tuple[int, int]:
+    left = _clamp_crop_ratio(left_ratio)
+    right = _clamp_crop_ratio(right_ratio)
+    left_x = int(width * left)
+    right_x = int(width * (1 - right))
+    if right_x <= left_x:
+        return 0, width
+    return left_x, right_x
+
+
+def _clamp_crop_ratio(value: float) -> float:
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(0.45, ratio))
+
+
+def _clamp_vertical_crop_ratio(value: float) -> float:
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(0.95, ratio))
+
+
+def _looks_like_bottom_side_noise(
+    bbox: tuple[float, float, float, float],
+    text: str,
+    frame_width: int,
+    frame_height: int,
+) -> bool:
+    if frame_width <= 0 or frame_height <= 0:
+        return False
+    normalized = normalize_ocr_text(text)
+    if not normalized:
+        return True
+    x1, y1, x2, y2 = bbox
+    box_width_ratio = max(0.0, x2 - x1) / frame_width
+    box_height_ratio = max(0.0, y2 - y1) / frame_height
+    center_x_ratio = ((x1 + x2) / 2) / frame_width
+    near_edge = x1 <= frame_width * 0.08 or x2 >= frame_width * 0.92 or center_x_ratio <= 0.15 or center_x_ratio >= 0.85
+    compact = box_width_ratio <= 0.20 and box_height_ratio <= 0.12 and len(normalized) <= 16
+    return bool(near_edge and compact)
+
+def _position_region(region_name: str, bbox: tuple[float, float, float, float], frame_height: int) -> str:
+    if region_name == "bottom":
+        return "bottom"
+    center_y = (bbox[1] + bbox[3]) / 2
+    ratio = center_y / max(1, frame_height)
+    if ratio < 0.30:
+        band = "top"
+    elif ratio < 0.62:
+        band = "middle"
+    else:
+        band = "lower"
+    return f"full_{band}"
+
+
+def _duplicates_bottom_box(box: OCRBox, bottom_boxes: list[OCRBox]) -> bool:
+    text = normalize_ocr_text(box.text)
+    if not text:
+        return False
+    for bottom in bottom_boxes:
+        if _bbox_iou(box.bbox, bottom.bbox) >= 0.55:
+            return True
+        if abs(_box_center_y(box) - _box_center_y(bottom)) <= 36 and text_similarity(text, normalize_ocr_text(bottom.text)) >= 0.86:
+            return True
+    return False
+
+
+def _bbox_iou(left: tuple[float, float, float, float], right: tuple[float, float, float, float]) -> float:
+    x1 = max(left[0], right[0])
+    y1 = max(left[1], right[1])
+    x2 = min(left[2], right[2])
+    y2 = min(left[3], right[3])
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    if intersection <= 0:
+        return 0.0
+    left_area = max(0.0, left[2] - left[0]) * max(0.0, left[3] - left[1])
+    right_area = max(0.0, right[2] - right[0]) * max(0.0, right[3] - right[1])
+    union = left_area + right_area - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _box_center_y(box: OCRBox) -> float:
+    return (box.bbox[1] + box.bbox[3]) / 2
 
 
 def _iter_ocr_items(result):

@@ -2,6 +2,7 @@ import argparse
 import io
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import requests
@@ -41,17 +42,21 @@ def normalize_url(url):
 
 
 def parse_quality(quality):
-    quality = quality.lower().replace("p", "").strip()
+    quality = str(quality or DEFAULT_QUALITY).lower().strip()
+    if quality in {"best", "highest", "max", "最高"}:
+        return None
+    quality = quality.replace("p", "").strip()
     if not quality.isdigit():
-        raise ValueError("分辨率格式错误，例如: 1080p、1080、720p、720")
+        raise ValueError("分辨率格式错误，例如: best、2160p、1440p、1080p、720p")
     return int(quality)
 
 
-def build_video_options(output_dir, height, *, proxy=DEFAULT_PROXY, format_selector=None, http_chunk_size=DEFAULT_HTTP_CHUNK_SIZE):
+def build_video_options(output_dir, height, *, proxy=DEFAULT_PROXY, format_selector=None, http_chunk_size=DEFAULT_HTTP_CHUNK_SIZE, archive=False):
     output_path = Path(output_dir).expanduser()
+    filename_template = "%(title)s.best.%(ext)s" if archive else "%(title)s.%(ext)s"
     ydl_opts = {
-        "format": format_selector or h264_format_selector(height),
-        "outtmpl": str(output_path / "%(title)s" / "%(title)s.%(ext)s"),
+        "format": format_selector or (best_format_selector() if height is None else h264_format_selector(height)),
+        "outtmpl": str(output_path / "%(title)s" / filename_template),
         "noplaylist": True,
         "merge_output_format": "mp4",
         "concurrent_fragment_downloads": 5,
@@ -72,8 +77,12 @@ def build_video_options(output_dir, height, *, proxy=DEFAULT_PROXY, format_selec
     return ydl_opts
 
 
+def is_video_file(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS and not path.name.startswith("._")
+
+
 def snapshot_video_files(output_dir: Path) -> set[Path]:
-    return {path for path in output_dir.rglob("*") if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS}
+    return {path for path in output_dir.rglob("*") if is_video_file(path)}
 
 
 def changed_video_files(output_dir: Path, before: set[Path]) -> list[Path]:
@@ -84,6 +93,10 @@ def changed_video_files(output_dir: Path, before: set[Path]) -> list[Path]:
     )
 
 
+def comparable_title(value: str) -> str:
+    return " ".join(str(value or "").replace("｜", "|").split()).casefold()
+
+
 def h264_format_selector(height):
     return (
         "bestvideo[height<=%d][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
@@ -92,7 +105,16 @@ def h264_format_selector(height):
     ) % (height, height, height)
 
 
+def best_format_selector():
+    return (
+        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+        "bestvideo*+bestaudio/best"
+    )
+
+
 def fallback_format_selector(height):
+    if height is None:
+        return "bestvideo*+bestaudio/best"
     return (
         "bestvideo[height<=%d][ext=mp4]+bestaudio[ext=m4a]/"
         "best[height<=%d][ext=mp4]/"
@@ -101,6 +123,12 @@ def fallback_format_selector(height):
 
 
 def download_attempts(height):
+    if height is None:
+        return [
+            ("best", best_format_selector(), DEFAULT_HTTP_CHUNK_SIZE),
+            ("best-small-chunks", best_format_selector(), 4 * 1024 * 1024),
+            ("best-fallback", fallback_format_selector(None), DEFAULT_HTTP_CHUNK_SIZE),
+        ]
     attempts = [
         ("h264-%dp" % height, h264_format_selector(height), DEFAULT_HTTP_CHUNK_SIZE),
         ("h264-%dp-small-chunks" % height, h264_format_selector(height), 4 * 1024 * 1024),
@@ -109,6 +137,64 @@ def download_attempts(height):
         attempts.append(("h264-720p-fallback", h264_format_selector(720), DEFAULT_HTTP_CHUNK_SIZE))
     attempts.append(("mp4-%dp-fallback" % height, fallback_format_selector(height), DEFAULT_HTTP_CHUNK_SIZE))
     return attempts
+
+
+def video_codec(path: Path) -> str:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:
+        return ""
+    return result.stdout.strip().splitlines()[0].lower() if result.stdout.strip() else ""
+
+
+def remove_incompatible_existing_h264_targets(output_dir: Path, title: str) -> None:
+    for video_path in matching_video_files(output_dir, title):
+        codec = video_codec(video_path)
+        if codec and codec not in {"h264", "avc1"}:
+            print(f"replace_incompatible_video: {video_path} codec={codec}")
+            video_path.unlink()
+
+
+def is_archive_quality(quality) -> bool:
+    return str(quality or "").strip().lower() in {"best", "highest", "max", "最高", "archive", "best_archive", "best-archive"}
+
+
+def matching_archive_video_files(output_dir: Path, title: str) -> list[Path]:
+    return [path for path in matching_video_files(output_dir, title) if ".best" in path.stem]
+
+
+def archive_video_path(path: Path) -> Path:
+    if ".best." in path.stem:
+        return path
+    codec = video_codec(path) or "video"
+    codec = "".join(ch for ch in codec.lower() if ch.isalnum() or ch in {"_", "-"}) or "video"
+    if path.stem.endswith(".best"):
+        target = path.with_name(f"{path.stem}.{codec}{path.suffix}")
+    else:
+        target = path.with_name(f"{path.stem}.best.{codec}{path.suffix}")
+    if target == path:
+        return path
+    if target.exists():
+        target.unlink()
+    path.rename(target)
+    return target
 
 
 def is_retriable_download_error(error):
@@ -128,6 +214,7 @@ def is_retriable_download_error(error):
 
 def download_video(url, quality=DEFAULT_QUALITY, output_dir=DEFAULT_OUTPUT_DIR, *, thumbnail_format=DEFAULT_THUMBNAIL_FORMAT):
     height = parse_quality(quality)
+    archive = is_archive_quality(quality)
     video_url = normalize_url(url)
     output_path = Path(output_dir).expanduser()
     output_path.mkdir(parents=True, exist_ok=True)
@@ -141,15 +228,26 @@ def download_video(url, quality=DEFAULT_QUALITY, output_dir=DEFAULT_OUTPUT_DIR, 
                 height,
                 format_selector=format_selector,
                 http_chunk_size=chunk_size,
+                archive=archive,
             )
             print(f"download_attempt: {attempt_name}")
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(video_url, download=False) if hasattr(ydl, "extract_info") else {}
-                    ydl.download([video_url])
+                    if height is not None:
+                        remove_incompatible_existing_h264_targets(output_path, str(info.get("title") or ""))
+                    try:
+                        ydl.download([video_url])
+                    except MaxDownloadsReached:
+                        print("Reached the maximum number of downloads. Download completed successfully.")
                 videos = changed_video_files(output_path, before_videos)
+                if archive:
+                    videos = [path for path in videos if ".best" in path.stem]
                 if not videos:
-                    videos = matching_video_files(output_path, str(info.get("title") or ""))
+                    matcher = matching_archive_video_files if archive else matching_video_files
+                    videos = matcher(output_path, str(info.get("title") or ""))
+                if archive:
+                    videos = [archive_video_path(path) for path in videos]
                 thumbnail = thumbnail_url_from_info(info)
                 for video_path in videos:
                     download_thumbnail(thumbnail, video_path, proxy=ydl_opts.get("proxy"), image_format=thumbnail_format)
@@ -162,7 +260,8 @@ def download_video(url, quality=DEFAULT_QUALITY, output_dir=DEFAULT_OUTPUT_DIR, 
                 print("download_retry_next_strategy")
     except MaxDownloadsReached:
         print("Reached the maximum number of downloads. Download completed successfully.")
-        return
+        videos = changed_video_files(output_path, before_videos)
+        return videos
     if last_error:
         raise last_error
 
@@ -170,14 +269,13 @@ def download_video(url, quality=DEFAULT_QUALITY, output_dir=DEFAULT_OUTPUT_DIR, 
 def matching_video_files(output_dir: Path, title: str) -> list[Path]:
     if not title:
         return []
-    comparable = title.casefold()
+    comparable = comparable_title(title)
     return sorted(
         [
             path
             for path in output_dir.rglob("*")
-            if path.is_file()
-            and path.suffix.lower() in VIDEO_EXTENSIONS
-            and path.stem.casefold().startswith(comparable)
+            if is_video_file(path)
+            and comparable_title(path.stem).startswith(comparable)
         ],
         key=lambda path: path.stat().st_mtime,
         reverse=True,
@@ -252,7 +350,7 @@ def convert_thumbnail_bytes(content: bytes, *, image_format=DEFAULT_THUMBNAIL_FO
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Download one YouTube video.")
     parser.add_argument("url", nargs="?", default=DEFAULT_VIDEO_URL, help="YouTube URL or video ID")
-    parser.add_argument("--quality", default=DEFAULT_QUALITY, help="Maximum height, e.g. 1080p or 720p")
+    parser.add_argument("--quality", default=DEFAULT_QUALITY, help="Video quality: best, 2160p, 1440p, 1080p, 720p, etc.")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--thumbnail-format", default=DEFAULT_THUMBNAIL_FORMAT, choices=sorted(THUMBNAIL_FORMATS), help="Thumbnail format: jpg, png, webp, or source")
     args = parser.parse_args(argv)
