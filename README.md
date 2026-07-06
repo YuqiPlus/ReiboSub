@@ -1,19 +1,30 @@
 # Video Translate
 
-Video Translate is an early-stage hard-subtitle extraction and translation tool. It can OCR video frames, merge repeated OCR results into subtitle timelines, filter persistent overlays such as logos, translate subtitles with an OpenAI-compatible LLM provider, and export SRT files. The included examples use Volcengine Ark/Doubao.
+[中文说明](README.zh-CN.md)
 
-## Features
+Video Translate is a YouTube/video subtitle production assistant. It can download YouTube videos, subtitles, and thumbnails; extract embedded hard subtitles with OCR; transcribe speech with ASR; generate and review glossary drafts; translate subtitles with an OpenAI-compatible LLM; edit and convert subtitle files; and copy playable sidecar subtitles next to the video.
 
-- Extract hard subtitles from video frames with PaddleOCR.
-- Merge frame-level OCR results into subtitle cues.
-- Filter long-lived overlays such as logos, watermarks, and fixed title cards.
-- Export `source.srt`, `zh.srt`, `tracks.json`, `ignored_tracks.json`, and `tracks_debug.csv`.
-- Use a glossary to keep character names, show names, and terms consistent.
-- Copy generated subtitles next to the source video for player debugging.
+The project is designed for a human-in-the-loop workflow: the Agent can run multiple video flows at the same time, pause when it needs your decision, and continue after you review glossary terms.
+
+## What It Can Do
+
+- **Agent cockpit**: paste a YouTube URL or video ID, let the Agent probe subtitles, choose a route, and wait for confirmation when needed.
+- **Project-based downloads**: each YouTube video is stored in its own folder with video, source subtitles, translated subtitles, thumbnail, and metadata.
+- **YouTube subtitles**: detect manual and auto subtitles, download selected tracks, and prefer source-language/manual tracks for translation.
+- **OCR subtitles**: extract hard subtitles from embedded video text with configurable crop regions and full-screen assist mode.
+- **ASR subtitles**: transcribe speech with `faster-whisper`, then optionally correct ASR text with an LLM.
+- **Hybrid workflows**: use a reliable uploaded subtitle timeline, such as English, while reconstructing original-language text from OCR when the embedded source subtitle is more accurate.
+- **Glossary review**: generate draft terms, review names/nicknames/program titles in the UI, use romanization and blind candidates, then continue translation.
+- **Subtitle editing**: edit, merge, delete, clean prefixes/trailing punctuation, and detect unmatched brackets/quotes.
+- **Subtitle conversion**: convert to common formats including SRT, VTT, ASS/SSA, LRC, TXT, JSON, and Bilibili BCC.
+- **Video overlay tool**: place watermark/logo masks on a video and export a new video without overwriting the original.
+- **Generic LLM config**: one OpenAI-compatible configuration path; the examples use Volcengine Ark/Doubao, but the variable names are provider-neutral.
+
+For the detailed YouTube Agent routing design, see [docs/youtube_agent_workflows.md](docs/youtube_agent_workflows.md).
 
 ## Quick Start
 
-Clone the project and create a Python environment:
+Clone and create a Python environment:
 
 ```bash
 git clone https://github.com/YuqiPlus/Video_Translate.git
@@ -23,42 +34,40 @@ conda activate Video_Translate
 python -m pip install -e ".[dev]"
 ```
 
-Copy the environment template:
+Optional ASR support:
+
+```bash
+python -m pip install -e ".[asr]"
+```
+
+Copy configuration templates:
 
 ```bash
 cp .env.example .env
+cp configs/llm.example.yaml configs/llm.yaml
+cp configs/run.example.yaml configs/run.yaml
 ```
 
-Edit `.env` and at least fill one provider API key. Then copy the matching LLM
-provider profile. This example enables Qianwen:
+Edit `.env`:
 
 ```text
-QIANWEN_API_KEY=your_qianwen_api_key
+LLM_API_KEY=your_api_key
+LLM_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
+YTDLP_PROXY=
+VIDEO_TRANSLATE_HOST=0.0.0.0
+VIDEO_TRANSLATE_PORT=7860
+VIDEO_TRANSLATE_DOWNLOAD_DIR=YoutubeDownloads
+VIDEO_TRANSLATE_CACHE_DIR=models
+VIDEO_TRANSLATE_OCR_DEVICE=auto
 ```
 
-```bash
-cp configs/llm.example.yaml configs/llm.yaml
-cp configs/llm.providers.qianwen.example.yaml configs/llm.providers.qianwen.yaml
-```
-
-To switch providers later, edit only `active_provider` in `configs/llm.yaml`
-after preparing the matching provider profile.
-
-If YouTube needs a proxy on your network, set it explicitly:
+If YouTube needs a proxy on your network, set only `YTDLP_PROXY`, for example:
 
 ```text
 YTDLP_PROXY=http://127.0.0.1:7890
 ```
 
-If you do not need a proxy, leave `YTDLP_PROXY=` empty. The project does not use
-a proxy by default.
-
-Run checks:
-
-```bash
-python -m video_translate doctor
-python -m pytest
-```
+Local OCR/ASR/LLM child processes do not use generic `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` by default; this keeps a YouTube proxy from slowing down local processing.
 
 Start the Agent UI:
 
@@ -72,36 +81,15 @@ Open:
 http://127.0.0.1:7860
 ```
 
-## Installation Details
+On a remote server, use the server IP and configured port, for example:
 
-Create and activate a Conda environment:
-
-```bash
-conda create -n Video_Translate python=3.11 -y
-conda activate Video_Translate
+```text
+http://<server-ip>:7860
 ```
 
-Install the project:
+## Frontend Development
 
-```bash
-python -m pip install -e .
-```
-
-For development and tests:
-
-```bash
-python -m pip install -e ".[dev]"
-python -m pytest
-```
-
-Install optional ASR support:
-
-```bash
-python -m pip install -e ".[asr]"
-```
-
-The frontend source is under `frontend/`. The Python web server serves the built
-frontend from `frontend/dist`. If you change frontend code:
+The Python server serves the built frontend from `frontend/dist`. After changing frontend code:
 
 ```bash
 cd frontend
@@ -111,175 +99,96 @@ cd ..
 python run_agent_ui.py
 ```
 
-### GPU Setup
+## LLM Configuration
 
-The default dependency can install CPU PaddlePaddle depending on your platform. If you want GPU OCR, install a GPU PaddlePaddle build that matches your CUDA runtime.
+The project uses OpenAI-compatible chat-completions APIs. Provider switching should normally require only:
 
-Example for CUDA 12.6:
+1. `.env`: update `LLM_API_KEY` and optionally `LLM_BASE_URL` / `LLM_MODEL`.
+2. `configs/llm.yaml`: update `defaults.base_url` and `defaults.models.*` if model IDs changed.
+
+Example `configs/llm.yaml` values use Volcengine Ark / Doubao:
+
+```yaml
+defaults:
+  provider: openai-compatible
+  base_url: https://ark.cn-beijing.volces.com/api/coding/v3
+  api_key_env: LLM_API_KEY
+  models:
+    default: doubao-seed-2.0-pro
+    pro: doubao-seed-2.0-pro
+    lite: doubao-seed-2.0-lite
+```
+
+Task-specific model roles live under `tasks`. Model selection order is:
+
+```text
+explicit --model
+> task-specific env var, e.g. ASR_CORRECTION_MODEL
+> configs/llm.yaml tasks.<task>.model
+> configs/llm.yaml tasks.<task>.model_role resolved through defaults.models
+> .env global LLM_MODEL
+> configs/llm.yaml defaults.model
+> configs/llm.yaml defaults.models.default
+```
+
+Legacy `ARK_*` environment variables remain compatible for older local installs, but new setups should use `LLM_*`.
+
+## GPU and Model Cache
+
+Model caches default to the project-local `models/` directory. You can override the root in `.env`:
+
+```text
+VIDEO_TRANSLATE_CACHE_DIR=/data/models/video_translate
+```
+
+For PaddleOCR GPU support, install a PaddlePaddle GPU build that matches your CUDA runtime. Example for CUDA 12.6:
 
 ```bash
 python -m pip uninstall -y paddlepaddle
 python -m pip install paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
 ```
 
-Check whether Paddle can see CUDA:
+Check CUDA visibility:
 
 ```bash
 python -c "import paddle; print(paddle.__version__); print(paddle.device.is_compiled_with_cuda()); print(paddle.device.get_device())"
 ```
 
-If CUDA is available, keep this in `configs/run.yaml`:
-
-```yaml
-ocr:
-  device: "auto"
-```
-
-When `device` is `auto`, you can set a machine-wide default in `.env`:
+If `ocr.device` is `auto`, `.env` can choose the default device:
 
 ```text
 VIDEO_TRANSLATE_OCR_DEVICE=gpu:0
 ```
 
-You can also force a device:
+For ASR with `faster-whisper`, the project tries to prepend CUDA library paths from installed `nvidia-*` Python packages. If CUDA libraries are still missing, verify your environment's `nvidia-cublas-cu12` and `nvidia-cudnn-cu12` packages.
 
-```yaml
-ocr:
-  device: "gpu:0"
-```
+## Agent Workflows
 
-## Configuration
+Typical UI flow:
 
-Copy the example files:
+1. Paste a YouTube URL or video ID in **Agent**.
+2. Tell the Agent whether embedded subtitles are present if you know.
+3. Let it probe video metadata, available subtitles, title, and route options.
+4. Choose the recommended route or manually switch to OCR/ASR/downloaded subtitles.
+5. If OCR is needed, download/preview a frame and tune the crop region.
+6. Generate a glossary draft and review terms in the glossary UI.
+7. Save the glossary; the Agent continues translation for that specific flow.
+8. Review the generated subtitle or convert it to another format.
 
-```bash
-cp .env.example .env
-cp configs/run.example.yaml configs/run.yaml
-cp configs/llm.example.yaml configs/llm.yaml
-cp configs/llm.providers.qianwen.example.yaml configs/llm.providers.qianwen.yaml
-cp configs/llm.providers.volcano.example.yaml configs/llm.providers.volcano.yaml
-```
+Multiple Agent flows can run in parallel. Running sessions are polled independently; when a flow waits for confirmation or glossary review, click its card in the Agent task list and handle it without stopping other flows.
 
-On Windows PowerShell:
+Common routes:
 
-```powershell
-copy .env.example .env
-copy configs\run.example.yaml configs\run.yaml
-copy configs\llm.example.yaml configs\llm.yaml
-copy configs\llm.providers.qianwen.example.yaml configs\llm.providers.qianwen.yaml
-copy configs\llm.providers.volcano.example.yaml configs\llm.providers.volcano.yaml
-```
+- **Existing Chinese subtitle**: download and optionally convert/rename.
+- **Source-language manual subtitle**: lock the uploaded timeline and translate with glossary guidance.
+- **Auto subtitle**: optionally correct source text, then glossary and translate.
+- **Embedded hard subtitle**: OCR source text, generate glossary, translate.
+- **Speech only**: ASR source text, optionally correct, generate glossary, translate.
+- **Hybrid anchor OCR**: use an uploaded subtitle's timeline as anchor while OCR reconstructs original-language source text.
 
-Edit `.env` and set the key for the provider selected by
-`configs/llm.yaml active_provider`:
+## Manual Commands
 
-```text
-QIANWEN_API_KEY=your_qianwen_api_key
-VOLCANO_API_KEY=your_volcano_api_key
-```
-
-Concrete model names and base URLs live in `configs/llm.providers.<name>.yaml`.
-The active provider and per-task model roles live in `configs/llm.yaml`.
-
-Do not commit `.env`. It is ignored by Git.
-
-### Environment Variables
-
-Most machine-specific settings should live in `.env`.
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `QIANWEN_API_KEY` | empty | API key used when `active_provider: qianwen`. |
-| `VOLCANO_API_KEY` | empty | API key used when `active_provider: volcano`. |
-| `LLM_API_KEY` | empty | Legacy/global fallback API key. New setups usually use provider-specific key env vars. |
-| `LLM_BASE_URL` | empty | Legacy/global fallback base URL. Provider profiles usually define this instead. |
-| `LLM_MODEL` | empty | Legacy/global fallback model. `configs/llm.yaml` task roles usually define model selection instead. |
-| `LLM_REQUEST_TIMEOUT` | `240` | HTTP timeout in seconds for LLM calls. Increase this for long subtitle batches. |
-| `LLM_REQUEST_RETRIES` | `3` | Retry count for LLM requests. |
-| `ASR_CORRECTION_MODEL` | empty | Optional override for ASR source-text correction. |
-| `YTDLP_PROXY` | empty | Proxy used only by YouTube download/probe paths. Example: `http://127.0.0.1:7890`. |
-| `YTDLP_OUTPUT_DIR` | `YoutubeDownloads` | Default output directory for direct YouTube download scripts. Relative paths are resolved from the project root. |
-| `YTDLP_SUB_LANGS` | `ko,en.*` in code, expanded in `.env.example` | Default subtitle language list for direct subtitle downloads. |
-| `VIDEO_TRANSLATE_HOST` | `0.0.0.0` | Agent UI bind host. |
-| `VIDEO_TRANSLATE_PORT` | `7860` | Agent UI port. |
-| `VIDEO_TRANSLATE_DOWNLOAD_DIR` | `YoutubeDownloads` | Download/media directory used by the Agent UI. |
-| `VIDEO_TRANSLATE_CACHE_DIR` | `models` in Agent child processes | Local model cache root for PaddleOCR/faster-whisper. |
-| `VIDEO_TRANSLATE_OCR_DEVICE` | `auto` | Global OCR device used when config/CLI passes `device=auto`. Use `gpu:0` on a single-GPU Windows machine. |
-| `HF_HOME` | `${VIDEO_TRANSLATE_CACHE_DIR}/huggingface` | Optional Hugging Face cache override. |
-| `PADDLE_HOME` | `${VIDEO_TRANSLATE_CACHE_DIR}/paddle` | Optional Paddle cache override. |
-| `PADDLE_PDX_CACHE_HOME` | `${VIDEO_TRANSLATE_CACHE_DIR}/paddlex` | Optional PaddleX model cache override. |
-
-Proxy note: generic `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` are removed
-from Agent child processes so local OCR/ASR/LLM work does not accidentally go
-through a YouTube proxy. Use `YTDLP_PROXY` for YouTube only.
-
-LLM task routing lives in `configs/llm.yaml`; provider details live in
-`configs/llm.providers.<name>.yaml`.
-
-Model selection order:
-
-```text
-explicit --model
-> task-specific env var, e.g. ASR_CORRECTION_MODEL
-> configs/llm.yaml tasks.<task>.model
-> configs/llm.yaml tasks.<task>.model_role resolved through active provider
-> .env global default LLM_MODEL
-> configs/llm.yaml defaults.model
-> active provider models.default
-```
-
-In practice, keep `configs/llm.yaml` provider-neutral by using model roles such
-as `pro` and `lite`. Then switch between Qianwen and Volcengine by changing only:
-
-```yaml
-active_provider: qianwen
-```
-
-Older local installs that still use `ARK_API_KEY`, `ARK_BASE_URL`,
-`ARK_MODEL`, `ARK_REQUEST_TIMEOUT`, or `ARK_REQUEST_RETRIES` remain compatible,
-but new setups should use the provider-neutral `LLM_*` names.
-
-Edit `configs/run.yaml`:
-
-```yaml
-mode: full
-input_video: "/path/to/video.mp4"
-source_srt: "outputs/demo/source.srt"
-output_dir: "outputs/demo"
-
-source_language: "korean"
-target_language: "简体中文"
-glossary: "configs/glossaries/examples/glossary.example.yaml"
-
-ocr:
-  device: "auto"
-  sample_fps: 3.0
-  bottom_ratio: 0.42
-  scan_full_frame: false
-
-translation:
-  provider: "volcengine"
-  batch_size: 40
-  model: null
-  base_url: null
-
-sidecar:
-  enabled: true
-  copy_source: true
-  copy_translated: true
-  source_suffix: ".source"
-  translated_suffix: ".zh"
-```
-
-Modes:
-
-- `extract`: OCR only.
-- `translate`: translate an existing `source_srt`.
-- `full`: OCR, then translate.
-
-## Usage
-
-Check dependencies and cache paths:
+Probe dependencies and cache paths:
 
 ```bash
 python -m video_translate doctor
@@ -289,122 +198,104 @@ Run from `configs/run.yaml`:
 
 ```bash
 python run_from_config.py
+# or
+video-translate run-config configs/run.yaml
 ```
 
-Run the Agent UI:
-
-```bash
-python run_agent_ui.py --host 0.0.0.0 --port 7860
-```
-
-Or via `.env`:
-
-```text
-VIDEO_TRANSLATE_HOST=0.0.0.0
-VIDEO_TRANSLATE_PORT=7860
-```
-
-Extract subtitles from a video:
+Extract hard subtitles from a local video:
 
 ```bash
 python -m video_translate extract "input.mp4" --lang korean --out "outputs/demo"
 ```
 
-Use full-frame OCR when screen text outside the lower subtitle area matters:
+Extract with full-screen assist:
 
 ```bash
 python -m video_translate extract "input.mp4" --lang korean --out "outputs/demo" --scan-full-frame
 ```
 
-Translate an extracted SRT with Volcengine Ark/Doubao:
+Translate an existing SRT with the configured OpenAI-compatible provider:
 
 ```bash
-python -m video_translate translate-volcengine "outputs/demo/source.srt" --glossary "configs/glossaries/examples/glossary.example.yaml" --out "outputs/demo/zh.srt"
+python -m video_translate translate-volcengine "outputs/demo/source.srt" \
+  --glossary "configs/glossaries/examples/glossary.example.yaml" \
+  --out "outputs/demo/zh.srt"
 ```
 
-Reprocess an existing `tracks.json` after changing filtering logic:
-
-```bash
-python -m video_translate reprocess-tracks "outputs/demo/tracks.json" --out "outputs/demo"
-```
-
-Prepare a JSON translation batch without calling an LLM:
-
-```bash
-python -m video_translate prepare-translation "outputs/demo/source.srt" --glossary "configs/glossaries/examples/glossary.example.yaml" --out "outputs/demo/translation_batch.json"
-```
-
-Apply a translated JSON result back to SRT:
-
-```bash
-python -m video_translate apply-translation "outputs/demo/source.srt" "outputs/demo/translated.json" --out "outputs/demo/zh.srt"
-```
-
-## Command-Line Tools
-
-Tool implementations live under `video_translate.youtube` and `video_translate.tools`.
-Prefer module commands for new automation:
+YouTube and subtitle helper modules:
 
 ```bash
 python -m video_translate.youtube.download_subtitles "https://www.youtube.com/watch?v=..." --sub-langs ko,en
 python -m video_translate.youtube.download_video "https://www.youtube.com/watch?v=..."
-python -m video_translate.tools.generate_glossary "YoutubeDownloads/example.ko.srt" --out "configs/glossaries/example.draft.yaml"
-python -m video_translate.tools.translate_subtitles "YoutubeDownloads/example.ko.srt" --glossary "configs/glossaries/examples/glossary.example.yaml"
+python -m video_translate.tools.generate_glossary "YoutubeDownloads/example.ko.srt" --out "outputs/example/glossary.draft.yaml"
+python -m video_translate.tools.translate_subtitles "YoutubeDownloads/example.ko.srt" --glossary "outputs/example/glossary.draft.yaml"
 python -m video_translate.tools.convert_subtitle "YoutubeDownloads/example.zh.srt" --format bcc
-python run_agent_ui.py --host 0.0.0.0 --port 7860
 ```
 
-Thin script wrappers are kept under `scripts/` for manual use, for example:
+Script wrappers under `scripts/` provide equivalent manual entry points.
 
-```bash
-python scripts/download_youtube_video.py "https://www.youtube.com/watch?v=..."
-python scripts/translate_downloaded_subtitles.py "YoutubeDownloads/example.ko.srt"
-```
+## Output Layout
 
-Downloaded videos and subtitles are ignored by Git. Agent-created per-task glossary drafts live under `outputs/agent_jobs/<job_id>/` with the rest of that task's logs and artifacts. Keep only reusable glossary files under `configs/glossaries/`; the tracked starter example is `configs/glossaries/examples/glossary.example.yaml`.
-
-## Outputs
-
-Typical output files:
-
-- `source.srt`: OCR source-language subtitles.
-- `zh.srt`: translated subtitles.
-- `tracks.json`: full OCR text tracks with boxes and metadata.
-- `ignored_tracks.json`: tracks filtered as persistent overlays.
-- `tracks_debug.csv`: spreadsheet-friendly debug table with bbox positions and filter reasons.
-
-If `sidecar.enabled` is `true`, generated subtitles are also copied next to the input video. For `demo.mp4`, the sidecar files are:
+Downloaded YouTube projects are stored under `YoutubeDownloads/<video-title>/` by default. Typical files:
 
 ```text
-demo.source.srt
-demo.zh.srt
+<video-title>.mp4
+<video-title>.jpg
+<video-title>.source.srt
+<video-title>.zh.srt
+project.yaml
 ```
 
-Existing sidecar files are overwritten on each run.
-
-## Cache
-
-By default, model caches are stored in the project directory:
+Agent task state and intermediate artifacts live under:
 
 ```text
-.cache/
+outputs/agent_tasks/<task-id>/
+outputs/agent_jobs/<job-id>/
 ```
 
-To put model caches elsewhere:
+Common pipeline outputs:
+
+- `source.srt`: source-language subtitle from OCR/ASR/downloaded track.
+- `zh.srt`: translated Chinese subtitle.
+- `tracks.json`: OCR text tracks with boxes and metadata.
+- `ignored_tracks.json`: tracks filtered as persistent overlays/noise.
+- `tracks_debug.csv`: spreadsheet-friendly OCR/debug table.
+- `*.bcc`: Bilibili subtitle JSON output.
+
+If sidecar copying is enabled, generated subtitles are copied next to the video so common players can auto-load them.
+
+## Files You Should Not Commit
+
+The repository ignores local data by default:
+
+- `.env`
+- `configs/run.yaml`
+- `configs/llm.yaml`
+- `YoutubeDownloads/`
+- `outputs/`
+- `models/`
+- generated media/subtitle files such as `*.mp4`, `*.srt`, `*.vtt`, `*.ass`, `*.bcc`
+
+Keep reusable glossary examples under `configs/glossaries/examples/`. Per-task glossary drafts belong in `outputs/agent_tasks/<task-id>/` or another ignored working directory.
+
+## Testing
+
+Backend tests:
 
 ```bash
-export VIDEO_TRANSLATE_CACHE_DIR="/path/to/model-cache"
+python -m pytest -q
 ```
 
-On Windows PowerShell:
+Frontend unit tests:
 
-```powershell
-$env:VIDEO_TRANSLATE_CACHE_DIR="C:\path\to\Video_Translate\.cache"
+```bash
+cd frontend
+node --test src/*.test.mjs
 ```
 
-## Notes
+Frontend build:
 
-- Start with `mode: extract` and `sample_fps: 1.0` when tuning OCR.
-- Use `tracks_debug.csv` to inspect text positions and filter reasons.
-- `scan_full_frame: true` catches more screen text, but also increases logo, watermark, and UI noise.
-- Keep personal paths in `configs/run.yaml`; it is ignored by Git.
+```bash
+cd frontend
+npm run build
+```
