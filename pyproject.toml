@@ -4,11 +4,12 @@ version = "0.1.0"
 description = "Extract hard subtitles from videos, filter overlay noise, and prepare translated subtitle files."
 requires-python = ">=3.10"
 dependencies = [
-    "opencv-python>=4.8",
-    "paddleocr>=2.7",
-    "paddlepaddle>=2.6",
-    "pyyaml>=6.0",
-    "requests>=2.31",
+    "opencv-python>=4.8,<5",
+    "paddleocr>=3.0,<4",
+    "paddlepaddle>=3.0,<4",
+    "Pillow>=10,<13",
+    "pyyaml>=6.0,<7",
+    "requests>=2.31,<3",
     "yt-dlp>=2025.1.1",
 ]
 

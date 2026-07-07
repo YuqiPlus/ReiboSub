@@ -1,0 +1,10 @@
+name: video-translate
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - ffmpeg
+  - nodejs>=20
+  - pip:
+      - -e .[dev,asr]

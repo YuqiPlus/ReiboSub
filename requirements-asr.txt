@@ -1,0 +1,5 @@
+# Optional ASR dependencies.
+# Install after requirements.txt if you need audio transcription.
+
+-r requirements.txt
+faster-whisper>=1.1,<2

@@ -13,6 +13,7 @@ Video Translate 是一个面向 YouTube 和本地视频的字幕制作 Agent。�
 - **YouTube 字幕下载**：区分作者上传字幕和自动字幕，可选择语言下载。
 - **OCR 硬字幕提取**：支持限定区域、全屏辅助、可视化裁剪预览、源文精修。
 - **ASR 音频字幕**：使用 `faster-whisper` 从音频生成源字幕，可选 LLM 原文纠错。
+- **视频上传流程**：在浏览器里上传本地视频后，直接启动 ASR 中文字幕任务。
 - **Hybrid 路线**：可用作者上传字幕的时间轴定轴，同时用 OCR 还原原声语言文本。
 - **Glossary 审核**：自动生成术语草稿，UI 中审核人名、昵称、作品名、专有词；支持罗马音、证据原句和盲翻候选。
 - **字幕精修**：逐条改字、合并、删除、去名前缀、去尾逗号、检测半边括号/引号。
@@ -24,6 +25,12 @@ Video Translate 是一个面向 YouTube 和本地视频的字幕制作 Agent。�
 
 ## 快速开始
 
+先安装系统工具：
+
+- Python 3.10 或更新版本，推荐 Python 3.11。
+- `ffmpeg` 需要在 `PATH` 里，用于视频/音频处理和字幕封装。
+- 只有需要重新构建前端时才需要 Node.js 20 或更新版本。
+
 克隆项目并创建 Python 环境：
 
 ```bash
@@ -31,13 +38,23 @@ git clone https://github.com/YuqiPlus/Video_Translate.git
 cd Video_Translate
 conda create -n Video_Translate python=3.11 -y
 conda activate Video_Translate
-python -m pip install -e ".[dev]"
+python -m pip install -U pip
+python -m pip install -r requirements-dev.txt
+python -m pip install -e ".[dev,asr]"
 ```
 
-如果要用 ASR：
+也可以直接使用提供的 conda 环境文件：
 
 ```bash
-python -m pip install -e ".[asr]"
+conda env create -f environment.yml
+conda activate video-translate
+```
+
+如果只想最小安装，不需要 ASR 和测试依赖：
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
 
 复制配置模板：
@@ -145,8 +162,12 @@ VIDEO_TRANSLATE_CACHE_DIR=/data/models/video_translate
 
 ```bash
 python -m pip uninstall -y paddlepaddle
+python -m pip install -r requirements-gpu-cu126.txt
 python -m pip install paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+python -m pip install -e ".[dev,asr]" --no-deps
 ```
+
+GPU requirements 文件不会安装 CPU 版 `paddlepaddle`，只包含通用运行依赖和 `faster-whisper` 常用的 CUDA Python wheels。
 
 检查 Paddle 是否能看到 CUDA：
 

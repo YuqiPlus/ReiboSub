@@ -13,6 +13,7 @@ The project is designed for a human-in-the-loop workflow: the Agent can run mult
 - **YouTube subtitles**: detect manual and auto subtitles, download selected tracks, and prefer source-language/manual tracks for translation.
 - **OCR subtitles**: extract hard subtitles from embedded video text with configurable crop regions and full-screen assist mode.
 - **ASR subtitles**: transcribe speech with `faster-whisper`, then optionally correct ASR text with an LLM.
+- **Video upload flow**: upload a local video from the browser and start an ASR-to-Chinese subtitle job directly.
 - **Hybrid workflows**: use a reliable uploaded subtitle timeline, such as English, while reconstructing original-language text from OCR when the embedded source subtitle is more accurate.
 - **Glossary review**: generate draft terms, review names/nicknames/program titles in the UI, use romanization and blind candidates, then continue translation.
 - **Subtitle editing**: edit, merge, delete, clean prefixes/trailing punctuation, and detect unmatched brackets/quotes.
@@ -24,6 +25,12 @@ For the detailed YouTube Agent routing design, see [docs/youtube_agent_workflows
 
 ## Quick Start
 
+Install system tools first:
+
+- Python 3.10 or newer, Python 3.11 recommended.
+- `ffmpeg` in `PATH` for video/audio processing and subtitle muxing.
+- Node.js 20 or newer only if you want to rebuild the frontend.
+
 Clone and create a Python environment:
 
 ```bash
@@ -31,13 +38,23 @@ git clone https://github.com/YuqiPlus/Video_Translate.git
 cd Video_Translate
 conda create -n Video_Translate python=3.11 -y
 conda activate Video_Translate
-python -m pip install -e ".[dev]"
+python -m pip install -U pip
+python -m pip install -r requirements-dev.txt
+python -m pip install -e ".[dev,asr]"
 ```
 
-Optional ASR support:
+If you prefer one conda command, use the provided environment file:
 
 ```bash
-python -m pip install -e ".[asr]"
+conda env create -f environment.yml
+conda activate video-translate
+```
+
+For a smaller install without ASR/test dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
 
 Copy configuration templates:
@@ -145,8 +162,12 @@ For PaddleOCR GPU support, install a PaddlePaddle GPU build that matches your CU
 
 ```bash
 python -m pip uninstall -y paddlepaddle
+python -m pip install -r requirements-gpu-cu126.txt
 python -m pip install paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+python -m pip install -e ".[dev,asr]" --no-deps
 ```
+
+The GPU requirements file avoids installing CPU `paddlepaddle`; it only lists the common runtime packages plus CUDA Python wheels used by `faster-whisper`.
 
 Check CUDA visibility:
 

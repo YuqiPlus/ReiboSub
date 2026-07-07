@@ -1,0 +1,4 @@
+# Development and test dependencies.
+
+-r requirements-asr.txt
+pytest>=8,<10
