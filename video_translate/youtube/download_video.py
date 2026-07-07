@@ -3,6 +3,7 @@ import io
 import os
 import shutil
 import subprocess
+import unicodedata
 from pathlib import Path
 
 import requests
@@ -11,6 +12,7 @@ from PIL import Image
 from yt_dlp.utils import DownloadError, MaxDownloadsReached
 
 from video_translate.env import load_dotenv
+from video_translate.youtube.filenames import youtube_output_template
 from video_translate.youtube_url import normalize_youtube_url
 
 
@@ -51,12 +53,13 @@ def parse_quality(quality):
     return int(quality)
 
 
-def build_video_options(output_dir, height, *, proxy=DEFAULT_PROXY, format_selector=None, http_chunk_size=DEFAULT_HTTP_CHUNK_SIZE, archive=False):
+def build_video_options(output_dir, height, *, proxy=DEFAULT_PROXY, format_selector=None, http_chunk_size=DEFAULT_HTTP_CHUNK_SIZE, archive=False, project_title=None):
     output_path = Path(output_dir).expanduser()
     filename_template = "%(title)s.best.%(ext)s" if archive else "%(title)s.%(ext)s"
+    outtmpl = youtube_output_template(output_path, project_title, archive=archive) if project_title else str(output_path / "%(title)s" / filename_template)
     ydl_opts = {
         "format": format_selector or (best_format_selector() if height is None else h264_format_selector(height)),
-        "outtmpl": str(output_path / "%(title)s" / filename_template),
+        "outtmpl": outtmpl,
         "noplaylist": True,
         "merge_output_format": "mp4",
         "concurrent_fragment_downloads": 5,
@@ -77,6 +80,17 @@ def build_video_options(output_dir, height, *, proxy=DEFAULT_PROXY, format_selec
     return ydl_opts
 
 
+def update_yt_dlp_outtmpl(ydl, ydl_opts: dict, outtmpl: str) -> None:
+    ydl_opts["outtmpl"] = outtmpl
+    if not hasattr(ydl, "params"):
+        return
+    current = ydl.params.get("outtmpl")
+    if isinstance(current, dict):
+        current["default"] = outtmpl
+    else:
+        ydl.params["outtmpl"] = {"default": outtmpl}
+
+
 def is_video_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS and not path.name.startswith("._")
 
@@ -94,7 +108,8 @@ def changed_video_files(output_dir: Path, before: set[Path]) -> list[Path]:
 
 
 def comparable_title(value: str) -> str:
-    return " ".join(str(value or "").replace("｜", "|").split()).casefold()
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    return " ".join(normalized.split()).casefold()
 
 
 def h264_format_selector(height):
@@ -234,8 +249,11 @@ def download_video(url, quality=DEFAULT_QUALITY, output_dir=DEFAULT_OUTPUT_DIR, 
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(video_url, download=False) if hasattr(ydl, "extract_info") else {}
+                    title = str(info.get("title") or "")
+                    if title:
+                        update_yt_dlp_outtmpl(ydl, ydl_opts, youtube_output_template(output_path, title, archive=archive))
                     if height is not None:
-                        remove_incompatible_existing_h264_targets(output_path, str(info.get("title") or ""))
+                        remove_incompatible_existing_h264_targets(output_path, title)
                     try:
                         ydl.download([video_url])
                     except MaxDownloadsReached:

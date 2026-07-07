@@ -10,7 +10,6 @@ from video_translate.youtube.download_video import (
     DEFAULT_OUTPUT_DIR,
     DEFAULT_PROXY,
     DEFAULT_THUMBNAIL_FORMAT,
-    IMAGE_EXTENSIONS,
     THUMBNAIL_FORMATS,
     convert_thumbnail_bytes,
     normalize_url,
@@ -18,6 +17,7 @@ from video_translate.youtube.download_video import (
     thumbnail_extension,
     thumbnail_url_from_info,
 )
+from video_translate.youtube.filenames import filesystem_safe_title, youtube_project_dir
 
 
 def build_thumbnail_options(output_dir=DEFAULT_OUTPUT_DIR, *, proxy=DEFAULT_PROXY):
@@ -47,9 +47,9 @@ def download_thumbnail(url, output_dir=DEFAULT_OUTPUT_DIR, *, proxy=DEFAULT_PROX
         response = requests.get(thumbnail_url, timeout=30, proxies={"http": proxy, "https": proxy} if proxy else None)
         response.raise_for_status()
         extension = thumbnail_extension(thumbnail_url, response.headers.get("Content-Type", ""), image_format=image_format)
-        thumbnail_path = Path(ydl.prepare_filename({**info, "ext": extension.lstrip(".")}))
-        if thumbnail_path.suffix.lower() not in IMAGE_EXTENSIONS:
-            thumbnail_path = thumbnail_path.with_suffix(extension)
+        title = str(info.get("title") or "youtube_video")
+        safe_title = filesystem_safe_title(title)
+        thumbnail_path = youtube_project_dir(output_dir, title) / f"{safe_title}{extension}"
         thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
         thumbnail_path.write_bytes(convert_thumbnail_bytes(response.content, image_format=image_format))
         print(f"thumbnail_path: {thumbnail_path}", flush=True)

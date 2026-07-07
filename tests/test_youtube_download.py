@@ -53,6 +53,20 @@ def test_build_subtitle_options_downloads_subtitles_only(tmp_path):
     assert "proxy" not in opts
 
 
+def test_build_subtitle_options_can_use_safe_project_title(tmp_path):
+    module = _load_subtitle_module()
+
+    opts = module.build_subtitle_options(
+        output_dir=tmp_path,
+        subtitle_languages="ko,en.*",
+        proxy="",
+        project_title='A | B: "C"?',
+    )
+
+    assert opts["outtmpl"] == str(tmp_path / "A ｜ B： ＂C＂？" / "A ｜ B： ＂C＂？.%(ext)s")
+    assert "|" not in Path(opts["outtmpl"]).parent.name
+
+
 def test_build_subtitle_options_can_list_subtitles(tmp_path):
     module = _load_subtitle_module()
 
@@ -211,6 +225,44 @@ def test_video_download_template_uses_project_folder(monkeypatch, tmp_path):
     assert captured["http_chunk_size"] == module.DEFAULT_HTTP_CHUNK_SIZE
 
 
+def test_video_download_template_can_use_safe_project_title(tmp_path):
+    module = _load_video_module()
+
+    opts = module.build_video_options(tmp_path, 1080, proxy="", project_title='A | B: "C"?')
+
+    assert opts["outtmpl"] == str(tmp_path / "A ｜ B： ＂C＂？" / "A ｜ B： ＂C＂？.%(ext)s")
+    assert "|" not in Path(opts["outtmpl"]).parent.name
+
+
+def test_video_download_updates_yt_dlp_default_outtmpl_after_probe(monkeypatch, tmp_path):
+    module = _load_video_module()
+    captured = {}
+
+    class FakeYoutubeDL:
+        def __init__(self, opts):
+            self.opts = opts
+            self.params = {"outtmpl": {"default": opts["outtmpl"]}}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {"title": "A | B", "thumbnail": ""}
+
+        def download(self, urls):
+            captured["outtmpl"] = self.params["outtmpl"]["default"]
+
+    monkeypatch.setattr(module.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(module.shutil, "which", lambda name: None)
+
+    module.download_video("abc123", output_dir=tmp_path)
+
+    assert captured["outtmpl"] == str(tmp_path / "A ｜ B" / "A ｜ B.%(ext)s")
+
+
 def test_best_video_download_uses_archive_template_and_preserves_primary(monkeypatch, tmp_path):
     module = _load_video_module()
     video_dir = tmp_path / "Demo Video"
@@ -247,7 +299,7 @@ def test_best_video_download_uses_archive_template_and_preserves_primary(monkeyp
     assert downloaded == [archive]
     assert primary.read_text(encoding="utf-8") == "primary"
     assert archive.read_text(encoding="utf-8") == "archive"
-    assert calls[0]["outtmpl"] == str(tmp_path / "%(title)s" / "%(title)s.best.%(ext)s")
+    assert calls[0]["outtmpl"] == str(tmp_path / "Demo Video" / "Demo Video.best.%(ext)s")
 
 
 def test_video_download_still_downloads_thumbnail_after_max_downloads_reached(monkeypatch, tmp_path):
@@ -349,6 +401,16 @@ def test_video_download_matches_yt_dlp_sanitized_pipe_title(tmp_path):
     assert module.matching_video_files(tmp_path, "A | B") == [video]
 
 
+def test_video_download_matches_safe_windows_title(tmp_path):
+    module = _load_video_module()
+    video_dir = tmp_path / "A ｜ B： C？"
+    video_dir.mkdir()
+    video = video_dir / "A ｜ B： C？.mp4"
+    video.write_bytes(b"video")
+
+    assert module.matching_video_files(tmp_path, "A | B: C?") == [video]
+
+
 def test_video_download_ignores_macos_resource_fork_files(tmp_path):
     module = _load_video_module()
     video_dir = tmp_path / "Demo Video"
@@ -423,7 +485,7 @@ def test_organize_downloads_dry_run_groups_related_files_without_moving(tmp_path
 
     actions = organize_downloads(tmp_path, dry_run=True)
 
-    lines = [action.line() for action in actions]
+    lines = [action.line().replace("\\", "/") for action in actions]
     assert any("Demo Video.mp4" in line and "Demo Video/Demo Video.mp4" in line for line in lines)
     assert any("Demo Video.source.corrected.zh.srt" in line and "Demo Video/Demo Video.source.corrected.zh.srt" in line for line in lines)
     assert any(line.startswith("delete:") and "._Demo Video.mp4" in line for line in lines)

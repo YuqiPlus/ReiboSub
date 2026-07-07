@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import time
 
@@ -23,6 +24,13 @@ def test_caption_entries_collects_formats():
     assert entries[0]["kind"] == "auto"
     assert entries[0]["formats"] == ["json3", "vtt"]
     assert entries[1]["label"] == "ko · 自动字幕"
+
+
+def test_filesystem_safe_title_removes_windows_forbidden_chars():
+    safe = web_agent._filesystem_safe_title('A | B: "C"? *D*')
+
+    assert safe == "A ｜ B： ＂C＂？ ＊D＊"
+    assert not any(char in safe for char in '<>:"/\\|?*')
 
 
 def test_probe_video_normalizes_url_and_adds_agent_plan(monkeypatch):
@@ -423,7 +431,7 @@ def test_agent_session_ocr_extracts_then_generates_glossary(monkeypatch, tmp_pat
     assert snapshot["question"]["kind"] == "review_glossary"
     assert "OCR 原文字幕" in snapshot["question"]["message"]
     assert snapshot["result"]["source_kind"] == "ocr"
-    assert snapshot["result"]["source_srt"].endswith("agent_tasks/abc123_demo/source.srt")
+    assert Path(snapshot["result"]["source_srt"]).parts[-3:] == ("agent_tasks", "abc123_demo", "source.srt")
     assert calls == ["ocr:https://www.youtube.com/watch?v=abc123", f"glossary:{snapshot['result']['source_srt']}:korean"]
 
 
@@ -487,7 +495,7 @@ def test_agent_session_asr_generates_glossary(monkeypatch, tmp_path):
     assert snapshot["question"]["kind"] == "review_glossary"
     assert "ASR" in snapshot["question"]["message"]
     assert snapshot["result"]["source_kind"] == "asr"
-    assert snapshot["result"]["source_srt"].endswith("agent_tasks/abc123_demo/source.srt")
+    assert Path(snapshot["result"]["source_srt"]).parts[-3:] == ("agent_tasks", "abc123_demo", "source.srt")
     assert calls == [
         "video:https://www.youtube.com/watch?v=abc123",
         f"asr:{video}:auto",
@@ -696,7 +704,7 @@ def test_agent_session_reuses_cached_ocr_before_generating_glossary(monkeypatch,
     snapshot = _wait_agent_phase(session.id, "review_glossary")
 
     assert snapshot["result"]["reused_ocr"] is True
-    assert snapshot["result"]["source_srt"].endswith("agent_tasks/abc123_demo/source.srt")
+    assert Path(snapshot["result"]["source_srt"]).parts[-3:] == ("agent_tasks", "abc123_demo", "source.srt")
     assert calls == [f"glossary:{snapshot['result']['source_srt']}:korean"]
 
 
@@ -2117,7 +2125,7 @@ def test_child_process_env_adds_nvidia_cuda_library_paths(monkeypatch, tmp_path:
 
     env = web_agent._child_process_env()
 
-    paths = env["LD_LIBRARY_PATH"].split(":")
+    paths = env["LD_LIBRARY_PATH"].split(os.pathsep)
     assert paths[0] == str(lib_dir)
     assert str(existing_dir) in paths
 

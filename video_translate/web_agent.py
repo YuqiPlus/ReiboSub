@@ -56,6 +56,7 @@ from video_translate.translate.volcengine import (
 )
 from video_translate.utils.timecode import format_srt_time, parse_srt_time
 from video_translate.youtube.download_video import convert_thumbnail_bytes, thumbnail_extension, thumbnail_url_from_info
+from video_translate.youtube.filenames import filesystem_safe_title
 from video_translate.youtube_url import normalize_youtube_url
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -4035,11 +4036,7 @@ def _matching_project_thumbnail(project_dir: Path, title: str) -> Path | None:
 
 
 def _filesystem_safe_title(title: str) -> str:
-    safe = str(title or "youtube_video").strip()
-    safe = safe.replace("/", "／").replace("\\", "＼")
-    safe = re.sub(r"[\x00-\x1f]", " ", safe)
-    safe = " ".join(safe.split())
-    return safe[:180] or "youtube_video"
+    return filesystem_safe_title(title)
 
 
 def _find_or_bind_youtube_project(normalized_url: str, title: str) -> dict[str, Any]:

@@ -5,6 +5,7 @@ from pathlib import Path
 import yt_dlp
 
 from video_translate.env import load_dotenv
+from video_translate.youtube.filenames import youtube_output_template
 from video_translate.youtube_url import normalize_youtube_url
 
 
@@ -48,12 +49,13 @@ def build_subtitle_options(
     subtitle_languages=DEFAULT_SUBTITLE_LANGUAGES,
     subtitle_format=DEFAULT_SUBTITLE_FORMAT,
     convert_subtitles=DEFAULT_CONVERT_SUBTITLES,
+    project_title=None,
 ):
     output_path = Path(output_dir).expanduser()
     output_path.mkdir(parents=True, exist_ok=True)
 
     ydl_opts = {
-        "outtmpl": str(output_path / "%(title)s" / "%(title)s.%(ext)s"),
+        "outtmpl": youtube_output_template(output_path, project_title) if project_title else str(output_path / "%(title)s" / "%(title)s.%(ext)s"),
         "noplaylist": True,
         "skip_download": True,
         "overwrites": True,
@@ -87,6 +89,15 @@ def download_subtitles(
     convert_subtitles=DEFAULT_CONVERT_SUBTITLES,
 ):
     video_url = normalize_url(url)
+    probe_opts = {
+        "noplaylist": True,
+        "skip_download": True,
+        "quiet": True,
+    }
+    if proxy:
+        probe_opts["proxy"] = proxy
+    with yt_dlp.YoutubeDL(probe_opts) as ydl:
+        info = ydl.extract_info(video_url, download=False) if hasattr(ydl, "extract_info") else {}
     ydl_opts = build_subtitle_options(
         output_dir,
         proxy=proxy,
@@ -96,6 +107,7 @@ def download_subtitles(
         subtitle_languages=subtitle_languages,
         subtitle_format=subtitle_format,
         convert_subtitles=convert_subtitles,
+        project_title=str(info.get("title") or ""),
     )
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:

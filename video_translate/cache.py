@@ -63,7 +63,8 @@ def cuda_library_dirs() -> list[Path]:
 
 
 def prepend_library_path(env: dict[str, str], paths: list[Path], *, variable: str = "LD_LIBRARY_PATH") -> None:
-    existing = [item for item in env.get(variable, "").split(":") if item]
+    separator = os.pathsep
+    existing = [item for item in env.get(variable, "").split(separator) if item]
     prefix = [str(path) for path in paths if str(path) not in existing]
     if prefix:
-        env[variable] = ":".join([*prefix, *existing])
+        env[variable] = separator.join([*prefix, *existing])
