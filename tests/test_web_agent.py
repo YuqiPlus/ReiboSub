@@ -2090,6 +2090,85 @@ def test_audio_local_video_job_builds_transcription_command(monkeypatch, tmp_pat
     assert (video.parent / "demo.source.srt").exists()
 
 
+
+
+def test_save_uploaded_project_cover_updates_manifest(monkeypatch, tmp_path: Path):
+    project = tmp_path / "YoutubeDownloads" / "demo"
+    project.mkdir(parents=True)
+    video = project / "demo.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "YoutubeDownloads")
+    web_agent.register_local_project({"input_video": str(video), "title": "demo"})
+
+    result = web_agent.save_uploaded_project_cover(
+        project_path=str(project),
+        filename="../cover.png",
+        content=b"png-bytes",
+    )
+
+    cover = project / "cover.png"
+    assert cover.read_bytes() == b"png-bytes"
+    assert result["thumbnail_path"] == str(cover)
+    assert result["project"]["thumbnail"] == str(cover)
+    manifest = yaml.safe_load((project / "project.yaml").read_text(encoding="utf-8"))
+    assert manifest["thumbnail"] == str(cover)
+
+def test_save_uploaded_video_creates_local_project(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "YoutubeDownloads")
+
+    result = web_agent.save_uploaded_video_file(
+        filename="../旅行 vlog.mp4",
+        content=b"video-bytes",
+        title="手机上传测试",
+    )
+
+    saved = Path(result["input_video"])
+    assert saved == tmp_path / "YoutubeDownloads" / "手机上传测试" / "旅行 vlog.mp4"
+    assert saved.read_bytes() == b"video-bytes"
+    assert result["project"]["source_type"] == "local"
+    assert result["project"]["name"] == "手机上传测试"
+    assert Path(result["project_manifest"]).exists()
+
+
+def test_mobile_asr_translate_job_runs_asr_then_translation(monkeypatch, tmp_path: Path):
+    video = tmp_path / "YoutubeDownloads" / "demo" / "demo.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "YoutubeDownloads")
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "outputs" / "agent_jobs")
+    monkeypatch.setattr(web_agent, "PYTHON", "/python")
+    calls = []
+
+    def fake_run_command(job_id, args):
+        calls.append(args)
+        out_dir = tmp_path / "outputs" / "agent_jobs" / job_id
+        if "video_translate.tools.transcribe_audio" in args:
+            (out_dir / "source.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕하세요\n", encoding="utf-8")
+        if "video_translate.tools.translate_subtitles" in args:
+            (out_dir / "zh.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8")
+
+    monkeypatch.setattr(web_agent, "_run_command", fake_run_command)
+
+    job = web_agent.mobile_asr_translate_job({
+        "input_video": str(video),
+        "language": "korean",
+        "source_language": "korean",
+        "model_size": "small",
+        "translation_mode": "translate_only",
+    })
+    deadline = time.time() + 2
+    while job.status == "running" and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert job.status == "done"
+    assert calls[0][:3] == ["/python", "-m", "video_translate.tools.transcribe_audio"]
+    assert calls[1][:3] == ["/python", "-m", "video_translate.tools.translate_subtitles"]
+    assert job.result["source_srt"].endswith("source.srt")
+    assert job.result["translated_srt"].endswith("zh.srt")
+    assert (video.parent / "demo.source.srt").exists()
+    assert (video.parent / "demo.zh.srt").exists()
+
 def test_child_process_env_sets_model_cache_without_proxy(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(web_agent, "ROOT", tmp_path)
     monkeypatch.setattr(web_agent, "DEFAULT_PROXY", "http://127.0.0.1:7890")

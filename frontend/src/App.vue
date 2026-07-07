@@ -92,9 +92,11 @@
               :assets="assets"
               :status="assetStatus.text"
               :status-class="assetStatus.class"
+              :upload-busy="mobileUploadBusy"
               @refresh="loadAssets"
               @local-ocr="runLocalOcr"
               @local-audio="runLocalAudio"
+              @upload-asr-translate="uploadAndTranslateMobileVideo"
               @register-local-project="registerLocalProject"
               @use-project="useProject"
               @use-video="useVideo"
@@ -102,6 +104,7 @@
               @use-subtitle="useSubtitle"
               @edit-subtitle="editSubtitle"
               @delete-project="deleteDownloadProject"
+              @upload-cover="uploadProjectCoverFile"
             />
           </div>
 
@@ -218,7 +221,7 @@
 
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { api, getJson } from './api'
+import { api, getJson, uploadProjectCover, uploadVideoFile } from './api'
 import SideNav from './components/SideNav.vue'
 import HeaderBar from './components/HeaderBar.vue'
 import AgentSessionPanel from './components/AgentSessionPanel.vue'
@@ -275,6 +278,7 @@ const agentSession = ref(null)
 const agentSessions = ref([])
 const agentTasks = ref([])
 const agentStarting = ref(false)
+const mobileUploadBusy = ref(false)
 
 const assets = reactive({ videos: [], subtitles: [], projects: [], ocr_jobs: [] })
 const jobs = reactive({})
@@ -779,6 +783,38 @@ async function runLocalAudio() {
   }
 }
 
+async function uploadAndTranslateMobileVideo({ file, title }) {
+  if (!file) {
+    setStatus(assetStatus, '先选择要上传的视频。', 'bad')
+    return
+  }
+  mobileUploadBusy.value = true
+  setStatus(assetStatus, '正在上传视频...', '')
+  try {
+    const uploaded = await uploadVideoFile(file, { title })
+    localVideo.value = uploaded.input_video || ''
+    await loadAssets()
+    setStatus(assetStatus, '上传完成，正在启动 ASR 翻译...', 'ok')
+    const job = await api('/api/jobs/mobile-asr-translate', {
+      input_video: localVideo.value,
+      language: audioLanguage.value,
+      source_language: sourceLanguage.value !== 'auto' ? sourceLanguage.value : audioLanguage.value,
+      model_size: audioModelSize.value,
+      device: 'cuda',
+      compute_type: 'float16',
+      translation_mode: 'standard_cleanup',
+      extra_hint: extraHint.value,
+    })
+    watchJob(job)
+    activeView.value = 'jobs'
+    setStatus(assetStatus, '已创建手机 ASR 翻译任务。', 'ok')
+  } catch (error) {
+    setStatus(assetStatus, error.message, 'bad')
+  } finally {
+    mobileUploadBusy.value = false
+  }
+}
+
 async function runVideoOverlay(payload) {
   if (!payload?.input_video) {
     setStatus(assetStatus, '先选择本地视频。', 'bad')
@@ -988,6 +1024,18 @@ async function deleteDownloadProject(project) {
     if (sourceSrt.value && sourceSrt.value.startsWith(project.path)) sourceSrt.value = ''
     await loadAssets()
     setStatus(assetStatus, `已删除视频项目目录：${project.name}`, 'ok')
+  } catch (error) {
+    setStatus(assetStatus, error.message, 'bad')
+  }
+}
+
+async function uploadProjectCoverFile({ project, file }) {
+  if (!project?.path || !file) return
+  setStatus(assetStatus, '正在上传封面...', '')
+  try {
+    const result = await uploadProjectCover(file, { projectPath: project.path })
+    await loadAssets()
+    setStatus(assetStatus, `封面已更新：${result.thumbnail_path}`, 'ok')
   } catch (error) {
     setStatus(assetStatus, error.message, 'bad')
   }

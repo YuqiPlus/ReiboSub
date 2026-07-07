@@ -16,6 +16,8 @@ import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from email.parser import BytesParser
+from email.policy import default as email_default_policy
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -642,6 +644,83 @@ def register_local_project(payload: dict[str, Any]) -> dict[str, Any]:
     manifest = update_local_project_manifest(input_video, download_dir=DOWNLOAD_DIR, title=title)
     project = _download_project_entry(Path(str(manifest["project_dir"])))
     return {"project": project, "manifest": manifest, "project_dir": manifest["project_dir"]}
+
+
+VIDEO_UPLOAD_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".ts", ".m2ts"}
+COVER_UPLOAD_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def save_uploaded_video_file(*, filename: str, content: bytes, title: str = "") -> dict[str, Any]:
+    original_name = Path(str(filename or "uploaded_video.mp4")).name.strip()
+    if not original_name or original_name in {".", ".."}:
+        original_name = "uploaded_video.mp4"
+    suffix = Path(original_name).suffix.lower()
+    if suffix not in VIDEO_UPLOAD_EXTENSIONS:
+        allowed = ", ".join(sorted(VIDEO_UPLOAD_EXTENSIONS))
+        raise ValueError(f"不支持的视频格式: {suffix or '<none>'}。支持: {allowed}")
+    safe_name = filesystem_safe_title(Path(original_name).stem).strip() + suffix
+    safe_title = filesystem_safe_title(str(title or Path(original_name).stem)).strip() or Path(safe_name).stem
+    project_dir = (DOWNLOAD_DIR / safe_title).resolve()
+    _ensure_under_root(project_dir)
+    project_dir.mkdir(parents=True, exist_ok=True)
+    input_video = (project_dir / safe_name).resolve()
+    _ensure_under_root(input_video)
+    input_video.write_bytes(content)
+    manifest = update_local_project_manifest(input_video, download_dir=DOWNLOAD_DIR, title=safe_title)
+    project = _download_project_entry(Path(str(manifest["project_dir"])))
+    return {
+        "input_video": str(input_video),
+        "project_dir": manifest["project_dir"],
+        "project_manifest": str(Path(str(manifest["project_dir"])) / PROJECT_MANIFEST_NAME),
+        "manifest": manifest,
+        "project": project,
+    }
+
+
+def save_uploaded_project_cover(*, project_path: str, filename: str, content: bytes) -> dict[str, Any]:
+    project_dir = _resolve_project_path(project_path)
+    _ensure_download_project_dir(project_dir)
+    original_name = Path(str(filename or "cover.jpg")).name.strip()
+    if not original_name or original_name in {".", ".."}:
+        original_name = "cover.jpg"
+    suffix = Path(original_name).suffix.lower()
+    if suffix not in COVER_UPLOAD_EXTENSIONS:
+        allowed = ", ".join(sorted(COVER_UPLOAD_EXTENSIONS))
+        raise ValueError(f"不支持的封面格式: {suffix or '<none>'}。支持: {allowed}")
+    safe_name = filesystem_safe_title(Path(original_name).stem).strip() + suffix
+    if not safe_name or safe_name == suffix:
+        safe_name = "cover" + suffix
+    cover_path = (project_dir / safe_name).resolve()
+    _ensure_under_root(cover_path)
+    cover_path.write_bytes(content)
+    manifest = infer_project_manifest(project_dir)
+    source_type = str(manifest.get("source_type") or "")
+    title = str(manifest.get("title") or project_dir.name)
+    if source_type == "youtube":
+        manifest = update_youtube_project_metadata(
+            project_dir,
+            source_url=str(manifest.get("source_url") or ""),
+            title=title,
+            primary_video=Path(str(manifest["primary_video"])) if manifest.get("primary_video") else None,
+            thumbnail_path=cover_path,
+        )
+    else:
+        primary_video = Path(str(manifest.get("primary_video") or "")).expanduser()
+        if not str(primary_video) or not primary_video.exists():
+            videos = [path for path in project_dir.iterdir() if _is_real_file(path) and path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}]
+            primary_video = sorted(videos, key=lambda path: path.stat().st_mtime, reverse=True)[0] if videos else project_dir / "uploaded.mp4"
+        manifest = update_local_project_manifest(primary_video, download_dir=DOWNLOAD_DIR, title=title)
+        manifest["thumbnail"] = str(cover_path)
+        from video_translate.project_manifest import save_project_manifest
+        manifest = save_project_manifest(project_dir, manifest)
+    project = _download_project_entry(project_dir)
+    return {
+        "thumbnail_path": str(cover_path),
+        "project_dir": str(project_dir),
+        "project_manifest": str(project_dir / PROJECT_MANIFEST_NAME),
+        "manifest": manifest,
+        "project": project,
+    }
 
 
 def answer_agent_session(session_id: str, answer: dict[str, Any]) -> AgentSession:
@@ -3246,6 +3325,107 @@ def audio_local_video_job(payload: dict[str, Any]) -> Job:
     return start_job(f"音频识别字幕 {job_slug}", target)
 
 
+def mobile_asr_translate_job(payload: dict[str, Any]) -> Job:
+    input_video = _resolve_project_path(_required_str(payload, "input_video"))
+    _ensure_under_root(input_video)
+    if not input_video.exists():
+        raise FileNotFoundError(f"视频文件不存在: {input_video}")
+    source_language = normalize_source_language(payload.get("source_language") or "auto")
+    language = str(payload.get("language") or asr_language_for_source(source_language)).strip()
+    model_size = str(payload.get("model_size") or "large-v3").strip()
+    device = str(payload.get("device") or "cuda").strip()
+    compute_type = str(payload.get("compute_type") or "float16").strip()
+    translation_mode = _normalize_subtitle_translation_mode(payload.get("translation_mode") or "standard_cleanup")
+    extra_hint = str(payload.get("extra_hint") or "").strip()
+    glossary_value = str(payload.get("glossary") or "").strip()
+    glossary = _resolve_project_path(glossary_value) if glossary_value else None
+    target_language = str(payload.get("target_language") or "简体中文").strip()
+    job_slug = _safe_slug(input_video.stem)[:80]
+
+    def target(job_id: str) -> dict[str, Any]:
+        out_dir = JOB_DIR / job_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        source_srt = out_dir / "source.srt"
+        translated_srt = out_dir / "zh.srt"
+        config_path = out_dir / "run.yaml"
+        config = {
+            "mode": "mobile_audio_translate",
+            "input_video": str(input_video),
+            "source_srt": str(source_srt),
+            "translated_srt": str(translated_srt),
+            "output_dir": str(out_dir),
+            "source_language": source_language,
+            "audio": {
+                "provider": "faster-whisper",
+                "model_size": model_size,
+                "language": language,
+                "device": device,
+                "compute_type": compute_type,
+            },
+            "translation": {
+                "mode": translation_mode,
+                "target_language": target_language,
+            },
+            "sidecar": {"enabled": True, "copy_source": True, "copy_translated": True, "source_suffix": ".source", "translated_suffix": ".zh"},
+        }
+        config_path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        _append_log(job_id, f"input_video: {input_video}")
+        _append_log(job_id, f"config: {config_path}")
+        _run_command(
+            job_id,
+            [
+                *_module_command("video_translate.tools.transcribe_audio", input_video),
+                "--out",
+                str(source_srt),
+                "--model-size",
+                model_size,
+                "--language",
+                language,
+                "--device",
+                device,
+                "--compute-type",
+                compute_type,
+            ],
+        )
+        translate_args = [
+            *_module_command("video_translate.tools.translate_subtitles", source_srt),
+            "--out",
+            str(translated_srt),
+            "--translation-mode",
+            translation_mode,
+            "--target-language",
+            target_language,
+        ]
+        if glossary:
+            translate_args.extend(["--glossary", str(glossary)])
+        mobile_prompt = "本次源字幕来自 ASR 音频识别，可能存在同音误识别；请结合上下文翻译，清理明显语音识别噪声，但不要改动时间轴。"
+        if extra_hint:
+            mobile_prompt += "\n" + extra_hint
+        translate_args.extend(["--extra-prompt", mobile_prompt])
+        _run_command(job_id, translate_args)
+        copied = copy_sidecar_subtitles(
+            input_video,
+            source_srt=source_srt,
+            translated_srt=translated_srt,
+            config=SidecarConfig(enabled=True, copy_source=True, copy_translated=True, source_suffix=".source", translated_suffix=".zh"),
+        )
+        manifest = update_local_project_manifest(input_video, download_dir=DOWNLOAD_DIR, title=input_video.parent.name)
+        result = {
+            "input_video": str(input_video),
+            "output_dir": str(out_dir),
+            "source_srt": str(source_srt),
+            "translated_srt": str(translated_srt),
+            "subtitle_path": str(translated_srt),
+            "project_dir": str(Path(str(manifest["project_dir"]))),
+            "project_manifest": str(Path(str(manifest["project_dir"])) / PROJECT_MANIFEST_NAME),
+            "translation_mode": translation_mode,
+        }
+        result.update({name: str(path) for name, path in copied.items()})
+        return result
+
+    return start_job(f"手机 ASR 翻译 {job_slug}", target)
+
+
 def _ocr_config(
     input_video: Path,
     output_dir: Path,
@@ -4578,6 +4758,12 @@ class AgentHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(job.to_dict())
                 return
+            if self.path == "/api/upload-video":
+                self._send_json(self._read_video_upload())
+                return
+            if self.path == "/api/upload-project-cover":
+                self._send_json(self._read_project_cover_upload())
+                return
             payload = self._read_json()
             if self.path == "/api/agent/start":
                 self._send_json(start_agent_session(payload).to_dict())
@@ -4648,6 +4834,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send_json(hybrid_anchor_ocr_job(payload).to_dict())
             elif self.path == "/api/jobs/audio-local":
                 self._send_json(audio_local_video_job(payload).to_dict())
+            elif self.path == "/api/jobs/mobile-asr-translate":
+                self._send_json(mobile_asr_translate_job(payload).to_dict())
             elif self.path == "/api/jobs/video-overlay":
                 self._send_json(video_overlay_job(payload).to_dict())
             elif self.path == "/api/ocr-preview-frame":
@@ -4683,6 +4871,52 @@ class AgentHandler(BaseHTTPRequestHandler):
         if not isinstance(data, dict):
             raise ValueError("请求体必须是 JSON 对象")
         return data
+
+    def _read_video_upload(self) -> dict[str, Any]:
+        fields = self._read_multipart_fields()
+        file_field = fields.get("file") or {}
+        filename = str(file_field.get("filename") or "")
+        content = file_field.get("content") if isinstance(file_field.get("content"), bytes) else b""
+        title = str((fields.get("title") or {}).get("text") or "")
+        if not filename or not content:
+            raise ValueError("上传文件为空")
+        return save_uploaded_video_file(filename=filename, content=content, title=title)
+
+    def _read_project_cover_upload(self) -> dict[str, Any]:
+        fields = self._read_multipart_fields()
+        file_field = fields.get("file") or {}
+        filename = str(file_field.get("filename") or "")
+        content = file_field.get("content") if isinstance(file_field.get("content"), bytes) else b""
+        project_path = str((fields.get("project_path") or {}).get("text") or "")
+        if not project_path:
+            raise ValueError("缺少参数: project_path")
+        if not filename or not content:
+            raise ValueError("上传封面为空")
+        return save_uploaded_project_cover(project_path=project_path, filename=filename, content=content)
+
+    def _read_multipart_fields(self) -> dict[str, dict[str, Any]]:
+        content_type = self.headers.get("Content-Type", "")
+        if not content_type.lower().startswith("multipart/form-data"):
+            raise ValueError("上传文件必须使用 multipart/form-data")
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            raise ValueError("上传文件为空")
+        body = self.rfile.read(length)
+        header = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
+        message = BytesParser(policy=email_default_policy).parsebytes(header + body)
+        fields: dict[str, dict[str, Any]] = {}
+        for part in message.iter_parts():
+            if part.get_content_disposition() != "form-data":
+                continue
+            name = str(part.get_param("name", header="content-disposition") or "")
+            payload = part.get_payload(decode=True)
+            content = payload if isinstance(payload, bytes) else b""
+            fields[name] = {
+                "filename": str(part.get_filename() or ""),
+                "content": content,
+                "text": content.decode(part.get_content_charset() or "utf-8", errors="replace") if content else "",
+            }
+        return fields
 
     def _send_json(self, data: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")

@@ -4,6 +4,21 @@
       <h2>本地素材库</h2>
       <button class="secondary mini" @click="$emit('refresh')">刷新</button>
     </div>
+    <div class="upload-card">
+      <div>
+        <div class="eyebrow">Mobile Upload</div>
+        <h3>上传视频后直接 ASR 翻译</h3>
+        <p class="panel-subtitle">视频会保存为本地项目，完成后自动生成 source.srt 和 zh.srt 到视频同目录。</p>
+      </div>
+      <div class="upload-grid">
+        <label class="file-picker">
+          <span>{{ uploadFileName || '选择视频' }}</span>
+          <input type="file" accept="video/*" @change="selectUploadFile" />
+        </label>
+        <input v-model="uploadTitle" placeholder="项目名，可不填" />
+        <button class="warning" :disabled="uploadBusy || !uploadFile" @click="submitUploadAsrTranslate">{{ uploadBusy ? '处理中' : '上传并 ASR 翻译' }}</button>
+      </div>
+    </div>
     <div class="grid2">
       <div>
         <label for="localVideo">本地视频路径</label>
@@ -50,6 +65,7 @@
                 <span class="badge">{{ sourceLabel(project.source_type) }}</span>
                 <button v-if="project.source_url" class="ghost mini" type="button" @click.prevent="copyPath(project.source_url)">复制链接</button>
                 <button v-if="project.manifest_path" class="ghost mini" type="button" @click.prevent="copyPath(project.manifest_path)">复制配置</button>
+                <label class="ghost-file mini" @click.stop>上传封面<input type="file" accept="image/*" @change="selectProjectCover(project, $event)" /></label>
               </div>
               <div v-if="project.source_url" class="muted path">{{ project.normalized_url || project.source_url }}</div>
               <div class="muted path">{{ project.path }}</div>
@@ -128,14 +144,44 @@ const props = defineProps({
   assets: { type: Object, required: true },
   status: { type: String, default: '' },
   statusClass: { type: String, default: '' },
+  uploadBusy: { type: Boolean, default: false },
 })
 const copyStatus = ref('')
+const uploadFile = ref(null)
+const uploadTitle = ref('')
+const uploadFileName = computed(() => uploadFile.value?.name || '')
 
-defineEmits([
+const emit = defineEmits([
   'update:localVideo', 'update:audioLanguage', 'update:audioModelSize',
   'refresh', 'local-ocr', 'local-audio', 'register-local-project', 'use-project', 'use-video', 'use-video-ocr', 'use-subtitle',
-  'edit-subtitle', 'delete-project',
+  'edit-subtitle', 'delete-project', 'upload-asr-translate', 'upload-cover',
 ])
+
+
+
+function selectProjectCover(project, event) {
+  const file = event.target.files?.[0] || null
+  event.target.value = ''
+  if (!file || !project?.path) return
+  __emit('upload-cover', { project, file })
+}
+
+function selectUploadFile(event) {
+  const file = event.target.files?.[0] || null
+  uploadFile.value = file
+  if (file && !uploadTitle.value.trim()) {
+    uploadTitle.value = file.name.replace(/\.[^.]+$/, '')
+  }
+}
+
+function submitUploadAsrTranslate() {
+  if (!uploadFile.value) return
+  emitUploadAsrTranslate(uploadFile.value, uploadTitle.value.trim())
+}
+
+function emitUploadAsrTranslate(file, title) {
+  __emit('upload-asr-translate', { file, title })
+}
 
 async function copyPath(path) {
   const ok = await copyText(path)
