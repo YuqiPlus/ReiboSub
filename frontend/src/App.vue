@@ -15,6 +15,7 @@
             <AgentSessionPanel
               v-model:url="url"
               v-model:embedded-subtitle-hint="embeddedSubtitleHint"
+              v-model:embedded-subtitle-goal="embeddedSubtitleGoal"
               v-model:source-language="sourceLanguage"
               v-model:ocr-language="ocrLanguage"
               v-model:ocr-scope="ocrScope"
@@ -267,6 +268,7 @@ const ocrRefinementMode = ref('none')
 const thumbnailFormat = ref('jpg')
 const videoQuality = ref('1080p')
 const embeddedSubtitleHint = ref('unknown')
+const embeddedSubtitleGoal = ref('screen_subtitle')
 const sourceLanguage = ref('auto')
 const ocrLanguage = ref('auto')
 const localVideo = ref('')
@@ -379,6 +381,7 @@ async function startAgent() {
     const session = await api('/api/agent/start', {
       url: url.value.trim(),
       embedded_subtitle_hint: embeddedSubtitleHint.value,
+      embedded_subtitle_goal: embeddedSubtitleGoal.value,
       source_language: sourceLanguage.value,
       ocr_language: ocrLanguage.value,
       target_language: 'zh',
@@ -416,6 +419,7 @@ async function answerAgent(action) {
       ocr_crop_right_ratio: ocrCropRightRatio.value,
       source_language: sourceLanguage.value,
       ocr_language: ocrLanguage.value,
+      embedded_subtitle_goal: embeddedSubtitleGoal.value,
     })
     agentSession.value = session
     await loadAgentSessions()

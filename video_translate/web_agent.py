@@ -854,6 +854,9 @@ def _agent_continue(session: AgentSession, answer: dict[str, Any]) -> None:
     if action == "run_asr":
         _agent_run_asr(session)
         return
+    if action == "run_asr_with_ocr":
+        _agent_run_asr_with_ocr_reference(session)
+        return
     if action == "probe_audio_language":
         _agent_probe_audio_language(session)
         return
@@ -900,6 +903,20 @@ def _session_ocr_language(session: AgentSession) -> str:
     return _session_source_language(session)
 
 
+EMBEDDED_SUBTITLE_GOALS = {"screen_subtitle", "full_speech"}
+
+
+def _normalize_embedded_subtitle_goal(value: Any) -> str:
+    goal = str(value or "screen_subtitle").strip()
+    if goal not in EMBEDDED_SUBTITLE_GOALS:
+        raise ValueError(f"未知内嵌字幕目标: {goal}")
+    return goal
+
+
+def _session_embedded_subtitle_goal(session: AgentSession) -> str:
+    return _normalize_embedded_subtitle_goal(session.payload.get("embedded_subtitle_goal"))
+
+
 def _planner_source_language(value: Any) -> str:
     raw = str(value or "").strip()
     if not raw:
@@ -927,6 +944,8 @@ def _agent_update_ocr_settings_from_answer(session: AgentSession, answer: dict[s
         updates["source_language"] = normalize_source_language(answer.get("source_language") or "auto")
     if "ocr_language" in answer:
         updates["ocr_language"] = normalize_source_language(answer.get("ocr_language") or "auto")
+    if "embedded_subtitle_goal" in answer:
+        updates["embedded_subtitle_goal"] = _normalize_embedded_subtitle_goal(answer.get("embedded_subtitle_goal"))
     if not updates:
         return
     with _LOCK:
@@ -1085,7 +1104,7 @@ def _agent_generate_glossary_review(session: AgentSession, source_srt: str) -> N
     is_hybrid = session.result.get("source_kind") == "hybrid_anchor_ocr"
     is_dual_reference = session.result.get("source_kind") == "dual_subtitle_reference"
     is_ocr = session.result.get("source_kind") == "ocr"
-    is_asr = session.result.get("source_kind") == "asr"
+    is_asr = session.result.get("source_kind") in {"asr", "asr_ocr_reference"}
     glossary_job = generate_glossary_job(
         {
             "source_srt": source_srt,
@@ -1117,6 +1136,8 @@ def _agent_generate_glossary_review(session: AgentSession, source_srt: str) -> N
         message = "OCR 原文字幕已生成。请审核 glossary，尤其是人名、昵称和音译词，然后继续翻译。"
     if is_asr:
         message = "ASR 原文字幕已生成。请审核 glossary，尤其是人名、昵称和同音误识别词，然后继续翻译。"
+    if session.result.get("source_kind") == "asr_ocr_reference":
+        message = "完整听译源字幕已生成：ASR 时间轴为主，并参考内嵌字幕 OCR 做了原文纠错。请审核 glossary 后继续翻译。"
     _agent_wait(
         session.id,
         "review_glossary",
@@ -1151,6 +1172,8 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
         extra_prompt = _hybrid_translation_prompt(_session_source_language(session))
     if session.result.get("source_kind") == "dual_subtitle_reference":
         extra_prompt = _dual_reference_translation_prompt(_session_source_language(session))
+    if session.result.get("source_kind") == "asr_ocr_reference":
+        extra_prompt = "源字幕来自完整听译路线：ASR 提供时间轴和主要台词，OCR 内嵌字幕只参与过原文纠错。翻译时不要额外增加画面说明或姓名牌内容。"
     _agent_set_phase(session.id, "translate")
     job = translate_subtitle_job(
         {
@@ -1207,17 +1230,18 @@ def _agent_continue_route_without_subtitle(session_id: str, plan: dict[str, Any]
             "message": message,
             "candidate_subtitles": (plan or {}).get("candidate_subtitles") or [],
             "recommended_route": route,
-            "options": _agent_ocr_asr_options(route),
+            "options": _agent_ocr_asr_options(route, _session_embedded_subtitle_goal(_AGENT_SESSIONS.get(session_id)) if _AGENT_SESSIONS.get(session_id) else "screen_subtitle"),
         },
     )
 
 
-def _agent_ocr_asr_options(route: str) -> list[dict[str, str]]:
+def _agent_ocr_asr_options(route: str, embedded_goal: str = "screen_subtitle") -> list[dict[str, str]]:
     if route == "asr":
         return [
             {"action": "download_video_for_preview", "label": "下载视频并抽帧预览"},
             {"action": "run_asr", "label": "使用 ASR（推荐）"},
-            {"action": "run_ocr", "label": "改用 OCR"},
+            {"action": "run_asr_with_ocr", "label": "ASR 主导 + OCR 参考纠错"},
+            {"action": "run_ocr", "label": "改用 OCR 复刻画面字幕"},
             {"action": "probe_audio_language", "label": "先检测音源语言"},
             {"action": "manual_mode", "label": "转到手动模式"},
         ]
@@ -1229,10 +1253,13 @@ def _agent_ocr_asr_options(route: str) -> list[dict[str, str]]:
             {"action": "run_asr", "label": "使用 ASR"},
             {"action": "manual_mode", "label": "转到手动模式"},
         ]
+    ocr_option = {"action": "run_ocr", "label": "复刻画面字幕：OCR 主导（推荐）"}
+    asr_ocr_option = {"action": "run_asr_with_ocr", "label": "完整听译字幕：ASR 主导 + OCR 参考"}
+    ordered = [asr_ocr_option, ocr_option] if embedded_goal == "full_speech" else [ocr_option, asr_ocr_option]
     return [
         {"action": "download_video_for_preview", "label": "下载视频并抽帧预览"},
-        {"action": "run_ocr", "label": "使用 OCR（推荐）"},
-        {"action": "run_asr", "label": "改用 ASR"},
+        *ordered,
+        {"action": "run_asr", "label": "纯 ASR 听译"},
         {"action": "probe_audio_language", "label": "先检测音源语言"},
         {"action": "manual_mode", "label": "转到手动模式"},
     ]
@@ -1588,6 +1615,93 @@ def _agent_run_asr(session: AgentSession) -> None:
             input_video=input_video,
             output_dir=asr_result.get("output_dir"),
             job_result=asr_result,
+        )
+    _agent_generate_glossary_review(session, source_srt)
+
+
+def _agent_run_asr_with_ocr_reference(session: AgentSession) -> None:
+    _agent_set_phase(session.id, "download_video_for_asr")
+    url = str(session.result.get("normalized_url") or session.payload.get("url") or "")
+    probe = session.result.get("probe") or {}
+    input_video = str(session.result.get("input_video") or "")
+    if not input_video or not Path(input_video).exists():
+        video_result = _wait_for_job(download_video_job({"url": url, "title": probe.get("title") or ""}), session_id=session.id)
+        input_video = str(video_result.get("input_video") or "")
+        _agent_update_result(session.id, {"input_video": input_video, "download_video": video_result})
+
+    _agent_set_phase(session.id, "audio_asr")
+    asr_result = _wait_for_job(
+        audio_local_video_job({"input_video": input_video, "source_language": _session_source_language(session), "language": asr_language_for_source(_session_source_language(session)), "model_size": "large-v3"}),
+        session_id=session.id,
+    )
+    asr_srt = str(asr_result.get("source_srt") or "")
+
+    _agent_set_phase(session.id, "ocr_reference")
+    ocr_result = _wait_for_job(
+        ocr_local_video_job(
+            {
+                "input_video": input_video,
+                "extra_hint": str(session.payload.get("extra_hint") or ""),
+                "translation_mode": "translate_only",
+                "ocr_scope": _normalize_ocr_scope(session.payload.get("ocr_scope")),
+                "ocr_refinement_mode": _normalize_ocr_refinement_mode(session.payload.get("ocr_refinement_mode")),
+                "ocr_crop_top_ratio": _normalize_ocr_crop_top_ratio(session.payload.get("ocr_crop_top_ratio"), _normalize_ocr_scope(session.payload.get("ocr_scope"))),
+                "ocr_crop_bottom_ratio": _normalize_ocr_vertical_crop_ratio(session.payload.get("ocr_crop_bottom_ratio")),
+                "ocr_crop_left_ratio": _normalize_ocr_crop_ratio(session.payload.get("ocr_crop_left_ratio")),
+                "ocr_crop_right_ratio": _normalize_ocr_crop_ratio(session.payload.get("ocr_crop_right_ratio")),
+                "source_language": _session_source_language(session),
+                "ocr_language": _session_ocr_language(session),
+                "extract_only": True,
+            }
+        ),
+        session_id=session.id,
+    )
+    ocr_srt = str(ocr_result.get("source_srt") or "")
+
+    _agent_set_phase(session.id, "asr_ocr_refine")
+    corrected_out = _agent_workspace(session) / "source.corrected.srt"
+    corrected_result = _wait_for_job(
+        correct_asr_subtitle_job(
+            {
+                "source_srt": asr_srt,
+                "reference_srt": ocr_srt,
+                "out": str(corrected_out),
+                "source_language": _session_source_language(session),
+                "extra_hint": (
+                    "本任务是完整听译字幕：ASR 时间轴和完整台词为主，OCR 内嵌字幕只作为同时间段人名、术语、短语纠错参考。"
+                    + ("\n" + str(session.payload.get("extra_hint") or "") if str(session.payload.get("extra_hint") or "").strip() else "")
+                ),
+            }
+        ),
+        session_id=session.id,
+    )
+    source_srt = str(corrected_result.get("source_srt") or corrected_out)
+    source_srt = _materialize_task_artifact(session, source_srt, "source.srt") or source_srt
+    reference_srt = _materialize_task_artifact(session, ocr_srt, "source.ocr_reference.srt") or ocr_srt
+    _agent_update_result(
+        session.id,
+        {
+            "asr": asr_result,
+            "ocr_reference": ocr_result,
+            "asr_ocr_correction": corrected_result,
+            "source_srt": source_srt,
+            "reference_srt": reference_srt,
+            "source_kind": "asr_ocr_reference",
+            "input_video": input_video,
+        },
+    )
+    task_id = str(session.result.get("task_id") or "")
+    if task_id:
+        _update_task_stage(
+            task_id,
+            "asr",
+            "done",
+            current_stage="asr_ocr_done",
+            source_srt=source_srt,
+            reference_srt=reference_srt,
+            input_video=input_video,
+            output_dir=asr_result.get("output_dir"),
+            job_result={"asr": asr_result, "ocr_reference": ocr_result, "correction": corrected_result},
         )
     _agent_generate_glossary_review(session, source_srt)
 
@@ -2414,6 +2528,7 @@ def translate_subtitle_job(payload: dict[str, Any]) -> Job:
         _run_command(job_id, args)
         result = {"translated_srt": str(out), "translation_mode": translation_mode}
         result.update({name: str(path) for name, path in _copy_translated_sidecar_for_source(source_srt, out).items()})
+        result.update(subtitle_pair_issues(out))
         return result
 
     return start_job("翻译外挂字幕", target)
@@ -2423,6 +2538,8 @@ def correct_asr_subtitle_job(payload: dict[str, Any]) -> Job:
     source_srt = _resolve_project_path(_required_str(payload, "source_srt"))
     glossary_value = str(payload.get("glossary") or "").strip()
     glossary = _resolve_project_path(glossary_value) if glossary_value else None
+    reference_value = str(payload.get("reference_srt") or "").strip()
+    reference_srt = _resolve_project_path(reference_value) if reference_value else None
     source_language = str(payload.get("source_language") or "auto").strip()
     extra_hint = str(payload.get("extra_hint") or "")
     out = _resolve_project_path(payload.get("out") or str(source_srt.with_name(source_srt.stem + ".corrected.srt")))
@@ -2441,10 +2558,14 @@ def correct_asr_subtitle_job(payload: dict[str, Any]) -> Job:
         ]
         if glossary:
             args.extend(["--glossary", str(glossary)])
+        if reference_srt:
+            args.extend(["--reference-srt", str(reference_srt)])
         if extra_hint.strip():
             args.extend(["--extra-prompt", extra_hint.strip()])
         _run_command(job_id, args)
         result = {"corrected_srt": str(out), "source_srt": str(out), "subtitle_path": str(out)}
+        if reference_srt:
+            result["reference_srt"] = str(reference_srt)
         result.update({name: str(path) for name, path in _copy_corrected_source_sidecar_for_source(source_srt, out).items()})
         return result
 
@@ -2822,6 +2943,7 @@ def ocr_local_video_job(payload: dict[str, Any]) -> Job:
     ocr_crop_right_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_right_ratio"))
     source_language = normalize_source_language(payload.get("source_language") or "auto")
     ocr_language = normalize_source_language(payload.get("ocr_language") or "auto")
+    extract_only = bool(payload.get("extract_only", False))
     config_source_language = ocr_language if ocr_language != "auto" else source_language
     job_slug = _safe_slug(input_video.stem)[:80]
 
@@ -2830,7 +2952,7 @@ def ocr_local_video_job(payload: dict[str, Any]) -> Job:
         out_dir.mkdir(parents=True, exist_ok=True)
         config_path = out_dir / "run.yaml"
         config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode, ocr_scope=ocr_scope, ocr_refinement_mode=ocr_refinement_mode, ocr_crop_top_ratio=ocr_crop_top_ratio, ocr_crop_bottom_ratio=ocr_crop_bottom_ratio, ocr_crop_left_ratio=ocr_crop_left_ratio, ocr_crop_right_ratio=ocr_crop_right_ratio, source_language=config_source_language)
-        if config_source_language == "chinese":
+        if extract_only or config_source_language == "chinese":
             config["mode"] = "extract"
             config["sidecar"]["copy_translated"] = False
         config_path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -3421,6 +3543,7 @@ def mobile_asr_translate_job(payload: dict[str, Any]) -> Job:
             "translation_mode": translation_mode,
         }
         result.update({name: str(path) for name, path in copied.items()})
+        result.update(subtitle_pair_issues(translated_srt))
         return result
 
     return start_job(f"手机 ASR 翻译 {job_slug}", target)
@@ -3453,6 +3576,8 @@ def _ocr_config(
 严格遵守 glossary 中的人名、角色名、节目名和固定术语。
 字幕要自然、简洁、口语化，适合 1-2 行外挂字幕显示。
 如果相邻两条字幕明显是同一句话的 OCR 变体，请保持译文一致。
+保留原文语气；源文是疑问、反问或确认提问时，中文应以“？”结尾。
+括号、引号、书名号等符号必须成对出现；无法确认另一半时不要输出半边符号。
 """.strip()
     if extra_hint.strip():
         prompt += "\n任务提示：" + extra_hint.strip()
@@ -3602,6 +3727,66 @@ def _ocr_translation_mode_config(mode: str, prompt: str) -> tuple[str, dict[str,
     translation.update(mode_config["settings"])
     translation["ocr_translation_mode"] = mode
     return prompt, translation
+
+
+PAIR_SYMBOLS = [
+    {"name": "中文双引号", "open": "“", "close": "”"},
+    {"name": "中文单引号", "open": "‘", "close": "’"},
+    {"name": "中文圆括号", "open": "（", "close": "）"},
+    {"name": "英文圆括号", "open": "(", "close": ")"},
+    {"name": "方括号", "open": "[", "close": "]"},
+    {"name": "中文方括号", "open": "【", "close": "】"},
+    {"name": "书名号", "open": "《", "close": "》"},
+    {"name": "直角引号", "open": "「", "close": "」"},
+    {"name": "双直角引号", "open": "『", "close": "』"},
+]
+
+
+def subtitle_pair_issues(path: Path) -> dict[str, Any]:
+    path = Path(path)
+    if not path.exists():
+        return {"pair_issue_count": 0, "pair_issues": []}
+    open_map = {item["open"]: item for item in PAIR_SYMBOLS}
+    close_map = {item["close"]: item for item in PAIR_SYMBOLS}
+    stack: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] = []
+    for cue in read_srt(path):
+        for char in cue.text or "":
+            if char in open_map:
+                stack.append({"pair": open_map[char], "cue": cue})
+                continue
+            pair = close_map.get(char)
+            if not pair:
+                continue
+            match_index = _find_pair_stack_index(stack, pair)
+            if match_index >= 0:
+                stack.pop(match_index)
+            else:
+                issues.append(_build_subtitle_pair_issue(cue, pair, "missing_open"))
+    for item in stack:
+        issues.append(_build_subtitle_pair_issue(item["cue"], item["pair"], "missing_close"))
+    issues.sort(key=lambda item: (item["cue_index"], item["type"]))
+    return {"pair_issue_count": len(issues), "pair_issues": issues}
+
+
+def _find_pair_stack_index(stack: list[dict[str, Any]], pair: dict[str, str]) -> int:
+    for index in range(len(stack) - 1, -1, -1):
+        item_pair = stack[index]["pair"]
+        if item_pair["open"] == pair["open"] and item_pair["close"] == pair["close"]:
+            return index
+    return -1
+
+
+def _build_subtitle_pair_issue(cue: SubtitleCue, pair: dict[str, str], issue_type: str) -> dict[str, Any]:
+    return {
+        "cue_index": cue.index,
+        "start": cue.start,
+        "end": cue.end,
+        "text": cue.text,
+        "symbol_name": pair["name"],
+        "missing_symbol": pair["open"] if issue_type == "missing_open" else pair["close"],
+        "type": issue_type,
+    }
 
 
 def read_text_file(payload: dict[str, Any]) -> dict[str, Any]:

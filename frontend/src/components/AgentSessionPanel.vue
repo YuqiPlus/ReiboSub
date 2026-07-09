@@ -37,6 +37,13 @@
           </div>
         </div>
         <div class="agent-setting">
+          <span>字幕目标</span>
+          <div class="segmented">
+            <button type="button" :class="{ active: embeddedSubtitleGoal === 'screen_subtitle' }" @click="$emit('update:embeddedSubtitleGoal', 'screen_subtitle')">复刻画面</button>
+            <button type="button" :class="{ active: embeddedSubtitleGoal === 'full_speech' }" @click="$emit('update:embeddedSubtitleGoal', 'full_speech')">完整听译</button>
+          </div>
+        </div>
+        <div class="agent-setting">
           <span>音源语言</span>
           <select :value="sourceLanguage" @change="$emit('update:sourceLanguage', $event.target.value)">
             <option value="auto">自动</option>
@@ -303,6 +310,7 @@ import OcrCropControls from './OcrCropControls.vue'
 const props = defineProps({
   url: { type: String, default: '' },
   embeddedSubtitleHint: { type: String, default: 'unknown' },
+  embeddedSubtitleGoal: { type: String, default: 'screen_subtitle' },
   sourceLanguage: { type: String, default: 'auto' },
   ocrLanguage: { type: String, default: 'auto' },
   ocrScope: { type: String, default: 'bottom' },
@@ -324,6 +332,7 @@ const props = defineProps({
 const emit = defineEmits([
   'update:url',
   'update:embeddedSubtitleHint',
+  'update:embeddedSubtitleGoal',
   'update:sourceLanguage',
   'update:ocrLanguage',
   'update:ocrScope',
@@ -378,6 +387,8 @@ const phaseOrder = [
   ['ocr_full', 'OCR'],
   ['confirm_ocr_reuse', '复用'],
   ['audio_asr', 'ASR'],
+  ['ocr_reference', 'OCR参考'],
+  ['asr_ocr_refine', '校准'],
   ['generate_glossary', '术语'],
   ['review_glossary', '审核'],
   ['translate', '翻译'],
@@ -420,13 +431,15 @@ function sessionPhaseLabel(phase) {
     download_video_for_hybrid: '下载视频',
     hybrid_anchor_ocr: '英文定轴 + 韩文 OCR',
     audio_asr: '音频 ASR',
+    ocr_reference: 'OCR 参考提取',
+    asr_ocr_refine: 'ASR + OCR 校准',
     cancelled: '已中断',
     done: '完成',
   }
   return labels[phase] || phase || '未开始'
 }
 
-const primaryActions = ['use_recommended', 'start_hybrid_anchor_ocr', 'continue_after_glossary', 'use_cached_ocr', 'download_video_for_preview', 'run_ocr', 'run_asr', 'probe_audio_language']
+const primaryActions = ['use_recommended', 'start_hybrid_anchor_ocr', 'continue_after_glossary', 'use_cached_ocr', 'download_video_for_preview', 'run_ocr', 'run_asr', 'run_asr_with_ocr', 'probe_audio_language']
 
 function sessionStatusLabel(status) {
   const labels = {
@@ -506,6 +519,7 @@ const routeLabel = computed(() => {
     probe_audio_language: '先检测音源语言',
     ocr: 'OCR 翻译',
     asr: 'ASR 翻译',
+    asr_ocr_reference: 'ASR 主导 + OCR 参考',
     diagnose_ocr_asr: '等待路线诊断',
   }
   return labels[route] || route || '等待检测'

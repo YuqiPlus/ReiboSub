@@ -503,6 +503,54 @@ def test_agent_session_asr_generates_glossary(monkeypatch, tmp_path):
     ]
 
 
+
+def test_agent_session_embedded_full_speech_runs_asr_with_ocr_reference(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    asr_source = tmp_path / "asr.srt"
+    asr_source.write_text("1\n00:00:00,000 --> 00:00:01,000\n박봉열 선생님\n", encoding="utf-8")
+    ocr_source = tmp_path / "ocr.srt"
+    ocr_source.write_text("1\n00:00:00,000 --> 00:00:01,000\n박보영 선생님\n", encoding="utf-8")
+    corrected = tmp_path / "corrected.srt"
+    corrected.write_text("1\n00:00:00,000 --> 00:00:01,000\n박보영 선생님\n", encoding="utf-8")
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"video")
+    glossary = tmp_path / "draft.yaml"
+    glossary.write_text("characters: []\n", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(web_agent, "_find_reusable_ocr_result", lambda **kwargs: None)
+    monkeypatch.setattr(
+        web_agent,
+        "probe_video",
+        lambda url, **kwargs: {
+            "title": "demo",
+            "normalized_url": "https://www.youtube.com/watch?v=abc123",
+            "webpage_url": "https://www.youtube.com/watch?v=abc123",
+            "subtitles": [],
+            "agent_plan": {"route": "ocr", "selected_subtitle": None, "confidence": 0.78},
+        },
+    )
+
+    def done_job(name, result):
+        return web_agent.Job(id=name, name=name, status="done", result=result)
+
+    monkeypatch.setattr(web_agent, "download_video_job", lambda payload: calls.append("video") or done_job("video", {"input_video": str(video)}))
+    monkeypatch.setattr(web_agent, "audio_local_video_job", lambda payload: calls.append(f"asr:{payload['input_video']}") or done_job("asr", {"source_srt": str(asr_source), "input_video": str(video)}))
+    monkeypatch.setattr(web_agent, "ocr_local_video_job", lambda payload: calls.append(f"ocr_ref:{payload['input_video']}:{payload.get('extract_only')}") or done_job("ocr", {"source_srt": str(ocr_source), "input_video": str(video)}))
+    monkeypatch.setattr(web_agent, "correct_asr_subtitle_job", lambda payload: calls.append(f"correct:{payload['reference_srt']}") or done_job("correct", {"source_srt": str(corrected), "corrected_srt": str(corrected)}))
+    monkeypatch.setattr(web_agent, "generate_glossary_job", lambda payload: calls.append(f"glossary:{payload['source_srt']}") or done_job("glossary", {"glossary_path": str(glossary), "content": "characters: []\n"}))
+
+    session = web_agent.start_agent_session({"url": "abc123", "embedded_subtitle_hint": "yes", "embedded_subtitle_goal": "full_speech"})
+    snapshot = _wait_agent_phase(session.id, "diagnose_ocr_asr")
+    assert any(option["action"] == "run_asr_with_ocr" for option in snapshot["question"]["options"])
+
+    web_agent.answer_agent_session(session.id, {"action": "run_asr_with_ocr"})
+    snapshot = _wait_agent_phase(session.id, "review_glossary")
+
+    assert snapshot["result"]["source_kind"] == "asr_ocr_reference"
+    assert Path(snapshot["result"]["source_srt"]).parts[-3:] == ("agent_tasks", "abc123_demo", "source.srt")
+    assert calls == ["video", f"asr:{video}", f"ocr_ref:{video}:True", f"correct:{ocr_source}", f"glossary:{snapshot['result']['source_srt']}"]
+
 def test_agent_session_chinese_ocr_finishes_without_glossary(monkeypatch, tmp_path):
     monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
     monkeypatch.setattr(web_agent, "_find_reusable_ocr_result", lambda **kwargs: None)
@@ -1822,6 +1870,17 @@ def test_list_local_assets_collects_videos_subtitles_and_ocr_jobs(tmp_path: Path
     assert assets["projects"][0]["subtitles"][0]["path"] == str(subtitle)
     assert assets["ocr_jobs"][0]["source_srt"].endswith("source.srt")
 
+
+
+def test_subtitle_pair_issues_report_unbalanced_symbols(tmp_path: Path):
+    srt = tmp_path / "bad.zh.srt"
+    srt.write_text("1\n00:00:00,000 --> 00:00:01,000\n他说“你好\n\n2\n00:00:01,200 --> 00:00:02,000\n没事\n", encoding="utf-8")
+
+    result = web_agent.subtitle_pair_issues(srt)
+
+    assert result["pair_issue_count"] == 1
+    assert result["pair_issues"][0]["missing_symbol"] == "”"
+    assert result["pair_issues"][0]["cue_index"] == 1
 
 def test_translate_subtitle_job_passes_translation_mode(monkeypatch, tmp_path: Path):
     source = tmp_path / "video.ko.srt"

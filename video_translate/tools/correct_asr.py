@@ -30,11 +30,33 @@ def default_output_path(source_srt: Path) -> Path:
     return source_srt.with_name(source_srt.stem + ".corrected.srt")
 
 
+def _nearby_reference_payload(cue: SubtitleCue, reference_cues: list[SubtitleCue], *, window_seconds: float = 1.0, max_items: int = 4) -> list[dict[str, Any]]:
+    nearby: list[tuple[float, float, SubtitleCue]] = []
+    for ref in reference_cues:
+        if ref.end < cue.start - window_seconds or ref.start > cue.end + window_seconds:
+            continue
+        overlap = max(0.0, min(cue.end, ref.end) - max(cue.start, ref.start))
+        if overlap > 0:
+            distance = 0.0
+        elif ref.end < cue.start:
+            distance = cue.start - ref.end
+        else:
+            distance = ref.start - cue.end
+        nearby.append((-overlap, distance, ref))
+    nearby.sort(key=lambda item: (item[0], item[1], item[2].start))
+    return [
+        {"start": ref.start, "end": ref.end, "text": ref.text}
+        for _, _, ref in nearby[:max_items]
+        if ref.text.strip()
+    ]
+
+
 def correct_asr_srt(
     source_srt: Path,
     out_srt: Path | None = None,
     *,
     glossary_path: Path | None = None,
+    reference_srt: Path | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     model: str | None = None,
     base_url: str | None = None,
@@ -46,6 +68,12 @@ def correct_asr_srt(
         raise FileNotFoundError(f"字幕文件不存在: {source_srt}")
     if source_srt.suffix.lower() != ".srt":
         raise ValueError("ASR 纠错入口只接受 .srt 文件。")
+    if reference_srt is not None:
+        reference_srt = reference_srt.expanduser().resolve()
+        if not reference_srt.exists():
+            raise FileNotFoundError(f"OCR 参考字幕不存在: {reference_srt}")
+        if reference_srt.suffix.lower() != ".srt":
+            raise ValueError("OCR 参考字幕只接受 .srt 文件。")
     out_srt = (out_srt or default_output_path(source_srt)).expanduser().resolve()
 
     _load_dotenv(source_srt)
@@ -63,6 +91,7 @@ def correct_asr_srt(
         raise RuntimeError("缺少 ASR 纠错模型，请传 --model 或配置 ASR_CORRECTION_MODEL。")
 
     cues = read_srt(source_srt)
+    reference_cues = read_srt(reference_srt) if reference_srt else []
     glossary = load_glossary(glossary_path)
     corrected: list[SubtitleCue] = []
     print(f"asr_correct_model: {selected_model}", flush=True)
@@ -78,6 +107,7 @@ def correct_asr_srt(
             source_language=source_language,
             glossary_context=glossary.to_context([cue.text for cue in batch]),
             extra_prompt=extra_prompt,
+            reference_cues=reference_cues,
             batch_label=f"{batch_index}/{total_batches}",
         )
         for cue in batch:
@@ -104,9 +134,16 @@ def build_correction_payload(
     source_language: str,
     glossary_context: dict[str, Any],
     extra_prompt: str = "",
+    reference_cues: list[SubtitleCue] | None = None,
 ) -> dict[str, Any]:
     subtitles = [
-        {"id": cue.index, "start": cue.start, "end": cue.end, "source": cue.text}
+        {
+            "id": cue.index,
+            "start": cue.start,
+            "end": cue.end,
+            "source": cue.text,
+            "ocr_reference": _nearby_reference_payload(cue, reference_cues or []),
+        }
         for cue in cues
     ]
     rules = [
@@ -115,6 +152,8 @@ def build_correction_payload(
         "必须保持 id 不变，不要增删字幕条目，不要拆分或合并字幕。",
         "不要改时间轴；输出只包含 id 和 corrected。",
         "参考 context.glossary 中的 source、aliases 和 zh 来判断固定人名/术语，但 corrected 仍然必须是原语言文本。",
+        "如果 subtitles[].ocr_reference 有内容，它来自同一视频、相近时间段的画面内嵌字幕 OCR；ASR 仍然主导时间轴和说话内容，OCR 只用于修正明显同音误识别、人名/术语或补足同一句中被 ASR 漏掉的短词。",
+        "不要把与 ASR 当前句无关的画面说明、姓名牌、角标、水印或后期花字强行加入 corrected。",
         "不确定时保留原文，避免过度脑补。",
     ]
     if extra_prompt.strip():
@@ -145,6 +184,7 @@ def _request_batch_correction_mapping(
     source_language: str,
     glossary_context: dict[str, Any],
     extra_prompt: str,
+    reference_cues: list[SubtitleCue] | None,
     batch_label: str,
 ) -> dict[int, str]:
     payload = build_correction_payload(
@@ -153,6 +193,7 @@ def _request_batch_correction_mapping(
         source_language=source_language,
         glossary_context=glossary_context,
         extra_prompt=extra_prompt,
+        reference_cues=reference_cues,
     )
     try:
         return _request_correction_mapping(endpoint, api_key, payload)
@@ -174,6 +215,7 @@ def _request_batch_correction_mapping(
             source_language=source_language,
             glossary_context=glossary_context,
             extra_prompt=extra_prompt,
+            reference_cues=reference_cues,
             batch_label=f"{batch_label}a",
         )
         mapping.update(
@@ -185,6 +227,7 @@ def _request_batch_correction_mapping(
                 source_language=source_language,
                 glossary_context=glossary_context,
                 extra_prompt=extra_prompt,
+                reference_cues=reference_cues,
                 batch_label=f"{batch_label}b",
             )
         )
@@ -215,6 +258,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("source_srt", type=Path)
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--glossary", type=Path, default=None)
+    parser.add_argument("--reference-srt", type=Path, default=None, help="Optional OCR SRT from the same video used as ASR correction reference.")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--model", default=None)
     parser.add_argument("--base-url", default=None)
@@ -225,6 +269,7 @@ def main(argv: list[str] | None = None) -> None:
         args.source_srt,
         args.out,
         glossary_path=args.glossary,
+        reference_srt=args.reference_srt,
         batch_size=args.batch_size,
         model=args.model,
         base_url=args.base_url,

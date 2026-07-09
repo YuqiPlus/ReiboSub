@@ -135,3 +135,23 @@ def test_correct_asr_subtitles_allows_model_override(monkeypatch, tmp_path: Path
     correct_asr.correct_asr_srt(source, out, model="minimax-m2.7")
 
     assert seen_models == ["minimax-m2.7"]
+
+
+def test_build_correction_payload_includes_ocr_reference():
+    payload = correct_asr.build_correction_payload(
+        [correct_asr.SubtitleCue(index=10, start=5.0, end=7.0, text="박봉열 선생님")],
+        model="model-id",
+        source_language="korean",
+        glossary_context={},
+        reference_cues=[
+            correct_asr.SubtitleCue(index=1, start=4.8, end=6.8, text="박보영 선생님"),
+            correct_asr.SubtitleCue(index=2, start=20.0, end=22.0, text="멀리 있는 자막"),
+        ],
+    )
+
+    content = payload["messages"][1]["content"]
+    data = correct_asr.json.loads(content)
+    assert data["subtitles"][0]["ocr_reference"][0]["text"] == "박보영 선생님"
+    assert "멀리 있는 자막" not in content
+    assert "OCR" in content
+    assert "ASR" in content

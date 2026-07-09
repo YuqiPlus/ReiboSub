@@ -1,5 +1,6 @@
 import pytest
 
+from video_translate.models import SubtitleCue
 from video_translate.translate import volcengine
 from video_translate.translate.volcengine import _parse_translation_mapping
 from video_translate.translate.volcengine import _request_translation_mapping
@@ -33,3 +34,20 @@ def test_request_translation_mapping_repairs_invalid_json(monkeypatch: pytest.Mo
     assert len(calls) == 2
     assert calls[1]["temperature"] == 0
     assert "不是合法 JSON" in calls[1]["messages"][-1]["content"]
+
+
+def test_translation_payload_instructs_question_marks_and_balanced_symbols():
+    payload = volcengine._build_payload(
+        [SubtitleCue(index=1, start=0, end=1, text="왜 그래")],
+        context={},
+        model="demo-model",
+        target_language="简体中文",
+        ignored_texts=[],
+    )
+
+    rules = payload["messages"][1]["content"]
+    assert "疑问" in rules
+    assert "？" in rules
+    assert "成对" in rules
+    assert "括号" in rules
+    assert "引号" in rules
