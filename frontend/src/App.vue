@@ -236,6 +236,7 @@ import VideoOverlayPanel from './components/VideoOverlayPanel.vue'
 import JobSidebar from './components/JobSidebar.vue'
 import { copyText } from './clipboard.js'
 import { createAgentSessionPoller } from './agentSessionPolling.js'
+import { glossaryReviewKey } from './glossaryReviewFlow.js'
 import { detectCuePairSymbolIssues, parsePrefixNames, stripCueSpeakerPrefixes, stripCueTrailingCommas } from './subtitlePrefixTools.js'
 
 const url = ref('')
@@ -280,6 +281,7 @@ const agentSession = ref(null)
 const agentSessions = ref([])
 const agentTasks = ref([])
 const agentStarting = ref(false)
+const openedGlossaryReviewKey = ref('')
 const mobileUploadBusy = ref(false)
 
 const assets = reactive({ videos: [], subtitles: [], projects: [], ocr_jobs: [] })
@@ -486,10 +488,12 @@ async function pollAgent(sessionId) {
   try {
     const session = await getJson(`/api/agent/${sessionId}`)
     const selected = isSelectedAgentSession(sessionId)
+    let openedGlossaryReview = false
     if (selected) {
       agentSession.value = session
       if (session.result?.source_srt) sourceSrt.value = session.result.source_srt
       if (session.result?.translated_srt) setStatus(agentStatus, `Agent 完成：${session.result.translated_srt}`, 'ok')
+      openedGlossaryReview = await openGlossaryReviewForSession(session)
     }
     await loadAgentSessions()
     await loadAgentTasks()
@@ -499,7 +503,7 @@ async function pollAgent(sessionId) {
     }
     agentPoller.cancel(sessionId)
     if (session.status === 'waiting') {
-      if (selected) setStatus(agentStatus, 'Agent 等待你的确认。', '')
+      if (selected && !openedGlossaryReview) setStatus(agentStatus, 'Agent 等待你的确认。', '')
       return
     }
     if (session.status === 'failed') {
@@ -542,6 +546,7 @@ async function selectAgentSession(sessionId) {
     const session = await getJson(`/api/agent/${sessionId}`)
     agentSession.value = session
     setStatus(agentStatus, `已切换到 Agent 任务：${session.id}`, '')
+    await openGlossaryReviewForSession(session)
     if (session.status === 'running') scheduleAgentPoll(session.id, 500)
   } catch (error) {
     setStatus(agentStatus, error.message, 'bad')
@@ -623,6 +628,26 @@ async function openGlossaryFromAgent(payload) {
   glossaryPath.value = path || ''
   activeView.value = 'glossary'
   await loadGlossary()
+}
+
+async function openGlossaryReviewForSession(session) {
+  const reviewKey = glossaryReviewKey(session)
+  if (!reviewKey) {
+    if (openedGlossaryReviewKey.value.startsWith(`${session?.id || ''}:`)) openedGlossaryReviewKey.value = ''
+    return false
+  }
+  if (openedGlossaryReviewKey.value === reviewKey) return false
+  glossaryPath.value = session.question.glossary_path || session.result.glossary_path
+  activeView.value = 'glossary'
+  try {
+    const loaded = await loadGlossary()
+    if (!loaded) return false
+    openedGlossaryReviewKey.value = reviewKey
+    setStatus(agentStatus, 'Glossary 已生成，已打开审核。保存后 Agent 将继续翻译。', 'ok')
+    return true
+  } catch {
+    return false
+  }
 }
 
 async function probeVideo() {
@@ -892,7 +917,7 @@ async function correctAsrSubtitle() {
 async function loadGlossary() {
   if (!glossaryPath.value.trim()) {
     setStatus(flowStatus, '先填写 glossary 路径。', 'bad')
-    return
+    return false
   }
   activeView.value = 'glossary'
   glossaryLoading.value = true
@@ -907,8 +932,10 @@ async function loadGlossary() {
     glossaryItems.value = review.items || []
     setStatus(flowStatus, `已加载 ${glossaryItems.value.length} 条 glossary。`, 'ok')
     activeView.value = 'glossary'
+    return true
   } catch (error) {
     setStatus(flowStatus, error.message, 'bad')
+    return false
   } finally {
     glossaryLoading.value = false
   }
@@ -956,6 +983,7 @@ async function continueAfterGlossarySave() {
     setStatus(flowStatus, 'Glossary 已保存，正在让 Agent 继续处理...', '')
     const session = await api('/api/agent/continue-glossary', { glossary_path: path })
     agentSession.value = session
+    openedGlossaryReviewKey.value = ''
     activeView.value = 'agent'
     setStatus(agentStatus, 'Glossary 已保存，Agent 继续处理翻译...', 'ok')
     await loadAgentSessions()

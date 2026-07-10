@@ -14,7 +14,6 @@ import threading
 import time
 import unicodedata
 import uuid
-from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from email.parser import BytesParser
 from email.policy import default as email_default_policy
@@ -29,6 +28,7 @@ import yaml
 import yt_dlp
 
 from video_translate.agent_planner import build_agent_plan
+from video_translate.agent.models import AgentSession
 from video_translate.cache import cuda_library_dirs, prepend_library_path
 from video_translate.env import load_dotenv
 from video_translate.llm_config import load_llm_task_config
@@ -39,6 +39,8 @@ from video_translate.languages import (
     youtube_language_for_source,
 )
 from video_translate.models import SubtitleCue
+from video_translate.jobs import Job, JobCancelled, JobService
+from video_translate.projects import ProjectPathPolicy
 from video_translate.project_manifest import (
     PROJECT_MANIFEST_NAME,
     infer_project_manifest,
@@ -113,67 +115,6 @@ def _dual_reference_translation_prompt(source_language: str) -> str:
 
 def _module_command(module: str, *args: object) -> list[str]:
     return [PYTHON, "-m", module, *[str(arg) for arg in args]]
-
-
-@dataclass
-class Job:
-    id: str
-    name: str
-    status: str = "running"
-    logs: list[str] = field(default_factory=list)
-    result: dict[str, Any] = field(default_factory=dict)
-    error: str = ""
-    created_at: float = field(default_factory=time.time)
-    updated_at: float = field(default_factory=time.time)
-    current_process: subprocess.Popen[str] | None = field(default=None, repr=False, compare=False)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "name": self.name,
-            "status": self.status,
-            "logs": self.logs[-500:],
-            "result": self.result,
-            "error": self.error,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "cancellable": self.status in {"running", "cancel_requested"},
-        }
-
-
-
-class JobCancelled(RuntimeError):
-    pass
-
-
-@dataclass
-class AgentSession:
-    id: str
-    status: str = "running"
-    phase: str = "created"
-    payload: dict[str, Any] = field(default_factory=dict)
-    result: dict[str, Any] = field(default_factory=dict)
-    question: dict[str, Any] = field(default_factory=dict)
-    logs: list[str] = field(default_factory=list)
-    error: str = ""
-    created_at: float = field(default_factory=time.time)
-    updated_at: float = field(default_factory=time.time)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "status": self.status,
-            "phase": self.phase,
-            "payload": self.payload,
-            "result": self.result,
-            "question": self.question,
-            "logs": self.logs[-500:],
-            "error": self.error,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "cancellable": self.status in {"running", "waiting"},
-            "retryable": self.status == "failed",
-        }
 
 
 _JOBS: dict[str, Job] = {}
@@ -362,69 +303,11 @@ def _caption_label(lang: str, kind: str) -> str:
 
 
 def start_job(name: str, target: Callable[[str], dict[str, Any] | None]) -> Job:
-    job = Job(id=uuid.uuid4().hex[:12], name=name)
-    with _LOCK:
-        _JOBS[job.id] = job
-
-    def runner() -> None:
-        try:
-            _append_log(job.id, f"job_start: {name}")
-            result = target(job.id) or {}
-            with _LOCK:
-                if job.status == "cancel_requested":
-                    job.status = "cancelled"
-                    job.current_process = None
-                    job.logs.append("job_cancelled")
-                    job.updated_at = time.time()
-                    return
-                job.result = result
-                job.status = "done"
-                job.current_process = None
-                job.logs.append("job_done")
-                job.updated_at = time.time()
-        except JobCancelled:
-            with _LOCK:
-                job.status = "cancelled"
-                job.current_process = None
-                job.logs.append("job_cancelled")
-                job.updated_at = time.time()
-        except Exception as exc:
-            with _LOCK:
-                if job.status == "cancel_requested":
-                    job.status = "cancelled"
-                    job.current_process = None
-                    job.logs.append("job_cancelled")
-                    job.updated_at = time.time()
-                else:
-                    job.status = "failed"
-                    job.error = str(exc)
-                    job.current_process = None
-                    job.logs.append(f"job_failed: {exc}")
-                    job.updated_at = time.time()
-
-    threading.Thread(target=runner, daemon=True).start()
-    return job
+    return _job_service().start(name, target)
 
 
 def cancel_job(job_id: str) -> Job | None:
-    with _LOCK:
-        job = _JOBS.get(job_id)
-        if not job:
-            return None
-        if job.status not in {"running", "cancel_requested"}:
-            return job
-        job.status = "cancel_requested"
-        job.updated_at = time.time()
-        process = job.current_process
-    _append_log(job_id, "job_cancel_requested")
-    if process and process.poll() is None:
-        _terminate_process_tree(process)
-    with _LOCK:
-        if job.status == "cancel_requested" and (process is None or process.poll() is not None):
-            job.status = "cancelled"
-            job.current_process = None
-            job.updated_at = time.time()
-    return job
+    return _job_service().cancel(job_id)
 
 
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
@@ -451,14 +334,11 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
         pass
 
 def get_job(job_id: str) -> Job | None:
-    with _LOCK:
-        return _JOBS.get(job_id)
+    return _job_service().get(job_id)
 
 
 def list_jobs() -> list[dict[str, Any]]:
-    with _LOCK:
-        jobs = sorted(_JOBS.values(), key=lambda job: job.created_at, reverse=True)
-        return [job.to_dict() for job in jobs]
+    return _job_service().list()
 
 
 def start_agent_session(payload: dict[str, Any]) -> AgentSession:
@@ -2447,6 +2327,15 @@ def _append_log(job_id: str, line: str) -> None:
             return
         job.logs.append(line.rstrip())
         job.updated_at = time.time()
+
+
+def _job_service() -> JobService:
+    return JobService(
+        _JOBS,
+        _LOCK,
+        append_log=_append_log,
+        terminate_process=_terminate_process_tree,
+    )
 
 
 def download_subtitle_job(payload: dict[str, Any]) -> Job:
@@ -4810,14 +4699,13 @@ def _required_str(payload: dict[str, Any], name: str) -> str:
 
 
 def _resolve_project_path(value: Any) -> Path:
-    path = Path(str(value)).expanduser()
-    if not path.is_absolute():
-        path = ROOT / path
-    return path.resolve()
+    return _project_path_policy().resolve(str(value))
 
 
 def _ensure_under_root(path: Path) -> None:
-    if not any(_is_relative_to(path, allowed) for allowed in _allowed_path_roots()):
+    try:
+        _project_path_policy().ensure_allowed(path)
+    except ValueError:
         allowed_text = "、".join(str(root) for root in _allowed_path_roots())
         raise ValueError(f"路径不在允许的工作目录下: {path}。允许目录: {allowed_text}")
 
@@ -4832,11 +4720,11 @@ def _allowed_path_roots() -> list[Path]:
 
 
 def _is_relative_to(path: Path, parent: Path) -> bool:
-    try:
-        path.resolve().relative_to(parent.resolve())
-        return True
-    except ValueError:
-        return False
+    return ProjectPathPolicy.is_relative_to(path, parent)
+
+
+def _project_path_policy() -> ProjectPathPolicy:
+    return ProjectPathPolicy(ROOT, _allowed_path_roots())
 
 
 def _safe_slug(value: Any) -> str:
