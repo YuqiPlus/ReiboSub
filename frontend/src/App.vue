@@ -19,10 +19,16 @@
               v-model:source-language="sourceLanguage"
               v-model:ocr-language="ocrLanguage"
               v-model:ocr-scope="ocrScope"
+              v-model:ocr-extraction-mode="ocrExtractionMode"
               v-model:ocr-crop-top-ratio="ocrCropTopRatio"
               v-model:ocr-crop-bottom-ratio="ocrCropBottomRatio"
               v-model:ocr-crop-left-ratio="ocrCropLeftRatio"
               v-model:ocr-crop-right-ratio="ocrCropRightRatio"
+              v-model:ocr-exclude-enabled="ocrExcludeEnabled"
+              v-model:ocr-exclude-top-ratio="ocrExcludeTopRatio"
+              v-model:ocr-exclude-bottom-ratio="ocrExcludeBottomRatio"
+              v-model:ocr-exclude-left-ratio="ocrExcludeLeftRatio"
+              v-model:ocr-exclude-right-ratio="ocrExcludeRightRatio"
               :input-video="agentPreviewVideo"
               v-model:ocr-refinement-mode="ocrRefinementMode"
               v-model:extra-hint="extraHint"
@@ -53,10 +59,16 @@
               v-model:source-language="sourceLanguage"
               v-model:ocr-language="ocrLanguage"
               v-model:ocr-scope="ocrScope"
+              v-model:ocr-extraction-mode="ocrExtractionMode"
               v-model:ocr-crop-top-ratio="ocrCropTopRatio"
               v-model:ocr-crop-bottom-ratio="ocrCropBottomRatio"
               v-model:ocr-crop-left-ratio="ocrCropLeftRatio"
               v-model:ocr-crop-right-ratio="ocrCropRightRatio"
+              v-model:ocr-exclude-enabled="ocrExcludeEnabled"
+              v-model:ocr-exclude-top-ratio="ocrExcludeTopRatio"
+              v-model:ocr-exclude-bottom-ratio="ocrExcludeBottomRatio"
+              v-model:ocr-exclude-left-ratio="ocrExcludeLeftRatio"
+              v-model:ocr-exclude-right-ratio="ocrExcludeRightRatio"
               :input-video="localVideo"
               v-model:ocr-refinement-mode="ocrRefinementMode"
               v-model:embedded-subtitle-hint="embeddedSubtitleHint"
@@ -236,7 +248,7 @@ import VideoOverlayPanel from './components/VideoOverlayPanel.vue'
 import JobSidebar from './components/JobSidebar.vue'
 import { copyText } from './clipboard.js'
 import { createAgentSessionPoller } from './agentSessionPolling.js'
-import { glossaryReviewKey } from './glossaryReviewFlow.js'
+import { findGlossaryReviewSession, glossaryReviewKey } from './glossaryReviewFlow.js'
 import { detectCuePairSymbolIssues, parsePrefixNames, stripCueSpeakerPrefixes, stripCueTrailingCommas } from './subtitlePrefixTools.js'
 
 const url = ref('')
@@ -261,10 +273,16 @@ const subtitleTranslationMode = ref('translate_only')
 const subtitleConvertFormat = ref('bcc')
 const ocrTranslationMode = ref('standard_cleanup')
 const ocrScope = ref('bottom')
+const ocrExtractionMode = ref('auto')
 const ocrCropTopRatio = ref(0.58)
 const ocrCropBottomRatio = ref(0)
 const ocrCropLeftRatio = ref(0)
 const ocrCropRightRatio = ref(0)
+const ocrExcludeEnabled = ref(false)
+const ocrExcludeTopRatio = ref(0.04)
+const ocrExcludeBottomRatio = ref(0.82)
+const ocrExcludeLeftRatio = ref(0.76)
+const ocrExcludeRightRatio = ref(0.02)
 const ocrRefinementMode = ref('none')
 const thumbnailFormat = ref('jpg')
 const videoQuality = ref('1080p')
@@ -390,10 +408,16 @@ async function startAgent() {
       extra_hint: extraHint.value,
       ocr_translation_mode: ocrTranslationMode.value,
       ocr_scope: ocrScope.value,
+      ocr_extraction_mode: ocrExtractionMode.value,
       ocr_crop_top_ratio: ocrCropTopRatio.value,
       ocr_crop_bottom_ratio: ocrCropBottomRatio.value,
       ocr_crop_left_ratio: ocrCropLeftRatio.value,
       ocr_crop_right_ratio: ocrCropRightRatio.value,
+      ocr_exclude_enabled: ocrExcludeEnabled.value,
+      ocr_exclude_top_ratio: ocrExcludeTopRatio.value,
+      ocr_exclude_bottom_ratio: ocrExcludeBottomRatio.value,
+      ocr_exclude_left_ratio: ocrExcludeLeftRatio.value,
+      ocr_exclude_right_ratio: ocrExcludeRightRatio.value,
       ocr_refinement_mode: ocrRefinementMode.value,
     })
     agentSession.value = session
@@ -415,10 +439,16 @@ async function answerAgent(action) {
     const session = await api(`/api/agent/${agentSession.value.id}/answer`, {
       action,
       ocr_scope: ocrScope.value,
+      ocr_extraction_mode: ocrExtractionMode.value,
       ocr_crop_top_ratio: ocrCropTopRatio.value,
       ocr_crop_bottom_ratio: ocrCropBottomRatio.value,
       ocr_crop_left_ratio: ocrCropLeftRatio.value,
       ocr_crop_right_ratio: ocrCropRightRatio.value,
+      ocr_exclude_enabled: ocrExcludeEnabled.value,
+      ocr_exclude_top_ratio: ocrExcludeTopRatio.value,
+      ocr_exclude_bottom_ratio: ocrExcludeBottomRatio.value,
+      ocr_exclude_left_ratio: ocrExcludeLeftRatio.value,
+      ocr_exclude_right_ratio: ocrExcludeRightRatio.value,
       source_language: sourceLanguage.value,
       ocr_language: ocrLanguage.value,
       embedded_subtitle_goal: embeddedSubtitleGoal.value,
@@ -527,9 +557,21 @@ async function loadAgentSessions() {
     const result = await getJson('/api/agent')
     agentSessions.value = result.sessions || []
     syncAgentSessionPolls()
+    await openWaitingGlossaryReviewFromSessions()
   } catch {
     agentSessions.value = agentSessions.value || []
   }
+}
+
+async function openWaitingGlossaryReviewFromSessions() {
+  const currentSession = agentSession.value
+  const reviewSession = findGlossaryReviewSession(agentSessions.value, currentSession?.id || '')
+  if (!reviewSession) return false
+  if (currentSession?.status === 'running' && currentSession.id !== reviewSession.id) return false
+  if (!currentSession?.id || currentSession.id !== reviewSession.id) {
+    agentSession.value = reviewSession
+  }
+  return openGlossaryReviewForSession(reviewSession)
 }
 
 async function loadAgentTasks() {
@@ -753,10 +795,16 @@ async function runOcrFull() {
       extra_hint: extraHint.value,
       translation_mode: ocrTranslationMode.value,
       ocr_scope: ocrScope.value,
+      ocr_extraction_mode: ocrExtractionMode.value,
       ocr_crop_top_ratio: ocrCropTopRatio.value,
       ocr_crop_bottom_ratio: ocrCropBottomRatio.value,
       ocr_crop_left_ratio: ocrCropLeftRatio.value,
       ocr_crop_right_ratio: ocrCropRightRatio.value,
+      ocr_exclude_enabled: ocrExcludeEnabled.value,
+      ocr_exclude_top_ratio: ocrExcludeTopRatio.value,
+      ocr_exclude_bottom_ratio: ocrExcludeBottomRatio.value,
+      ocr_exclude_left_ratio: ocrExcludeLeftRatio.value,
+      ocr_exclude_right_ratio: ocrExcludeRightRatio.value,
       ocr_refinement_mode: ocrRefinementMode.value,
       source_language: sourceLanguage.value,
       ocr_language: ocrLanguage.value,
@@ -778,10 +826,16 @@ async function runLocalOcr() {
       extra_hint: extraHint.value,
       translation_mode: ocrTranslationMode.value,
       ocr_scope: ocrScope.value,
+      ocr_extraction_mode: ocrExtractionMode.value,
       ocr_crop_top_ratio: ocrCropTopRatio.value,
       ocr_crop_bottom_ratio: ocrCropBottomRatio.value,
       ocr_crop_left_ratio: ocrCropLeftRatio.value,
       ocr_crop_right_ratio: ocrCropRightRatio.value,
+      ocr_exclude_enabled: ocrExcludeEnabled.value,
+      ocr_exclude_top_ratio: ocrExcludeTopRatio.value,
+      ocr_exclude_bottom_ratio: ocrExcludeBottomRatio.value,
+      ocr_exclude_left_ratio: ocrExcludeLeftRatio.value,
+      ocr_exclude_right_ratio: ocrExcludeRightRatio.value,
       ocr_refinement_mode: ocrRefinementMode.value,
       source_language: sourceLanguage.value,
       ocr_language: ocrLanguage.value,

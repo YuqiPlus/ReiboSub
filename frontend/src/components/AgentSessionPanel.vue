@@ -71,6 +71,13 @@
           </div>
         </div>
         <div v-if="showOcrControls" class="agent-setting">
+          <span>提取方式</span>
+          <div class="segmented">
+            <button type="button" :class="{ active: ocrExtractionMode === 'auto' }" @click="$emit('update:ocrExtractionMode', 'auto')">自动主字幕</button>
+            <button type="button" :class="{ active: ocrExtractionMode === 'region' }" @click="$emit('update:ocrExtractionMode', 'region')">区域 OCR</button>
+          </div>
+        </div>
+        <div v-if="showOcrControls" class="agent-setting">
           <span>裁剪预设</span>
           <div class="segmented">
             <button type="button" :class="{ active: isCropPreset(0.58) }" @click="applyCropPreset(0.58)">底部</button>
@@ -100,10 +107,20 @@
           :ocr-crop-bottom-ratio="ocrCropBottomRatio"
           :ocr-crop-left-ratio="ocrCropLeftRatio"
           :ocr-crop-right-ratio="ocrCropRightRatio"
+          :ocr-exclude-enabled="ocrExcludeEnabled"
+          :ocr-exclude-top-ratio="ocrExcludeTopRatio"
+          :ocr-exclude-bottom-ratio="ocrExcludeBottomRatio"
+          :ocr-exclude-left-ratio="ocrExcludeLeftRatio"
+          :ocr-exclude-right-ratio="ocrExcludeRightRatio"
           @update:ocr-crop-top-ratio="$emit('update:ocrCropTopRatio', $event)"
           @update:ocr-crop-bottom-ratio="$emit('update:ocrCropBottomRatio', $event)"
           @update:ocr-crop-left-ratio="$emit('update:ocrCropLeftRatio', $event)"
           @update:ocr-crop-right-ratio="$emit('update:ocrCropRightRatio', $event)"
+          @update:ocr-exclude-enabled="$emit('update:ocrExcludeEnabled', $event)"
+          @update:ocr-exclude-top-ratio="$emit('update:ocrExcludeTopRatio', $event)"
+          @update:ocr-exclude-bottom-ratio="$emit('update:ocrExcludeBottomRatio', $event)"
+          @update:ocr-exclude-left-ratio="$emit('update:ocrExcludeLeftRatio', $event)"
+          @update:ocr-exclude-right-ratio="$emit('update:ocrExcludeRightRatio', $event)"
         />
       </div>
     </div>
@@ -125,7 +142,7 @@
             <span>{{ item.id }} · {{ sessionPhaseLabel(item.phase) }} · {{ sessionStatusLabel(item.status) }}</span>
           </button>
           <button v-if="item.result?.glossary_path" class="secondary mini" type="button" @click="$emit('open-glossary', { path: item.result.glossary_path, sessionId: item.id })">
-            审核 Glossary
+            {{ sessionGlossaryActionLabel(item) }}
           </button>
         </div>
       </div>
@@ -152,9 +169,9 @@
           <div class="agent-task-stages">
             <div v-for="stage in task.stage_items || []" :key="stage.id" class="agent-task-stage" :class="stage.status || 'pending'">
               <span>{{ stage.label }}</span>
-              <b>{{ stageStatusLabel(stage.status) }}</b>
+              <b>{{ stageStatusLabel(stage, task) }}</b>
               <div class="agent-task-actions">
-                <button v-if="stage.id === 'glossary' && stage.glossary_path" class="secondary mini" type="button" @click="$emit('open-glossary', stage.glossary_path)">审核</button>
+                <button v-if="stage.id === 'glossary' && stage.glossary_path" class="secondary mini" type="button" @click="$emit('open-glossary', stage.glossary_path)">{{ taskGlossaryActionLabel(task) }}</button>
                 <button v-if="canRerun(stage)" class="secondary mini" type="button" @click="$emit('rerun-task', { taskId: task.id, stage: stage.id })">重跑</button>
               </div>
             </div>
@@ -181,9 +198,9 @@
             <div class="agent-task-stages">
               <div v-for="stage in task.stage_items || []" :key="stage.id" class="agent-task-stage" :class="stage.status || 'pending'">
                 <span>{{ stage.label }}</span>
-                <b>{{ stageStatusLabel(stage.status) }}</b>
+                <b>{{ stageStatusLabel(stage, task) }}</b>
                 <div class="agent-task-actions">
-                  <button v-if="stage.id === 'glossary' && stage.glossary_path" class="secondary mini" type="button" @click="$emit('open-glossary', stage.glossary_path)">审核</button>
+                  <button v-if="stage.id === 'glossary' && stage.glossary_path" class="secondary mini" type="button" @click="$emit('open-glossary', stage.glossary_path)">{{ taskGlossaryActionLabel(task) }}</button>
                   <button v-if="canRerun(stage)" class="secondary mini" type="button" @click="$emit('rerun-task', { taskId: task.id, stage: stage.id })">重跑</button>
                 </div>
               </div>
@@ -314,11 +331,17 @@ const props = defineProps({
   sourceLanguage: { type: String, default: 'auto' },
   ocrLanguage: { type: String, default: 'auto' },
   ocrScope: { type: String, default: 'bottom' },
+  ocrExtractionMode: { type: String, default: 'auto' },
   inputVideo: { type: String, default: '' },
   ocrCropTopRatio: { type: Number, default: 0.58 },
   ocrCropBottomRatio: { type: Number, default: 0 },
   ocrCropLeftRatio: { type: Number, default: 0 },
   ocrCropRightRatio: { type: Number, default: 0 },
+  ocrExcludeEnabled: { type: Boolean, default: false },
+  ocrExcludeTopRatio: { type: Number, default: 0.04 },
+  ocrExcludeBottomRatio: { type: Number, default: 0.82 },
+  ocrExcludeLeftRatio: { type: Number, default: 0.76 },
+  ocrExcludeRightRatio: { type: Number, default: 0.02 },
   ocrRefinementMode: { type: String, default: 'none' },
   extraHint: { type: String, default: '' },
   session: { type: Object, default: null },
@@ -336,10 +359,16 @@ const emit = defineEmits([
   'update:sourceLanguage',
   'update:ocrLanguage',
   'update:ocrScope',
+  'update:ocrExtractionMode',
   'update:ocrCropTopRatio',
   'update:ocrCropBottomRatio',
   'update:ocrCropLeftRatio',
   'update:ocrCropRightRatio',
+  'update:ocrExcludeEnabled',
+  'update:ocrExcludeTopRatio',
+  'update:ocrExcludeBottomRatio',
+  'update:ocrExcludeLeftRatio',
+  'update:ocrExcludeRightRatio',
   'update:ocrRefinementMode',
   'update:extraHint',
   'start-agent',
@@ -452,6 +481,10 @@ function sessionStatusLabel(status) {
   return labels[status] || status || '未知'
 }
 
+function sessionGlossaryActionLabel(item) {
+  return item?.status === 'done' ? '查看 Glossary' : '审核 Glossary'
+}
+
 function completedLabel(task) {
   if (!task?.completed_at) return '已完成'
   return new Date(task.completed_at * 1000).toLocaleString()
@@ -481,7 +514,11 @@ function taskStageLabel(stage) {
   return labels[stage] || stage || '未开始'
 }
 
-function stageStatusLabel(status) {
+function stageStatusLabel(stage, task) {
+  if (stage?.id === 'glossary' && stage?.status === 'waiting_review' && taskHasDoneTranslation(task)) {
+    return '已用于翻译'
+  }
+  const status = stage?.status
   const labels = {
     pending: '未开始',
     done: '完成',
@@ -491,6 +528,16 @@ function stageStatusLabel(status) {
     rerunning: '重跑中',
   }
   return labels[status] || status || '未开始'
+}
+
+function taskGlossaryActionLabel(task) {
+  return taskHasDoneTranslation(task) ? '查看' : '审核'
+}
+
+function taskHasDoneTranslation(task) {
+  const stages = task?.stages || {}
+  if (stages.translate?.status === 'done' || stages.translate?.translated_srt) return true
+  return (task?.stage_items || []).some((stage) => stage.id === 'translate' && stage.status === 'done')
 }
 
 function canRerun(stage) {

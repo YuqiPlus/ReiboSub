@@ -3,11 +3,16 @@
     <div class="crop-header">
       <div>
         <b>{{ title }}</b>
-        <span>亮区会参与底部主 OCR；智能全屏辅助仍保留全画面。</span>
+        <span>{{ cropStatus }}</span>
       </div>
-      <button class="secondary mini" type="button" :disabled="loading || !inputVideo" @click="loadPreview">
-        {{ preview.image_data_url ? (loading ? '换帧中' : '换一帧') : (loading ? '抽帧中' : '抽一帧预览') }}
-      </button>
+      <div class="crop-actions">
+        <button class="secondary mini" type="button" @click="toggleExclude">
+          {{ ocrExcludeEnabled ? '关闭排除框' : '添加 Logo 排除框' }}
+        </button>
+        <button class="secondary mini" type="button" :disabled="loading || !inputVideo" @click="loadPreview">
+          {{ preview.image_data_url ? (loading ? '换帧中' : '换一帧') : (loading ? '抽帧中' : '抽一帧预览') }}
+        </button>
+      </div>
     </div>
 
     <div class="crop-tune-panel">
@@ -42,6 +47,37 @@
         </div>
       </div>
 
+      <div v-if="ocrExcludeEnabled" class="crop-controls grid-crop exclude-controls" aria-label="Logo 排除框微调">
+        <div class="crop-field exclude">
+          <span>排上</span>
+          <button type="button" class="crop-value-step" aria-label="减少排除框上边界" @click="stepExcludeTop(-1)">−</button>
+          <input type="text" inputmode="decimal" :value="ratioToPercent(ocrExcludeTopRatio)" @input="onExcludeTopInput" @keydown.enter.prevent />
+          <button type="button" class="crop-value-step" aria-label="增加排除框上边界" @click="stepExcludeTop(1)">＋</button>
+          <b>%</b>
+        </div>
+        <div class="crop-field exclude">
+          <span>排下</span>
+          <button type="button" class="crop-value-step" aria-label="减少排除框下边界" @click="stepExcludeBottom(-1)">−</button>
+          <input type="text" inputmode="decimal" :value="ratioToPercent(ocrExcludeBottomRatio)" @input="onExcludeBottomInput" @keydown.enter.prevent />
+          <button type="button" class="crop-value-step" aria-label="增加排除框下边界" @click="stepExcludeBottom(1)">＋</button>
+          <b>%</b>
+        </div>
+        <div class="crop-field exclude">
+          <span>排左</span>
+          <button type="button" class="crop-value-step" aria-label="减少排除框左边界" @click="stepExcludeLeft(-1)">−</button>
+          <input type="text" inputmode="decimal" :value="ratioToPercent(ocrExcludeLeftRatio)" @input="onExcludeLeftInput" @keydown.enter.prevent />
+          <button type="button" class="crop-value-step" aria-label="增加排除框左边界" @click="stepExcludeLeft(1)">＋</button>
+          <b>%</b>
+        </div>
+        <div class="crop-field exclude">
+          <span>排右</span>
+          <button type="button" class="crop-value-step" aria-label="减少排除框右边界" @click="stepExcludeRight(-1)">−</button>
+          <input type="text" inputmode="decimal" :value="ratioToPercent(ocrExcludeRightRatio)" @input="onExcludeRightInput" @keydown.enter.prevent />
+          <button type="button" class="crop-value-step" aria-label="增加排除框右边界" @click="stepExcludeRight(1)">＋</button>
+          <b>%</b>
+        </div>
+      </div>
+
       <div class="crop-joystick" aria-label="OCR 裁剪微调">
         <div class="crop-step-switch" aria-label="微调步长">
           <button v-for="step in nudgeSteps" :key="step" type="button" :class="{ active: nudgeStep === step }" @click="nudgeStep = step">{{ ratioToPercent(step) }}%</button>
@@ -62,16 +98,24 @@
 
     <div v-if="!inputVideo" class="muted crop-note">下载或选择视频后才能抽帧预览。</div>
     <div v-else-if="preview.image_data_url" class="crop-preview-wrap">
-      <div class="crop-preview">
+      <div ref="previewEl" class="crop-preview" @pointermove="onPointerMove" @pointerup="endDrag" @pointercancel="endDrag">
         <img :src="preview.image_data_url" alt="OCR crop preview" />
         <div class="crop-shade top" :style="topShadeStyle"></div>
         <div class="crop-shade bottom" :style="bottomShadeStyle"></div>
         <div class="crop-shade left" :style="leftShadeStyle"></div>
         <div class="crop-shade right" :style="rightShadeStyle"></div>
-        <div class="crop-window" :style="windowStyle"></div>
+        <div class="crop-window draggable" :style="windowStyle" title="拖动移动字幕区域；拖右下角调整大小" @pointerdown.stop.prevent="startDrag('crop', 'move', $event)">
+          <span class="crop-window-label">字幕区</span>
+          <span class="crop-resize-handle" @pointerdown.stop.prevent="startDrag('crop', 'resize', $event)"></span>
+        </div>
+        <div v-if="ocrExcludeEnabled" class="exclude-window draggable" :style="excludeWindowStyle" title="拖动移动 Logo 排除框；拖右下角调整大小" @pointerdown.stop.prevent="startDrag('exclude', 'move', $event)">
+          <span class="crop-window-label">排除</span>
+          <span class="crop-resize-handle" @pointerdown.stop.prevent="startDrag('exclude', 'resize', $event)"></span>
+        </div>
       </div>
       <div class="crop-preview-meta">
         <span>预览帧 {{ previewTimeLabel }}</span>
+        <span v-if="ocrExcludeEnabled">红框内 OCR 会被忽略</span>
         <span v-if="preview.width && preview.height">{{ preview.width }} × {{ preview.height }}</span>
       </div>
     </div>
@@ -80,7 +124,7 @@
 </template>
 
 <script setup>
-import { computed, reactive, ref } from 'vue'
+import { computed, onUnmounted, reactive, ref, watch } from 'vue'
 import { api } from '../api'
 
 const props = defineProps({
@@ -91,6 +135,11 @@ const props = defineProps({
   ocrCropBottomRatio: { type: Number, default: 0 },
   ocrCropLeftRatio: { type: Number, default: 0 },
   ocrCropRightRatio: { type: Number, default: 0 },
+  ocrExcludeEnabled: { type: Boolean, default: false },
+  ocrExcludeTopRatio: { type: Number, default: 0.04 },
+  ocrExcludeBottomRatio: { type: Number, default: 0.82 },
+  ocrExcludeLeftRatio: { type: Number, default: 0.76 },
+  ocrExcludeRightRatio: { type: Number, default: 0.02 },
 })
 
 const emit = defineEmits([
@@ -98,13 +147,21 @@ const emit = defineEmits([
   'update:ocrCropBottomRatio',
   'update:ocrCropLeftRatio',
   'update:ocrCropRightRatio',
+  'update:ocrExcludeEnabled',
+  'update:ocrExcludeTopRatio',
+  'update:ocrExcludeBottomRatio',
+  'update:ocrExcludeLeftRatio',
+  'update:ocrExcludeRightRatio',
 ])
 
 const preview = reactive({ image_data_url: '', time_seconds: 0, duration_seconds: 0, width: 0, height: 0 })
+const previewEl = ref(null)
 const loading = ref(false)
 const error = ref('')
 const nudgeSteps = [0.01, 0.03, 0.05]
 const nudgeStep = ref(0.03)
+const cropStatus = ref('调整后会自动保存到当前 OCR 参数。')
+const dragState = ref(null)
 
 const topPct = computed(() => ratioToPercent(props.ocrCropTopRatio))
 const bottomPct = computed(() => ratioToPercent(props.ocrCropBottomRatio))
@@ -114,6 +171,12 @@ const keepTop = computed(() => topPct.value)
 const keepBottom = computed(() => 100 - bottomPct.value)
 const keepLeft = computed(() => leftPct.value)
 const keepRight = computed(() => 100 - rightPct.value)
+const excludeTopPct = computed(() => ratioToPercent(props.ocrExcludeTopRatio))
+const excludeBottomPct = computed(() => ratioToPercent(props.ocrExcludeBottomRatio))
+const excludeLeftPct = computed(() => ratioToPercent(props.ocrExcludeLeftRatio))
+const excludeRightPct = computed(() => ratioToPercent(props.ocrExcludeRightRatio))
+const excludeKeepBottom = computed(() => 100 - excludeBottomPct.value)
+const excludeKeepRight = computed(() => 100 - excludeRightPct.value)
 
 const windowStyle = computed(() => ({
   left: `${keepLeft.value}%`,
@@ -125,7 +188,34 @@ const topShadeStyle = computed(() => ({ left: 0, top: 0, width: '100%', height: 
 const bottomShadeStyle = computed(() => ({ left: 0, top: `${keepBottom.value}%`, width: '100%', height: `${100 - keepBottom.value}%` }))
 const leftShadeStyle = computed(() => ({ left: 0, top: `${keepTop.value}%`, width: `${keepLeft.value}%`, height: `${Math.max(0, keepBottom.value - keepTop.value)}%` }))
 const rightShadeStyle = computed(() => ({ left: `${keepRight.value}%`, top: `${keepTop.value}%`, width: `${100 - keepRight.value}%`, height: `${Math.max(0, keepBottom.value - keepTop.value)}%` }))
+const excludeWindowStyle = computed(() => ({
+  left: `${excludeLeftPct.value}%`,
+  top: `${excludeTopPct.value}%`,
+  width: `${Math.max(0, excludeKeepRight.value - excludeLeftPct.value)}%`,
+  height: `${Math.max(0, excludeKeepBottom.value - excludeTopPct.value)}%`,
+}))
 const previewTimeLabel = computed(() => formatTime(preview.time_seconds))
+const cropKey = computed(() => [
+  props.ocrScope,
+  Number(props.ocrCropTopRatio || 0).toFixed(4),
+  Number(props.ocrCropBottomRatio || 0).toFixed(4),
+  Number(props.ocrCropLeftRatio || 0).toFixed(4),
+  Number(props.ocrCropRightRatio || 0).toFixed(4),
+  props.ocrExcludeEnabled ? 'exclude-on' : 'exclude-off',
+  Number(props.ocrExcludeTopRatio || 0).toFixed(4),
+  Number(props.ocrExcludeBottomRatio || 0).toFixed(4),
+  Number(props.ocrExcludeLeftRatio || 0).toFixed(4),
+  Number(props.ocrExcludeRightRatio || 0).toFixed(4),
+].join('|'))
+
+watch(cropKey, (_next, previous) => {
+  if (!previous) return
+  cropStatus.value = '已自动保存当前裁剪设置，下一次 OCR 会使用。'
+})
+
+onUnmounted(() => {
+  window.removeEventListener('pointerup', endDrag)
+})
 
 function ratioToPercent(value) {
   return Math.round(Number(value || 0) * 100)
@@ -140,6 +230,11 @@ function emitRatio(eventName, value, maxPercent = 45) {
   emit(eventName, Number((percent / 100).toFixed(4)))
 }
 
+function emitExcludeRatio(eventName, value) {
+  const percent = clamp(parsePercent(value), 0, 98)
+  emit(eventName, Number((percent / 100).toFixed(4)))
+}
+
 function parsePercent(value) {
   const normalized = String(value ?? '').replace(/[^0-9.]/g, '')
   const parsed = Number(normalized)
@@ -150,6 +245,12 @@ function stepPercent(eventName, currentRatio, direction, maxPercent = 45) {
   const current = ratioToPercent(currentRatio)
   const step = Math.max(1, ratioToPercent(nudgeStep.value))
   emitRatio(eventName, current + direction * step, maxPercent)
+}
+
+function stepExcludePercent(eventName, currentRatio, direction) {
+  const current = ratioToPercent(currentRatio)
+  const step = Math.max(1, ratioToPercent(nudgeStep.value))
+  emitExcludeRatio(eventName, current + direction * step)
 }
 
 function onTopInput(event) {
@@ -168,6 +269,22 @@ function onRightInput(event) {
   emitRatio('update:ocrCropRightRatio', event.target.value)
 }
 
+function onExcludeTopInput(event) {
+  emitExcludeRatio('update:ocrExcludeTopRatio', event.target.value)
+}
+
+function onExcludeBottomInput(event) {
+  emitExcludeRatio('update:ocrExcludeBottomRatio', event.target.value)
+}
+
+function onExcludeLeftInput(event) {
+  emitExcludeRatio('update:ocrExcludeLeftRatio', event.target.value)
+}
+
+function onExcludeRightInput(event) {
+  emitExcludeRatio('update:ocrExcludeRightRatio', event.target.value)
+}
+
 function stepTop(direction) {
   stepPercent('update:ocrCropTopRatio', props.ocrCropTopRatio, direction, 95)
 }
@@ -184,11 +301,120 @@ function stepRight(direction) {
   stepPercent('update:ocrCropRightRatio', props.ocrCropRightRatio, direction)
 }
 
+function stepExcludeTop(direction) {
+  stepExcludePercent('update:ocrExcludeTopRatio', props.ocrExcludeTopRatio, direction)
+}
+
+function stepExcludeBottom(direction) {
+  stepExcludePercent('update:ocrExcludeBottomRatio', props.ocrExcludeBottomRatio, direction)
+}
+
+function stepExcludeLeft(direction) {
+  stepExcludePercent('update:ocrExcludeLeftRatio', props.ocrExcludeLeftRatio, direction)
+}
+
+function stepExcludeRight(direction) {
+  stepExcludePercent('update:ocrExcludeRightRatio', props.ocrExcludeRightRatio, direction)
+}
+
 function setRatios({ top, bottom, left, right }) {
   if (top !== undefined) emit('update:ocrCropTopRatio', Number(clamp(top, 0, 0.95).toFixed(4)))
   if (bottom !== undefined) emit('update:ocrCropBottomRatio', Number(clamp(bottom, 0, 0.95).toFixed(4)))
   if (left !== undefined) emit('update:ocrCropLeftRatio', Number(clamp(left, 0, 0.45).toFixed(4)))
   if (right !== undefined) emit('update:ocrCropRightRatio', Number(clamp(right, 0, 0.45).toFixed(4)))
+}
+
+function setExcludeRatios({ top, bottom, left, right }) {
+  if (top !== undefined) emit('update:ocrExcludeTopRatio', Number(clamp(top, 0, 0.98).toFixed(4)))
+  if (bottom !== undefined) emit('update:ocrExcludeBottomRatio', Number(clamp(bottom, 0, 0.98).toFixed(4)))
+  if (left !== undefined) emit('update:ocrExcludeLeftRatio', Number(clamp(left, 0, 0.98).toFixed(4)))
+  if (right !== undefined) emit('update:ocrExcludeRightRatio', Number(clamp(right, 0, 0.98).toFixed(4)))
+}
+
+function toggleExclude() {
+  if (!props.ocrExcludeEnabled) {
+    if ((1 - props.ocrExcludeRightRatio) <= props.ocrExcludeLeftRatio || (1 - props.ocrExcludeBottomRatio) <= props.ocrExcludeTopRatio) {
+      setExcludeRatios({ top: 0.04, bottom: 0.82, left: 0.76, right: 0.02 })
+    }
+    emit('update:ocrExcludeEnabled', true)
+  } else {
+    emit('update:ocrExcludeEnabled', false)
+  }
+}
+
+function startDrag(kind, action, event) {
+  const box = kind === 'exclude'
+    ? edgesFromRatios(props.ocrExcludeTopRatio, props.ocrExcludeBottomRatio, props.ocrExcludeLeftRatio, props.ocrExcludeRightRatio, true)
+    : edgesFromRatios(props.ocrCropTopRatio, props.ocrCropBottomRatio, props.ocrCropLeftRatio, props.ocrCropRightRatio, false)
+  const point = previewPointerPoint(event)
+  if (!point) return
+  dragState.value = { kind, action, startX: point.x, startY: point.y, box }
+  event.currentTarget?.setPointerCapture?.(event.pointerId)
+  window.addEventListener('pointerup', endDrag, { once: true })
+}
+
+function onPointerMove(event) {
+  if (!dragState.value) return
+  const point = previewPointerPoint(event)
+  if (!point) return
+  const state = dragState.value
+  const dx = point.x - state.startX
+  const dy = point.y - state.startY
+  if (state.action === 'resize') {
+    applyDragResize(state.kind, state.box, dx, dy)
+  } else {
+    applyDragMove(state.kind, state.box, dx, dy)
+  }
+}
+
+function endDrag() {
+  dragState.value = null
+}
+
+function previewPointerPoint(event) {
+  const el = previewEl.value
+  if (!el) return null
+  const rect = el.getBoundingClientRect()
+  if (!rect.width || !rect.height) return null
+  return {
+    x: clamp((event.clientX - rect.left) / rect.width, 0, 1),
+    y: clamp((event.clientY - rect.top) / rect.height, 0, 1),
+  }
+}
+
+function edgesFromRatios(top, bottom, left, right, exclude) {
+  const maxEdge = exclude ? 0.98 : 0.95
+  const maxHorizontal = exclude ? 0.98 : 0.45
+  const safeTop = clamp(top, 0, maxEdge)
+  const safeBottom = clamp(1 - Number(bottom || 0), 0.02, 1)
+  const safeLeft = clamp(left, 0, maxHorizontal)
+  const safeRight = clamp(1 - Number(right || 0), 0.02, 1)
+  return { left: safeLeft, top: safeTop, right: Math.max(safeLeft + 0.01, safeRight), bottom: Math.max(safeTop + 0.01, safeBottom) }
+}
+
+function applyDragMove(kind, box, dx, dy) {
+  const width = box.right - box.left
+  const height = box.bottom - box.top
+  const nextLeft = clamp(box.left + dx, 0, 1 - width)
+  const nextTop = clamp(box.top + dy, 0, 1 - height)
+  applyBox(kind, { left: nextLeft, top: nextTop, right: nextLeft + width, bottom: nextTop + height })
+}
+
+function applyDragResize(kind, box, dx, dy) {
+  const minWidth = kind === 'exclude' ? 0.04 : 0.08
+  const minHeight = kind === 'exclude' ? 0.04 : 0.06
+  const nextRight = clamp(box.right + dx, box.left + minWidth, 1)
+  const nextBottom = clamp(box.bottom + dy, box.top + minHeight, 1)
+  applyBox(kind, { ...box, right: nextRight, bottom: nextBottom })
+}
+
+function applyBox(kind, box) {
+  const ratios = { left: box.left, top: box.top, right: 1 - box.right, bottom: 1 - box.bottom }
+  if (kind === 'exclude') {
+    setExcludeRatios(ratios)
+  } else {
+    setRatios(ratios)
+  }
 }
 
 function nudgeWindow(dx, dy) {
@@ -263,6 +489,11 @@ async function loadPreview() {
       ocr_crop_bottom_ratio: props.ocrCropBottomRatio,
       ocr_crop_left_ratio: props.ocrCropLeftRatio,
       ocr_crop_right_ratio: props.ocrCropRightRatio,
+      ocr_exclude_enabled: props.ocrExcludeEnabled,
+      ocr_exclude_top_ratio: props.ocrExcludeTopRatio,
+      ocr_exclude_bottom_ratio: props.ocrExcludeBottomRatio,
+      ocr_exclude_left_ratio: props.ocrExcludeLeftRatio,
+      ocr_exclude_right_ratio: props.ocrExcludeRightRatio,
     }
     if (requestedTime !== undefined) payload.time_seconds = requestedTime
     const result = await api('/api/ocr-preview-frame', payload)

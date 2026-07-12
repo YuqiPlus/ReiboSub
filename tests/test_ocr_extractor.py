@@ -110,3 +110,35 @@ def test_ocr_frame_applies_vertical_crop_and_restores_coordinates():
     assert fake.seen_shapes == [(45, 140)]
     assert boxes[0].bbox == (30.0, 29.0, 100.0, 43.0)
     assert boxes[0].region == "bottom"
+
+
+def test_ocr_frame_filters_boxes_inside_exclude_region():
+    import numpy as np
+    from video_translate.ocr.extractor import ExtractConfig, _ocr_frame
+
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    fake = _FakeOCR([
+        ("LOGO", 0.95, [(156, 8), (194, 8), (194, 24), (156, 24)]),
+        ("정상 자막", 0.95, [(40, 70), (150, 70), (150, 90), (40, 90)]),
+    ])
+
+    boxes = list(
+        _ocr_frame(
+            fake,
+            frame,
+            2.0,
+            4,
+            ExtractConfig(
+                crop_top_ratio=0.0,
+                crop_bottom_ratio=0.0,
+                exclude_enabled=True,
+                exclude_top_ratio=0.0,
+                exclude_bottom_ratio=0.70,
+                exclude_left_ratio=0.75,
+                exclude_right_ratio=0.0,
+                auto_trim_side_noise=False,
+            ),
+        )
+    )
+
+    assert [box.text for box in boxes] == ["정상 자막"]

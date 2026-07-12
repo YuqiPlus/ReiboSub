@@ -5,7 +5,7 @@ from video_translate.ocr.classifier import ClassificationConfig, classify_tracks
 from video_translate.ocr.text_track import build_text_tracks
 from video_translate.subtitle.srt import read_srt, write_srt
 from video_translate.models import SubtitleCue
-from video_translate.pipeline import CueTimingConfig, write_extraction_outputs
+from video_translate.pipeline import CueTimingConfig, _apply_region_ocr_track_policy, write_extraction_outputs
 
 
 def test_persistent_overlay_is_filtered() -> None:
@@ -70,6 +70,28 @@ def test_non_bottom_caption_is_suppressed_when_bottom_subtitle_exists() -> None:
     assert kinds["아래 자막"] == TrackKind.MAIN_SUBTITLE
     assert kinds["화면 글자"] == TrackKind.SECONDARY_CAPTION
     assert reasons["화면 글자"] == "non_bottom_suppressed_by_bottom_subtitle"
+
+
+def test_region_ocr_policy_keeps_selected_area_tracks_as_main_subtitles() -> None:
+    tracks = [
+        TextTrack(
+            id=1,
+            text="화면 안 자막",
+            start=1.0,
+            end=1.33,
+            kind=TrackKind.PERSISTENT_OVERLAY,
+            reason="old_classifier_reason",
+            boxes=[OCRBox("화면 안 자막", (400, 520, 900, 580), 0.92, 1.0, 30, "crop")],
+        ),
+        TextTrack(id=2, text="   ", start=2.0, end=2.0, kind=TrackKind.UNKNOWN),
+    ]
+
+    _apply_region_ocr_track_policy(tracks)
+
+    assert tracks[0].kind == TrackKind.MAIN_SUBTITLE
+    assert tracks[0].reason == "region_ocr_selected_area"
+    assert tracks[1].kind == TrackKind.UNKNOWN
+    assert tracks[1].reason == "region_ocr_empty_text"
 
 
 def test_srt_roundtrip(tmp_path: Path) -> None:

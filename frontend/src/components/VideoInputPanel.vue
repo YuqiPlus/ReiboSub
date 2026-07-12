@@ -86,6 +86,14 @@
       <span class="muted">限定区域只扫绿色裁剪框；全屏辅助会额外扫全画面候选，适合字幕位置不固定或有花字。</span>
     </div>
     <div class="mode-row">
+      <label>OCR 提取方式</label>
+      <div class="segmented">
+        <button type="button" :class="{ active: ocrExtractionMode === 'auto' }" @click="$emit('update:ocrExtractionMode', 'auto')">自动主字幕</button>
+        <button type="button" :class="{ active: ocrExtractionMode === 'region' }" @click="$emit('update:ocrExtractionMode', 'region')">区域 OCR</button>
+      </div>
+      <span class="muted">区域 OCR 会信任绿色裁剪框里的文字，不走原来的 logo/主字幕分类；旧自动模式不变。</span>
+    </div>
+    <div class="mode-row">
       <label>裁剪预设</label>
       <div class="segmented">
         <button type="button" :class="{ active: isCropPreset(0.58) }" @click="applyCropPreset(0.58)">底部</button>
@@ -101,10 +109,20 @@
       :ocr-crop-bottom-ratio="ocrCropBottomRatio"
       :ocr-crop-left-ratio="ocrCropLeftRatio"
       :ocr-crop-right-ratio="ocrCropRightRatio"
+      :ocr-exclude-enabled="ocrExcludeEnabled"
+      :ocr-exclude-top-ratio="ocrExcludeTopRatio"
+      :ocr-exclude-bottom-ratio="ocrExcludeBottomRatio"
+      :ocr-exclude-left-ratio="ocrExcludeLeftRatio"
+      :ocr-exclude-right-ratio="ocrExcludeRightRatio"
       @update:ocr-crop-top-ratio="$emit('update:ocrCropTopRatio', $event)"
       @update:ocr-crop-bottom-ratio="$emit('update:ocrCropBottomRatio', $event)"
       @update:ocr-crop-left-ratio="$emit('update:ocrCropLeftRatio', $event)"
       @update:ocr-crop-right-ratio="$emit('update:ocrCropRightRatio', $event)"
+      @update:ocr-exclude-enabled="$emit('update:ocrExcludeEnabled', $event)"
+      @update:ocr-exclude-top-ratio="$emit('update:ocrExcludeTopRatio', $event)"
+      @update:ocr-exclude-bottom-ratio="$emit('update:ocrExcludeBottomRatio', $event)"
+      @update:ocr-exclude-left-ratio="$emit('update:ocrExcludeLeftRatio', $event)"
+      @update:ocr-exclude-right-ratio="$emit('update:ocrExcludeRightRatio', $event)"
     />
     <div class="mode-row">
       <label for="ocrRefinementMode">OCR 原文精修</label>
@@ -124,11 +142,17 @@ const props = defineProps({
   url: { type: String, default: '' },
   ocrTranslationMode: { type: String, default: 'standard_cleanup' },
   ocrScope: { type: String, default: 'bottom' },
+  ocrExtractionMode: { type: String, default: 'auto' },
   inputVideo: { type: String, default: '' },
   ocrCropTopRatio: { type: Number, default: 0.58 },
   ocrCropBottomRatio: { type: Number, default: 0 },
   ocrCropLeftRatio: { type: Number, default: 0 },
   ocrCropRightRatio: { type: Number, default: 0 },
+  ocrExcludeEnabled: { type: Boolean, default: false },
+  ocrExcludeTopRatio: { type: Number, default: 0.04 },
+  ocrExcludeBottomRatio: { type: Number, default: 0.82 },
+  ocrExcludeLeftRatio: { type: Number, default: 0.76 },
+  ocrExcludeRightRatio: { type: Number, default: 0.02 },
   ocrRefinementMode: { type: String, default: 'none' },
   thumbnailFormat: { type: String, default: 'jpg' },
   videoQuality: { type: String, default: '1080p' },
@@ -139,7 +163,7 @@ const props = defineProps({
   status: { type: String, default: '' },
   statusClass: { type: String, default: '' },
 })
-const emit = defineEmits(['update:url', 'update:ocrTranslationMode', 'update:ocrScope', 'update:ocrCropTopRatio', 'update:ocrCropBottomRatio', 'update:ocrCropLeftRatio', 'update:ocrCropRightRatio', 'update:ocrRefinementMode', 'update:embeddedSubtitleHint', 'update:sourceLanguage', 'update:ocrLanguage', 'update:thumbnailFormat', 'update:videoQuality', 'probe', 'download-video', 'download-thumbnail', 'ocr-full'])
+const emit = defineEmits(['update:url', 'update:ocrTranslationMode', 'update:ocrScope', 'update:ocrExtractionMode', 'update:ocrCropTopRatio', 'update:ocrCropBottomRatio', 'update:ocrCropLeftRatio', 'update:ocrCropRightRatio', 'update:ocrExcludeEnabled', 'update:ocrExcludeTopRatio', 'update:ocrExcludeBottomRatio', 'update:ocrExcludeLeftRatio', 'update:ocrExcludeRightRatio', 'update:ocrRefinementMode', 'update:embeddedSubtitleHint', 'update:sourceLanguage', 'update:ocrLanguage', 'update:thumbnailFormat', 'update:videoQuality', 'probe', 'download-video', 'download-thumbnail', 'ocr-full'])
 
 function setOcrMode(mode) {
   emit('update:ocrScope', mode === 'smart_full' ? 'smart_full' : 'bottom')

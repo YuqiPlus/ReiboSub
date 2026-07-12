@@ -44,9 +44,15 @@ def extract_subtitles_from_video(
     crop_bottom_ratio: float = 0.0,
     crop_left_ratio: float = 0.0,
     crop_right_ratio: float = 0.0,
+    exclude_enabled: bool = False,
+    exclude_top_ratio: float = 0.04,
+    exclude_bottom_ratio: float = 0.82,
+    exclude_left_ratio: float = 0.76,
+    exclude_right_ratio: float = 0.02,
     scan_full_frame: bool = False,
     auto_trim_side_noise: bool = True,
     device: str = "auto",
+    extraction_mode: str = "auto",
     ignored_texts: list[str] | None = None,
     ignored_contains: list[str] | None = None,
     ignored_patterns: list[str] | None = None,
@@ -65,6 +71,11 @@ def extract_subtitles_from_video(
             crop_bottom_ratio=crop_bottom_ratio,
             crop_left_ratio=crop_left_ratio,
             crop_right_ratio=crop_right_ratio,
+            exclude_enabled=exclude_enabled,
+            exclude_top_ratio=exclude_top_ratio,
+            exclude_bottom_ratio=exclude_bottom_ratio,
+            exclude_left_ratio=exclude_left_ratio,
+            exclude_right_ratio=exclude_right_ratio,
             scan_full_frame=scan_full_frame,
             auto_trim_side_noise=auto_trim_side_noise,
             device=device,
@@ -74,15 +85,18 @@ def extract_subtitles_from_video(
     out_dir.mkdir(parents=True, exist_ok=True)
     boxes_path.write_text(json.dumps([box.to_dict() for box in boxes], ensure_ascii=False, indent=2), encoding="utf-8")
     tracks = build_text_tracks(boxes)
-    classify_tracks(
-        tracks,
-        ClassificationConfig(
-            video_duration=_video_duration_hint(boxes),
-            ignored_texts=tuple(ignored_texts or []),
-            ignored_contains=tuple(ignored_contains or []),
-            ignored_patterns=tuple(ignored_patterns or []),
-        ),
-    )
+    if _normalize_extraction_mode(extraction_mode) == "region":
+        _apply_region_ocr_track_policy(tracks)
+    else:
+        classify_tracks(
+            tracks,
+            ClassificationConfig(
+                video_duration=_video_duration_hint(boxes),
+                ignored_texts=tuple(ignored_texts or []),
+                ignored_contains=tuple(ignored_contains or []),
+                ignored_patterns=tuple(ignored_patterns or []),
+            ),
+        )
     outputs = write_extraction_outputs(tracks, out_dir, cue_timing=timing)
     outputs["ocr_boxes"] = boxes_path
     return outputs
@@ -207,6 +221,24 @@ def _tracks_duration_hint(tracks: list[TextTrack]) -> float | None:
     if not tracks:
         return None
     return max(track.end for track in tracks)
+
+
+def _normalize_extraction_mode(value: str | None) -> str:
+    mode = str(value or "auto").strip().lower()
+    if mode not in {"auto", "region"}:
+        raise ValueError(f"未知 OCR 提取模式: {mode}")
+    return mode
+
+
+def _apply_region_ocr_track_policy(tracks: list[TextTrack]) -> list[TextTrack]:
+    for track in tracks:
+        if normalize_ocr_text(track.text):
+            track.kind = TrackKind.MAIN_SUBTITLE
+            track.reason = "region_ocr_selected_area"
+        else:
+            track.kind = TrackKind.UNKNOWN
+            track.reason = "region_ocr_empty_text"
+    return tracks
 
 
 @dataclass(slots=True)

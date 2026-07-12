@@ -811,6 +811,8 @@ def _agent_update_ocr_settings_from_answer(session: AgentSession, answer: dict[s
     updates: dict[str, Any] = {}
     if "ocr_scope" in answer:
         updates["ocr_scope"] = _normalize_ocr_scope(answer.get("ocr_scope"))
+    if "ocr_extraction_mode" in answer:
+        updates["ocr_extraction_mode"] = _normalize_ocr_extraction_mode(answer.get("ocr_extraction_mode"))
     scope = str(updates.get("ocr_scope") or session.payload.get("ocr_scope") or "bottom")
     if "ocr_crop_top_ratio" in answer:
         updates["ocr_crop_top_ratio"] = _normalize_ocr_crop_top_ratio(answer.get("ocr_crop_top_ratio"), scope)
@@ -820,6 +822,16 @@ def _agent_update_ocr_settings_from_answer(session: AgentSession, answer: dict[s
         updates["ocr_crop_left_ratio"] = _normalize_ocr_crop_ratio(answer.get("ocr_crop_left_ratio"))
     if "ocr_crop_right_ratio" in answer:
         updates["ocr_crop_right_ratio"] = _normalize_ocr_crop_ratio(answer.get("ocr_crop_right_ratio"))
+    if "ocr_exclude_enabled" in answer:
+        updates["ocr_exclude_enabled"] = bool(answer.get("ocr_exclude_enabled"))
+    if "ocr_exclude_top_ratio" in answer:
+        updates["ocr_exclude_top_ratio"] = _normalize_ocr_exclude_ratio(answer.get("ocr_exclude_top_ratio"))
+    if "ocr_exclude_bottom_ratio" in answer:
+        updates["ocr_exclude_bottom_ratio"] = _normalize_ocr_exclude_ratio(answer.get("ocr_exclude_bottom_ratio"))
+    if "ocr_exclude_left_ratio" in answer:
+        updates["ocr_exclude_left_ratio"] = _normalize_ocr_exclude_ratio(answer.get("ocr_exclude_left_ratio"))
+    if "ocr_exclude_right_ratio" in answer:
+        updates["ocr_exclude_right_ratio"] = _normalize_ocr_exclude_ratio(answer.get("ocr_exclude_right_ratio"))
     if "source_language" in answer:
         updates["source_language"] = normalize_source_language(answer.get("source_language") or "auto")
     if "ocr_language" in answer:
@@ -1199,11 +1211,17 @@ def _agent_run_ocr(session: AgentSession, *, force: bool = False) -> None:
     title = str((session.result.get("probe") or {}).get("title") or "")
     translation_mode = str(session.payload.get("ocr_translation_mode") or "standard_cleanup")
     ocr_scope = _normalize_ocr_scope(session.payload.get("ocr_scope"))
+    ocr_extraction_mode = _normalize_ocr_extraction_mode(session.payload.get("ocr_extraction_mode"))
     ocr_refinement_mode = _normalize_ocr_refinement_mode(session.payload.get("ocr_refinement_mode"))
     ocr_crop_top_ratio = _normalize_ocr_crop_top_ratio(session.payload.get("ocr_crop_top_ratio"), ocr_scope)
     ocr_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(session.payload.get("ocr_crop_bottom_ratio"))
     ocr_crop_left_ratio = _normalize_ocr_crop_ratio(session.payload.get("ocr_crop_left_ratio"))
     ocr_crop_right_ratio = _normalize_ocr_crop_ratio(session.payload.get("ocr_crop_right_ratio"))
+    ocr_exclude_enabled = bool(session.payload.get("ocr_exclude_enabled", False))
+    ocr_exclude_top_ratio = _normalize_ocr_exclude_ratio(session.payload.get("ocr_exclude_top_ratio", 0.04))
+    ocr_exclude_bottom_ratio = _normalize_ocr_exclude_ratio(session.payload.get("ocr_exclude_bottom_ratio", 0.82))
+    ocr_exclude_left_ratio = _normalize_ocr_exclude_ratio(session.payload.get("ocr_exclude_left_ratio", 0.76))
+    ocr_exclude_right_ratio = _normalize_ocr_exclude_ratio(session.payload.get("ocr_exclude_right_ratio", 0.02))
     source_language = _session_source_language(session)
     ocr_language = _session_ocr_language(session)
     cache_language = ocr_language if ocr_language != "auto" else source_language
@@ -1213,11 +1231,17 @@ def _agent_run_ocr(session: AgentSession, *, force: bool = False) -> None:
             title=title,
             translation_mode=translation_mode,
             ocr_scope=ocr_scope,
+            ocr_extraction_mode=ocr_extraction_mode,
             ocr_refinement_mode=ocr_refinement_mode,
             ocr_crop_top_ratio=ocr_crop_top_ratio,
             ocr_crop_bottom_ratio=ocr_crop_bottom_ratio,
             ocr_crop_left_ratio=ocr_crop_left_ratio,
             ocr_crop_right_ratio=ocr_crop_right_ratio,
+            ocr_exclude_enabled=ocr_exclude_enabled,
+            ocr_exclude_top_ratio=ocr_exclude_top_ratio,
+            ocr_exclude_bottom_ratio=ocr_exclude_bottom_ratio,
+            ocr_exclude_left_ratio=ocr_exclude_left_ratio,
+            ocr_exclude_right_ratio=ocr_exclude_right_ratio,
             source_language=cache_language,
             exclude_session_id=session.id,
         )
@@ -1245,11 +1269,17 @@ def _agent_run_ocr(session: AgentSession, *, force: bool = False) -> None:
             "extra_hint": str(session.payload.get("extra_hint") or ""),
             "translation_mode": translation_mode,
             "ocr_scope": ocr_scope,
+            "ocr_extraction_mode": ocr_extraction_mode,
             "ocr_refinement_mode": ocr_refinement_mode,
             "ocr_crop_top_ratio": ocr_crop_top_ratio,
             "ocr_crop_bottom_ratio": ocr_crop_bottom_ratio,
             "ocr_crop_left_ratio": ocr_crop_left_ratio,
             "ocr_crop_right_ratio": ocr_crop_right_ratio,
+            "ocr_exclude_enabled": ocr_exclude_enabled,
+            "ocr_exclude_top_ratio": ocr_exclude_top_ratio,
+            "ocr_exclude_bottom_ratio": ocr_exclude_bottom_ratio,
+            "ocr_exclude_left_ratio": ocr_exclude_left_ratio,
+            "ocr_exclude_right_ratio": ocr_exclude_right_ratio,
             "source_language": source_language,
             "ocr_language": ocr_language,
         }
@@ -1277,11 +1307,17 @@ def _agent_run_ocr(session: AgentSession, *, force: bool = False) -> None:
             input_video=result.get("input_video"),
             output_dir=result.get("output_dir"),
             ocr_scope=ocr_scope,
+            ocr_extraction_mode=ocr_extraction_mode,
             ocr_refinement_mode=ocr_refinement_mode,
             ocr_crop_top_ratio=ocr_crop_top_ratio,
             ocr_crop_bottom_ratio=ocr_crop_bottom_ratio,
             ocr_crop_left_ratio=ocr_crop_left_ratio,
             ocr_crop_right_ratio=ocr_crop_right_ratio,
+            ocr_exclude_enabled=ocr_exclude_enabled,
+            ocr_exclude_top_ratio=ocr_exclude_top_ratio,
+            ocr_exclude_bottom_ratio=ocr_exclude_bottom_ratio,
+            ocr_exclude_left_ratio=ocr_exclude_left_ratio,
+            ocr_exclude_right_ratio=ocr_exclude_right_ratio,
             source_language=source_language,
             ocr_language=ocr_language,
             job_result=result,
@@ -1320,11 +1356,17 @@ def _agent_use_cached_ocr(session: AgentSession, cached: dict[str, Any]) -> None
             input_video=cached.get("input_video"),
             output_dir=cached.get("output_dir"),
             ocr_scope=cached.get("ocr_scope"),
+            ocr_extraction_mode=cached.get("ocr_extraction_mode"),
             ocr_refinement_mode=cached.get("ocr_refinement_mode"),
             ocr_crop_top_ratio=cached.get("ocr_crop_top_ratio"),
             ocr_crop_bottom_ratio=cached.get("ocr_crop_bottom_ratio"),
             ocr_crop_left_ratio=cached.get("ocr_crop_left_ratio"),
             ocr_crop_right_ratio=cached.get("ocr_crop_right_ratio"),
+            ocr_exclude_enabled=cached.get("ocr_exclude_enabled"),
+            ocr_exclude_top_ratio=cached.get("ocr_exclude_top_ratio"),
+            ocr_exclude_bottom_ratio=cached.get("ocr_exclude_bottom_ratio"),
+            ocr_exclude_left_ratio=cached.get("ocr_exclude_left_ratio"),
+            ocr_exclude_right_ratio=cached.get("ocr_exclude_right_ratio"),
             source_language=cached.get("source_language") or _session_source_language(session),
             job_result=cached,
             reused=True,
@@ -1524,11 +1566,17 @@ def _agent_run_asr_with_ocr_reference(session: AgentSession) -> None:
                 "extra_hint": str(session.payload.get("extra_hint") or ""),
                 "translation_mode": "translate_only",
                 "ocr_scope": _normalize_ocr_scope(session.payload.get("ocr_scope")),
+                "ocr_extraction_mode": _normalize_ocr_extraction_mode(session.payload.get("ocr_extraction_mode")),
                 "ocr_refinement_mode": _normalize_ocr_refinement_mode(session.payload.get("ocr_refinement_mode")),
                 "ocr_crop_top_ratio": _normalize_ocr_crop_top_ratio(session.payload.get("ocr_crop_top_ratio"), _normalize_ocr_scope(session.payload.get("ocr_scope"))),
                 "ocr_crop_bottom_ratio": _normalize_ocr_vertical_crop_ratio(session.payload.get("ocr_crop_bottom_ratio")),
                 "ocr_crop_left_ratio": _normalize_ocr_crop_ratio(session.payload.get("ocr_crop_left_ratio")),
                 "ocr_crop_right_ratio": _normalize_ocr_crop_ratio(session.payload.get("ocr_crop_right_ratio")),
+                "ocr_exclude_enabled": bool(session.payload.get("ocr_exclude_enabled", False)),
+                "ocr_exclude_top_ratio": _normalize_ocr_exclude_ratio(session.payload.get("ocr_exclude_top_ratio", 0.04)),
+                "ocr_exclude_bottom_ratio": _normalize_ocr_exclude_ratio(session.payload.get("ocr_exclude_bottom_ratio", 0.82)),
+                "ocr_exclude_left_ratio": _normalize_ocr_exclude_ratio(session.payload.get("ocr_exclude_left_ratio", 0.76)),
+                "ocr_exclude_right_ratio": _normalize_ocr_exclude_ratio(session.payload.get("ocr_exclude_right_ratio", 0.02)),
                 "source_language": _session_source_language(session),
                 "ocr_language": _session_ocr_language(session),
                 "extract_only": True,
@@ -2074,11 +2122,17 @@ def _find_reusable_ocr_result(
     title: str,
     translation_mode: str,
     ocr_scope: str = "bottom",
+    ocr_extraction_mode: str = "auto",
     ocr_refinement_mode: str = "none",
     ocr_crop_top_ratio: float | None = None,
     ocr_crop_bottom_ratio: float = 0.0,
     ocr_crop_left_ratio: float = 0.0,
     ocr_crop_right_ratio: float = 0.0,
+    ocr_exclude_enabled: bool = False,
+    ocr_exclude_top_ratio: float = 0.04,
+    ocr_exclude_bottom_ratio: float = 0.82,
+    ocr_exclude_left_ratio: float = 0.76,
+    ocr_exclude_right_ratio: float = 0.02,
     source_language: str = "auto",
     exclude_session_id: str = "",
 ) -> dict[str, Any] | None:
@@ -2086,14 +2140,20 @@ def _find_reusable_ocr_result(
     title_key = _filename_match_key(title)
     mode = _normalize_ocr_translation_mode(translation_mode)
     scope = _normalize_ocr_scope(ocr_scope)
+    extraction_mode = _normalize_ocr_extraction_mode(ocr_extraction_mode)
     refinement_mode = _normalize_ocr_refinement_mode(ocr_refinement_mode)
     crop_top_ratio = _normalize_ocr_crop_top_ratio(ocr_crop_top_ratio, scope)
     crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(ocr_crop_bottom_ratio)
     crop_left_ratio = _normalize_ocr_crop_ratio(ocr_crop_left_ratio)
     crop_right_ratio = _normalize_ocr_crop_ratio(ocr_crop_right_ratio)
+    exclude_enabled = bool(ocr_exclude_enabled)
+    exclude_top_ratio = _normalize_ocr_exclude_ratio(ocr_exclude_top_ratio)
+    exclude_bottom_ratio = _normalize_ocr_exclude_ratio(ocr_exclude_bottom_ratio)
+    exclude_left_ratio = _normalize_ocr_exclude_ratio(ocr_exclude_left_ratio)
+    exclude_right_ratio = _normalize_ocr_exclude_ratio(ocr_exclude_right_ratio)
     normalized_source_language = normalize_source_language(source_language or "auto")
     candidates: list[dict[str, Any]] = []
-    candidates.extend(_reusable_ocr_from_tasks(normalized_url=normalized_url, title_key=title_key, mode=mode, scope=scope, refinement_mode=refinement_mode, crop_top_ratio=crop_top_ratio, crop_bottom_ratio=crop_bottom_ratio, crop_left_ratio=crop_left_ratio, crop_right_ratio=crop_right_ratio, source_language=normalized_source_language, exclude_session_id=exclude_session_id))
+    candidates.extend(_reusable_ocr_from_tasks(normalized_url=normalized_url, title_key=title_key, mode=mode, scope=scope, extraction_mode=extraction_mode, refinement_mode=refinement_mode, crop_top_ratio=crop_top_ratio, crop_bottom_ratio=crop_bottom_ratio, crop_left_ratio=crop_left_ratio, crop_right_ratio=crop_right_ratio, exclude_enabled=exclude_enabled, exclude_top_ratio=exclude_top_ratio, exclude_bottom_ratio=exclude_bottom_ratio, exclude_left_ratio=exclude_left_ratio, exclude_right_ratio=exclude_right_ratio, source_language=normalized_source_language, exclude_session_id=exclude_session_id))
     if not JOB_DIR.exists():
         return sorted(candidates, key=lambda item: float(item.get("created_at") or 0), reverse=True)[0] if candidates else None
     for run_yaml in JOB_DIR.glob("*/run.yaml"):
@@ -2115,11 +2175,17 @@ def _find_reusable_ocr_result(
         cached_url = str(cache.get("normalized_url") or "").strip()
         cached_mode = str(cache.get("ocr_translation_mode") or "").strip()
         cached_scope = str(cache.get("ocr_scope") or "bottom").strip()
+        cached_extraction_mode = str(cache.get("ocr_extraction_mode") or "auto").strip()
         cached_refinement_mode = str(cache.get("ocr_refinement_mode") or "none").strip()
         cached_crop_top_ratio = _normalize_ocr_crop_top_ratio(cache.get("ocr_crop_top_ratio"), cached_scope)
         cached_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(cache.get("ocr_crop_bottom_ratio"))
         cached_crop_left_ratio = _normalize_ocr_crop_ratio(cache.get("ocr_crop_left_ratio"))
         cached_crop_right_ratio = _normalize_ocr_crop_ratio(cache.get("ocr_crop_right_ratio"))
+        cached_exclude_enabled = bool(cache.get("ocr_exclude_enabled", False))
+        cached_exclude_top_ratio = _normalize_ocr_exclude_ratio(cache.get("ocr_exclude_top_ratio", 0.04))
+        cached_exclude_bottom_ratio = _normalize_ocr_exclude_ratio(cache.get("ocr_exclude_bottom_ratio", 0.82))
+        cached_exclude_left_ratio = _normalize_ocr_exclude_ratio(cache.get("ocr_exclude_left_ratio", 0.76))
+        cached_exclude_right_ratio = _normalize_ocr_exclude_ratio(cache.get("ocr_exclude_right_ratio", 0.02))
         cached_source_language = normalize_source_language(cache.get("source_language") or config.get("source_language") or "auto")
         if normalized_source_language != "auto" and cached_source_language != normalized_source_language:
             continue
@@ -2131,15 +2197,26 @@ def _find_reusable_ocr_result(
                 continue
             if _normalize_ocr_scope(cached_scope) != scope:
                 continue
+            if _normalize_ocr_extraction_mode(cached_extraction_mode) != extraction_mode:
+                continue
             if _normalize_ocr_refinement_mode(cached_refinement_mode) != refinement_mode:
                 continue
         elif not title_match:
+            continue
+        if _normalize_ocr_extraction_mode(cached_extraction_mode) != extraction_mode:
             continue
         if (
             cached_crop_top_ratio != crop_top_ratio
             or cached_crop_bottom_ratio != crop_bottom_ratio
             or cached_crop_left_ratio != crop_left_ratio
             or cached_crop_right_ratio != crop_right_ratio
+            or cached_exclude_enabled != exclude_enabled
+            or (exclude_enabled and (
+                cached_exclude_top_ratio != exclude_top_ratio
+                or cached_exclude_bottom_ratio != exclude_bottom_ratio
+                or cached_exclude_left_ratio != exclude_left_ratio
+                or cached_exclude_right_ratio != exclude_right_ratio
+            ))
         ):
             continue
         candidates.append(
@@ -2152,11 +2229,17 @@ def _find_reusable_ocr_result(
                 "created_at": run_yaml.stat().st_mtime,
                 "ocr_translation_mode": cached_mode or mode,
                 "ocr_scope": _normalize_ocr_scope(cached_scope),
+                "ocr_extraction_mode": _normalize_ocr_extraction_mode(cached_extraction_mode),
                 "ocr_refinement_mode": _normalize_ocr_refinement_mode(cached_refinement_mode),
                 "ocr_crop_top_ratio": cached_crop_top_ratio,
                 "ocr_crop_bottom_ratio": cached_crop_bottom_ratio,
                 "ocr_crop_left_ratio": cached_crop_left_ratio,
                 "ocr_crop_right_ratio": cached_crop_right_ratio,
+                "ocr_exclude_enabled": cached_exclude_enabled,
+                "ocr_exclude_top_ratio": cached_exclude_top_ratio,
+                "ocr_exclude_bottom_ratio": cached_exclude_bottom_ratio,
+                "ocr_exclude_left_ratio": cached_exclude_left_ratio,
+                "ocr_exclude_right_ratio": cached_exclude_right_ratio,
                 "source_language": cached_source_language,
             }
         )
@@ -2165,7 +2248,7 @@ def _find_reusable_ocr_result(
     return sorted(candidates, key=lambda item: float(item.get("created_at") or 0), reverse=True)[0]
 
 
-def _reusable_ocr_from_tasks(*, normalized_url: str, title_key: str, mode: str, scope: str, refinement_mode: str, crop_top_ratio: float, crop_bottom_ratio: float, crop_left_ratio: float, crop_right_ratio: float, source_language: str, exclude_session_id: str) -> list[dict[str, Any]]:
+def _reusable_ocr_from_tasks(*, normalized_url: str, title_key: str, mode: str, scope: str, extraction_mode: str, refinement_mode: str, crop_top_ratio: float, crop_bottom_ratio: float, crop_left_ratio: float, crop_right_ratio: float, exclude_enabled: bool, exclude_top_ratio: float, exclude_bottom_ratio: float, exclude_left_ratio: float, exclude_right_ratio: float, source_language: str, exclude_session_id: str) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     if not TASK_DIR.exists():
         return results
@@ -2188,6 +2271,9 @@ def _reusable_ocr_from_tasks(*, normalized_url: str, title_key: str, mode: str, 
         cached_scope = _normalize_ocr_scope(_task_stage_value(task, "ocr", "ocr_scope") or "bottom")
         if cached_scope != scope:
             continue
+        cached_extraction_mode = _normalize_ocr_extraction_mode(_task_stage_value(task, "ocr", "ocr_extraction_mode") or "auto")
+        if cached_extraction_mode != extraction_mode:
+            continue
         cached_refinement_mode = _normalize_ocr_refinement_mode(_task_stage_value(task, "ocr", "ocr_refinement_mode") or "none")
         if cached_refinement_mode != refinement_mode:
             continue
@@ -2195,6 +2281,11 @@ def _reusable_ocr_from_tasks(*, normalized_url: str, title_key: str, mode: str, 
         cached_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(_task_stage_value(task, "ocr", "ocr_crop_bottom_ratio"))
         cached_crop_left_ratio = _normalize_ocr_crop_ratio(_task_stage_value(task, "ocr", "ocr_crop_left_ratio"))
         cached_crop_right_ratio = _normalize_ocr_crop_ratio(_task_stage_value(task, "ocr", "ocr_crop_right_ratio"))
+        cached_exclude_enabled = bool(_task_stage_value(task, "ocr", "ocr_exclude_enabled") or False)
+        cached_exclude_top_ratio = _normalize_ocr_exclude_ratio(_task_stage_value(task, "ocr", "ocr_exclude_top_ratio") or 0.04)
+        cached_exclude_bottom_ratio = _normalize_ocr_exclude_ratio(_task_stage_value(task, "ocr", "ocr_exclude_bottom_ratio") or 0.82)
+        cached_exclude_left_ratio = _normalize_ocr_exclude_ratio(_task_stage_value(task, "ocr", "ocr_exclude_left_ratio") or 0.76)
+        cached_exclude_right_ratio = _normalize_ocr_exclude_ratio(_task_stage_value(task, "ocr", "ocr_exclude_right_ratio") or 0.02)
         cached_source_language = normalize_source_language(_task_stage_value(task, "ocr", "source_language") or "auto")
         if source_language != "auto" and cached_source_language != source_language:
             continue
@@ -2203,6 +2294,13 @@ def _reusable_ocr_from_tasks(*, normalized_url: str, title_key: str, mode: str, 
             or cached_crop_bottom_ratio != crop_bottom_ratio
             or cached_crop_left_ratio != crop_left_ratio
             or cached_crop_right_ratio != crop_right_ratio
+            or cached_exclude_enabled != exclude_enabled
+            or (exclude_enabled and (
+                cached_exclude_top_ratio != exclude_top_ratio
+                or cached_exclude_bottom_ratio != exclude_bottom_ratio
+                or cached_exclude_left_ratio != exclude_left_ratio
+                or cached_exclude_right_ratio != exclude_right_ratio
+            ))
         ):
             continue
         results.append(
@@ -2215,11 +2313,17 @@ def _reusable_ocr_from_tasks(*, normalized_url: str, title_key: str, mode: str, 
                 "created_at": float(_task_stage_value(task, "ocr", "updated_at") or task.get("updated_at") or task_yaml.stat().st_mtime),
                 "ocr_translation_mode": mode,
                 "ocr_scope": cached_scope,
+                "ocr_extraction_mode": cached_extraction_mode,
                 "ocr_refinement_mode": cached_refinement_mode,
                 "ocr_crop_top_ratio": cached_crop_top_ratio,
                 "ocr_crop_bottom_ratio": cached_crop_bottom_ratio,
                 "ocr_crop_left_ratio": cached_crop_left_ratio,
                 "ocr_crop_right_ratio": cached_crop_right_ratio,
+                "ocr_exclude_enabled": cached_exclude_enabled,
+                "ocr_exclude_top_ratio": cached_exclude_top_ratio,
+                "ocr_exclude_bottom_ratio": cached_exclude_bottom_ratio,
+                "ocr_exclude_left_ratio": cached_exclude_left_ratio,
+                "ocr_exclude_right_ratio": cached_exclude_right_ratio,
                 "source_language": cached_source_language,
             }
         )
@@ -2691,11 +2795,17 @@ def ocr_full_job(payload: dict[str, Any]) -> Job:
     extra_hint = str(payload.get("extra_hint") or "")
     translation_mode = _normalize_ocr_translation_mode(payload.get("translation_mode"), bool(payload.get("preserve_timing", False)))
     ocr_scope = _normalize_ocr_scope(payload.get("ocr_scope"))
+    ocr_extraction_mode = _normalize_ocr_extraction_mode(payload.get("ocr_extraction_mode"))
     ocr_refinement_mode = _normalize_ocr_refinement_mode(payload.get("ocr_refinement_mode"))
     ocr_crop_top_ratio = _normalize_ocr_crop_top_ratio(payload.get("ocr_crop_top_ratio"), ocr_scope)
     ocr_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(payload.get("ocr_crop_bottom_ratio"))
     ocr_crop_left_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_left_ratio"))
     ocr_crop_right_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_right_ratio"))
+    ocr_exclude_enabled = bool(payload.get("ocr_exclude_enabled", False))
+    ocr_exclude_top_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_top_ratio", 0.04))
+    ocr_exclude_bottom_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_bottom_ratio", 0.82))
+    ocr_exclude_left_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_left_ratio", 0.76))
+    ocr_exclude_right_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_right_ratio", 0.02))
     source_language = normalize_source_language(payload.get("source_language") or "auto")
     ocr_language = normalize_source_language(payload.get("ocr_language") or "auto")
     config_source_language = ocr_language if ocr_language != "auto" else source_language
@@ -2716,7 +2826,7 @@ def ocr_full_job(payload: dict[str, Any]) -> Job:
         manifest = update_youtube_project_manifest(input_video, source_url=url, title=title or input_video.parent.name, thumbnail_path=thumbnail)
         _append_log(job_id, f"input_video: {input_video}")
         config_path = out_dir / "run.yaml"
-        config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode, ocr_scope=ocr_scope, ocr_refinement_mode=ocr_refinement_mode, ocr_crop_top_ratio=ocr_crop_top_ratio, ocr_crop_bottom_ratio=ocr_crop_bottom_ratio, ocr_crop_left_ratio=ocr_crop_left_ratio, ocr_crop_right_ratio=ocr_crop_right_ratio, source_language=config_source_language)
+        config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode, ocr_scope=ocr_scope, ocr_extraction_mode=ocr_extraction_mode, ocr_refinement_mode=ocr_refinement_mode, ocr_crop_top_ratio=ocr_crop_top_ratio, ocr_crop_bottom_ratio=ocr_crop_bottom_ratio, ocr_crop_left_ratio=ocr_crop_left_ratio, ocr_crop_right_ratio=ocr_crop_right_ratio, ocr_exclude_enabled=ocr_exclude_enabled, ocr_exclude_top_ratio=ocr_exclude_top_ratio, ocr_exclude_bottom_ratio=ocr_exclude_bottom_ratio, ocr_exclude_left_ratio=ocr_exclude_left_ratio, ocr_exclude_right_ratio=ocr_exclude_right_ratio, source_language=config_source_language)
         if config_source_language == "chinese":
             config["mode"] = "extract"
             config["sidecar"]["copy_translated"] = False
@@ -2725,11 +2835,17 @@ def ocr_full_job(payload: dict[str, Any]) -> Job:
             "normalized_url": normalize_youtube_url(url),
             "ocr_translation_mode": translation_mode,
             "ocr_scope": ocr_scope,
+            "ocr_extraction_mode": ocr_extraction_mode,
             "ocr_refinement_mode": ocr_refinement_mode,
             "ocr_crop_top_ratio": ocr_crop_top_ratio,
             "ocr_crop_bottom_ratio": ocr_crop_bottom_ratio,
             "ocr_crop_left_ratio": ocr_crop_left_ratio,
             "ocr_crop_right_ratio": ocr_crop_right_ratio,
+            "ocr_exclude_enabled": ocr_exclude_enabled,
+            "ocr_exclude_top_ratio": ocr_exclude_top_ratio,
+            "ocr_exclude_bottom_ratio": ocr_exclude_bottom_ratio,
+            "ocr_exclude_left_ratio": ocr_exclude_left_ratio,
+            "ocr_exclude_right_ratio": ocr_exclude_right_ratio,
             "source_language": config_source_language,
             "ocr_language": ocr_language,
         }
@@ -2745,6 +2861,8 @@ def ocr_full_job(payload: dict[str, Any]) -> Job:
             "project_manifest": str(Path(str(manifest["project_dir"])) / PROJECT_MANIFEST_NAME),
             "source_language": config_source_language,
             "ocr_language": ocr_language,
+            "ocr_extraction_mode": ocr_extraction_mode,
+            "ocr_exclude_enabled": ocr_exclude_enabled,
         }
         if config_source_language == "chinese":
             result.update(_materialize_chinese_ocr_output(input_video, out_dir))
@@ -2759,11 +2877,17 @@ def ocr_extract_job(payload: dict[str, Any]) -> Job:
     extra_hint = str(payload.get("extra_hint") or "")
     translation_mode = _normalize_ocr_translation_mode(payload.get("translation_mode"), bool(payload.get("preserve_timing", False)))
     ocr_scope = _normalize_ocr_scope(payload.get("ocr_scope"))
+    ocr_extraction_mode = _normalize_ocr_extraction_mode(payload.get("ocr_extraction_mode"))
     ocr_refinement_mode = _normalize_ocr_refinement_mode(payload.get("ocr_refinement_mode"))
     ocr_crop_top_ratio = _normalize_ocr_crop_top_ratio(payload.get("ocr_crop_top_ratio"), ocr_scope)
     ocr_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(payload.get("ocr_crop_bottom_ratio"))
     ocr_crop_left_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_left_ratio"))
     ocr_crop_right_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_right_ratio"))
+    ocr_exclude_enabled = bool(payload.get("ocr_exclude_enabled", False))
+    ocr_exclude_top_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_top_ratio", 0.04))
+    ocr_exclude_bottom_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_bottom_ratio", 0.82))
+    ocr_exclude_left_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_left_ratio", 0.76))
+    ocr_exclude_right_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_right_ratio", 0.02))
     source_language = normalize_source_language(payload.get("source_language") or "auto")
     ocr_language = normalize_source_language(payload.get("ocr_language") or "auto")
     config_source_language = ocr_language if ocr_language != "auto" else source_language
@@ -2784,7 +2908,7 @@ def ocr_extract_job(payload: dict[str, Any]) -> Job:
         manifest = update_youtube_project_manifest(input_video, source_url=url, title=title or input_video.parent.name, thumbnail_path=thumbnail)
         _append_log(job_id, f"input_video: {input_video}")
         config_path = out_dir / "run.yaml"
-        config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode, ocr_scope=ocr_scope, ocr_refinement_mode=ocr_refinement_mode, ocr_crop_top_ratio=ocr_crop_top_ratio, ocr_crop_bottom_ratio=ocr_crop_bottom_ratio, ocr_crop_left_ratio=ocr_crop_left_ratio, ocr_crop_right_ratio=ocr_crop_right_ratio, source_language=config_source_language)
+        config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode, ocr_scope=ocr_scope, ocr_extraction_mode=ocr_extraction_mode, ocr_refinement_mode=ocr_refinement_mode, ocr_crop_top_ratio=ocr_crop_top_ratio, ocr_crop_bottom_ratio=ocr_crop_bottom_ratio, ocr_crop_left_ratio=ocr_crop_left_ratio, ocr_crop_right_ratio=ocr_crop_right_ratio, ocr_exclude_enabled=ocr_exclude_enabled, ocr_exclude_top_ratio=ocr_exclude_top_ratio, ocr_exclude_bottom_ratio=ocr_exclude_bottom_ratio, ocr_exclude_left_ratio=ocr_exclude_left_ratio, ocr_exclude_right_ratio=ocr_exclude_right_ratio, source_language=config_source_language)
         config["mode"] = "extract"
         config["sidecar"]["copy_translated"] = False
         config["agent_cache"] = {
@@ -2792,11 +2916,17 @@ def ocr_extract_job(payload: dict[str, Any]) -> Job:
             "normalized_url": normalize_youtube_url(url),
             "ocr_translation_mode": translation_mode,
             "ocr_scope": ocr_scope,
+            "ocr_extraction_mode": ocr_extraction_mode,
             "ocr_refinement_mode": ocr_refinement_mode,
             "ocr_crop_top_ratio": ocr_crop_top_ratio,
             "ocr_crop_bottom_ratio": ocr_crop_bottom_ratio,
             "ocr_crop_left_ratio": ocr_crop_left_ratio,
             "ocr_crop_right_ratio": ocr_crop_right_ratio,
+            "ocr_exclude_enabled": ocr_exclude_enabled,
+            "ocr_exclude_top_ratio": ocr_exclude_top_ratio,
+            "ocr_exclude_bottom_ratio": ocr_exclude_bottom_ratio,
+            "ocr_exclude_left_ratio": ocr_exclude_left_ratio,
+            "ocr_exclude_right_ratio": ocr_exclude_right_ratio,
             "source_language": config_source_language,
             "ocr_language": ocr_language,
         }
@@ -2812,6 +2942,8 @@ def ocr_extract_job(payload: dict[str, Any]) -> Job:
             "project_manifest": str(Path(str(manifest["project_dir"])) / PROJECT_MANIFEST_NAME),
             "source_language": config_source_language,
             "ocr_language": ocr_language,
+            "ocr_extraction_mode": ocr_extraction_mode,
+            "ocr_exclude_enabled": ocr_exclude_enabled,
         }
 
     return start_job(f"OCR 提取 {job_slug}", target)
@@ -2825,11 +2957,17 @@ def ocr_local_video_job(payload: dict[str, Any]) -> Job:
     extra_hint = str(payload.get("extra_hint") or "")
     translation_mode = _normalize_ocr_translation_mode(payload.get("translation_mode"), bool(payload.get("preserve_timing", False)))
     ocr_scope = _normalize_ocr_scope(payload.get("ocr_scope"))
+    ocr_extraction_mode = _normalize_ocr_extraction_mode(payload.get("ocr_extraction_mode"))
     ocr_refinement_mode = _normalize_ocr_refinement_mode(payload.get("ocr_refinement_mode"))
     ocr_crop_top_ratio = _normalize_ocr_crop_top_ratio(payload.get("ocr_crop_top_ratio"), ocr_scope)
     ocr_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(payload.get("ocr_crop_bottom_ratio"))
     ocr_crop_left_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_left_ratio"))
     ocr_crop_right_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_right_ratio"))
+    ocr_exclude_enabled = bool(payload.get("ocr_exclude_enabled", False))
+    ocr_exclude_top_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_top_ratio", 0.04))
+    ocr_exclude_bottom_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_bottom_ratio", 0.82))
+    ocr_exclude_left_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_left_ratio", 0.76))
+    ocr_exclude_right_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_right_ratio", 0.02))
     source_language = normalize_source_language(payload.get("source_language") or "auto")
     ocr_language = normalize_source_language(payload.get("ocr_language") or "auto")
     extract_only = bool(payload.get("extract_only", False))
@@ -2840,7 +2978,7 @@ def ocr_local_video_job(payload: dict[str, Any]) -> Job:
         out_dir = JOB_DIR / job_id
         out_dir.mkdir(parents=True, exist_ok=True)
         config_path = out_dir / "run.yaml"
-        config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode, ocr_scope=ocr_scope, ocr_refinement_mode=ocr_refinement_mode, ocr_crop_top_ratio=ocr_crop_top_ratio, ocr_crop_bottom_ratio=ocr_crop_bottom_ratio, ocr_crop_left_ratio=ocr_crop_left_ratio, ocr_crop_right_ratio=ocr_crop_right_ratio, source_language=config_source_language)
+        config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode, ocr_scope=ocr_scope, ocr_extraction_mode=ocr_extraction_mode, ocr_refinement_mode=ocr_refinement_mode, ocr_crop_top_ratio=ocr_crop_top_ratio, ocr_crop_bottom_ratio=ocr_crop_bottom_ratio, ocr_crop_left_ratio=ocr_crop_left_ratio, ocr_crop_right_ratio=ocr_crop_right_ratio, ocr_exclude_enabled=ocr_exclude_enabled, ocr_exclude_top_ratio=ocr_exclude_top_ratio, ocr_exclude_bottom_ratio=ocr_exclude_bottom_ratio, ocr_exclude_left_ratio=ocr_exclude_left_ratio, ocr_exclude_right_ratio=ocr_exclude_right_ratio, source_language=config_source_language)
         if extract_only or config_source_language == "chinese":
             config["mode"] = "extract"
             config["sidecar"]["copy_translated"] = False
@@ -2858,6 +2996,8 @@ def ocr_local_video_job(payload: dict[str, Any]) -> Job:
             "project_manifest": str(Path(str(manifest["project_dir"])) / PROJECT_MANIFEST_NAME),
             "source_language": config_source_language,
             "ocr_language": ocr_language,
+            "ocr_extraction_mode": ocr_extraction_mode,
+            "ocr_exclude_enabled": ocr_exclude_enabled,
         }
         if config_source_language == "chinese":
             result.update(_materialize_chinese_ocr_output(input_video, out_dir))
@@ -3446,20 +3586,32 @@ def _ocr_config(
     translation_mode: str = "standard_cleanup",
     preserve_timing: bool = False,
     ocr_scope: str = "bottom",
+    ocr_extraction_mode: str = "auto",
     ocr_refinement_mode: str = "none",
     ocr_crop_top_ratio: float | None = None,
     ocr_crop_bottom_ratio: float = 0.0,
     ocr_crop_left_ratio: float = 0.0,
     ocr_crop_right_ratio: float = 0.0,
+    ocr_exclude_enabled: bool = False,
+    ocr_exclude_top_ratio: float = 0.04,
+    ocr_exclude_bottom_ratio: float = 0.82,
+    ocr_exclude_left_ratio: float = 0.76,
+    ocr_exclude_right_ratio: float = 0.02,
     source_language: str = "korean",
 ) -> dict[str, Any]:
     translation_mode = _normalize_ocr_translation_mode(translation_mode, preserve_timing)
     ocr_settings = _ocr_scope_settings(ocr_scope)
+    ocr_extraction_mode = _normalize_ocr_extraction_mode(ocr_extraction_mode)
     ocr_refinement_mode = _normalize_ocr_refinement_mode(ocr_refinement_mode)
     crop_top_ratio = _normalize_ocr_crop_top_ratio(ocr_crop_top_ratio, ocr_scope)
     crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(ocr_crop_bottom_ratio)
     crop_left_ratio = _normalize_ocr_crop_ratio(ocr_crop_left_ratio)
     crop_right_ratio = _normalize_ocr_crop_ratio(ocr_crop_right_ratio)
+    exclude_enabled = bool(ocr_exclude_enabled)
+    exclude_top_ratio = _normalize_ocr_exclude_ratio(ocr_exclude_top_ratio)
+    exclude_bottom_ratio = _normalize_ocr_exclude_ratio(ocr_exclude_bottom_ratio)
+    exclude_left_ratio = _normalize_ocr_exclude_ratio(ocr_exclude_left_ratio)
+    exclude_right_ratio = _normalize_ocr_exclude_ratio(ocr_exclude_right_ratio)
     normalized_source_language = normalize_source_language(source_language or "korean")
     prompt = """
 严格遵守 glossary 中的人名、角色名、节目名和固定术语。
@@ -3472,6 +3624,27 @@ def _ocr_config(
         prompt += "\n任务提示：" + extra_hint.strip()
     mode_prompt, translation = _ocr_translation_mode_config(translation_mode, prompt)
     prompt = mode_prompt
+    ocr_config = {
+        "device": "auto",
+        "sample_fps": 3.0,
+        **ocr_settings,
+        "extraction_mode": ocr_extraction_mode,
+        "crop_top_ratio": crop_top_ratio,
+        "crop_bottom_ratio": crop_bottom_ratio,
+        "crop_left_ratio": crop_left_ratio,
+        "crop_right_ratio": crop_right_ratio,
+        "exclude_enabled": exclude_enabled,
+        "exclude_top_ratio": exclude_top_ratio,
+        "exclude_bottom_ratio": exclude_bottom_ratio,
+        "exclude_left_ratio": exclude_left_ratio,
+        "exclude_right_ratio": exclude_right_ratio,
+        "auto_trim_side_noise": True,
+    }
+    subtitle_config = {"merge_gap_seconds": 0.85, "same_text_similarity": 0.88, "merge_same_start_seconds": 0.16, "merge_short_fragment_gap_seconds": 0.50, "short_fragment_max_chars": 14, "short_fragment_similarity": 0.55, "snapshot_similarity": 0.72, "snapshot_max_gap_seconds": None, "snapshot_min_confidence": 0.50, "end_padding_seconds": 0.35, "sample_end_extension_ratio": 0.75, "min_duration_seconds": 0.60, "max_next_overlap_seconds": 0.04, "enforce_no_overlap": True}
+    if ocr_extraction_mode == "region":
+        ocr_config.update({"sample_fps": 6.0, "scan_full_frame": False, "auto_trim_side_noise": False})
+        subtitle_config.update({"same_text_similarity": 0.78, "merge_short_fragment_gap_seconds": 0.75, "short_fragment_similarity": 0.45, "snapshot_min_confidence": 0.35, "min_duration_seconds": 0.35})
+
     return {
         "mode": "full",
         "input_video": str(input_video),
@@ -3480,11 +3653,11 @@ def _ocr_config(
         "source_language": normalized_source_language,
         "target_language": "简体中文",
         "glossary": "",
-        "ocr": {"device": "auto", "sample_fps": 3.0, **ocr_settings, "crop_top_ratio": crop_top_ratio, "crop_bottom_ratio": crop_bottom_ratio, "crop_left_ratio": crop_left_ratio, "crop_right_ratio": crop_right_ratio, "auto_trim_side_noise": True},
+        "ocr": ocr_config,
         "ocr_refinement": {"mode": ocr_refinement_mode, "batch_size": 12, "window_padding_seconds": 0.50, "max_boxes_per_frame": 16},
         "source_cleanup": {"mode": "llm_context", "batch_size": 18, "overlap": 3},
         "filters": {"ignored_texts": ["Disney+", "디즈니+"], "ignored_contains": [], "ignored_patterns": ["disn[e3][yp]?\\+?"]},
-        "subtitle": {"merge_gap_seconds": 0.85, "same_text_similarity": 0.88, "merge_same_start_seconds": 0.16, "merge_short_fragment_gap_seconds": 0.50, "short_fragment_max_chars": 14, "short_fragment_similarity": 0.55, "snapshot_similarity": 0.72, "snapshot_max_gap_seconds": None, "snapshot_min_confidence": 0.50, "end_padding_seconds": 0.35, "sample_end_extension_ratio": 0.75, "min_duration_seconds": 0.60, "max_next_overlap_seconds": 0.04, "enforce_no_overlap": True},
+        "subtitle": subtitle_config,
         "translation": translation,
         "sidecar": {"enabled": True, "copy_source": True, "copy_translated": True, "source_suffix": ".source", "translated_suffix": ".zh"},
     }
@@ -3495,6 +3668,8 @@ OCR_SCOPE_SETTINGS = {
     "expanded": {"bottom_ratio": 0.62, "scan_full_frame": False},
     "smart_full": {"bottom_ratio": 0.42, "scan_full_frame": True},
 }
+
+OCR_EXTRACTION_MODES = {"auto", "region"}
 
 
 def _normalize_ocr_scope(value: Any) -> str:
@@ -3507,6 +3682,13 @@ def _normalize_ocr_scope(value: Any) -> str:
 def _ocr_scope_settings(scope: Any) -> dict[str, Any]:
     normalized = _normalize_ocr_scope(scope)
     return dict(OCR_SCOPE_SETTINGS[normalized])
+
+
+def _normalize_ocr_extraction_mode(value: Any) -> str:
+    mode = str(value or "auto").strip()
+    if mode not in OCR_EXTRACTION_MODES:
+        raise ValueError(f"未知 OCR 提取方式: {mode}")
+    return mode
 
 
 
@@ -3530,6 +3712,14 @@ def _normalize_ocr_crop_ratio(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return round(max(0.0, min(0.45, ratio)), 4)
+
+
+def _normalize_ocr_exclude_ratio(value: Any) -> float:
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return round(max(0.0, min(0.98, ratio)), 4)
 
 
 OCR_REFINEMENT_MODES = {"none", "llm_boxes"}
@@ -4631,6 +4821,15 @@ def ocr_preview_frame(payload: dict[str, Any]) -> dict[str, Any]:
         crop_left_ratio=payload.get("ocr_crop_left_ratio"),
         crop_right_ratio=payload.get("ocr_crop_right_ratio"),
     )
+    exclude_rect = _ocr_exclude_preview_rect(
+        width,
+        height,
+        exclude_enabled=bool(payload.get("ocr_exclude_enabled", False)),
+        exclude_top_ratio=payload.get("ocr_exclude_top_ratio", 0.04),
+        exclude_bottom_ratio=payload.get("ocr_exclude_bottom_ratio", 0.82),
+        exclude_left_ratio=payload.get("ocr_exclude_left_ratio", 0.76),
+        exclude_right_ratio=payload.get("ocr_exclude_right_ratio", 0.02),
+    )
     image_base64 = base64.b64encode(encoded.tobytes()).decode("ascii")
     return {
         "input_video": str(input_video),
@@ -4639,6 +4838,7 @@ def ocr_preview_frame(payload: dict[str, Any]) -> dict[str, Any]:
         "width": width,
         "height": height,
         "crop_rect": rect,
+        "exclude_rect": exclude_rect,
         "image_data_url": f"data:image/jpeg;base64,{image_base64}",
     }
 
@@ -4688,6 +4888,35 @@ def _ocr_crop_preview_rect(
         "top": top,
         "width": max(0, right - left),
         "height": max(0, bottom - top),
+        "ratios": {"top": top_ratio, "bottom": bottom_ratio, "left": left_ratio, "right": right_ratio},
+    }
+
+
+def _ocr_exclude_preview_rect(
+    width: int,
+    height: int,
+    *,
+    exclude_enabled: bool = False,
+    exclude_top_ratio: Any = 0.04,
+    exclude_bottom_ratio: Any = 0.82,
+    exclude_left_ratio: Any = 0.76,
+    exclude_right_ratio: Any = 0.02,
+) -> dict[str, Any]:
+    top_ratio = _normalize_ocr_exclude_ratio(exclude_top_ratio)
+    bottom_ratio = _normalize_ocr_exclude_ratio(exclude_bottom_ratio)
+    left_ratio = _normalize_ocr_exclude_ratio(exclude_left_ratio)
+    right_ratio = _normalize_ocr_exclude_ratio(exclude_right_ratio)
+    left = round(width * left_ratio)
+    top = round(height * top_ratio)
+    right = round(width * (1 - right_ratio))
+    bottom = round(height * (1 - bottom_ratio))
+    enabled = bool(exclude_enabled and right > left and bottom > top)
+    return {
+        "enabled": enabled,
+        "left": left if enabled else 0,
+        "top": top if enabled else 0,
+        "width": max(0, right - left) if enabled else 0,
+        "height": max(0, bottom - top) if enabled else 0,
         "ratios": {"top": top_ratio, "bottom": bottom_ratio, "left": left_ratio, "right": right_ratio},
     }
 

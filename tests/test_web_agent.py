@@ -755,6 +755,18 @@ def test_agent_session_reuses_cached_ocr_before_generating_glossary(monkeypatch,
     assert Path(snapshot["result"]["source_srt"]).parts[-3:] == ("agent_tasks", "abc123_demo", "source.srt")
     assert calls == [f"glossary:{snapshot['result']['source_srt']}:korean"]
 
+    assert (
+        web_agent._find_reusable_ocr_result(
+            url="https://www.youtube.com/watch?v=abc123",
+            title="demo",
+            translation_mode="standard_cleanup",
+            ocr_scope="bottom",
+            ocr_extraction_mode="region",
+            source_language="korean",
+        )
+        is None
+    )
+
 
 def test_agent_task_persists_glossary_review_and_can_continue(monkeypatch, tmp_path):
     monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
@@ -1228,7 +1240,26 @@ def test_ocr_scope_settings_drive_generated_run_config(tmp_path: Path):
 
     assert config["ocr"]["bottom_ratio"] == 0.42
     assert config["ocr"]["scan_full_frame"] is True
+    assert config["ocr"]["extraction_mode"] == "auto"
+    assert config["ocr"]["sample_fps"] == 3.0
     assert web_agent._ocr_scope_settings("expanded") == {"bottom_ratio": 0.62, "scan_full_frame": False}
+
+
+def test_ocr_config_region_extraction_mode_keeps_old_mode_separate(tmp_path: Path):
+    config = web_agent._ocr_config(
+        tmp_path / "demo.mp4",
+        tmp_path / "job",
+        extra_hint="",
+        ocr_scope="smart_full",
+        ocr_extraction_mode="region",
+    )
+
+    assert config["ocr"]["extraction_mode"] == "region"
+    assert config["ocr"]["sample_fps"] == 6.0
+    assert config["ocr"]["scan_full_frame"] is False
+    assert config["ocr"]["auto_trim_side_noise"] is False
+    assert config["subtitle"]["snapshot_min_confidence"] == 0.35
+    assert config["subtitle"]["min_duration_seconds"] == 0.35
 
 
 
@@ -1249,6 +1280,25 @@ def test_ocr_config_includes_horizontal_crop_ratios(tmp_path: Path):
     assert config["ocr"]["crop_left_ratio"] == 0.08
     assert config["ocr"]["crop_right_ratio"] == 0.14
     assert config["ocr"]["auto_trim_side_noise"] is True
+
+
+def test_ocr_config_includes_logo_exclude_region(tmp_path: Path):
+    config = web_agent._ocr_config(
+        tmp_path / "demo.mp4",
+        tmp_path / "job",
+        extra_hint="",
+        ocr_exclude_enabled=True,
+        ocr_exclude_top_ratio=0.03,
+        ocr_exclude_bottom_ratio=0.80,
+        ocr_exclude_left_ratio=0.72,
+        ocr_exclude_right_ratio=0.04,
+    )
+
+    assert config["ocr"]["exclude_enabled"] is True
+    assert config["ocr"]["exclude_top_ratio"] == 0.03
+    assert config["ocr"]["exclude_bottom_ratio"] == 0.80
+    assert config["ocr"]["exclude_left_ratio"] == 0.72
+    assert config["ocr"]["exclude_right_ratio"] == 0.04
 
 
 
@@ -1282,6 +1332,16 @@ def test_ocr_crop_preview_rect_uses_explicit_edges():
     assert rect["top"] == 25
     assert rect["width"] == 130
     assert rect["height"] == 65
+
+
+def test_ocr_exclude_preview_rect_uses_explicit_edges():
+    rect = web_agent._ocr_exclude_preview_rect(200, 100, exclude_enabled=True, exclude_top_ratio=0.04, exclude_bottom_ratio=0.82, exclude_left_ratio=0.76, exclude_right_ratio=0.02)
+
+    assert rect["enabled"] is True
+    assert rect["left"] == 152
+    assert rect["top"] == 4
+    assert rect["width"] == 44
+    assert rect["height"] == 14
 
 
 def test_ocr_config_can_enable_llm_box_refinement(tmp_path: Path):

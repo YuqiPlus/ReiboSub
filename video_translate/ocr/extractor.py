@@ -19,6 +19,11 @@ class ExtractConfig:
     crop_bottom_ratio: float = 0.0
     crop_left_ratio: float = 0.0
     crop_right_ratio: float = 0.0
+    exclude_enabled: bool = False
+    exclude_top_ratio: float = 0.04
+    exclude_bottom_ratio: float = 0.82
+    exclude_left_ratio: float = 0.76
+    exclude_right_ratio: float = 0.02
     min_confidence: float = 0.45
     scan_full_frame: bool = False
     auto_trim_side_noise: bool = True
@@ -223,6 +228,8 @@ def _ocr_region(
         xs = [float(point[0]) + offset_x for point in raw_points]
         ys = [float(point[1]) + offset_y for point in raw_points]
         bbox = (min(xs), min(ys), max(xs), max(ys))
+        if config.exclude_enabled and _box_center_in_exclude_region(bbox, frame_width, frame_height, config):
+            continue
         if region_name == "bottom" and config.auto_trim_side_noise and _looks_like_bottom_side_noise(bbox, str(text), frame_width, frame_height):
             continue
         yield OCRBox(
@@ -260,6 +267,34 @@ def _horizontal_crop_bounds(width: int, left_ratio: float, right_ratio: float) -
     return left_x, right_x
 
 
+def _box_center_in_exclude_region(
+    bbox: tuple[float, float, float, float],
+    frame_width: int,
+    frame_height: int,
+    config: ExtractConfig,
+) -> bool:
+    left, top, right, bottom = _exclude_region_bounds(frame_width, frame_height, config)
+    if right <= left or bottom <= top:
+        return False
+    center_x = (bbox[0] + bbox[2]) / 2
+    center_y = (bbox[1] + bbox[3]) / 2
+    return left <= center_x <= right and top <= center_y <= bottom
+
+
+def _exclude_region_bounds(width: int, height: int, config: ExtractConfig) -> tuple[int, int, int, int]:
+    left_ratio = _clamp_unit_ratio(config.exclude_left_ratio)
+    right_ratio = _clamp_unit_ratio(config.exclude_right_ratio)
+    top_ratio = _clamp_unit_ratio(config.exclude_top_ratio)
+    bottom_ratio = _clamp_unit_ratio(config.exclude_bottom_ratio)
+    left = int(width * left_ratio)
+    right = int(width * (1 - right_ratio))
+    top = int(height * top_ratio)
+    bottom = int(height * (1 - bottom_ratio))
+    if right <= left or bottom <= top:
+        return 0, 0, 0, 0
+    return left, top, right, bottom
+
+
 def _clamp_crop_ratio(value: float) -> float:
     try:
         ratio = float(value)
@@ -274,6 +309,14 @@ def _clamp_vertical_crop_ratio(value: float) -> float:
     except (TypeError, ValueError):
         return 0.0
     return max(0.0, min(0.95, ratio))
+
+
+def _clamp_unit_ratio(value: float) -> float:
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(0.98, ratio))
 
 
 def _looks_like_bottom_side_noise(
