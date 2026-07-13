@@ -4,7 +4,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from video_translate.cache import configure_model_cache
 from video_translate.models import OCRBox
@@ -25,6 +25,8 @@ class ExtractConfig:
     exclude_left_ratio: float = 0.76
     exclude_right_ratio: float = 0.02
     min_confidence: float = 0.45
+    refine_timing_boundaries: bool = False
+    timing_refine_max_frames: int = 24
     scan_full_frame: bool = False
     auto_trim_side_noise: bool = True
     suppress_full_frame_duplicates: bool = True
@@ -95,6 +97,7 @@ def extract_video_ocr(
     video_path: Path,
     lang: str,
     config: ExtractConfig | None = None,
+    sampled_frames: list[dict[str, Any]] | None = None,
 ) -> list[OCRBox]:
     config = config or ExtractConfig()
     cv2 = _load_cv2()
@@ -111,7 +114,7 @@ def extract_video_ocr(
     total_samples = (frame_count + step - 1) // step if frame_count else None
     frame_index = 0
     sampled_count = 0
-    boxes: list[OCRBox] = []
+    frame_results: dict[int, tuple[list[OCRBox], str]] = {}
 
     _print_ocr_progress(0, total_samples, 0.0, video_duration)
     try:
@@ -124,15 +127,87 @@ def extract_video_ocr(
                 continue
 
             time_seconds = frame_index / native_fps
-            boxes.extend(_ocr_frame(ocr, frame, time_seconds, frame_index, config))
+            frame_boxes = list(_ocr_frame(ocr, frame, time_seconds, frame_index, config))
+            frame_results[frame_index] = (frame_boxes, "coarse")
             sampled_count += 1
             _print_ocr_progress(sampled_count, total_samples, time_seconds, video_duration)
             frame_index += 1
+
+        if config.refine_timing_boundaries:
+            _refine_timing_boundaries(
+                cv2,
+                capture,
+                ocr,
+                frame_results,
+                frame_count=frame_count,
+                native_fps=native_fps,
+                config=config,
+            )
     finally:
         capture.release()
         _finish_ocr_progress()
 
-    return boxes
+    if sampled_frames is not None:
+        sampled_frames.extend(
+            {
+                "frame_index": index,
+                "time": index / native_fps,
+                "scan_type": scan_type,
+                "boxes": [box.to_dict() for box in frame_boxes],
+            }
+            for index, (frame_boxes, scan_type) in sorted(frame_results.items())
+        )
+    return [box for frame_boxes, _ in frame_results.values() for box in frame_boxes]
+
+
+def _refine_timing_boundaries(
+    cv2,
+    capture,
+    ocr,
+    frame_results: dict[int, tuple[list[OCRBox], str]],
+    *,
+    frame_count: int,
+    native_fps: float,
+    config: ExtractConfig,
+) -> None:
+    indexes = _timing_refinement_frame_indexes(
+        {index: frame_boxes for index, (frame_boxes, _) in frame_results.items()},
+        frame_count=frame_count,
+        max_frames=config.timing_refine_max_frames,
+    )
+    for index in indexes:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+        ok, frame = capture.read()
+        if not ok:
+            continue
+        frame_results[index] = (
+            list(_ocr_frame(ocr, frame, index / native_fps, index, config)),
+            "timing_refine",
+        )
+
+
+def _timing_refinement_frame_indexes(
+    frame_boxes: dict[int, list[OCRBox]],
+    *,
+    frame_count: int,
+    max_frames: int,
+) -> list[int]:
+    indexes = sorted(frame_boxes)
+    if not indexes:
+        return []
+    maximum = max(0, int(max_frames))
+    selected: set[int] = set()
+    for previous, current in zip(indexes, indexes[1:]):
+        if bool(frame_boxes[previous]) == bool(frame_boxes[current]):
+            continue
+        between = list(range(previous + 1, current))
+        if len(between) <= maximum:
+            selected.update(between)
+    last_index = indexes[-1]
+    if frame_boxes[last_index]:
+        trailing = range(last_index + 1, min(frame_count, last_index + maximum + 1))
+        selected.update(trailing)
+    return sorted(selected)
 
 
 def _print_ocr_progress(

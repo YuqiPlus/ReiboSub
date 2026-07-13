@@ -1301,6 +1301,63 @@ def test_ocr_config_includes_logo_exclude_region(tmp_path: Path):
     assert config["ocr"]["exclude_right_ratio"] == 0.04
 
 
+def test_ocr_development_job_writes_raw_region_ocr_config(monkeypatch, tmp_path):
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"video")
+    captured = {}
+
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "agent_jobs")
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "YoutubeDownloads")
+    monkeypatch.setattr(web_agent, "PYTHON", "/python")
+
+    def fake_run_command(job_id, args):
+        config = yaml.safe_load(Path(args[-1]).read_text(encoding="utf-8"))
+        captured["config"] = config
+        output_dir = Path(config["output_dir"])
+        for name in ["source.srt", "source.cleaned.srt", "source.before_cleanup.srt", "ocr_boxes.json", "ocr_sample_frames.json", "tracks.json"]:
+            (output_dir / name).write_text("[]", encoding="utf-8")
+
+    monkeypatch.setattr(web_agent, "_run_command", fake_run_command)
+
+    job = web_agent.ocr_development_job(
+        {
+            "input_video": str(video),
+            "source_language": "korean",
+            "sample_fps": 8,
+            "min_confidence": 30,
+            "refine_timing_boundaries": True,
+            "flicker_smoothing_max_duration_seconds": 0.8,
+            "llm_cleanup": True,
+            "ocr_exclude_enabled": True,
+        }
+    )
+    snapshot = _wait_job_status(job.id, "done")
+
+    assert snapshot["result"]["ocr_sample_frames"].endswith("ocr_sample_frames.json")
+    assert Path(snapshot["result"]["debug_dir"]) == tmp_path / "YoutubeDownloads" / "debug" / "demo"
+    assert Path(snapshot["result"]["debug_dir"]).is_dir()
+    assert Path(snapshot["result"]["debug_video"]).exists()
+    assert Path(snapshot["result"]["debug_source_srt"]).name == "demo.srt"
+    assert Path(snapshot["result"]["debug_source_srt"]).read_text(encoding="utf-8") == "[]"
+    assert Path(snapshot["result"]["debug_cleaned_srt"]).name == "demo.cleaned.srt"
+    assert Path(snapshot["result"]["debug_cleaned_srt"]).read_text(encoding="utf-8") == "[]"
+    assert captured["config"]["mode"] == "extract"
+    assert captured["config"]["ocr"]["extraction_mode"] == "region"
+    assert captured["config"]["ocr"]["sample_fps"] == 8
+    assert captured["config"]["ocr"]["min_confidence"] == 0.3
+    assert captured["config"]["ocr"]["refine_timing_boundaries"] is True
+    assert captured["config"]["subtitle"]["flicker_smoothing_max_duration_seconds"] == 0.8
+    assert captured["config"]["ocr"]["auto_trim_side_noise"] is False
+    assert captured["config"]["source_cleanup"] == {
+        "mode": "llm_context",
+        "batch_size": 18,
+        "overlap": 3,
+        "preserve_source": True,
+    }
+    assert captured["config"]["filters"] == {"ignored_texts": [], "ignored_contains": [], "ignored_patterns": []}
+
+
 
 def test_ocr_config_defaults_crop_top_from_scope(tmp_path: Path):
     config = web_agent._ocr_config(
@@ -1906,7 +1963,9 @@ def test_list_local_assets_collects_videos_subtitles_and_ocr_jobs(tmp_path: Path
     downloads.mkdir(parents=True)
     job_dir.mkdir(parents=True)
     project = downloads / "demo"
+    debug_dir = downloads / "debug" / "demo-debug"
     project.mkdir()
+    debug_dir.mkdir(parents=True)
     video = project / "demo.mp4"
     subtitle = project / "demo.ko.srt"
     source = job_dir / "source.srt"
@@ -1915,6 +1974,8 @@ def test_list_local_assets_collects_videos_subtitles_and_ocr_jobs(tmp_path: Path
     subtitle.write_text("1\n", encoding="utf-8")
     source.write_text("1\n", encoding="utf-8")
     run_yaml.write_text("mode: full\n", encoding="utf-8")
+    (debug_dir / "demo-debug.srt").write_text("1\n", encoding="utf-8")
+    (debug_dir / "demo-debug.cleaned.srt").write_text("1\n", encoding="utf-8")
     (downloads / "._demo.mp4").write_text("meta", encoding="utf-8")
 
     monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
@@ -1929,6 +1990,8 @@ def test_list_local_assets_collects_videos_subtitles_and_ocr_jobs(tmp_path: Path
     assert assets["projects"][0]["videos"][0]["path"] == str(video)
     assert assets["projects"][0]["subtitles"][0]["path"] == str(subtitle)
     assert assets["ocr_jobs"][0]["source_srt"].endswith("source.srt")
+    assert assets["ocr_debug_folders"][0]["source_srt"].endswith("demo-debug.srt")
+    assert assets["ocr_debug_folders"][0]["cleaned_srt"].endswith("demo-debug.cleaned.srt")
 
 
 
@@ -2711,3 +2774,74 @@ def test_probe_video_downloads_thumbnail_for_new_project(monkeypatch, tmp_path: 
     assert result['thumbnail_path'] == str(thumbnail)
     assert manifest['normalized_url'] == 'https://www.youtube.com/watch?v=abc123'
     assert manifest['thumbnail'] == str(thumbnail)
+def test_cleanup_existing_ocr_source_writes_sibling_file(monkeypatch, tmp_path):
+    source_srt = tmp_path / "source.srt"
+    source_srt.write_text("raw", encoding="utf-8")
+    captured = {}
+
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+
+    def fake_cleanup(source, output, *, config, progress_callback):
+        captured["source"] = source
+        captured["output"] = output
+        captured["config"] = config
+        progress_callback("source_cleanup: 24 cues in 2 batches")
+        progress_callback("source_cleanup_batch: 1/2 cues 1-18")
+        output.write_text("cleaned", encoding="utf-8")
+        return {"cleaned_srt": output}
+
+    monkeypatch.setattr(web_agent, "cleanup_ocr_source_with_llm", fake_cleanup)
+
+    job = web_agent.cleanup_existing_ocr_source_job({"source_srt": str(source_srt)})
+    snapshot = _wait_job_status(job.id, "done")
+
+    cleaned_srt = tmp_path / "source.cleaned.srt"
+    assert captured["source"] == source_srt
+    assert captured["output"] == cleaned_srt
+    assert captured["config"].batch_size == 18
+    assert cleaned_srt.read_text(encoding="utf-8") == "cleaned"
+    assert "source_cleanup: 24 cues in 2 batches" in snapshot["logs"]
+    assert "source_cleanup_batch: 1/2 cues 1-18" in snapshot["logs"]
+    assert snapshot["result"] == {"source_srt": str(source_srt), "cleaned_srt": str(cleaned_srt)}
+
+
+def test_rebuild_ocr_debug_with_llm_uses_existing_json(monkeypatch, tmp_path):
+    debug_dir = tmp_path / "YoutubeDownloads" / "debug" / "demo"
+    debug_dir.mkdir(parents=True)
+    (debug_dir / "tracks.json").write_text('[{"id": 1, "text": "caption", "start": 1.0, "end": 2.0, "kind": "main_subtitle", "boxes": []}]', encoding="utf-8")
+    (debug_dir / "ocr_boxes.json").write_text("[]", encoding="utf-8")
+    (debug_dir / "run.yaml").write_text("ocr:\n  sample_fps: 6\nsubtitle:\n  min_duration_seconds: 0.35\n", encoding="utf-8")
+    captured = {}
+
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "YoutubeDownloads")
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "agent_jobs")
+
+    def fake_write_outputs(tracks, out_dir, *, cue_timing):
+        captured["tracks"] = tracks
+        captured["timing"] = cue_timing
+        source = out_dir / "source.srt"
+        source.write_text("rebuilt", encoding="utf-8")
+        return {"source_srt": source}
+
+    def fake_refine(source, boxes, output, *, config, progress_callback):
+        captured["source"] = source
+        captured["boxes"] = boxes
+        captured["config"] = config
+        progress_callback("ocr_refine: 1 cues in 1 batches")
+        output.write_text("refined", encoding="utf-8")
+        return {"refined_srt": output}
+
+    monkeypatch.setattr(web_agent, "write_extraction_outputs", fake_write_outputs)
+    monkeypatch.setattr(web_agent, "refine_ocr_source_with_llm", fake_refine)
+
+    job = web_agent.rebuild_ocr_debug_with_llm_job({"debug_dir": str(debug_dir)})
+    snapshot = _wait_job_status(job.id, "done")
+
+    assert captured["timing"].sample_interval_seconds == pytest.approx(1 / 6)
+    assert captured["boxes"] == debug_dir / "ocr_boxes.json"
+    assert captured["config"].batch_size == 12
+    assert (debug_dir / "source.rebuilt.srt").read_text(encoding="utf-8") == "rebuilt"
+    assert (debug_dir / "source.track_refined.srt").read_text(encoding="utf-8") == "refined"
+    assert any("video decoding is skipped" in line for line in snapshot["logs"])
+    assert "ocr_refine: 1 cues in 1 batches" in snapshot["logs"]

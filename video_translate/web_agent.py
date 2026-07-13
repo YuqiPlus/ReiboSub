@@ -38,8 +38,15 @@ from video_translate.languages import (
     ocr_language_for_source,
     youtube_language_for_source,
 )
-from video_translate.models import SubtitleCue
+from video_translate.models import SubtitleCue, TextTrack, TrackKind
 from video_translate.jobs import Job, JobCancelled, JobService
+from video_translate.ocr.llm_refine import (
+    OCRRefinementConfig,
+    SourceCleanupConfig,
+    cleanup_ocr_source_with_llm,
+    refine_ocr_source_with_llm,
+)
+from video_translate.pipeline import CueTimingConfig, write_extraction_outputs
 from video_translate.projects import ProjectPathPolicy
 from video_translate.project_manifest import (
     PROJECT_MANIFEST_NAME,
@@ -59,6 +66,7 @@ from video_translate.translate.volcengine import (
     _request_translation,
 )
 from video_translate.utils.timecode import format_srt_time, parse_srt_time
+from video_translate.utils.text import normalize_ocr_text
 from video_translate.youtube.download_video import convert_thumbnail_bytes, thumbnail_extension, thumbnail_url_from_info
 from video_translate.youtube.filenames import filesystem_safe_title
 from video_translate.youtube_url import normalize_youtube_url
@@ -3006,6 +3014,252 @@ def ocr_local_video_job(payload: dict[str, Any]) -> Job:
     return start_job(f"本地视频 OCR {job_slug}", target)
 
 
+def ocr_development_job(payload: dict[str, Any]) -> Job:
+    input_video = _resolve_project_path(_required_str(payload, "input_video"))
+    _ensure_under_root(input_video)
+    if not input_video.exists():
+        raise FileNotFoundError(f"视频文件不存在: {input_video}")
+
+    source_language = normalize_source_language(payload.get("source_language") or "korean")
+    if source_language == "auto":
+        source_language = "korean"
+    sample_fps = _normalize_ocr_sample_fps(payload.get("sample_fps", 6.0))
+    min_confidence = _normalize_ocr_min_confidence(payload.get("min_confidence", 30))
+    refine_timing_boundaries = bool(payload.get("refine_timing_boundaries", True))
+    flicker_smoothing_max_duration_seconds = _normalize_ocr_flicker_smoothing_duration(payload.get("flicker_smoothing_max_duration_seconds", 0.55))
+    llm_cleanup = bool(payload.get("llm_cleanup", True))
+    ocr_scope = _normalize_ocr_scope(payload.get("ocr_scope"))
+    crop_top_ratio = _normalize_ocr_crop_top_ratio(payload.get("ocr_crop_top_ratio"), ocr_scope)
+    crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(payload.get("ocr_crop_bottom_ratio"))
+    crop_left_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_left_ratio"))
+    crop_right_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_right_ratio"))
+    exclude_enabled = bool(payload.get("ocr_exclude_enabled", False))
+    exclude_top_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_top_ratio", 0.04))
+    exclude_bottom_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_bottom_ratio", 0.82))
+    exclude_left_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_left_ratio", 0.76))
+    exclude_right_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_right_ratio", 0.02))
+    job_slug = _safe_slug(input_video.stem)[:80]
+
+    def target(job_id: str) -> dict[str, Any]:
+        out_dir = JOB_DIR / job_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        config_path = out_dir / "run.yaml"
+        config = {
+            "mode": "extract",
+            "input_video": str(input_video),
+            "source_srt": str(out_dir / "source.srt"),
+            "output_dir": str(out_dir),
+            "source_language": source_language,
+            "ocr": {
+                "device": "auto",
+                "sample_fps": sample_fps,
+                "bottom_ratio": 0.42,
+                "crop_top_ratio": crop_top_ratio,
+                "crop_bottom_ratio": crop_bottom_ratio,
+                "crop_left_ratio": crop_left_ratio,
+                "crop_right_ratio": crop_right_ratio,
+                "exclude_enabled": exclude_enabled,
+                "exclude_top_ratio": exclude_top_ratio,
+                "exclude_bottom_ratio": exclude_bottom_ratio,
+                "exclude_left_ratio": exclude_left_ratio,
+                "exclude_right_ratio": exclude_right_ratio,
+                "min_confidence": min_confidence,
+                "refine_timing_boundaries": refine_timing_boundaries,
+                "timing_refine_max_frames": 24,
+                "scan_full_frame": False,
+                "auto_trim_side_noise": False,
+                "extraction_mode": "region",
+            },
+            "subtitle": {
+                "merge_gap_seconds": 0.85,
+                "same_text_similarity": 0.78,
+                "merge_short_fragment_gap_seconds": 0.75,
+                "short_fragment_similarity": 0.45,
+                "snapshot_min_confidence": 0.0,
+                "min_duration_seconds": 0.35,
+                "flicker_smoothing_max_duration_seconds": flicker_smoothing_max_duration_seconds,
+                "flicker_smoothing_max_gap_seconds": 0.35,
+            },
+            "filters": {"ignored_texts": [], "ignored_contains": [], "ignored_patterns": []},
+            "source_cleanup": {
+                "mode": "llm_context" if llm_cleanup else "none",
+                "batch_size": 18,
+                "overlap": 3,
+                "preserve_source": True,
+            },
+            "sidecar": {"enabled": False, "copy_source": False, "copy_translated": False},
+        }
+        config_path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        _append_log(job_id, f"input_video: {input_video}")
+        _append_log(job_id, f"config: {config_path}")
+        _run_command(job_id, [PYTHON, str(ROOT / "run_from_config.py"), str(config_path)])
+        result = {
+            "input_video": str(input_video),
+            "output_dir": str(out_dir),
+            "config_path": str(config_path),
+            "source_srt": str(out_dir / "source.srt"),
+            "cleaned_srt": str(out_dir / "source.cleaned.srt") if llm_cleanup else "",
+            "ocr_boxes": str(out_dir / "ocr_boxes.json"),
+            "ocr_sample_frames": str(out_dir / "ocr_sample_frames.json"),
+            "tracks": str(out_dir / "tracks.json"),
+            "refine_timing_boundaries": refine_timing_boundaries,
+            "flicker_smoothing_max_duration_seconds": flicker_smoothing_max_duration_seconds,
+            "llm_cleanup": llm_cleanup,
+        }
+        result.update(_materialize_ocr_debug_bundle(input_video, out_dir))
+        return result
+
+    return start_job(f"OCR 开发测试 {job_slug}", target)
+
+
+def cleanup_existing_ocr_source_job(payload: dict[str, Any]) -> Job:
+    source_srt = _resolve_project_path(_required_str(payload, "source_srt"))
+    _ensure_under_root(source_srt)
+    if source_srt.suffix.lower() != ".srt":
+        raise ValueError("Only SRT subtitle files are supported.")
+    if not source_srt.exists():
+        raise FileNotFoundError(f"Subtitle file does not exist: {source_srt}")
+    output_srt = source_srt.with_name(f"{source_srt.stem}.cleaned.srt")
+
+    def target(job_id: str) -> dict[str, Any]:
+        _append_log(job_id, f"source_srt: {source_srt}")
+        _append_log(job_id, f"cleaned_srt: {output_srt}")
+        cleanup_ocr_source_with_llm(
+            source_srt,
+            output_srt,
+            config=SourceCleanupConfig(batch_size=18, overlap=3),
+            progress_callback=lambda message: _append_log(job_id, message),
+        )
+        return {
+            "source_srt": str(source_srt),
+            "cleaned_srt": str(output_srt),
+        }
+
+    return start_job(f"OCR source cleanup {_safe_slug(source_srt.stem)[:80]}", target)
+
+
+def rebuild_ocr_debug_with_llm_job(payload: dict[str, Any]) -> Job:
+    debug_dir = _resolve_project_path(_required_str(payload, "debug_dir"))
+    _ensure_under_root(debug_dir)
+    if not debug_dir.is_dir():
+        raise FileNotFoundError(f"Debug folder does not exist: {debug_dir}")
+    tracks_path = debug_dir / "tracks.json"
+    boxes_path = debug_dir / "ocr_boxes.json"
+    if not tracks_path.exists() or not boxes_path.exists():
+        raise FileNotFoundError("The debug folder must contain tracks.json and ocr_boxes.json.")
+
+    def target(job_id: str) -> dict[str, Any]:
+        out_dir = JOB_DIR / job_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _append_log(job_id, f"debug_dir: {debug_dir}")
+        _append_log(job_id, "rebuild: using existing OCR JSON; video decoding is skipped")
+        tracks = [TextTrack.from_dict(item) for item in json.loads(tracks_path.read_text(encoding="utf-8"))]
+        for track in tracks:
+            track.kind = TrackKind.MAIN_SUBTITLE if normalize_ocr_text(track.text) else TrackKind.UNKNOWN
+            track.reason = "debug_rebuild_candidate"
+        rebuild_outputs = write_extraction_outputs(tracks, out_dir, cue_timing=_debug_rebuild_timing(debug_dir))
+        rebuilt_srt = out_dir / "source.srt"
+        debug_rebuilt_srt = debug_dir / "source.rebuilt.srt"
+        shutil.copy2(rebuilt_srt, debug_rebuilt_srt)
+        refined_srt = out_dir / "source.track_refined.srt"
+        refine_ocr_source_with_llm(
+            rebuilt_srt,
+            boxes_path,
+            refined_srt,
+            config=OCRRefinementConfig(batch_size=12, window_padding_seconds=0.50, max_boxes_per_frame=16),
+            progress_callback=lambda message: _append_log(job_id, message),
+        )
+        debug_refined_srt = debug_dir / "source.track_refined.srt"
+        shutil.copy2(refined_srt, debug_refined_srt)
+        return {
+            "debug_dir": str(debug_dir),
+            "source_rebuilt_srt": str(debug_rebuilt_srt),
+            "source_track_refined_srt": str(debug_refined_srt),
+            "tracks": str(tracks_path),
+            "ocr_boxes": str(boxes_path),
+            "ocr_sample_frames": str(debug_dir / "ocr_sample_frames.json"),
+        }
+
+    return start_job(f"OCR JSON rebuild {_safe_slug(debug_dir.name)[:80]}", target)
+
+
+def _debug_rebuild_timing(debug_dir: Path) -> CueTimingConfig:
+    config_path = debug_dir / "run.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+    config = config if isinstance(config, dict) else {}
+    subtitle = config.get("subtitle") if isinstance(config.get("subtitle"), dict) else {}
+    ocr = config.get("ocr") if isinstance(config.get("ocr"), dict) else {}
+    sample_fps = float(ocr.get("sample_fps", 6.0) or 6.0)
+    return CueTimingConfig(
+        merge_gap_seconds=float(subtitle.get("merge_gap_seconds", 0.85)),
+        end_padding_seconds=float(subtitle.get("end_padding_seconds", 0.35)),
+        sample_interval_seconds=1.0 / max(0.2, sample_fps),
+        sample_end_extension_ratio=float(subtitle.get("sample_end_extension_ratio", 0.75)),
+        min_duration_seconds=float(subtitle.get("min_duration_seconds", 0.60)),
+        same_text_similarity=float(subtitle.get("same_text_similarity", 0.88)),
+        max_next_overlap_seconds=float(subtitle.get("max_next_overlap_seconds", 0.04)),
+        enforce_no_overlap=bool(subtitle.get("enforce_no_overlap", True)),
+        merge_same_start_seconds=float(subtitle.get("merge_same_start_seconds", 0.16)),
+        merge_short_fragment_gap_seconds=float(subtitle.get("merge_short_fragment_gap_seconds", 0.50)),
+        short_fragment_max_chars=int(subtitle.get("short_fragment_max_chars", 14)),
+        short_fragment_similarity=float(subtitle.get("short_fragment_similarity", 0.55)),
+        snapshot_similarity=float(subtitle.get("snapshot_similarity", 0.72)),
+        snapshot_max_gap_seconds=float(subtitle["snapshot_max_gap_seconds"]) if subtitle.get("snapshot_max_gap_seconds") is not None else None,
+        snapshot_min_confidence=float(subtitle.get("snapshot_min_confidence", 0.50)),
+        flicker_smoothing_max_duration_seconds=float(subtitle.get("flicker_smoothing_max_duration_seconds", 0.0)),
+        flicker_smoothing_max_gap_seconds=float(subtitle.get("flicker_smoothing_max_gap_seconds", 0.35)),
+    )
+
+
+def _materialize_ocr_debug_bundle(input_video: Path, output_dir: Path) -> dict[str, str]:
+    debug_dir = DOWNLOAD_DIR / "debug" / _filesystem_safe_title(input_video.stem)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    debug_video = debug_dir / input_video.name
+    _link_or_copy_debug_file(input_video, debug_video)
+    copied: dict[str, str] = {
+        "debug_dir": str(debug_dir),
+        "debug_video": str(debug_video),
+    }
+    artifact_names = {
+        "source_srt": "source.srt",
+        "cleaned_srt": "source.cleaned.srt",
+        "source_before_cleanup": "source.before_cleanup.srt",
+        "ocr_boxes": "ocr_boxes.json",
+        "ocr_sample_frames": "ocr_sample_frames.json",
+        "tracks": "tracks.json",
+        "tracks_debug": "tracks_debug.csv",
+        "run_config": "run.yaml",
+    }
+    for result_key, filename in artifact_names.items():
+        source = output_dir / filename
+        if not source.exists():
+            continue
+        if result_key == "source_srt":
+            target = debug_video.with_suffix(".srt")
+        elif result_key == "cleaned_srt":
+            target = debug_video.with_name(f"{debug_video.stem}.cleaned.srt")
+        else:
+            target = debug_dir / filename
+        shutil.copy2(source, target)
+        copied[f"debug_{result_key}"] = str(target)
+    return copied
+
+
+def _link_or_copy_debug_file(source: Path, target: Path) -> None:
+    if target.exists() or target.is_symlink():
+        target.unlink()
+    try:
+        target.symlink_to(source)
+        return
+    except OSError:
+        pass
+    try:
+        os.link(source, target)
+        return
+    except OSError:
+        shutil.copy2(source, target)
+
+
 def hybrid_anchor_ocr_job(payload: dict[str, Any]) -> Job:
     input_video = _resolve_project_path(_required_str(payload, "input_video"))
     anchor_srt = _resolve_project_path(_required_str(payload, "anchor_srt"))
@@ -3722,6 +3976,32 @@ def _normalize_ocr_exclude_ratio(value: Any) -> float:
     return round(max(0.0, min(0.98, ratio)), 4)
 
 
+def _normalize_ocr_sample_fps(value: Any) -> float:
+    try:
+        sample_fps = float(value)
+    except (TypeError, ValueError):
+        return 6.0
+    return round(max(0.2, min(30.0, sample_fps)), 3)
+
+
+def _normalize_ocr_min_confidence(value: Any) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 0.30
+    if confidence > 1:
+        confidence /= 100
+    return round(max(0.0, min(1.0, confidence)), 4)
+
+
+def _normalize_ocr_flicker_smoothing_duration(value: Any) -> float:
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return 0.55
+    return round(max(0.0, min(2.0, duration)), 3)
+
+
 OCR_REFINEMENT_MODES = {"none", "llm_boxes"}
 
 
@@ -4341,6 +4621,7 @@ def list_local_assets() -> dict[str, Any]:
         "subtitles": subtitles,
         "projects": _download_project_entries(DOWNLOAD_DIR),
         "ocr_jobs": _ocr_job_entries(),
+        "ocr_debug_folders": _ocr_debug_folder_entries(),
     }
 
 
@@ -4552,6 +4833,40 @@ def _ocr_job_entries(limit: int = 80) -> list[dict[str, Any]]:
         )
         jobs.append(entry)
     return jobs
+
+
+def _ocr_debug_folder_entries(limit: int = 80) -> list[dict[str, Any]]:
+    debug_root = DOWNLOAD_DIR / "debug"
+    if not debug_root.exists():
+        return []
+    folders: list[dict[str, Any]] = []
+    debug_dirs = sorted(
+        [path for path in debug_root.iterdir() if path.is_dir()],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for debug_dir in debug_dirs[:limit]:
+        files = [path for path in debug_dir.iterdir() if _is_real_file(path)]
+        subtitles = [path for path in files if path.suffix.lower() == ".srt"]
+        raw_subtitles = [path for path in subtitles if not path.stem.endswith(".cleaned")]
+        source_srt = next((path for path in raw_subtitles if path.stem == debug_dir.name), raw_subtitles[0] if raw_subtitles else None)
+        cleaned_srt = next((path for path in subtitles if path.stem.endswith(".cleaned")), None)
+        videos = [path for path in files if path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}]
+        modified_at = max((path.stat().st_mtime for path in files), default=debug_dir.stat().st_mtime)
+        folders.append(
+            {
+                "name": debug_dir.name,
+                "path": str(debug_dir),
+                "kind": "ocr_debug_folder",
+                "role": "ocr_debug_folder",
+                "modified_at": modified_at,
+                "modified_label": time.strftime("%Y-%m-%d %H:%M", time.localtime(modified_at)),
+                "source_srt": str(source_srt) if source_srt else "",
+                "cleaned_srt": str(cleaned_srt) if cleaned_srt else "",
+                "video": str(videos[0]) if videos else "",
+            }
+        )
+    return folders
 
 
 def _subtitle_role(path: Path) -> str:
@@ -5132,6 +5447,12 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send_json(ocr_full_job(payload).to_dict())
             elif self.path == "/api/jobs/ocr-local":
                 self._send_json(ocr_local_video_job(payload).to_dict())
+            elif self.path == "/api/jobs/ocr-dev":
+                self._send_json(ocr_development_job(payload).to_dict())
+            elif self.path == "/api/jobs/ocr-source-cleanup":
+                self._send_json(cleanup_existing_ocr_source_job(payload).to_dict())
+            elif self.path == "/api/jobs/ocr-rebuild-refine":
+                self._send_json(rebuild_ocr_debug_with_llm_job(payload).to_dict())
             elif self.path == "/api/jobs/hybrid-anchor-ocr":
                 self._send_json(hybrid_anchor_ocr_job(payload).to_dict())
             elif self.path == "/api/jobs/audio-local":

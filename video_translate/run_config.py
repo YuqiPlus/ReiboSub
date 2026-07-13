@@ -51,6 +51,9 @@ def run_config(config_path: Path) -> None:
             exclude_bottom_ratio=float(ocr.get("exclude_bottom_ratio", 0.82)),
             exclude_left_ratio=float(ocr.get("exclude_left_ratio", 0.76)),
             exclude_right_ratio=float(ocr.get("exclude_right_ratio", 0.02)),
+            min_confidence=float(ocr.get("min_confidence", 0.45)),
+            refine_timing_boundaries=bool(ocr.get("refine_timing_boundaries", False)),
+            timing_refine_max_frames=int(ocr.get("timing_refine_max_frames", 24)),
             scan_full_frame=bool(ocr.get("scan_full_frame", False)),
             auto_trim_side_noise=bool(ocr.get("auto_trim_side_noise", True)),
             device=str(ocr.get("device", "auto")),
@@ -96,7 +99,8 @@ def run_config(config_path: Path) -> None:
                     overlap=int(source_cleanup.get("overlap", 3)),
                 ),
             )
-            shutil.copyfile(cleaned_srt, source_srt)
+            if not bool(source_cleanup.get("preserve_source", False)):
+                shutil.copyfile(cleaned_srt, source_srt)
             print(f"pre_cleanup_source_srt: {cleanup_input_srt}")
             print(f"cleaned_source_srt: {cleaned_srt}")
         print(f"source_srt: {source_srt}")
@@ -219,4 +223,6 @@ def _cue_timing_config(raw: dict[str, Any]) -> CueTimingConfig:
         snapshot_similarity=float(raw.get("snapshot_similarity", 0.72)),
         snapshot_max_gap_seconds=float(raw["snapshot_max_gap_seconds"]) if raw.get("snapshot_max_gap_seconds") is not None else None,
         snapshot_min_confidence=float(raw.get("snapshot_min_confidence", 0.50)),
+        flicker_smoothing_max_duration_seconds=float(raw.get("flicker_smoothing_max_duration_seconds", 0.0)),
+        flicker_smoothing_max_gap_seconds=float(raw.get("flicker_smoothing_max_gap_seconds", 0.35)),
     )

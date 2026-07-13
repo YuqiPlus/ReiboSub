@@ -142,3 +142,32 @@ def test_ocr_frame_filters_boxes_inside_exclude_region():
     )
 
     assert [box.text for box in boxes] == ["정상 자막"]
+
+
+def test_timing_refinement_only_rescans_presence_boundaries():
+    from video_translate.models import OCRBox
+    from video_translate.ocr.extractor import _timing_refinement_frame_indexes
+
+    visible = [OCRBox("안", (10, 10, 30, 30), 0.9, 0.0, 0, "bottom")]
+    indexes = _timing_refinement_frame_indexes(
+        {
+            0: [],
+            5: visible,
+            10: visible,
+            15: [],
+        },
+        frame_count=20,
+        max_frames=24,
+    )
+
+    assert indexes == [1, 2, 3, 4, 11, 12, 13, 14]
+
+
+def test_timing_refinement_limits_large_sampling_gaps():
+    from video_translate.models import OCRBox
+    from video_translate.ocr.extractor import _timing_refinement_frame_indexes
+
+    visible = [OCRBox("안", (10, 10, 30, 30), 0.9, 0.0, 0, "bottom")]
+    indexes = _timing_refinement_frame_indexes({0: [], 60: visible}, frame_count=90, max_frames=24)
+
+    assert indexes == list(range(61, 85))

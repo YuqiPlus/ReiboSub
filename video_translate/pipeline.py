@@ -31,6 +31,8 @@ class CueTimingConfig:
     snapshot_similarity: float = 0.72
     snapshot_max_gap_seconds: float | None = None
     snapshot_min_confidence: float = 0.50
+    flicker_smoothing_max_duration_seconds: float = 0.0
+    flicker_smoothing_max_gap_seconds: float = 0.35
 
 
 def extract_subtitles_from_video(
@@ -49,6 +51,9 @@ def extract_subtitles_from_video(
     exclude_bottom_ratio: float = 0.82,
     exclude_left_ratio: float = 0.76,
     exclude_right_ratio: float = 0.02,
+    min_confidence: float = 0.45,
+    refine_timing_boundaries: bool = False,
+    timing_refine_max_frames: int = 24,
     scan_full_frame: bool = False,
     auto_trim_side_noise: bool = True,
     device: str = "auto",
@@ -61,6 +66,7 @@ def extract_subtitles_from_video(
     timing = cue_timing or CueTimingConfig()
     if timing.sample_interval_seconds is None and sample_fps > 0:
         timing.sample_interval_seconds = 1.0 / sample_fps
+    sampled_frames: list[dict[str, object]] = []
     boxes = extract_video_ocr(
         video_path,
         lang=lang,
@@ -76,14 +82,34 @@ def extract_subtitles_from_video(
             exclude_bottom_ratio=exclude_bottom_ratio,
             exclude_left_ratio=exclude_left_ratio,
             exclude_right_ratio=exclude_right_ratio,
+            min_confidence=min_confidence,
+            refine_timing_boundaries=refine_timing_boundaries,
+            timing_refine_max_frames=timing_refine_max_frames,
             scan_full_frame=scan_full_frame,
             auto_trim_side_noise=auto_trim_side_noise,
             device=device,
         ),
+        sampled_frames=sampled_frames,
     )
     boxes_path = out_dir / "ocr_boxes.json"
+    sampled_frames_path = out_dir / "ocr_sample_frames.json"
     out_dir.mkdir(parents=True, exist_ok=True)
     boxes_path.write_text(json.dumps([box.to_dict() for box in boxes], ensure_ascii=False, indent=2), encoding="utf-8")
+    sampled_frames_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sample_fps": sample_fps,
+                "min_confidence": min_confidence,
+                "refine_timing_boundaries": refine_timing_boundaries,
+                "timing_refine_max_frames": timing_refine_max_frames,
+                "frames": sampled_frames,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     tracks = build_text_tracks(boxes)
     if _normalize_extraction_mode(extraction_mode) == "region":
         _apply_region_ocr_track_policy(tracks)
@@ -99,6 +125,7 @@ def extract_subtitles_from_video(
         )
     outputs = write_extraction_outputs(tracks, out_dir, cue_timing=timing)
     outputs["ocr_boxes"] = boxes_path
+    outputs["ocr_sample_frames"] = sampled_frames_path
     return outputs
 
 
@@ -265,7 +292,7 @@ def _tracks_to_snapshot_cues(tracks: list[TextTrack], timing: CueTimingConfig) -
     if not snapshots:
         return []
 
-    raw_cues: list[SubtitleCue] = []
+    segments: list[list[_SubtitleSnapshot]] = []
     current: list[_SubtitleSnapshot] = []
     for snapshot in snapshots:
         if not current:
@@ -274,9 +301,14 @@ def _tracks_to_snapshot_cues(tracks: list[TextTrack], timing: CueTimingConfig) -
         if _snapshot_belongs_to_segment(current, snapshot, timing):
             current.append(snapshot)
             continue
-        _append_snapshot_cue(raw_cues, current, timing)
+        segments.append(current)
         current = [snapshot]
-    _append_snapshot_cue(raw_cues, current, timing)
+    if current:
+        segments.append(current)
+
+    raw_cues: list[SubtitleCue] = []
+    for segment in _smooth_short_snapshot_segments(segments, timing):
+        _append_snapshot_cue(raw_cues, segment, timing)
     return raw_cues
 
 
@@ -311,13 +343,21 @@ def _build_subtitle_snapshots(boxes: list[OCRBox]) -> list[_SubtitleSnapshot]:
 
     snapshots: list[_SubtitleSnapshot] = []
     for time in sorted(by_time):
-        frame_boxes = by_time[time]
+        frame_boxes = _filter_snapshot_frame_boxes(by_time[time])
         text = _merge_boxes_text(frame_boxes)
         if not text:
             continue
         confidence = sum(box.confidence for box in frame_boxes) / len(frame_boxes)
         snapshots.append(_SubtitleSnapshot(time=time, text=text, boxes=frame_boxes, confidence=confidence))
     return snapshots
+
+
+def _filter_snapshot_frame_boxes(boxes: list[OCRBox]) -> list[OCRBox]:
+    if len(boxes) < 2:
+        return boxes
+    baseline = max(_box_center_y(box) for box in boxes)
+    subtitle_boxes = [box for box in boxes if _box_center_y(box) >= baseline - 150]
+    return subtitle_boxes or boxes
 
 
 def _merge_boxes_text(boxes: list[OCRBox]) -> str:
@@ -349,7 +389,25 @@ def _snapshot_belongs_to_segment(
     if snapshot.time - previous.time > _snapshot_continuity_gap(timing):
         return False
     current_text = _choose_snapshot_text(current)
-    return _snapshot_text_related(current_text, snapshot.text, timing)
+    if _snapshot_text_related(current_text, snapshot.text, timing):
+        return True
+    return _is_progressive_snapshot_extension(current_text, snapshot.text, allow_single_fragment=len(current) == 1)
+
+
+def _is_progressive_snapshot_extension(left: str, right: str, *, allow_single_fragment: bool) -> bool:
+    left_words = _single_line_text(left).split()
+    right_words = _single_line_text(right).split()
+    if not left_words or not right_words:
+        return False
+    if len(left_words) == 1 or len(right_words) == 1:
+        return allow_single_fragment and left_words[0] == right_words[0]
+    comparable = min(2, len(left_words), len(right_words))
+    matched = sum(
+        1
+        for index in range(comparable)
+        if left_words[index] == right_words[index] or text_similarity(left_words[index], right_words[index]) >= 0.50
+    )
+    return matched == comparable and len(left_words) != len(right_words)
 
 
 def _snapshot_continuity_gap(timing: CueTimingConfig) -> float:
@@ -397,6 +455,9 @@ def _append_snapshot_cue(
 
 
 def _choose_snapshot_text(snapshots: list[_SubtitleSnapshot]) -> str:
+    consensus = _choose_spatial_consensus_text(snapshots)
+    if consensus:
+        return consensus
     candidates = [_clean_snapshot_text(snapshot.text) for snapshot in snapshots if snapshot.text.strip()]
     candidates = _remove_contained_texts(candidates)
     if not candidates:
@@ -414,6 +475,84 @@ def _choose_snapshot_text(snapshots: list[_SubtitleSnapshot]) -> str:
     return max(candidates, key=score)
 
 
+def _choose_spatial_consensus_text(snapshots: list[_SubtitleSnapshot]) -> str:
+    if len(snapshots) < 3:
+        return ""
+    frame_bottoms = [max((_box_center_y(box) for box in snapshot.boxes), default=0.0) for snapshot in snapshots]
+    baseline = sorted(frame_bottoms)[len(frame_bottoms) // 2]
+    boxes = [
+        box
+        for snapshot in snapshots
+        for box in snapshot.boxes
+        if normalize_ocr_text(box.text).strip() and _box_center_y(box) >= baseline - 150
+    ]
+    if len(boxes) < 4:
+        return ""
+    minimum_support = max(2, (len(snapshots) + 3) // 4)
+    rows = _group_consensus_rows(boxes)
+    lines = [
+        _choose_consensus_row_text(row["boxes"], minimum_support)
+        for row in sorted(rows, key=lambda row: row["center_y"])
+    ]
+    lines = [line for line in lines if line]
+    if not lines or sum(len(line.split()) for line in lines) < 2:
+        return ""
+    return "\n".join(lines)
+
+
+def _group_consensus_rows(boxes: list[OCRBox]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for box in sorted(boxes, key=_box_center_y):
+        center_y = _box_center_y(box)
+        nearest = min(rows, key=lambda row: abs(row["center_y"] - center_y), default=None)
+        if nearest is None or abs(nearest["center_y"] - center_y) > 32:
+            rows.append({"center_y": center_y, "boxes": [box]})
+            continue
+        nearest["boxes"].append(box)
+        nearest["center_y"] = sum(_box_center_y(item) for item in nearest["boxes"]) / len(nearest["boxes"])
+    return rows
+
+
+def _choose_consensus_row_text(boxes: list[OCRBox], minimum_support: int) -> str:
+    slots: list[list[OCRBox]] = []
+    for box in sorted(boxes, key=lambda item: (item.bbox[0] + item.bbox[2]) / 2):
+        slot = next((candidate for candidate in slots if _same_horizontal_slot(candidate, box)), None)
+        if slot is None:
+            slots.append([box])
+        else:
+            slot.append(box)
+
+    pieces: list[tuple[float, str]] = []
+    for slot in slots:
+        support = len({round(box.time, 3) for box in slot})
+        if support < minimum_support:
+            continue
+        scores: dict[str, tuple[float, int]] = {}
+        for box in slot:
+            text = normalize_ocr_text(box.text).strip()
+            if not text:
+                continue
+            weight, count = scores.get(text, (0.0, 0))
+            scores[text] = (weight + box.confidence, count + 1)
+        if not scores:
+            continue
+        text = max(scores, key=lambda item: (scores[item][0], scores[item][1], len(_compact_text(item))))
+        center_x = sum((box.bbox[0] + box.bbox[2]) / 2 for box in slot) / len(slot)
+        pieces.append((center_x, text))
+    return _join_text_fragments([text for _, text in sorted(pieces)])
+
+
+def _same_horizontal_slot(slot: list[OCRBox], box: OCRBox) -> bool:
+    box_center = (box.bbox[0] + box.bbox[2]) / 2
+    for candidate in slot:
+        candidate_center = (candidate.bbox[0] + candidate.bbox[2]) / 2
+        overlap = max(0.0, min(candidate.bbox[2], box.bbox[2]) - max(candidate.bbox[0], box.bbox[0]))
+        narrow_width = max(1.0, min(candidate.bbox[2] - candidate.bbox[0], box.bbox[2] - box.bbox[0]))
+        if overlap / narrow_width >= 0.35 or abs(candidate_center - box_center) <= 30:
+            return True
+    return False
+
+
 def _clean_snapshot_text(text: str) -> str:
     lines = [_join_text_fragments(_remove_contained_texts([part.strip() for part in line.split() if part.strip()])) for line in text.splitlines()]
     return "\n".join(_dedupe_texts([line for line in lines if line]))
@@ -428,9 +567,71 @@ def _should_drop_snapshot_segment(snapshots: list[_SubtitleSnapshot], text: str)
     max_confidence = max((snapshot.confidence for snapshot in snapshots), default=0.0)
     if len(snapshots) == 1 and len(key) <= 3 and max_confidence < 0.90:
         return True
-    if len(key) <= 2 and len(snapshots) == 1 and max_confidence < 0.98:
+    if len(key) <= 2 and len(snapshots) <= 2 and max_confidence < 0.98:
         return True
     return False
+
+
+def _smooth_short_snapshot_segments(
+    segments: list[list[_SubtitleSnapshot]],
+    timing: CueTimingConfig,
+) -> list[list[_SubtitleSnapshot]]:
+    max_duration = max(0.0, timing.flicker_smoothing_max_duration_seconds)
+    if max_duration <= 0 or len(segments) < 2:
+        return segments
+
+    smoothed = [list(segment) for segment in segments]
+    index = 0
+    while index < len(smoothed):
+        current = smoothed[index]
+        if not _is_short_snapshot_segment(current, timing, max_duration):
+            index += 1
+            continue
+        left = smoothed[index - 1] if index > 0 else None
+        right = smoothed[index + 1] if index + 1 < len(smoothed) else None
+        if left and right and _snapshot_segments_related(left, right, timing) and _snapshot_segments_close(left, current, timing) and _snapshot_segments_close(current, right, timing):
+            left.extend(right)
+            del smoothed[index : index + 2]
+            index = max(0, index - 1)
+            continue
+        if left and _snapshot_segments_related(left, current, timing) and _snapshot_segments_close(left, current, timing):
+            left.extend(current)
+            del smoothed[index]
+            index = max(0, index - 1)
+            continue
+        if right and _snapshot_segments_related(current, right, timing) and _snapshot_segments_close(current, right, timing):
+            right[0:0] = current
+            del smoothed[index]
+            continue
+        index += 1
+    return smoothed
+
+
+def _is_short_snapshot_segment(
+    snapshots: list[_SubtitleSnapshot],
+    timing: CueTimingConfig,
+    max_duration: float,
+) -> bool:
+    if not snapshots:
+        return False
+    extension = (timing.sample_interval_seconds or 0.0) * timing.sample_end_extension_ratio
+    return snapshots[-1].time - snapshots[0].time + max(0.0, extension) <= max_duration
+
+
+def _snapshot_segments_related(
+    left: list[_SubtitleSnapshot],
+    right: list[_SubtitleSnapshot],
+    timing: CueTimingConfig,
+) -> bool:
+    return _snapshot_text_related(_choose_snapshot_text(left), _choose_snapshot_text(right), timing)
+
+
+def _snapshot_segments_close(
+    left: list[_SubtitleSnapshot],
+    right: list[_SubtitleSnapshot],
+    timing: CueTimingConfig,
+) -> bool:
+    return bool(left and right) and right[0].time - left[-1].time <= timing.flicker_smoothing_max_gap_seconds
 
 
 def _box_center_y(box: OCRBox) -> float:

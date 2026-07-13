@@ -135,6 +135,38 @@
             <VideoOverlayPanel :input-video="localVideo" @run="runVideoOverlay" />
           </div>
 
+          <div v-else-if="activeView === 'ocr-dev'" class="page-stack">
+            <OcrDevPanel
+              v-model:input-video="localVideo"
+              v-model:source-language="ocrDevSourceLanguage"
+              v-model:sample-fps="ocrDevSampleFps"
+              v-model:min-confidence="ocrDevMinConfidence"
+              v-model:refine-timing-boundaries="ocrDevRefineTimingBoundaries"
+              v-model:flicker-smoothing-max-duration-seconds="ocrDevFlickerSmoothingMaxDurationSeconds"
+              v-model:llm-cleanup="ocrDevLlmCleanup"
+              v-model:source-srt="sourceSrt"
+              :debug-folders="assets.ocr_debug_folders"
+              :ocr-scope="ocrScope"
+              v-model:ocr-crop-top-ratio="ocrCropTopRatio"
+              v-model:ocr-crop-bottom-ratio="ocrCropBottomRatio"
+              v-model:ocr-crop-left-ratio="ocrCropLeftRatio"
+              v-model:ocr-crop-right-ratio="ocrCropRightRatio"
+              v-model:ocr-exclude-enabled="ocrExcludeEnabled"
+              v-model:ocr-exclude-top-ratio="ocrExcludeTopRatio"
+              v-model:ocr-exclude-bottom-ratio="ocrExcludeBottomRatio"
+              v-model:ocr-exclude-left-ratio="ocrExcludeLeftRatio"
+              v-model:ocr-exclude-right-ratio="ocrExcludeRightRatio"
+              :running="ocrDevRunning"
+              :status="ocrDevStatus.text"
+              :status-class="ocrDevStatus.class"
+              @open-assets="activeView = 'assets'"
+              @run="runOcrDevelopmentTest"
+              @run-cleanup="runExistingOcrSourceCleanup"
+              @rebuild-track-refine="runOcrJsonRebuild"
+              @refresh-debug-assets="loadAssets"
+            />
+          </div>
+
           <div v-else-if="activeView === 'subtitles'" class="page-stack">
             <TranslationFlow
               v-model:source-srt="sourceSrt"
@@ -245,6 +277,7 @@ import GlossaryReviewPanel from './components/GlossaryReviewPanel.vue'
 import SubtitleEditorPanel from './components/SubtitleEditorPanel.vue'
 import AssetLibrary from './components/AssetLibrary.vue'
 import VideoOverlayPanel from './components/VideoOverlayPanel.vue'
+import OcrDevPanel from './components/OcrDevPanel.vue'
 import JobSidebar from './components/JobSidebar.vue'
 import { copyText } from './clipboard.js'
 import { createAgentSessionPoller } from './agentSessionPolling.js'
@@ -283,6 +316,13 @@ const ocrExcludeTopRatio = ref(0.04)
 const ocrExcludeBottomRatio = ref(0.82)
 const ocrExcludeLeftRatio = ref(0.76)
 const ocrExcludeRightRatio = ref(0.02)
+const ocrDevSourceLanguage = ref('korean')
+const ocrDevSampleFps = ref(6)
+const ocrDevMinConfidence = ref(30)
+const ocrDevRefineTimingBoundaries = ref(true)
+const ocrDevFlickerSmoothingMaxDurationSeconds = ref(0.55)
+const ocrDevLlmCleanup = ref(true)
+const ocrDevRunning = ref(false)
 const ocrRefinementMode = ref('none')
 const thumbnailFormat = ref('jpg')
 const videoQuality = ref('1080p')
@@ -302,7 +342,7 @@ const agentStarting = ref(false)
 const openedGlossaryReviewKey = ref('')
 const mobileUploadBusy = ref(false)
 
-const assets = reactive({ videos: [], subtitles: [], projects: [], ocr_jobs: [] })
+const assets = reactive({ videos: [], subtitles: [], projects: [], ocr_jobs: [], ocr_debug_folders: [] })
 const jobs = reactive({})
 const pollTimers = new Map()
 
@@ -310,6 +350,7 @@ const probeStatus = reactive({ text: '', class: '' })
 const titleStatus = reactive({ text: '', class: '' })
 const flowStatus = reactive({ text: '', class: '' })
 const subtitleEditorStatus = reactive({ text: '', class: '' })
+const ocrDevStatus = reactive({ text: '', class: '' })
 const assetStatus = reactive({ text: '', class: '' })
 const agentStatus = reactive({ text: '', class: '' })
 
@@ -370,6 +411,7 @@ watch(ocrScope, (scope) => {
 
 const navItems = computed(() => [
   { id: 'agent', label: 'Agent', hint: '自动编排', icon: 'A', badge: waitingAgentCount.value ? `${waitingAgentCount.value} 待确认` : runningAgentCount.value || '' },
+  { id: 'ocr-dev', label: 'OCR Lab', hint: '原始提取测试', icon: 'O', badge: '' },
   { id: 'assets', label: '素材', hint: '视频与字幕', icon: 'M', badge: assets.videos.length + assets.subtitles.length || '' },
   { id: 'video-overlay', label: '贴图', hint: '水印与遮 Logo', icon: 'V', badge: localVideo.value ? '已选' : '' },
   { id: 'glossary', label: '审核', hint: 'Glossary', icon: 'G', badge: glossaryItems.value.length || '' },
@@ -846,6 +888,80 @@ async function runLocalOcr() {
   }
 }
 
+async function runOcrDevelopmentTest() {
+  if (!localVideo.value.trim()) {
+    setStatus(ocrDevStatus, '请先选择本地视频。', 'bad')
+    return
+  }
+  ocrDevRunning.value = true
+  setStatus(ocrDevStatus, '正在运行区域 OCR 开发测试…', '')
+  try {
+    const job = await api('/api/jobs/ocr-dev', {
+      input_video: localVideo.value.trim(),
+      source_language: ocrDevSourceLanguage.value,
+      sample_fps: ocrDevSampleFps.value,
+      min_confidence: ocrDevMinConfidence.value,
+      refine_timing_boundaries: ocrDevRefineTimingBoundaries.value,
+      flicker_smoothing_max_duration_seconds: ocrDevFlickerSmoothingMaxDurationSeconds.value,
+      llm_cleanup: ocrDevLlmCleanup.value,
+      ocr_scope: ocrScope.value,
+      ocr_crop_top_ratio: ocrCropTopRatio.value,
+      ocr_crop_bottom_ratio: ocrCropBottomRatio.value,
+      ocr_crop_left_ratio: ocrCropLeftRatio.value,
+      ocr_crop_right_ratio: ocrCropRightRatio.value,
+      ocr_exclude_enabled: ocrExcludeEnabled.value,
+      ocr_exclude_top_ratio: ocrExcludeTopRatio.value,
+      ocr_exclude_bottom_ratio: ocrExcludeBottomRatio.value,
+      ocr_exclude_left_ratio: ocrExcludeLeftRatio.value,
+      ocr_exclude_right_ratio: ocrExcludeRightRatio.value,
+    })
+    watchJob(job)
+    activeView.value = 'jobs'
+    setStatus(ocrDevStatus, 'OCR 开发测试已启动；完成后可在任务输出中查看 JSON。', 'ok')
+  } catch (error) {
+    setStatus(ocrDevStatus, error.message, 'bad')
+  } finally {
+    ocrDevRunning.value = false
+  }
+}
+
+async function runExistingOcrSourceCleanup() {
+  if (!sourceSrt.value.trim()) {
+    setStatus(ocrDevStatus, '请填写已有 source.srt 的路径。', 'bad')
+    return
+  }
+  ocrDevRunning.value = true
+  setStatus(ocrDevStatus, '正在对已有 source.srt 进行 LLM 去噪…', '')
+  try {
+    const job = await api('/api/jobs/ocr-source-cleanup', {
+      source_srt: sourceSrt.value.trim(),
+    })
+    watchJob(job)
+    activeView.value = 'jobs'
+    setStatus(ocrDevStatus, '字幕去噪已启动；清洗版将写入原文件同目录。', 'ok')
+  } catch (error) {
+    setStatus(ocrDevStatus, error.message, 'bad')
+  } finally {
+    ocrDevRunning.value = false
+  }
+}
+
+async function runOcrJsonRebuild(debugDir) {
+  if (!debugDir) return
+  ocrDevRunning.value = true
+  setStatus(ocrDevStatus, '正在从已有 OCR JSON 重建候选并进行证据型 LLM 精修…', '')
+  try {
+    const job = await api('/api/jobs/ocr-rebuild-refine', { debug_dir: debugDir })
+    watchJob(job)
+    activeView.value = 'jobs'
+    setStatus(ocrDevStatus, 'JSON 重建已启动；不会重新读取视频。', 'ok')
+  } catch (error) {
+    setStatus(ocrDevStatus, error.message, 'bad')
+  } finally {
+    ocrDevRunning.value = false
+  }
+}
+
 async function runLocalAudio() {
   if (!localVideo.value.trim()) {
     setStatus(assetStatus, '先选择本地视频。', 'bad')
@@ -1095,6 +1211,7 @@ async function loadAssets() {
     assets.subtitles = result.subtitles || []
     assets.projects = result.projects || []
     assets.ocr_jobs = result.ocr_jobs || []
+    assets.ocr_debug_folders = result.ocr_debug_folders || []
     setStatus(assetStatus, `已扫描：${assets.projects.length} 个项目，${assets.videos.length} 个视频，${assets.subtitles.length} 个字幕。`, 'ok')
   } catch (error) {
     setStatus(assetStatus, error.message, 'bad')
@@ -1209,6 +1326,7 @@ function applyJobResult(job) {
   const result = job.result || {}
   if (result.subtitle_path) sourceSrt.value = result.subtitle_path
   if (result.source_srt) sourceSrt.value = result.source_srt
+  if (result.source_track_refined_srt) sourceSrt.value = result.source_track_refined_srt
   if (result.input_video) localVideo.value = result.input_video
   if (result.output_video) {
     localVideo.value = result.output_video
