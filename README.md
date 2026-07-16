@@ -425,3 +425,7 @@ Frontend build:
 cd frontend
 npm run build
 ```
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

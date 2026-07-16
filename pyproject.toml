@@ -3,6 +3,8 @@ name = "video-translate"
 version = "0.1.0"
 description = "Human-in-the-loop OCR, ASR, glossary, translation, and subtitle refinement for video."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 keywords = ["subtitle", "ocr", "asr", "translation", "video"]
 classifiers = [
@@ -41,7 +43,7 @@ Repository = "https://github.com/YuqiPlus/Video_Translate.git"
 Issues = "https://github.com/YuqiPlus/Video_Translate/issues"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
