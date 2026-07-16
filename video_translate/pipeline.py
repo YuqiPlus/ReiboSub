@@ -5,10 +5,12 @@ import csv
 import re
 from pathlib import Path
 from dataclasses import dataclass
+from typing import Any
 
 from video_translate.models import OCRBox, SubtitleCue, TextTrack, TrackKind
 from video_translate.ocr.classifier import ClassificationConfig, classify_tracks
 from video_translate.ocr.extractor import ExtractConfig, extract_video_ocr
+from video_translate.ocr.geometry_track import build_geometry_text_tracks
 from video_translate.ocr.text_track import build_text_tracks
 from video_translate.subtitle.srt import write_srt
 from video_translate.utils.text import normalize_ocr_text, text_similarity
@@ -58,15 +60,19 @@ def extract_subtitles_from_video(
     auto_trim_side_noise: bool = True,
     device: str = "auto",
     extraction_mode: str = "auto",
+    shape_mode: str | None = None,
     ignored_texts: list[str] | None = None,
     ignored_contains: list[str] | None = None,
     ignored_patterns: list[str] | None = None,
     cue_timing: CueTimingConfig | None = None,
 ) -> dict[str, Path]:
+    normalized_extraction_mode = _normalize_extraction_mode(extraction_mode)
+    normalized_shape_mode = _normalize_shape_mode(shape_mode, extraction_mode=normalized_extraction_mode)
     timing = cue_timing or CueTimingConfig()
     if timing.sample_interval_seconds is None and sample_fps > 0:
         timing.sample_interval_seconds = 1.0 / sample_fps
-    sampled_frames: list[dict[str, object]] = []
+    sampled_frames: list[dict[str, Any]] = []
+    rejected_boxes: list[dict[str, Any]] = []
     boxes = extract_video_ocr(
         video_path,
         lang=lang,
@@ -88,31 +94,40 @@ def extract_subtitles_from_video(
             scan_full_frame=scan_full_frame,
             auto_trim_side_noise=auto_trim_side_noise,
             device=device,
+            extraction_mode=normalized_extraction_mode,
+            shape_mode=normalized_shape_mode,
         ),
         sampled_frames=sampled_frames,
+        rejected_boxes=rejected_boxes,
     )
     boxes_path = out_dir / "ocr_boxes.json"
     sampled_frames_path = out_dir / "ocr_sample_frames.json"
     out_dir.mkdir(parents=True, exist_ok=True)
     boxes_path.write_text(json.dumps([box.to_dict() for box in boxes], ensure_ascii=False, indent=2), encoding="utf-8")
+    sampled_frames_payload: dict[str, object] = {
+        "schema_version": 1,
+        "sample_fps": sample_fps,
+        "min_confidence": min_confidence,
+        "refine_timing_boundaries": refine_timing_boundaries,
+        "timing_refine_max_frames": timing_refine_max_frames,
+        "frames": sampled_frames,
+    }
+    if normalized_extraction_mode == "region_v3":
+        sampled_frames_payload["extraction_mode"] = normalized_extraction_mode
+        sampled_frames_payload["shape_mode"] = normalized_shape_mode
     sampled_frames_path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "sample_fps": sample_fps,
-                "min_confidence": min_confidence,
-                "refine_timing_boundaries": refine_timing_boundaries,
-                "timing_refine_max_frames": timing_refine_max_frames,
-                "frames": sampled_frames,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
+        json.dumps(sampled_frames_payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    tracks = build_text_tracks(boxes)
-    if _normalize_extraction_mode(extraction_mode) == "region":
+    tracks = (
+        build_geometry_text_tracks(boxes)
+        if normalized_extraction_mode == "region_v3"
+        else build_text_tracks(boxes)
+    )
+    if normalized_extraction_mode == "region":
         _apply_region_ocr_track_policy(tracks)
+    elif normalized_extraction_mode == "region_v3":
+        _apply_region_v3_ocr_track_policy(tracks, normalized_shape_mode)
     else:
         classify_tracks(
             tracks,
@@ -126,6 +141,22 @@ def extract_subtitles_from_video(
     outputs = write_extraction_outputs(tracks, out_dir, cue_timing=timing)
     outputs["ocr_boxes"] = boxes_path
     outputs["ocr_sample_frames"] = sampled_frames_path
+    if normalized_extraction_mode == "region_v3":
+        rejected_boxes_path = out_dir / "ocr_rejected_boxes.json"
+        rejected_boxes_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "extraction_mode": normalized_extraction_mode,
+                    "shape_mode": normalized_shape_mode,
+                    "boxes": rejected_boxes,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        outputs["ocr_rejected_boxes"] = rejected_boxes_path
     return outputs
 
 
@@ -194,7 +225,7 @@ def write_extraction_outputs(
 
     main_tracks = [track for track in tracks if track.kind == TrackKind.MAIN_SUBTITLE]
     ignored_tracks = [track for track in tracks if track.kind == TrackKind.PERSISTENT_OVERLAY]
-    cues = _tracks_to_cues(main_tracks, cue_timing or CueTimingConfig())
+    cues = tracks_to_cues(main_tracks, cue_timing=cue_timing)
 
     tracks_path = out_dir / "tracks.json"
     debug_csv_path = out_dir / "tracks_debug.csv"
@@ -218,6 +249,22 @@ def write_extraction_outputs(
         "ignored_tracks": ignored_path,
         "source_srt": source_srt_path,
     }
+
+
+def tracks_to_cues(
+    tracks: list[TextTrack],
+    *,
+    cue_timing: CueTimingConfig | None = None,
+) -> list[SubtitleCue]:
+    """Render classified tracks with the pipeline's canonical SRT grouping.
+
+    OCR 3.0 classifies geometry at track granularity, then calls this same
+    renderer after removing only server-confirmed scene tracks. That keeps its
+    subtitle timing/grouping behavior aligned with the machine SRT generated
+    immediately before refinement.
+    """
+
+    return _tracks_to_cues(tracks, cue_timing or CueTimingConfig())
 
 
 def _sample_interval_hint(boxes: list[OCRBox]) -> float | None:
@@ -252,9 +299,20 @@ def _tracks_duration_hint(tracks: list[TextTrack]) -> float | None:
 
 def _normalize_extraction_mode(value: str | None) -> str:
     mode = str(value or "auto").strip().lower()
-    if mode not in {"auto", "region"}:
+    if mode not in {"auto", "region", "region_v3"}:
         raise ValueError(f"未知 OCR 提取模式: {mode}")
     return mode
+
+
+def _normalize_shape_mode(value: str | None, *, extraction_mode: str) -> str:
+    if extraction_mode != "region_v3":
+        return "unrestricted"
+    raw_mode = str(value or "").strip().lower()
+    if not raw_mode:
+        return "horizontal_preferred"
+    if raw_mode not in {"unrestricted", "horizontal_preferred", "horizontal_strict"}:
+        raise ValueError(f"未知 OCR 文字形态模式: {raw_mode}")
+    return raw_mode
 
 
 def _apply_region_ocr_track_policy(tracks: list[TextTrack]) -> list[TextTrack]:
@@ -265,6 +323,17 @@ def _apply_region_ocr_track_policy(tracks: list[TextTrack]) -> list[TextTrack]:
         else:
             track.kind = TrackKind.UNKNOWN
             track.reason = "region_ocr_empty_text"
+    return tracks
+
+
+def _apply_region_v3_ocr_track_policy(tracks: list[TextTrack], shape_mode: str) -> list[TextTrack]:
+    for track in tracks:
+        if normalize_ocr_text(track.text):
+            track.kind = TrackKind.MAIN_SUBTITLE
+            track.reason = f"region_v3_selected_area:{shape_mode}"
+        else:
+            track.kind = TrackKind.UNKNOWN
+            track.reason = "region_v3_empty_text"
     return tracks
 
 

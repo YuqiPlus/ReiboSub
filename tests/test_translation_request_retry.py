@@ -116,7 +116,7 @@ def test_translate_batch_uses_fallback_model_after_timeout(monkeypatch, tmp_path
     assert "备用译文1" in out.read_text(encoding="utf-8")
 
 
-def test_translate_merges_exact_adjacent_duplicates_even_without_general_dedupe(monkeypatch, tmp_path):
+def test_translate_merges_exact_adjacent_duplicates_when_enabled(monkeypatch, tmp_path):
     source = tmp_path / "source.srt"
     source.write_text(
         "\n\n".join(
@@ -149,6 +149,50 @@ def test_translate_merges_exact_adjacent_duplicates_even_without_general_dedupe(
     text = out.read_text(encoding="utf-8")
     assert text.count("简单对台词的禧主&小昱") == 1
     assert "00:04:05,912 --> 00:04:09,182" in text
+
+
+def test_translate_only_preserves_source_cue_structure(monkeypatch, tmp_path):
+    source = tmp_path / "source.srt"
+    source.write_text(
+        "\n\n".join(
+            [
+                "1\n00:04:05,912 --> 00:04:07,207\n간단하게",
+                "2\n00:04:07,247 --> 00:04:07,541\n간단하게",
+                "3\n00:04:07,581 --> 00:04:09,182\n간단하게",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.srt"
+
+    def fake_request_mapping(_endpoint, _key, payload, batch_label, **kwargs):
+        user = json.loads(payload["messages"][1]["content"])
+        return {item["id"]: "简单对台词的禧主&小昱" for item in user["subtitles"]}
+
+    monkeypatch.setenv("ARK_API_KEY", "key")
+    monkeypatch.setattr(volcengine, "_load_dotenv", lambda _path: None)
+    monkeypatch.setattr(
+        volcengine,
+        "load_llm_task_config",
+        lambda *args, **kwargs: SimpleNamespace(model="model", base_url="https://example.test", fallback_models=()),
+    )
+    monkeypatch.setattr(volcengine, "_request_translation_mapping", fake_request_mapping)
+
+    source_cues = volcengine.read_srt(source)
+    volcengine.translate_srt_with_volcengine(
+        source,
+        out,
+        batch_size=3,
+        dedupe_translated=False,
+        dedupe_exact_translated=False,
+    )
+    translated_cues = volcengine.read_srt(out)
+
+    assert [(cue.index, cue.start, cue.end) for cue in translated_cues] == [
+        (cue.index, cue.start, cue.end) for cue in source_cues
+    ]
+    assert [cue.text for cue in translated_cues] == ["简单对台词的禧主&小昱"] * 3
 
 
 def test_translate_srt_strips_plain_sentence_periods_before_write(monkeypatch, tmp_path):

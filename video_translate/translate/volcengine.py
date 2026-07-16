@@ -33,6 +33,7 @@ def translate_srt_with_volcengine(
     ignored_patterns: list[str] | None = None,
     extra_prompt: str = "",
     dedupe_translated: bool = False,
+    dedupe_exact_translated: bool = True,
     dedupe_similarity: float = 0.88,
     dedupe_max_gap_seconds: float = 1.2,
     llm_cleanup_translated: bool = False,
@@ -182,7 +183,8 @@ def translate_srt_with_volcengine(
             source_max_gap_seconds=max(dedupe_max_gap_seconds, llm_cleanup_max_gap_seconds, 3.5),
         )
 
-    translated = dedupe_exact_adjacent_translated_cues(translated, max_gap_seconds=0.20)
+    if dedupe_exact_translated:
+        translated = dedupe_exact_adjacent_translated_cues(translated, max_gap_seconds=0.20)
 
     if retime_translated:
         translated = retime_translated_cues_for_readability(
@@ -1161,12 +1163,6 @@ def _chat_completions_url(base_url: str) -> str:
 
 
 def _load_dotenv(anchor: Path) -> None:
-    for candidate in [Path.cwd() / ".env", anchor.resolve().parent / ".env"]:
-        if not candidate.exists():
-            continue
-        for line in candidate.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#") or "=" not in stripped:
-                continue
-            key, value = stripped.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+    from video_translate.env import load_dotenv
+
+    load_dotenv(anchor)

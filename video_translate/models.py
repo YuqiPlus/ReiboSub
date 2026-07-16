@@ -6,6 +6,8 @@ from typing import Any
 
 
 BBox = tuple[float, float, float, float]
+Point = tuple[float, float]
+Polygon = tuple[Point, ...]
 
 
 class TrackKind(str, Enum):
@@ -24,9 +26,13 @@ class OCRBox:
     time: float
     frame_index: int
     region: str = "unknown"
+    polygon: Polygon | None = None
+    angle_degrees: float | None = None
+    shape_hint: str | None = None
+    shape_limit_degrees: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "text": self.text,
             "bbox": list(self.bbox),
             "confidence": self.confidence,
@@ -34,9 +40,33 @@ class OCRBox:
             "frame_index": self.frame_index,
             "region": self.region,
         }
+        # Geometry is opt-in so OCR 1.0/2.0 JSON remains byte-for-byte compatible
+        # at the schema level. OCR 3.0 populates these fields from PaddleOCR's
+        # original quadrilateral.
+        if self.polygon is not None:
+            data["polygon"] = [list(point) for point in self.polygon]
+        if self.angle_degrees is not None:
+            data["angle_degrees"] = self.angle_degrees
+        if self.shape_hint is not None:
+            data["shape_hint"] = self.shape_hint
+        if self.shape_limit_degrees is not None:
+            data["shape_limit_degrees"] = self.shape_limit_degrees
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "OCRBox":
+        raw_polygon = data.get("polygon")
+        polygon: Polygon | None = None
+        if isinstance(raw_polygon, (list, tuple)):
+            points: list[Point] = []
+            for raw_point in raw_polygon:
+                if not isinstance(raw_point, (list, tuple)) or len(raw_point) < 2:
+                    continue
+                points.append((float(raw_point[0]), float(raw_point[1])))
+            if points:
+                polygon = tuple(points)
+        raw_angle = data.get("angle_degrees")
+        raw_shape_limit = data.get("shape_limit_degrees")
         return cls(
             text=str(data["text"]),
             bbox=tuple(float(v) for v in data["bbox"]),  # type: ignore[arg-type]
@@ -44,6 +74,10 @@ class OCRBox:
             time=float(data["time"]),
             frame_index=int(data.get("frame_index", 0)),
             region=str(data.get("region", "unknown")),
+            polygon=polygon,
+            angle_degrees=float(raw_angle) if raw_angle is not None else None,
+            shape_hint=str(data.get("shape_hint")) if data.get("shape_hint") is not None else None,
+            shape_limit_degrees=float(raw_shape_limit) if raw_shape_limit is not None else None,
         )
 
 

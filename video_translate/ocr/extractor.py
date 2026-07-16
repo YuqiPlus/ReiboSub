@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import sys
 from dataclasses import dataclass
@@ -31,6 +32,14 @@ class ExtractConfig:
     auto_trim_side_noise: bool = True
     suppress_full_frame_duplicates: bool = True
     device: str = "auto"
+    extraction_mode: str = "auto"
+    shape_mode: str | None = None
+    horizontal_preferred_max_angle_degrees: float = 15.0
+    horizontal_strict_max_angle_degrees: float = 8.0
+
+
+_EXTRACTION_MODES = {"auto", "region", "region_v3"}
+_SHAPE_MODES = {"unrestricted", "horizontal_preferred", "horizontal_strict"}
 
 
 def _load_cv2():
@@ -98,8 +107,11 @@ def extract_video_ocr(
     lang: str,
     config: ExtractConfig | None = None,
     sampled_frames: list[dict[str, Any]] | None = None,
+    rejected_boxes: list[dict[str, Any]] | None = None,
 ) -> list[OCRBox]:
     config = config or ExtractConfig()
+    _normalize_extraction_mode(config.extraction_mode)
+    _resolved_shape_mode(config)
     cv2 = _load_cv2()
     ocr = _load_paddle_ocr(lang, config.device)
 
@@ -115,6 +127,7 @@ def extract_video_ocr(
     frame_index = 0
     sampled_count = 0
     frame_results: dict[int, tuple[list[OCRBox], str]] = {}
+    progress_open = True
 
     _print_ocr_progress(0, total_samples, 0.0, video_duration)
     try:
@@ -127,25 +140,53 @@ def extract_video_ocr(
                 continue
 
             time_seconds = frame_index / native_fps
-            frame_boxes = list(_ocr_frame(ocr, frame, time_seconds, frame_index, config))
+            frame_boxes = list(
+                _ocr_frame(
+                    ocr,
+                    frame,
+                    time_seconds,
+                    frame_index,
+                    config,
+                    rejected_boxes=rejected_boxes,
+                )
+            )
             frame_results[frame_index] = (frame_boxes, "coarse")
             sampled_count += 1
             _print_ocr_progress(sampled_count, total_samples, time_seconds, video_duration)
             frame_index += 1
 
+        # End the coarse-scan progress line before FFmpeg performs any random
+        # access for boundary refinement.  Otherwise decoder diagnostics are
+        # appended to the ``100%`` line and make a healthy follow-up stage look
+        # like a crashed OCR run.
+        _finish_ocr_progress()
+        progress_open = False
         if config.refine_timing_boundaries:
-            _refine_timing_boundaries(
-                cv2,
-                capture,
-                ocr,
-                frame_results,
-                frame_count=frame_count,
-                native_fps=native_fps,
-                config=config,
-            )
+            # Start boundary refinement with a fresh decoder at frame zero.
+            # Sequential H.264 decoding preserves reference-frame state and
+            # avoids the FFmpeg ``mmco`` warning storm caused by thousands of
+            # random ``CAP_PROP_POS_FRAMES`` seeks on the exhausted decoder.
+            capture.release()
+            capture = cv2.VideoCapture(str(video_path))
+            if capture.isOpened():
+                _refine_timing_boundaries(
+                    ocr,
+                    capture,
+                    frame_results,
+                    frame_count=frame_count,
+                    native_fps=native_fps,
+                    config=config,
+                    rejected_boxes=rejected_boxes,
+                )
+            else:
+                sys.stderr.write(
+                    "OCR timing refine warning: could not reopen video; coarse OCR samples were preserved\n"
+                )
+                sys.stderr.flush()
     finally:
         capture.release()
-        _finish_ocr_progress()
+        if progress_open:
+            _finish_ocr_progress()
 
     if sampled_frames is not None:
         sampled_frames.extend(
@@ -161,29 +202,71 @@ def extract_video_ocr(
 
 
 def _refine_timing_boundaries(
-    cv2,
-    capture,
     ocr,
+    capture,
     frame_results: dict[int, tuple[list[OCRBox], str]],
     *,
     frame_count: int,
     native_fps: float,
     config: ExtractConfig,
+    rejected_boxes: list[dict[str, Any]] | None = None,
 ) -> None:
     indexes = _timing_refinement_frame_indexes(
         {index: frame_boxes for index, (frame_boxes, _) in frame_results.items()},
         frame_count=frame_count,
         max_frames=config.timing_refine_max_frames,
     )
-    for index in indexes:
-        capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+    if not indexes:
+        return
+
+    sys.stderr.write(
+        f"OCR timing refine: {len(indexes)} boundary frames via sequential decode\n"
+    )
+    sys.stderr.flush()
+    target_cursor = 0
+    next_target = indexes[target_cursor]
+    decoded_index = 0
+    refined_count = 0
+    progress_interval = max(1, (len(indexes) + 19) // 20)
+    while target_cursor < len(indexes):
         ok, frame = capture.read()
         if not ok:
-            continue
-        frame_results[index] = (
-            list(_ocr_frame(ocr, frame, index / native_fps, index, config)),
-            "timing_refine",
+            break
+        if decoded_index == next_target:
+            frame_results[next_target] = (
+                list(
+                    _ocr_frame(
+                        ocr,
+                        frame,
+                        next_target / native_fps,
+                        next_target,
+                        config,
+                        rejected_boxes=rejected_boxes,
+                    )
+                ),
+                "timing_refine",
+            )
+            refined_count += 1
+            target_cursor += 1
+            if refined_count % progress_interval == 0 or target_cursor == len(indexes):
+                percent = refined_count * 100.0 / len(indexes)
+                sys.stderr.write(
+                    f"OCR timing refine: {percent:5.1f}% "
+                    f"{refined_count}/{len(indexes)} boundary frames\n"
+                )
+                sys.stderr.flush()
+            if target_cursor == len(indexes):
+                break
+            next_target = indexes[target_cursor]
+        decoded_index += 1
+
+    failed_reads = len(indexes) - refined_count
+    if failed_reads:
+        sys.stderr.write(
+            f"OCR timing refine warning: skipped {failed_reads} undecodable boundary frames; "
+            "coarse OCR samples were preserved\n"
         )
+        sys.stderr.flush()
 
 
 def _timing_refinement_frame_indexes(
@@ -249,7 +332,14 @@ def _format_duration(seconds: float | None) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def _ocr_frame(ocr, frame, time_seconds: float, frame_index: int, config: ExtractConfig) -> Iterable[OCRBox]:
+def _ocr_frame(
+    ocr,
+    frame,
+    time_seconds: float,
+    frame_index: int,
+    config: ExtractConfig,
+    rejected_boxes: list[dict[str, Any]] | None = None,
+) -> Iterable[OCRBox]:
     height, width = frame.shape[:2]
     top_y, bottom_y = _vertical_crop_bounds(height, config)
     left_x, right_x = _horizontal_crop_bounds(width, config.crop_left_ratio, config.crop_right_ratio)
@@ -265,15 +355,30 @@ def _ocr_frame(ocr, frame, time_seconds: float, frame_index: int, config: Extrac
             top_y,
             height,
             width,
+            rejected_boxes,
         )
     )
     for box in bottom_boxes:
         yield box
 
     if config.scan_full_frame:
-        full_boxes = _ocr_region(ocr, frame, time_seconds, frame_index, config, "full", 0, 0, height, width)
+        full_boxes = _ocr_region(
+            ocr,
+            frame,
+            time_seconds,
+            frame_index,
+            config,
+            "full",
+            0,
+            0,
+            height,
+            width,
+            rejected_boxes,
+        )
         for box in full_boxes:
             if config.suppress_full_frame_duplicates and _duplicates_bottom_box(box, bottom_boxes):
+                if _normalize_extraction_mode(config.extraction_mode) == "region_v3":
+                    _record_rejected_box(rejected_boxes, box, "full_frame_duplicate")
                 continue
             yield box
 
@@ -289,6 +394,7 @@ def _ocr_region(
     offset_y: int,
     frame_height: int,
     frame_width: int,
+    rejected_boxes: list[dict[str, Any]] | None = None,
 ) -> Iterable[OCRBox]:
     result = ocr.predict(
         image,
@@ -296,25 +402,181 @@ def _ocr_region(
         use_doc_unwarping=False,
         use_textline_orientation=False,
     )
+    is_region_v3 = _normalize_extraction_mode(config.extraction_mode) == "region_v3"
+    shape_mode = _resolved_shape_mode(config)
     for text, confidence, raw_points in _iter_ocr_items(result):
         confidence = float(confidence)
-        if confidence < config.min_confidence:
+        polygon = tuple((float(point[0]) + offset_x, float(point[1]) + offset_y) for point in raw_points)
+        xs = [point[0] for point in polygon]
+        ys = [point[1] for point in polygon]
+        if not xs or not ys:
             continue
-        xs = [float(point[0]) + offset_x for point in raw_points]
-        ys = [float(point[1]) + offset_y for point in raw_points]
         bbox = (min(xs), min(ys), max(xs), max(ys))
-        if config.exclude_enabled and _box_center_in_exclude_region(bbox, frame_width, frame_height, config):
-            continue
-        if region_name == "bottom" and config.auto_trim_side_noise and _looks_like_bottom_side_noise(bbox, str(text), frame_width, frame_height):
-            continue
-        yield OCRBox(
+        angle_degrees = _polygon_baseline_angle_degrees(polygon) if is_region_v3 else None
+        box = OCRBox(
             text=str(text),
             bbox=bbox,
             confidence=confidence,
             time=time_seconds,
             frame_index=frame_index,
             region=_position_region(region_name, bbox, frame_height),
+            polygon=polygon if is_region_v3 else None,
+            angle_degrees=angle_degrees,
         )
+        if is_region_v3:
+            box.shape_hint, box.shape_limit_degrees = _shape_hint(
+                box.angle_degrees,
+                shape_mode,
+                config,
+            )
+        if confidence < config.min_confidence:
+            if is_region_v3:
+                _record_rejected_box(rejected_boxes, box, "below_min_confidence")
+            continue
+        if config.exclude_enabled and _box_center_in_exclude_region(bbox, frame_width, frame_height, config):
+            if is_region_v3:
+                _record_rejected_box(rejected_boxes, box, "inside_exclude_region")
+            continue
+        if region_name == "bottom" and config.auto_trim_side_noise and _looks_like_bottom_side_noise(bbox, str(text), frame_width, frame_height):
+            if is_region_v3:
+                _record_rejected_box(rejected_boxes, box, "bottom_side_noise")
+            continue
+        rejection_reason, angle_limit = _shape_rejection(box.angle_degrees, shape_mode, config)
+        if is_region_v3 and rejection_reason:
+            _record_rejected_box(
+                rejected_boxes,
+                box,
+                rejection_reason,
+                shape_mode=shape_mode,
+                angle_limit_degrees=angle_limit,
+            )
+            continue
+        yield box
+
+
+def _normalize_extraction_mode(value: str | None) -> str:
+    mode = str(value or "auto").strip().lower()
+    if mode not in _EXTRACTION_MODES:
+        raise ValueError(f"未知 OCR 提取模式: {mode}")
+    return mode
+
+
+def _resolved_shape_mode(config: ExtractConfig) -> str:
+    if _normalize_extraction_mode(config.extraction_mode) != "region_v3":
+        return "unrestricted"
+    raw_mode = config.shape_mode
+    if raw_mode is None or not str(raw_mode).strip():
+        return "horizontal_preferred"
+    mode = str(raw_mode).strip().lower()
+    if mode not in _SHAPE_MODES:
+        raise ValueError(f"未知 OCR 文字形态模式: {mode}")
+    return mode
+
+
+def _polygon_baseline_angle_degrees(polygon: tuple[tuple[float, float], ...]) -> float | None:
+    """Return the signed text baseline angle normalized to [-90, 90).
+
+    PaddleOCR orders quadrilateral points around the text line. The first edge
+    and the reversed opposite edge therefore point along the reading baseline.
+    Averaging both makes the estimate less sensitive to perspective skew while
+    still handling one-character boxes whose height can exceed their width.
+    """
+
+    if len(polygon) < 2:
+        return None
+    first_dx = polygon[1][0] - polygon[0][0]
+    first_dy = polygon[1][1] - polygon[0][1]
+    dx = first_dx
+    dy = first_dy
+    if len(polygon) >= 4:
+        opposite_dx = polygon[2][0] - polygon[3][0]
+        opposite_dy = polygon[2][1] - polygon[3][1]
+        if math.hypot(opposite_dx, opposite_dy) > 1e-6:
+            dx += opposite_dx
+            dy += opposite_dy
+    if math.hypot(dx, dy) <= 1e-6:
+        dx, dy = first_dx, first_dy
+    if math.hypot(dx, dy) <= 1e-6:
+        return None
+    angle = math.degrees(math.atan2(dy, dx))
+    normalized = (angle + 90.0) % 180.0 - 90.0
+    return round(normalized, 3)
+
+
+def _shape_rejection(
+    angle_degrees: float | None,
+    shape_mode: str,
+    config: ExtractConfig,
+) -> tuple[str | None, float | None]:
+    if shape_mode == "unrestricted":
+        return None, None
+    if angle_degrees is None or not math.isfinite(angle_degrees):
+        if shape_mode == "horizontal_strict":
+            return "shape_missing_polygon_geometry", None
+        # Preferred mode is deliberately conservative when PaddleOCR supplies
+        # no usable geometry, avoiding a new false-negative source.
+        return None, None
+    if shape_mode != "horizontal_strict":
+        # OCR 3.0 preferred mode is a soft geometry hint. The candidate must
+        # reach the track/LLM stage; angle alone cannot distinguish a product
+        # label from a deliberately slanted program caption.
+        return None, _clamp_angle_limit(config.horizontal_preferred_max_angle_degrees, 15.0)
+    limit = _clamp_angle_limit(config.horizontal_strict_max_angle_degrees, 8.0)
+    reason = "shape_angle_exceeds_horizontal_strict"
+    if abs(angle_degrees) > limit:
+        return reason, limit
+    return None, limit
+
+
+def _shape_hint(
+    angle_degrees: float | None,
+    shape_mode: str,
+    config: ExtractConfig,
+) -> tuple[str, float | None]:
+    if shape_mode == "unrestricted":
+        return "unrestricted_candidate", None
+    if shape_mode == "horizontal_strict":
+        limit = _clamp_angle_limit(config.horizontal_strict_max_angle_degrees, 8.0)
+        if angle_degrees is None or not math.isfinite(angle_degrees):
+            return "geometry_missing_hard_reject", limit
+        if abs(angle_degrees) > limit:
+            return "tilted_hard_reject", limit
+        return "horizontal_candidate", limit
+    limit = _clamp_angle_limit(config.horizontal_preferred_max_angle_degrees, 15.0)
+    if angle_degrees is None or not math.isfinite(angle_degrees):
+        return "geometry_unknown_candidate", limit
+    if abs(angle_degrees) > limit:
+        return "tilted_soft_candidate", limit
+    return "horizontal_candidate", limit
+
+
+def _record_rejected_box(
+    rejected_boxes: list[dict[str, Any]] | None,
+    box: OCRBox,
+    reason: str,
+    *,
+    shape_mode: str | None = None,
+    angle_limit_degrees: float | None = None,
+) -> None:
+    if rejected_boxes is None:
+        return
+    item = box.to_dict()
+    item["reason"] = reason
+    if shape_mode is not None:
+        item["shape_mode"] = shape_mode
+    if angle_limit_degrees is not None:
+        item["angle_limit_degrees"] = angle_limit_degrees
+    rejected_boxes.append(item)
+
+
+def _clamp_angle_limit(value: float, fallback: float) -> float:
+    try:
+        limit = float(value)
+    except (TypeError, ValueError):
+        limit = fallback
+    if not math.isfinite(limit):
+        limit = fallback
+    return max(0.0, min(90.0, limit))
 
 
 

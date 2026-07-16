@@ -20,7 +20,7 @@ from video_translate.subtitle.srt import read_srt, write_srt
 
 def test_build_ocr_refinement_payload_contains_track_evidence() -> None:
     cues = [SubtitleCue(index=1, start=1.0, end=2.0, text="안녕\n하세요")]
-    boxes = [OCRBox("안녕하세요", (500, 880, 1200, 940), 0.96, 1.2, 36, "bottom")]
+    boxes = [OCRBox("안녕하세요", (500, 880, 1200, 940), 0.96, 1.2, 36, "bottom", angle_degrees=6.5)]
 
     payload = build_ocr_refinement_payload(cues, boxes, model="lite", config=OCRRefinementConfig())
     content = payload["messages"][1]["content"]
@@ -33,9 +33,21 @@ def test_build_ocr_refinement_payload_contains_track_evidence() -> None:
     assert "context_cues" in content
     assert "안녕하세요" in content
     assert "bottom" in content
+    assert '"average_abs_angle_degrees": 6.5' in content
     system_prompt = payload["messages"][0]["content"]
     assert "必须先把每个目标分类" in system_prompt
+    assert "average_abs_angle_degrees" in system_prompt
     assert "绝对不要串接 machine_text 与候选" in system_prompt
+
+
+def test_build_ocr_refinement_payload_keeps_legacy_prompt_without_v3_geometry() -> None:
+    cues = [SubtitleCue(index=1, start=1.0, end=2.0, text="안녕하세요")]
+    boxes = [OCRBox("안녕하세요", (500, 880, 1200, 940), 0.96, 1.2, 36, "bottom")]
+
+    payload = build_ocr_refinement_payload(cues, boxes, model="lite")
+
+    assert "average_abs_angle_degrees" not in payload["messages"][0]["content"]
+    assert "average_abs_angle_degrees" not in payload["messages"][1]["content"]
 
 
 def test_build_ocr_refinement_payload_adds_visual_reading_order() -> None:
@@ -277,6 +289,74 @@ def test_run_config_applies_source_cleanup_after_ocr(monkeypatch, tmp_path: Path
     assert calls["config"].batch_size == 8
     assert calls["config"].overlap == 1
     assert [cue.text for cue in read_srt(source)] == ["정상 자막"]
+
+
+def test_run_config_v2_refines_boxes_without_legacy_source_cleanup(monkeypatch, tmp_path: Path) -> None:
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    input_video = tmp_path / "demo.mp4"
+    input_video.write_bytes(b"video")
+    config_path = config_dir / "run.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "mode: extract",
+                f"input_video: {input_video}",
+                "output_dir: outputs/job",
+                "source_language: korean",
+                "ocr_pipeline:",
+                "  version: v2",
+                "ocr:",
+                "  extraction_mode: region",
+                "ocr_refinement:",
+                "  mode: llm_boxes",
+                "source_cleanup:",
+                "  mode: none",
+                "sidecar:",
+                "  enabled: false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "outputs" / "job"
+    calls: list[str] = []
+
+    def fake_extract(*args, **kwargs):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        source = output_dir / "source.srt"
+        write_srt([SubtitleCue(index=1, start=1.0, end=2.0, text="raw OCR")], source)
+        boxes = output_dir / "ocr_boxes.json"
+        boxes.write_text("[]", encoding="utf-8")
+        return {"source_srt": source, "ocr_boxes": boxes}
+
+    def fake_refine(source_srt, boxes_path, out_srt, *, config, **kwargs):
+        calls.append("boxes_refine")
+        assert source_srt == output_dir / "source.machine.srt"
+        assert boxes_path == output_dir / "ocr_boxes.json"
+        assert config.batch_size == 12
+        write_srt(
+            [SubtitleCue(index=1, start=1.0, end=2.0, text="v2 refined OCR")],
+            out_srt,
+        )
+        return {"refined_srt": out_srt}
+
+    def fail_legacy_cleanup(*args, **kwargs):
+        calls.append("legacy_cleanup")
+        raise AssertionError("OCR 2.0 must not call legacy source cleanup")
+
+    monkeypatch.setattr(run_config_mod, "extract_subtitles_from_video", fake_extract)
+    monkeypatch.setattr(run_config_mod, "refine_ocr_source_with_llm", fake_refine)
+    monkeypatch.setattr(run_config_mod, "cleanup_ocr_source_with_llm", fail_legacy_cleanup)
+
+    run_config_mod.run_config(config_path)
+
+    assert calls == ["boxes_refine"]
+    assert [cue.text for cue in read_srt(output_dir / "source.machine.srt")] == ["raw OCR"]
+    assert [cue.text for cue in read_srt(output_dir / "source.refined.srt")] == ["v2 refined OCR"]
+    assert [cue.text for cue in read_srt(output_dir / "source.srt")] == ["v2 refined OCR"]
+    assert not (output_dir / "source.before_cleanup.srt").exists()
+
+
 def test_run_config_preserves_raw_source_when_requested(monkeypatch, tmp_path: Path) -> None:
     config_dir = tmp_path / "configs"
     config_dir.mkdir()

@@ -10,6 +10,14 @@ from video_translate.ocr.llm_refine import (
     cleanup_ocr_source_with_llm,
     refine_ocr_source_with_llm,
 )
+from video_translate.ocr.geometry_refine import (
+    GeometryRefinementConfig,
+    refine_ocr_geometry_with_llm,
+)
+from video_translate.ocr.layered_refine import (
+    LayeredOCRRefinementConfig,
+    refine_ocr_layers_with_llm,
+)
 from video_translate.languages import normalize_source_language, ocr_language_for_source
 from video_translate.pipeline import CueTimingConfig, extract_subtitles_from_video
 from video_translate.subtitle.sidecar import SidecarConfig, copy_sidecar_subtitles
@@ -58,6 +66,7 @@ def run_config(config_path: Path) -> None:
             auto_trim_side_noise=bool(ocr.get("auto_trim_side_noise", True)),
             device=str(ocr.get("device", "auto")),
             extraction_mode=str(ocr.get("extraction_mode", "auto")),
+            shape_mode=ocr.get("shape_mode"),
             ignored_texts=ignored_texts,
             ignored_contains=ignored_contains,
             ignored_patterns=ignored_patterns,
@@ -65,7 +74,8 @@ def run_config(config_path: Path) -> None:
         )
         source_srt = outputs["source_srt"]
         refinement = config.get("ocr_refinement", {}) or {}
-        if str(refinement.get("mode") or "none") == "llm_boxes":
+        refinement_mode = str(refinement.get("mode") or "none")
+        if refinement_mode == "llm_boxes":
             machine_srt = output_dir / "source.machine.srt"
             refined_srt = output_dir / "source.refined.srt"
             shutil.copyfile(source_srt, machine_srt)
@@ -84,8 +94,70 @@ def run_config(config_path: Path) -> None:
             shutil.copyfile(refined_srt, source_srt)
             print(f"machine_source_srt: {machine_srt}")
             print(f"refined_source_srt: {refined_srt}")
+        elif refinement_mode == "llm_geometry":
+            if str(ocr.get("extraction_mode") or "auto").strip().lower() != "region_v3":
+                raise ValueError("ocr_refinement.mode=llm_geometry 仅支持 ocr.extraction_mode=region_v3。")
+            machine_srt = output_dir / "source.machine.srt"
+            geometry_srt = output_dir / "source.geometry_refined.srt"
+            geometry_debug = output_dir / "ocr_geometry.json"
+            v3_refined_srt = output_dir / "source.v3.refined.srt"
+            v3_layered_srt = output_dir / "source.v3.layered.srt"
+            v3_layers_debug = output_dir / "ocr_v3_layers.json"
+            shutil.copyfile(source_srt, machine_srt)
+            refine_ocr_geometry_with_llm(
+                outputs["tracks"],
+                outputs["ocr_boxes"],
+                geometry_srt,
+                geometry_debug,
+                cue_timing=cue_timing,
+                model=refinement.get("model"),
+                base_url=refinement.get("base_url"),
+                config=GeometryRefinementConfig(
+                    batch_size=int(refinement.get("batch_size", 20)),
+                    max_observations_per_track=int(refinement.get("max_observations_per_track", 10)),
+                ),
+            )
+            # Geometry is a diagnostic/semantic prior, not the finished SRT.
+            # In particular, a scene_text/drop decision can be caused by cuts
+            # or animated program captions.  Rebuild readable text from the
+            # untouched machine baseline, then expose geometry only as soft
+            # evidence to the spatial layer composer.
+            refine_ocr_source_with_llm(
+                machine_srt,
+                outputs["ocr_boxes"],
+                v3_refined_srt,
+                model=refinement.get("text_model"),
+                base_url=refinement.get("text_base_url"),
+                config=OCRRefinementConfig(
+                    batch_size=int(refinement.get("text_batch_size", 12)),
+                    window_padding_seconds=float(refinement.get("window_padding_seconds", 0.50)),
+                    max_boxes_per_frame=int(refinement.get("max_boxes_per_frame", 16)),
+                ),
+            )
+            refine_ocr_layers_with_llm(
+                v3_refined_srt,
+                outputs["ocr_boxes"],
+                v3_layered_srt,
+                v3_layers_debug,
+                recovery_srt=machine_srt,
+                geometry_json=geometry_debug,
+                model=refinement.get("text_model"),
+                base_url=refinement.get("text_base_url"),
+                config=LayeredOCRRefinementConfig(
+                    pipeline_version="v3",
+                    batch_size=int(refinement.get("layered_batch_size", 8)),
+                    context_overlap=int(refinement.get("layered_context_overlap", 1)),
+                ),
+            )
+            shutil.copyfile(v3_layered_srt, source_srt)
+            print(f"machine_source_srt: {machine_srt}")
+            print(f"geometry_refined_source_srt: {geometry_srt}")
+            print(f"ocr_geometry: {geometry_debug}")
+            print(f"v3_refined_source_srt: {v3_refined_srt}")
+            print(f"v3_layered_source_srt: {v3_layered_srt}")
+            print(f"ocr_v3_layers: {v3_layers_debug}")
         source_cleanup = config.get("source_cleanup", {}) or {}
-        if str(source_cleanup.get("mode") or "none") == "llm_context":
+        if str(source_cleanup.get("mode") or "none") == "llm_context" and refinement_mode != "llm_geometry":
             cleanup_input_srt = output_dir / "source.before_cleanup.srt"
             cleaned_srt = output_dir / "source.cleaned.srt"
             shutil.copyfile(source_srt, cleanup_input_srt)
@@ -123,6 +195,12 @@ def run_config(config_path: Path) -> None:
             ignored_patterns=ignored_patterns,
             extra_prompt=str(translation.get("extra_prompt", "") or ""),
             dedupe_translated=bool(translation.get("dedupe_translated", False)),
+            dedupe_exact_translated=bool(
+                translation.get(
+                    "dedupe_exact_translated",
+                    str(translation.get("ocr_translation_mode") or "").strip() != "translate_only",
+                )
+            ),
             dedupe_similarity=float(translation.get("dedupe_similarity", 0.88)),
             dedupe_max_gap_seconds=float(translation.get("dedupe_max_gap_seconds", 1.2)),
             llm_cleanup_translated=bool(translation.get("llm_cleanup_translated", False)),

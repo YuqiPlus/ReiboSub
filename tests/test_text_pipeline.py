@@ -71,6 +71,20 @@ def test_persistent_overlay_is_filtered() -> None:
     assert kinds["안녕하세요"] == TrackKind.MAIN_SUBTITLE
 
 
+def test_text_tracks_only_deduplicate_nearby_intervals() -> None:
+    boxes = [
+        OCRBox("반복 자막", (520, 900, 1200, 960), 0.96, time, index, "bottom")
+        for index, time in enumerate([0.0, 0.2, 3.0], start=1)
+    ]
+
+    tracks = build_text_tracks(boxes, max_gap_seconds=0.05)
+
+    assert [(track.start, track.end, track.sample_count) for track in tracks] == [
+        (0.0, 0.2, 2),
+        (3.0, 3.0, 1),
+    ]
+
+
 def test_non_bottom_caption_is_promoted_when_no_bottom_subtitle() -> None:
     boxes = [
         OCRBox("위쪽 자막", (520, 410, 1180, 470), 0.94, 1.0, 30, "full_middle"),
@@ -162,8 +176,10 @@ def test_snapshot_cues_use_complete_text_for_typing_subtitles(tmp_path: Path) ->
 def test_extraction_writes_raw_ocr_boxes_grouped_by_sampled_frame(monkeypatch, tmp_path: Path) -> None:
     boxes = [OCRBox("테스트", (100, 500, 300, 560), 0.31, 1.5, 45, "bottom")]
 
-    def fake_extract(video_path, lang, config, sampled_frames=None):
+    def fake_extract(video_path, lang, config, sampled_frames=None, rejected_boxes=None):
         assert config.min_confidence == 0.3
+        assert config.extraction_mode == "region"
+        assert config.shape_mode == "unrestricted"
         assert sampled_frames is not None
         sampled_frames.extend(
             [
@@ -185,10 +201,70 @@ def test_extraction_writes_raw_ocr_boxes_grouped_by_sampled_frame(monkeypatch, t
     )
 
     raw_samples = json.loads(outputs["ocr_sample_frames"].read_text(encoding="utf-8"))
+    assert "ocr_rejected_boxes" not in outputs
+    assert "extraction_mode" not in raw_samples
+    assert "shape_mode" not in raw_samples
     assert raw_samples["sample_fps"] == 6
     assert raw_samples["min_confidence"] == 0.3
     assert raw_samples["frames"][0]["boxes"] == []
     assert raw_samples["frames"][1]["boxes"][0]["text"] == "테스트"
+
+
+def test_region_v3_writes_geometry_and_rejected_candidates_separately(monkeypatch, tmp_path: Path) -> None:
+    box = OCRBox(
+        "정상 자막",
+        (100, 500, 300, 560),
+        0.95,
+        1.5,
+        45,
+        "bottom",
+        polygon=((100, 500), (300, 500), (300, 560), (100, 560)),
+        angle_degrees=0.0,
+    )
+
+    def fake_extract(video_path, lang, config, sampled_frames=None, rejected_boxes=None):
+        assert config.extraction_mode == "region_v3"
+        assert config.shape_mode == "horizontal_preferred"
+        assert sampled_frames is not None
+        assert rejected_boxes is not None
+        sampled_frames.append({"frame_index": 45, "time": 1.5, "boxes": [box.to_dict()]})
+        rejected_boxes.append(
+            {
+                "text": "기울어진 글자",
+                "bbox": [400, 400, 600, 600],
+                "confidence": 0.94,
+                "time": 1.5,
+                "frame_index": 45,
+                "region": "bottom",
+                "polygon": [[400, 400], [600, 500], [580, 600], [380, 500]],
+                "angle_degrees": 26.565,
+                "reason": "shape_angle_exceeds_horizontal_preferred",
+                "shape_mode": "horizontal_preferred",
+                "angle_limit_degrees": 15.0,
+            }
+        )
+        return [box]
+
+    monkeypatch.setattr("video_translate.pipeline.extract_video_ocr", fake_extract)
+
+    outputs = extract_subtitles_from_video(
+        tmp_path / "demo.mp4",
+        tmp_path / "output",
+        lang="korean",
+        extraction_mode="region_v3",
+    )
+
+    raw_boxes = json.loads(outputs["ocr_boxes"].read_text(encoding="utf-8"))
+    raw_samples = json.loads(outputs["ocr_sample_frames"].read_text(encoding="utf-8"))
+    rejected = json.loads(outputs["ocr_rejected_boxes"].read_text(encoding="utf-8"))
+    tracks = json.loads(outputs["tracks"].read_text(encoding="utf-8"))
+    assert raw_boxes[0]["polygon"][0] == [100, 500]
+    assert raw_boxes[0]["angle_degrees"] == 0.0
+    assert raw_samples["extraction_mode"] == "region_v3"
+    assert raw_samples["shape_mode"] == "horizontal_preferred"
+    assert rejected["boxes"][0]["reason"] == "shape_angle_exceeds_horizontal_preferred"
+    assert tracks[0]["kind"] == "main_subtitle"
+    assert tracks[0]["reason"] == "region_v3_selected_area:horizontal_preferred"
 
 
 def test_srt_roundtrip(tmp_path: Path) -> None:

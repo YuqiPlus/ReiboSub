@@ -19,6 +19,7 @@ TRANSLATION_MODES = {
         "prompt": "本次使用锁定时间轴模式：必须逐条翻译，不合并、不拆分、不删除字幕条目，不调整字幕时间。",
         "settings": {
             "dedupe_translated": False,
+            "dedupe_exact_translated": False,
             "llm_cleanup_translated": False,
             "cleanup_residual_fragments": False,
             "retime_translated": False,
@@ -28,6 +29,7 @@ TRANSLATION_MODES = {
         "prompt": "本次使用标准清理模式：可以清理明显重复、残缺或噪声字幕，但不要为了阅读速度改动时间轴。",
         "settings": {
             "dedupe_translated": True,
+            "dedupe_exact_translated": True,
             "llm_cleanup_translated": True,
             "cleanup_residual_fragments": True,
             "retime_translated": False,
@@ -37,6 +39,7 @@ TRANSLATION_MODES = {
         "prompt": "本次使用强力精修模式：可以清理重复和残片，并在不和下一条字幕重叠的前提下优化中文字幕显示时长。",
         "settings": {
             "dedupe_translated": True,
+            "dedupe_exact_translated": True,
             "llm_cleanup_translated": True,
             "cleanup_residual_fragments": True,
             "retime_translated": True,

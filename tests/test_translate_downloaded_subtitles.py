@@ -47,6 +47,7 @@ def test_translate_downloaded_subtitles_preserves_timing_mode(monkeypatch, tmp_p
     assert calls["source_srt"] == source.resolve()
     assert calls["glossary_path"] == glossary
     assert calls["dedupe_translated"] is False
+    assert calls["dedupe_exact_translated"] is False
     assert calls["llm_cleanup_translated"] is False
     assert calls["cleanup_residual_fragments"] is False
     assert calls["retime_translated"] is False
@@ -67,6 +68,7 @@ def test_translate_downloaded_subtitles_can_enable_readability_retime(monkeypatc
     module.translate_downloaded_subtitles(source, translation_mode="readability_retime")
 
     assert calls["dedupe_translated"] is True
+    assert calls["dedupe_exact_translated"] is True
     assert calls["llm_cleanup_translated"] is True
     assert calls["cleanup_residual_fragments"] is True
     assert calls["retime_translated"] is True

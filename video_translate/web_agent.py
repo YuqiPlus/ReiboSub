@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import gc
+import ipaddress
 import json
 import mimetypes
 import os
@@ -31,6 +33,7 @@ from video_translate.agent_planner import build_agent_plan
 from video_translate.agent.models import AgentSession
 from video_translate.cache import cuda_library_dirs, prepend_library_path
 from video_translate.env import load_dotenv
+from video_translate.app_settings import get_app_settings_payload, save_app_settings
 from video_translate.llm_config import load_llm_task_config
 from video_translate.languages import (
     asr_language_for_source,
@@ -40,14 +43,27 @@ from video_translate.languages import (
 )
 from video_translate.models import SubtitleCue, TextTrack, TrackKind
 from video_translate.jobs import Job, JobCancelled, JobService
+from video_translate.ocr.extractor import ExtractConfig, _load_paddle_ocr, _ocr_frame
 from video_translate.ocr.llm_refine import (
     OCRRefinementConfig,
     SourceCleanupConfig,
     cleanup_ocr_source_with_llm,
     refine_ocr_source_with_llm,
 )
+from video_translate.ocr.layered_refine import LayeredOCRRefinementConfig, refine_ocr_layers_with_llm
+from video_translate.ocr.geometry_refine import GeometryRefinementConfig, refine_ocr_geometry_with_llm
 from video_translate.pipeline import CueTimingConfig, write_extraction_outputs
 from video_translate.projects import ProjectPathPolicy
+from video_translate.provider_profiles import fetch_provider_models
+from video_translate.provider_management import (
+    create_provider_profile,
+    delete_provider_profile,
+    update_provider_profile,
+)
+from video_translate.provider_secrets import (
+    get_provider_connection_settings,
+    update_provider_connection_settings,
+)
 from video_translate.project_manifest import (
     PROJECT_MANIFEST_NAME,
     infer_project_manifest,
@@ -89,7 +105,7 @@ JOB_DIR = _rooted_dir("VIDEO_TRANSLATE_JOB_DIR", ROOT / "outputs" / "agent_jobs"
 TASK_DIR = _rooted_dir("VIDEO_TRANSLATE_TASK_DIR", ROOT / "outputs" / "agent_tasks")
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 DEFAULT_PROXY = os.environ.get("YTDLP_PROXY", "").strip()
-DEFAULT_HOST = os.environ.get("VIDEO_TRANSLATE_HOST", "0.0.0.0").strip() or "0.0.0.0"
+DEFAULT_HOST = os.environ.get("VIDEO_TRANSLATE_HOST", "127.0.0.1").strip() or "127.0.0.1"
 DEFAULT_PORT = int(os.environ.get("VIDEO_TRANSLATE_PORT", "7860"))
 PYTHON = sys.executable
 _HYBRID_TRANSLATION_PROMPT = """本次源字幕是 hybrid 格式：时间轴来自作者上传的英文人工字幕，文本中可能同时包含“韩文OCR”和“英文参考”。
@@ -128,6 +144,10 @@ def _module_command(module: str, *args: object) -> list[str]:
 _JOBS: dict[str, Job] = {}
 _AGENT_SESSIONS: dict[str, AgentSession] = {}
 _LOCK = threading.Lock()
+_OCR_PREVIEW_LOCK = threading.Lock()
+_OCR_PREVIEW_MODEL_KEY: tuple[str, str] | None = None
+_OCR_PREVIEW_MODEL: Any = None
+_OCR_ACTIVE_COMMANDS = 0
 
 
 def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
@@ -353,6 +373,26 @@ def start_agent_session(payload: dict[str, Any]) -> AgentSession:
     normalized_payload = dict(payload)
     normalized_payload["source_language"] = normalize_source_language(normalized_payload.get("source_language") or "auto")
     normalized_payload["ocr_language"] = normalize_source_language(normalized_payload.get("ocr_language") or "auto")
+    pipeline_version = _normalize_agent_ocr_pipeline_version(
+        normalized_payload.get("ocr_pipeline_version"),
+        normalized_payload.get("ocr_extraction_mode"),
+    )
+    pipeline = _resolve_ocr_pipeline(
+        pipeline_version,
+        extraction_mode=normalized_payload.get("ocr_extraction_mode"),
+        translation_mode=normalized_payload.get("ocr_translation_mode"),
+        refinement_mode=normalized_payload.get("ocr_refinement_mode"),
+    )
+    normalized_payload["ocr_pipeline_version"] = pipeline["version"]
+    normalized_payload["ocr_extraction_mode"] = pipeline["extraction_mode"]
+    normalized_payload["ocr_refinement_mode"] = pipeline["refinement_mode"]
+    normalized_payload["ocr_translation_mode"] = pipeline["translation_mode"]
+    if pipeline["version"] == "v2":
+        normalized_payload["ocr_scope"] = "bottom"
+    normalized_payload["ocr_shape_mode"] = _normalize_ocr_shape_mode(
+        normalized_payload.get("ocr_shape_mode"),
+        normalized_payload["ocr_extraction_mode"],
+    )
     session = AgentSession(id=uuid.uuid4().hex[:12], payload=normalized_payload)
     with _LOCK:
         _AGENT_SESSIONS[session.id] = session
@@ -819,8 +859,35 @@ def _agent_update_ocr_settings_from_answer(session: AgentSession, answer: dict[s
     updates: dict[str, Any] = {}
     if "ocr_scope" in answer:
         updates["ocr_scope"] = _normalize_ocr_scope(answer.get("ocr_scope"))
-    if "ocr_extraction_mode" in answer:
-        updates["ocr_extraction_mode"] = _normalize_ocr_extraction_mode(answer.get("ocr_extraction_mode"))
+    pipeline_keys = {"ocr_pipeline_version", "ocr_extraction_mode", "ocr_refinement_mode", "ocr_translation_mode"}
+    if pipeline_keys.intersection(answer):
+        requested_extraction = answer.get("ocr_extraction_mode", session.payload.get("ocr_extraction_mode"))
+        requested_version = answer.get("ocr_pipeline_version")
+        if requested_version is None:
+            if "ocr_extraction_mode" in answer:
+                requested_version = _normalize_agent_ocr_pipeline_version(None, requested_extraction)
+            else:
+                requested_version = session.payload.get("ocr_pipeline_version")
+        pipeline = _resolve_ocr_pipeline(
+            requested_version,
+            extraction_mode=requested_extraction,
+            translation_mode=answer.get("ocr_translation_mode", session.payload.get("ocr_translation_mode")),
+            refinement_mode=answer.get("ocr_refinement_mode", session.payload.get("ocr_refinement_mode")),
+        )
+        updates.update(
+            {
+                "ocr_pipeline_version": pipeline["version"],
+                "ocr_extraction_mode": pipeline["extraction_mode"],
+                "ocr_refinement_mode": pipeline["refinement_mode"],
+                "ocr_translation_mode": pipeline["translation_mode"],
+            }
+        )
+        if pipeline["version"] == "v2":
+            updates["ocr_scope"] = "bottom"
+    extraction_mode = str(updates.get("ocr_extraction_mode") or session.payload.get("ocr_extraction_mode") or "auto")
+    if "ocr_shape_mode" in answer or pipeline_keys.intersection(answer):
+        shape_value = answer.get("ocr_shape_mode", session.payload.get("ocr_shape_mode"))
+        updates["ocr_shape_mode"] = _normalize_ocr_shape_mode(shape_value, extraction_mode)
     scope = str(updates.get("ocr_scope") or session.payload.get("ocr_scope") or "bottom")
     if "ocr_crop_top_ratio" in answer:
         updates["ocr_crop_top_ratio"] = _normalize_ocr_crop_top_ratio(answer.get("ocr_crop_top_ratio"), scope)
@@ -854,6 +921,12 @@ def _agent_update_ocr_settings_from_answer(session: AgentSession, answer: dict[s
             current.payload.update(updates)
             current.updated_at = time.time()
             session.payload.update(updates)
+    task_id = str(session.result.get("task_id") or "")
+    if task_id:
+        task = _read_task(task_id)
+        task_payload = dict(task.get("payload") if isinstance(task.get("payload"), dict) else {})
+        task_payload.update(updates)
+        _update_task_fields(task_id, {"payload": task_payload})
 
 
 def _agent_prepare_hybrid_ocr_settings(session: AgentSession) -> None:
@@ -1068,6 +1141,20 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
     source_srt = str(session.result.get("source_srt") or "")
     glossary_path = str(session.result.get("glossary_path") or "") if use_glossary else ""
     extra_prompt = ""
+    translation_mode = "translate_only"
+    ocr_pipeline_version = ""
+    if session.result.get("source_kind") == "ocr":
+        pipeline = _resolve_ocr_pipeline(
+            _normalize_agent_ocr_pipeline_version(
+                session.payload.get("ocr_pipeline_version"),
+                session.payload.get("ocr_extraction_mode"),
+            ),
+            extraction_mode=session.payload.get("ocr_extraction_mode"),
+            translation_mode=session.payload.get("ocr_translation_mode"),
+            refinement_mode=session.payload.get("ocr_refinement_mode"),
+        )
+        translation_mode = pipeline["translation_mode"]
+        ocr_pipeline_version = pipeline["version"]
     if session.result.get("source_kind") == "hybrid_anchor_ocr":
         extra_prompt = _hybrid_translation_prompt(_session_source_language(session))
     if session.result.get("source_kind") == "dual_subtitle_reference":
@@ -1079,7 +1166,7 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
         {
             "source_srt": source_srt,
             "glossary": glossary_path,
-            "translation_mode": "translate_only",
+            "translation_mode": translation_mode,
             "extra_prompt": extra_prompt,
         }
     )
@@ -1106,6 +1193,8 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
             translated_sidecar=translated.get("translated_sidecar"),
             glossary_path=glossary_path,
             source_srt=source_srt,
+            ocr_pipeline_version=ocr_pipeline_version,
+            translation_mode=translation_mode,
             job_result=translated,
         )
     _agent_done(session.id, done_result)
@@ -1217,10 +1306,28 @@ def _agent_run_ocr(session: AgentSession, *, force: bool = False) -> None:
     _agent_set_phase(session.id, "ocr_full")
     url = str(session.result.get("normalized_url") or session.payload.get("url") or "")
     title = str((session.result.get("probe") or {}).get("title") or "")
-    translation_mode = str(session.payload.get("ocr_translation_mode") or "standard_cleanup")
-    ocr_scope = _normalize_ocr_scope(session.payload.get("ocr_scope"))
-    ocr_extraction_mode = _normalize_ocr_extraction_mode(session.payload.get("ocr_extraction_mode"))
-    ocr_refinement_mode = _normalize_ocr_refinement_mode(session.payload.get("ocr_refinement_mode"))
+    pipeline = _resolve_ocr_pipeline(
+        _normalize_agent_ocr_pipeline_version(
+            session.payload.get("ocr_pipeline_version"),
+            session.payload.get("ocr_extraction_mode"),
+        ),
+        extraction_mode=session.payload.get("ocr_extraction_mode"),
+        translation_mode=session.payload.get("ocr_translation_mode"),
+        refinement_mode=session.payload.get("ocr_refinement_mode"),
+    )
+    ocr_pipeline_version = pipeline["version"]
+    translation_mode = pipeline["translation_mode"]
+    ocr_scope = "bottom" if ocr_pipeline_version == "v2" else _normalize_ocr_scope(session.payload.get("ocr_scope"))
+    ocr_extraction_mode = pipeline["extraction_mode"]
+    ocr_shape_mode = _normalize_ocr_shape_mode(session.payload.get("ocr_shape_mode"), ocr_extraction_mode)
+    ocr_refinement_mode = pipeline["refinement_mode"]
+    _agent_log(
+        session.id,
+        "ocr_pipeline: "
+        f"{ocr_pipeline_version} extraction={ocr_extraction_mode} "
+        f"refinement={ocr_refinement_mode} source_cleanup={pipeline['source_cleanup_mode']} "
+        f"translation={translation_mode}",
+    )
     ocr_crop_top_ratio = _normalize_ocr_crop_top_ratio(session.payload.get("ocr_crop_top_ratio"), ocr_scope)
     ocr_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(session.payload.get("ocr_crop_bottom_ratio"))
     ocr_crop_left_ratio = _normalize_ocr_crop_ratio(session.payload.get("ocr_crop_left_ratio"))
@@ -1238,8 +1345,10 @@ def _agent_run_ocr(session: AgentSession, *, force: bool = False) -> None:
             url=url,
             title=title,
             translation_mode=translation_mode,
+            ocr_pipeline_version=ocr_pipeline_version,
             ocr_scope=ocr_scope,
             ocr_extraction_mode=ocr_extraction_mode,
+            ocr_shape_mode=ocr_shape_mode,
             ocr_refinement_mode=ocr_refinement_mode,
             ocr_crop_top_ratio=ocr_crop_top_ratio,
             ocr_crop_bottom_ratio=ocr_crop_bottom_ratio,
@@ -1276,8 +1385,10 @@ def _agent_run_ocr(session: AgentSession, *, force: bool = False) -> None:
             "title": title,
             "extra_hint": str(session.payload.get("extra_hint") or ""),
             "translation_mode": translation_mode,
+            "ocr_pipeline_version": ocr_pipeline_version,
             "ocr_scope": ocr_scope,
             "ocr_extraction_mode": ocr_extraction_mode,
+            "ocr_shape_mode": ocr_shape_mode,
             "ocr_refinement_mode": ocr_refinement_mode,
             "ocr_crop_top_ratio": ocr_crop_top_ratio,
             "ocr_crop_bottom_ratio": ocr_crop_bottom_ratio,
@@ -1314,8 +1425,12 @@ def _agent_run_ocr(session: AgentSession, *, force: bool = False) -> None:
             source_srt=source_srt,
             input_video=result.get("input_video"),
             output_dir=result.get("output_dir"),
+            ocr_pipeline_version=ocr_pipeline_version,
+            ocr_translation_mode=translation_mode,
+            ocr_source_cleanup_mode=pipeline["source_cleanup_mode"],
             ocr_scope=ocr_scope,
             ocr_extraction_mode=ocr_extraction_mode,
+            ocr_shape_mode=ocr_shape_mode,
             ocr_refinement_mode=ocr_refinement_mode,
             ocr_crop_top_ratio=ocr_crop_top_ratio,
             ocr_crop_bottom_ratio=ocr_crop_bottom_ratio,
@@ -1363,8 +1478,12 @@ def _agent_use_cached_ocr(session: AgentSession, cached: dict[str, Any]) -> None
             source_srt=source_srt,
             input_video=cached.get("input_video"),
             output_dir=cached.get("output_dir"),
+            ocr_pipeline_version=cached.get("ocr_pipeline_version"),
+            ocr_translation_mode=cached.get("ocr_translation_mode"),
+            ocr_source_cleanup_mode=cached.get("ocr_source_cleanup_mode"),
             ocr_scope=cached.get("ocr_scope"),
             ocr_extraction_mode=cached.get("ocr_extraction_mode"),
+            ocr_shape_mode=cached.get("ocr_shape_mode"),
             ocr_refinement_mode=cached.get("ocr_refinement_mode"),
             ocr_crop_top_ratio=cached.get("ocr_crop_top_ratio"),
             ocr_crop_bottom_ratio=cached.get("ocr_crop_bottom_ratio"),
@@ -1567,15 +1686,27 @@ def _agent_run_asr_with_ocr_reference(session: AgentSession) -> None:
     asr_srt = str(asr_result.get("source_srt") or "")
 
     _agent_set_phase(session.id, "ocr_reference")
+    ocr_pipeline = _resolve_ocr_pipeline(
+        _normalize_agent_ocr_pipeline_version(
+            session.payload.get("ocr_pipeline_version"),
+            session.payload.get("ocr_extraction_mode"),
+        ),
+        extraction_mode=session.payload.get("ocr_extraction_mode"),
+        translation_mode=session.payload.get("ocr_translation_mode"),
+        refinement_mode=session.payload.get("ocr_refinement_mode"),
+    )
+    ocr_extraction_mode = ocr_pipeline["extraction_mode"]
     ocr_result = _wait_for_job(
         ocr_local_video_job(
             {
                 "input_video": input_video,
                 "extra_hint": str(session.payload.get("extra_hint") or ""),
-                "translation_mode": "translate_only",
+                "translation_mode": ocr_pipeline["translation_mode"],
+                "ocr_pipeline_version": ocr_pipeline["version"],
                 "ocr_scope": _normalize_ocr_scope(session.payload.get("ocr_scope")),
-                "ocr_extraction_mode": _normalize_ocr_extraction_mode(session.payload.get("ocr_extraction_mode")),
-                "ocr_refinement_mode": _normalize_ocr_refinement_mode(session.payload.get("ocr_refinement_mode")),
+                "ocr_extraction_mode": ocr_extraction_mode,
+                "ocr_shape_mode": _normalize_ocr_shape_mode(session.payload.get("ocr_shape_mode"), ocr_extraction_mode),
+                "ocr_refinement_mode": ocr_pipeline["refinement_mode"],
                 "ocr_crop_top_ratio": _normalize_ocr_crop_top_ratio(session.payload.get("ocr_crop_top_ratio"), _normalize_ocr_scope(session.payload.get("ocr_scope"))),
                 "ocr_crop_bottom_ratio": _normalize_ocr_vertical_crop_ratio(session.payload.get("ocr_crop_bottom_ratio")),
                 "ocr_crop_left_ratio": _normalize_ocr_crop_ratio(session.payload.get("ocr_crop_left_ratio")),
@@ -1850,6 +1981,37 @@ def _import_legacy_agent_jobs() -> None:
 def _agent_session_from_task(task: dict[str, Any]) -> AgentSession:
     payload = dict(task.get("payload") if isinstance(task.get("payload"), dict) else {})
     payload["url"] = task.get("url") or payload.get("url") or ""
+    stage_extraction = _task_stage_value(task, "ocr", "ocr_extraction_mode")
+    stage_pipeline_version = _task_stage_value(task, "ocr", "ocr_pipeline_version")
+    pipeline_extraction = stage_extraction or payload.get("ocr_extraction_mode") or "auto"
+    explicit_pipeline_version = stage_pipeline_version or payload.get("ocr_pipeline_version")
+    if explicit_pipeline_version:
+        pipeline_version = _normalize_agent_ocr_pipeline_version(explicit_pipeline_version, pipeline_extraction)
+    elif _normalize_ocr_extraction_mode(pipeline_extraction) == "region_v3":
+        pipeline_version = "v3"
+    else:
+        # A historical unversioned `region` task used the old cleanup chain.
+        # Never relabel its already-produced source as the complete OCR 2.0
+        # pipeline; only explicitly versioned tasks may resume as v2.
+        pipeline_version = "v1"
+    pipeline = _resolve_ocr_pipeline(
+        pipeline_version,
+        extraction_mode=pipeline_extraction,
+        translation_mode=payload.get("ocr_translation_mode"),
+        refinement_mode=_task_stage_value(task, "ocr", "ocr_refinement_mode") or payload.get("ocr_refinement_mode"),
+    )
+    payload.update(
+        {
+            "ocr_pipeline_version": pipeline["version"],
+            "ocr_extraction_mode": pipeline["extraction_mode"],
+            "ocr_refinement_mode": pipeline["refinement_mode"],
+            "ocr_translation_mode": pipeline["translation_mode"],
+            "ocr_shape_mode": _normalize_ocr_shape_mode(
+                _task_stage_value(task, "ocr", "ocr_shape_mode") or payload.get("ocr_shape_mode"),
+                pipeline["extraction_mode"],
+            ),
+        }
+    )
     session = AgentSession(id=uuid.uuid4().hex[:12], payload=payload)
     result = {
         "task_id": task.get("id"),
@@ -2129,8 +2291,10 @@ def _find_reusable_ocr_result(
     url: str,
     title: str,
     translation_mode: str,
+    ocr_pipeline_version: str = "",
     ocr_scope: str = "bottom",
     ocr_extraction_mode: str = "auto",
+    ocr_shape_mode: str | None = None,
     ocr_refinement_mode: str = "none",
     ocr_crop_top_ratio: float | None = None,
     ocr_crop_bottom_ratio: float = 0.0,
@@ -2146,10 +2310,27 @@ def _find_reusable_ocr_result(
 ) -> dict[str, Any] | None:
     normalized_url = normalize_youtube_url(url) if str(url or "").strip() else ""
     title_key = _filename_match_key(title)
-    mode = _normalize_ocr_translation_mode(translation_mode)
+    requested_pipeline_version = str(ocr_pipeline_version or "").strip()
+    if requested_pipeline_version:
+        pipeline = _resolve_ocr_pipeline(
+            requested_pipeline_version,
+            extraction_mode=ocr_extraction_mode,
+            translation_mode=translation_mode,
+            refinement_mode=ocr_refinement_mode,
+        )
+        pipeline_version = pipeline["version"]
+        source_cleanup_mode = pipeline["source_cleanup_mode"]
+        mode = pipeline["translation_mode"]
+        extraction_mode = pipeline["extraction_mode"]
+        refinement_mode = pipeline["refinement_mode"]
+    else:
+        pipeline_version = ""
+        source_cleanup_mode = ""
+        mode = _normalize_ocr_translation_mode(translation_mode)
+        extraction_mode = _normalize_ocr_extraction_mode(ocr_extraction_mode)
+        refinement_mode = _normalize_ocr_refinement_mode(ocr_refinement_mode)
     scope = _normalize_ocr_scope(ocr_scope)
-    extraction_mode = _normalize_ocr_extraction_mode(ocr_extraction_mode)
-    refinement_mode = _normalize_ocr_refinement_mode(ocr_refinement_mode)
+    shape_mode = _normalize_ocr_shape_mode(ocr_shape_mode, extraction_mode)
     crop_top_ratio = _normalize_ocr_crop_top_ratio(ocr_crop_top_ratio, scope)
     crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(ocr_crop_bottom_ratio)
     crop_left_ratio = _normalize_ocr_crop_ratio(ocr_crop_left_ratio)
@@ -2161,7 +2342,7 @@ def _find_reusable_ocr_result(
     exclude_right_ratio = _normalize_ocr_exclude_ratio(ocr_exclude_right_ratio)
     normalized_source_language = normalize_source_language(source_language or "auto")
     candidates: list[dict[str, Any]] = []
-    candidates.extend(_reusable_ocr_from_tasks(normalized_url=normalized_url, title_key=title_key, mode=mode, scope=scope, extraction_mode=extraction_mode, refinement_mode=refinement_mode, crop_top_ratio=crop_top_ratio, crop_bottom_ratio=crop_bottom_ratio, crop_left_ratio=crop_left_ratio, crop_right_ratio=crop_right_ratio, exclude_enabled=exclude_enabled, exclude_top_ratio=exclude_top_ratio, exclude_bottom_ratio=exclude_bottom_ratio, exclude_left_ratio=exclude_left_ratio, exclude_right_ratio=exclude_right_ratio, source_language=normalized_source_language, exclude_session_id=exclude_session_id))
+    candidates.extend(_reusable_ocr_from_tasks(normalized_url=normalized_url, title_key=title_key, mode=mode, pipeline_version=pipeline_version, source_cleanup_mode=source_cleanup_mode, scope=scope, extraction_mode=extraction_mode, shape_mode=shape_mode, refinement_mode=refinement_mode, crop_top_ratio=crop_top_ratio, crop_bottom_ratio=crop_bottom_ratio, crop_left_ratio=crop_left_ratio, crop_right_ratio=crop_right_ratio, exclude_enabled=exclude_enabled, exclude_top_ratio=exclude_top_ratio, exclude_bottom_ratio=exclude_bottom_ratio, exclude_left_ratio=exclude_left_ratio, exclude_right_ratio=exclude_right_ratio, source_language=normalized_source_language, exclude_session_id=exclude_session_id))
     if not JOB_DIR.exists():
         return sorted(candidates, key=lambda item: float(item.get("created_at") or 0), reverse=True)[0] if candidates else None
     for run_yaml in JOB_DIR.glob("*/run.yaml"):
@@ -2184,6 +2365,14 @@ def _find_reusable_ocr_result(
         cached_mode = str(cache.get("ocr_translation_mode") or "").strip()
         cached_scope = str(cache.get("ocr_scope") or "bottom").strip()
         cached_extraction_mode = str(cache.get("ocr_extraction_mode") or "auto").strip()
+        cached_pipeline_version = _cached_ocr_pipeline_version(cache.get("ocr_pipeline_version"), cached_extraction_mode)
+        cached_pipeline_config = config.get("ocr_pipeline") if isinstance(config.get("ocr_pipeline"), dict) else {}
+        cached_source_cleanup_mode = str(
+            cache.get("ocr_source_cleanup_mode")
+            or cached_pipeline_config.get("source_cleanup_mode")
+            or ({"v1": "llm_context", "v2": "none"}.get(cached_pipeline_version, ""))
+        ).strip()
+        cached_shape_mode = _normalize_ocr_shape_mode(cache.get("ocr_shape_mode"), cached_extraction_mode)
         cached_refinement_mode = str(cache.get("ocr_refinement_mode") or "none").strip()
         cached_crop_top_ratio = _normalize_ocr_crop_top_ratio(cache.get("ocr_crop_top_ratio"), cached_scope)
         cached_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(cache.get("ocr_crop_bottom_ratio"))
@@ -2200,18 +2389,26 @@ def _find_reusable_ocr_result(
         input_video = Path(str(config.get("input_video") or ""))
         exact_url_match = bool(normalized_url and cached_url == normalized_url)
         title_match = _cached_ocr_title_matches(input_video, title_key)
+        if pipeline_version and cached_pipeline_version != pipeline_version:
+            continue
+        if source_cleanup_mode and cached_source_cleanup_mode != source_cleanup_mode:
+            continue
+        if cached_mode and cached_mode != mode:
+            continue
+        if _normalize_ocr_scope(cached_scope) != scope:
+            continue
         if exact_url_match:
-            if cached_mode and cached_mode != mode:
-                continue
-            if _normalize_ocr_scope(cached_scope) != scope:
-                continue
             if _normalize_ocr_extraction_mode(cached_extraction_mode) != extraction_mode:
                 continue
-            if _normalize_ocr_refinement_mode(cached_refinement_mode) != refinement_mode:
+            if cached_shape_mode != shape_mode:
                 continue
         elif not title_match:
             continue
         if _normalize_ocr_extraction_mode(cached_extraction_mode) != extraction_mode:
+            continue
+        if cached_shape_mode != shape_mode:
+            continue
+        if _normalize_ocr_refinement_mode(cached_refinement_mode) != refinement_mode:
             continue
         if (
             cached_crop_top_ratio != crop_top_ratio
@@ -2235,9 +2432,12 @@ def _find_reusable_ocr_result(
                 "job_id": job_dir.name,
                 "matched_by": "url" if exact_url_match else "title",
                 "created_at": run_yaml.stat().st_mtime,
+                "ocr_pipeline_version": cached_pipeline_version or "custom",
+                "ocr_source_cleanup_mode": cached_source_cleanup_mode,
                 "ocr_translation_mode": cached_mode or mode,
                 "ocr_scope": _normalize_ocr_scope(cached_scope),
                 "ocr_extraction_mode": _normalize_ocr_extraction_mode(cached_extraction_mode),
+                "ocr_shape_mode": cached_shape_mode,
                 "ocr_refinement_mode": _normalize_ocr_refinement_mode(cached_refinement_mode),
                 "ocr_crop_top_ratio": cached_crop_top_ratio,
                 "ocr_crop_bottom_ratio": cached_crop_bottom_ratio,
@@ -2256,7 +2456,7 @@ def _find_reusable_ocr_result(
     return sorted(candidates, key=lambda item: float(item.get("created_at") or 0), reverse=True)[0]
 
 
-def _reusable_ocr_from_tasks(*, normalized_url: str, title_key: str, mode: str, scope: str, extraction_mode: str, refinement_mode: str, crop_top_ratio: float, crop_bottom_ratio: float, crop_left_ratio: float, crop_right_ratio: float, exclude_enabled: bool, exclude_top_ratio: float, exclude_bottom_ratio: float, exclude_left_ratio: float, exclude_right_ratio: float, source_language: str, exclude_session_id: str) -> list[dict[str, Any]]:
+def _reusable_ocr_from_tasks(*, normalized_url: str, title_key: str, mode: str, pipeline_version: str, source_cleanup_mode: str, scope: str, extraction_mode: str, shape_mode: str, refinement_mode: str, crop_top_ratio: float, crop_bottom_ratio: float, crop_left_ratio: float, crop_right_ratio: float, exclude_enabled: bool, exclude_top_ratio: float, exclude_bottom_ratio: float, exclude_left_ratio: float, exclude_right_ratio: float, source_language: str, exclude_session_id: str) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     if not TASK_DIR.exists():
         return results
@@ -2281,6 +2481,21 @@ def _reusable_ocr_from_tasks(*, normalized_url: str, title_key: str, mode: str, 
             continue
         cached_extraction_mode = _normalize_ocr_extraction_mode(_task_stage_value(task, "ocr", "ocr_extraction_mode") or "auto")
         if cached_extraction_mode != extraction_mode:
+            continue
+        cached_pipeline_version = _cached_ocr_pipeline_version(
+            _task_stage_value(task, "ocr", "ocr_pipeline_version"),
+            cached_extraction_mode,
+        )
+        if pipeline_version and cached_pipeline_version != pipeline_version:
+            continue
+        cached_source_cleanup_mode = str(
+            _task_stage_value(task, "ocr", "ocr_source_cleanup_mode")
+            or ({"v1": "llm_context", "v2": "none"}.get(cached_pipeline_version, ""))
+        ).strip()
+        if source_cleanup_mode and cached_source_cleanup_mode != source_cleanup_mode:
+            continue
+        cached_shape_mode = _normalize_ocr_shape_mode(_task_stage_value(task, "ocr", "ocr_shape_mode"), cached_extraction_mode)
+        if cached_shape_mode != shape_mode:
             continue
         cached_refinement_mode = _normalize_ocr_refinement_mode(_task_stage_value(task, "ocr", "ocr_refinement_mode") or "none")
         if cached_refinement_mode != refinement_mode:
@@ -2319,9 +2534,12 @@ def _reusable_ocr_from_tasks(*, normalized_url: str, title_key: str, mode: str, 
                 "job_id": str(task.get("id") or task_yaml.parent.name),
                 "matched_by": "url" if exact_url_match else "title",
                 "created_at": float(_task_stage_value(task, "ocr", "updated_at") or task.get("updated_at") or task_yaml.stat().st_mtime),
+                "ocr_pipeline_version": cached_pipeline_version or "custom",
+                "ocr_source_cleanup_mode": cached_source_cleanup_mode,
                 "ocr_translation_mode": mode,
                 "ocr_scope": cached_scope,
                 "ocr_extraction_mode": cached_extraction_mode,
+                "ocr_shape_mode": cached_shape_mode,
                 "ocr_refinement_mode": cached_refinement_mode,
                 "ocr_crop_top_ratio": cached_crop_top_ratio,
                 "ocr_crop_bottom_ratio": cached_crop_bottom_ratio,
@@ -2801,10 +3019,19 @@ def ocr_full_job(payload: dict[str, Any]) -> Job:
     url = _required_str(payload, "url")
     title = str(payload.get("title") or "").strip()
     extra_hint = str(payload.get("extra_hint") or "")
-    translation_mode = _normalize_ocr_translation_mode(payload.get("translation_mode"), bool(payload.get("preserve_timing", False)))
-    ocr_scope = _normalize_ocr_scope(payload.get("ocr_scope"))
-    ocr_extraction_mode = _normalize_ocr_extraction_mode(payload.get("ocr_extraction_mode"))
-    ocr_refinement_mode = _normalize_ocr_refinement_mode(payload.get("ocr_refinement_mode"))
+    pipeline = _resolve_ocr_pipeline(
+        payload.get("ocr_pipeline_version"),
+        extraction_mode=payload.get("ocr_extraction_mode"),
+        translation_mode=payload.get("translation_mode"),
+        refinement_mode=payload.get("ocr_refinement_mode"),
+        preserve_timing=bool(payload.get("preserve_timing", False)),
+    )
+    ocr_pipeline_version = pipeline["version"]
+    translation_mode = pipeline["translation_mode"]
+    ocr_scope = "bottom" if ocr_pipeline_version == "v2" else _normalize_ocr_scope(payload.get("ocr_scope"))
+    ocr_extraction_mode = pipeline["extraction_mode"]
+    ocr_shape_mode = _normalize_ocr_shape_mode(payload.get("ocr_shape_mode"), ocr_extraction_mode)
+    ocr_refinement_mode = pipeline["refinement_mode"]
     ocr_crop_top_ratio = _normalize_ocr_crop_top_ratio(payload.get("ocr_crop_top_ratio"), ocr_scope)
     ocr_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(payload.get("ocr_crop_bottom_ratio"))
     ocr_crop_left_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_left_ratio"))
@@ -2834,16 +3061,19 @@ def ocr_full_job(payload: dict[str, Any]) -> Job:
         manifest = update_youtube_project_manifest(input_video, source_url=url, title=title or input_video.parent.name, thumbnail_path=thumbnail)
         _append_log(job_id, f"input_video: {input_video}")
         config_path = out_dir / "run.yaml"
-        config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode, ocr_scope=ocr_scope, ocr_extraction_mode=ocr_extraction_mode, ocr_refinement_mode=ocr_refinement_mode, ocr_crop_top_ratio=ocr_crop_top_ratio, ocr_crop_bottom_ratio=ocr_crop_bottom_ratio, ocr_crop_left_ratio=ocr_crop_left_ratio, ocr_crop_right_ratio=ocr_crop_right_ratio, ocr_exclude_enabled=ocr_exclude_enabled, ocr_exclude_top_ratio=ocr_exclude_top_ratio, ocr_exclude_bottom_ratio=ocr_exclude_bottom_ratio, ocr_exclude_left_ratio=ocr_exclude_left_ratio, ocr_exclude_right_ratio=ocr_exclude_right_ratio, source_language=config_source_language)
+        config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode, ocr_scope=ocr_scope, ocr_extraction_mode=ocr_extraction_mode, ocr_shape_mode=ocr_shape_mode, ocr_refinement_mode=ocr_refinement_mode, ocr_pipeline_version=ocr_pipeline_version, ocr_crop_top_ratio=ocr_crop_top_ratio, ocr_crop_bottom_ratio=ocr_crop_bottom_ratio, ocr_crop_left_ratio=ocr_crop_left_ratio, ocr_crop_right_ratio=ocr_crop_right_ratio, ocr_exclude_enabled=ocr_exclude_enabled, ocr_exclude_top_ratio=ocr_exclude_top_ratio, ocr_exclude_bottom_ratio=ocr_exclude_bottom_ratio, ocr_exclude_left_ratio=ocr_exclude_left_ratio, ocr_exclude_right_ratio=ocr_exclude_right_ratio, source_language=config_source_language)
         if config_source_language == "chinese":
             config["mode"] = "extract"
             config["sidecar"]["copy_translated"] = False
         config["agent_cache"] = {
             "kind": "youtube_ocr",
             "normalized_url": normalize_youtube_url(url),
+            "ocr_pipeline_version": ocr_pipeline_version,
+            "ocr_source_cleanup_mode": pipeline["source_cleanup_mode"],
             "ocr_translation_mode": translation_mode,
             "ocr_scope": ocr_scope,
             "ocr_extraction_mode": ocr_extraction_mode,
+            "ocr_shape_mode": ocr_shape_mode,
             "ocr_refinement_mode": ocr_refinement_mode,
             "ocr_crop_top_ratio": ocr_crop_top_ratio,
             "ocr_crop_bottom_ratio": ocr_crop_bottom_ratio,
@@ -2863,13 +3093,19 @@ def ocr_full_job(payload: dict[str, Any]) -> Job:
         result = {
             "input_video": str(input_video),
             "output_dir": str(out_dir),
+            **_ocr_geometry_result_artifacts(out_dir, ocr_refinement_mode),
             "source_srt": str(out_dir / "source.srt"),
             "translated_srt": str(out_dir / "zh.srt"),
             "project_dir": str(Path(str(manifest["project_dir"]))),
             "project_manifest": str(Path(str(manifest["project_dir"])) / PROJECT_MANIFEST_NAME),
             "source_language": config_source_language,
             "ocr_language": ocr_language,
+            "ocr_pipeline_version": ocr_pipeline_version,
+            "ocr_translation_mode": translation_mode,
+            "ocr_refinement_mode": ocr_refinement_mode,
+            "ocr_source_cleanup_mode": pipeline["source_cleanup_mode"],
             "ocr_extraction_mode": ocr_extraction_mode,
+            "ocr_shape_mode": ocr_shape_mode,
             "ocr_exclude_enabled": ocr_exclude_enabled,
         }
         if config_source_language == "chinese":
@@ -2883,10 +3119,19 @@ def ocr_extract_job(payload: dict[str, Any]) -> Job:
     url = _required_str(payload, "url")
     title = str(payload.get("title") or "").strip()
     extra_hint = str(payload.get("extra_hint") or "")
-    translation_mode = _normalize_ocr_translation_mode(payload.get("translation_mode"), bool(payload.get("preserve_timing", False)))
-    ocr_scope = _normalize_ocr_scope(payload.get("ocr_scope"))
-    ocr_extraction_mode = _normalize_ocr_extraction_mode(payload.get("ocr_extraction_mode"))
-    ocr_refinement_mode = _normalize_ocr_refinement_mode(payload.get("ocr_refinement_mode"))
+    pipeline = _resolve_ocr_pipeline(
+        payload.get("ocr_pipeline_version"),
+        extraction_mode=payload.get("ocr_extraction_mode"),
+        translation_mode=payload.get("translation_mode"),
+        refinement_mode=payload.get("ocr_refinement_mode"),
+        preserve_timing=bool(payload.get("preserve_timing", False)),
+    )
+    ocr_pipeline_version = pipeline["version"]
+    translation_mode = pipeline["translation_mode"]
+    ocr_scope = "bottom" if ocr_pipeline_version == "v2" else _normalize_ocr_scope(payload.get("ocr_scope"))
+    ocr_extraction_mode = pipeline["extraction_mode"]
+    ocr_shape_mode = _normalize_ocr_shape_mode(payload.get("ocr_shape_mode"), ocr_extraction_mode)
+    ocr_refinement_mode = pipeline["refinement_mode"]
     ocr_crop_top_ratio = _normalize_ocr_crop_top_ratio(payload.get("ocr_crop_top_ratio"), ocr_scope)
     ocr_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(payload.get("ocr_crop_bottom_ratio"))
     ocr_crop_left_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_left_ratio"))
@@ -2916,15 +3161,18 @@ def ocr_extract_job(payload: dict[str, Any]) -> Job:
         manifest = update_youtube_project_manifest(input_video, source_url=url, title=title or input_video.parent.name, thumbnail_path=thumbnail)
         _append_log(job_id, f"input_video: {input_video}")
         config_path = out_dir / "run.yaml"
-        config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode, ocr_scope=ocr_scope, ocr_extraction_mode=ocr_extraction_mode, ocr_refinement_mode=ocr_refinement_mode, ocr_crop_top_ratio=ocr_crop_top_ratio, ocr_crop_bottom_ratio=ocr_crop_bottom_ratio, ocr_crop_left_ratio=ocr_crop_left_ratio, ocr_crop_right_ratio=ocr_crop_right_ratio, ocr_exclude_enabled=ocr_exclude_enabled, ocr_exclude_top_ratio=ocr_exclude_top_ratio, ocr_exclude_bottom_ratio=ocr_exclude_bottom_ratio, ocr_exclude_left_ratio=ocr_exclude_left_ratio, ocr_exclude_right_ratio=ocr_exclude_right_ratio, source_language=config_source_language)
+        config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode, ocr_scope=ocr_scope, ocr_extraction_mode=ocr_extraction_mode, ocr_shape_mode=ocr_shape_mode, ocr_refinement_mode=ocr_refinement_mode, ocr_pipeline_version=ocr_pipeline_version, ocr_crop_top_ratio=ocr_crop_top_ratio, ocr_crop_bottom_ratio=ocr_crop_bottom_ratio, ocr_crop_left_ratio=ocr_crop_left_ratio, ocr_crop_right_ratio=ocr_crop_right_ratio, ocr_exclude_enabled=ocr_exclude_enabled, ocr_exclude_top_ratio=ocr_exclude_top_ratio, ocr_exclude_bottom_ratio=ocr_exclude_bottom_ratio, ocr_exclude_left_ratio=ocr_exclude_left_ratio, ocr_exclude_right_ratio=ocr_exclude_right_ratio, source_language=config_source_language)
         config["mode"] = "extract"
         config["sidecar"]["copy_translated"] = False
         config["agent_cache"] = {
             "kind": "youtube_ocr",
             "normalized_url": normalize_youtube_url(url),
+            "ocr_pipeline_version": ocr_pipeline_version,
+            "ocr_source_cleanup_mode": pipeline["source_cleanup_mode"],
             "ocr_translation_mode": translation_mode,
             "ocr_scope": ocr_scope,
             "ocr_extraction_mode": ocr_extraction_mode,
+            "ocr_shape_mode": ocr_shape_mode,
             "ocr_refinement_mode": ocr_refinement_mode,
             "ocr_crop_top_ratio": ocr_crop_top_ratio,
             "ocr_crop_bottom_ratio": ocr_crop_bottom_ratio,
@@ -2944,13 +3192,19 @@ def ocr_extract_job(payload: dict[str, Any]) -> Job:
         return {
             "input_video": str(input_video),
             "output_dir": str(out_dir),
+            **_ocr_geometry_result_artifacts(out_dir, ocr_refinement_mode),
             "source_srt": str(out_dir / "source.srt"),
             "subtitle_path": str(out_dir / "source.srt"),
             "project_dir": str(Path(str(manifest["project_dir"]))),
             "project_manifest": str(Path(str(manifest["project_dir"])) / PROJECT_MANIFEST_NAME),
             "source_language": config_source_language,
             "ocr_language": ocr_language,
+            "ocr_pipeline_version": ocr_pipeline_version,
+            "ocr_translation_mode": translation_mode,
+            "ocr_refinement_mode": ocr_refinement_mode,
+            "ocr_source_cleanup_mode": pipeline["source_cleanup_mode"],
             "ocr_extraction_mode": ocr_extraction_mode,
+            "ocr_shape_mode": ocr_shape_mode,
             "ocr_exclude_enabled": ocr_exclude_enabled,
         }
 
@@ -2963,10 +3217,19 @@ def ocr_local_video_job(payload: dict[str, Any]) -> Job:
     if not input_video.exists():
         raise FileNotFoundError(f"视频文件不存在: {input_video}")
     extra_hint = str(payload.get("extra_hint") or "")
-    translation_mode = _normalize_ocr_translation_mode(payload.get("translation_mode"), bool(payload.get("preserve_timing", False)))
-    ocr_scope = _normalize_ocr_scope(payload.get("ocr_scope"))
-    ocr_extraction_mode = _normalize_ocr_extraction_mode(payload.get("ocr_extraction_mode"))
-    ocr_refinement_mode = _normalize_ocr_refinement_mode(payload.get("ocr_refinement_mode"))
+    pipeline = _resolve_ocr_pipeline(
+        payload.get("ocr_pipeline_version"),
+        extraction_mode=payload.get("ocr_extraction_mode"),
+        translation_mode=payload.get("translation_mode"),
+        refinement_mode=payload.get("ocr_refinement_mode"),
+        preserve_timing=bool(payload.get("preserve_timing", False)),
+    )
+    ocr_pipeline_version = pipeline["version"]
+    translation_mode = pipeline["translation_mode"]
+    ocr_scope = "bottom" if ocr_pipeline_version == "v2" else _normalize_ocr_scope(payload.get("ocr_scope"))
+    ocr_extraction_mode = pipeline["extraction_mode"]
+    ocr_shape_mode = _normalize_ocr_shape_mode(payload.get("ocr_shape_mode"), ocr_extraction_mode)
+    ocr_refinement_mode = pipeline["refinement_mode"]
     ocr_crop_top_ratio = _normalize_ocr_crop_top_ratio(payload.get("ocr_crop_top_ratio"), ocr_scope)
     ocr_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(payload.get("ocr_crop_bottom_ratio"))
     ocr_crop_left_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_left_ratio"))
@@ -2986,7 +3249,7 @@ def ocr_local_video_job(payload: dict[str, Any]) -> Job:
         out_dir = JOB_DIR / job_id
         out_dir.mkdir(parents=True, exist_ok=True)
         config_path = out_dir / "run.yaml"
-        config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode, ocr_scope=ocr_scope, ocr_extraction_mode=ocr_extraction_mode, ocr_refinement_mode=ocr_refinement_mode, ocr_crop_top_ratio=ocr_crop_top_ratio, ocr_crop_bottom_ratio=ocr_crop_bottom_ratio, ocr_crop_left_ratio=ocr_crop_left_ratio, ocr_crop_right_ratio=ocr_crop_right_ratio, ocr_exclude_enabled=ocr_exclude_enabled, ocr_exclude_top_ratio=ocr_exclude_top_ratio, ocr_exclude_bottom_ratio=ocr_exclude_bottom_ratio, ocr_exclude_left_ratio=ocr_exclude_left_ratio, ocr_exclude_right_ratio=ocr_exclude_right_ratio, source_language=config_source_language)
+        config = _ocr_config(input_video, out_dir, extra_hint=extra_hint, translation_mode=translation_mode, ocr_scope=ocr_scope, ocr_extraction_mode=ocr_extraction_mode, ocr_shape_mode=ocr_shape_mode, ocr_refinement_mode=ocr_refinement_mode, ocr_pipeline_version=ocr_pipeline_version, ocr_crop_top_ratio=ocr_crop_top_ratio, ocr_crop_bottom_ratio=ocr_crop_bottom_ratio, ocr_crop_left_ratio=ocr_crop_left_ratio, ocr_crop_right_ratio=ocr_crop_right_ratio, ocr_exclude_enabled=ocr_exclude_enabled, ocr_exclude_top_ratio=ocr_exclude_top_ratio, ocr_exclude_bottom_ratio=ocr_exclude_bottom_ratio, ocr_exclude_left_ratio=ocr_exclude_left_ratio, ocr_exclude_right_ratio=ocr_exclude_right_ratio, source_language=config_source_language)
         if extract_only or config_source_language == "chinese":
             config["mode"] = "extract"
             config["sidecar"]["copy_translated"] = False
@@ -2998,13 +3261,19 @@ def ocr_local_video_job(payload: dict[str, Any]) -> Job:
         result = {
             "input_video": str(input_video),
             "output_dir": str(out_dir),
+            **_ocr_geometry_result_artifacts(out_dir, ocr_refinement_mode),
             "source_srt": str(out_dir / "source.srt"),
             "translated_srt": str(out_dir / "zh.srt"),
             "project_dir": str(Path(str(manifest["project_dir"]))),
             "project_manifest": str(Path(str(manifest["project_dir"])) / PROJECT_MANIFEST_NAME),
             "source_language": config_source_language,
             "ocr_language": ocr_language,
+            "ocr_pipeline_version": ocr_pipeline_version,
+            "ocr_translation_mode": translation_mode,
+            "ocr_refinement_mode": ocr_refinement_mode,
+            "ocr_source_cleanup_mode": pipeline["source_cleanup_mode"],
             "ocr_extraction_mode": ocr_extraction_mode,
+            "ocr_shape_mode": ocr_shape_mode,
             "ocr_exclude_enabled": ocr_exclude_enabled,
         }
         if config_source_language == "chinese":
@@ -3029,6 +3298,10 @@ def ocr_development_job(payload: dict[str, Any]) -> Job:
     flicker_smoothing_max_duration_seconds = _normalize_ocr_flicker_smoothing_duration(payload.get("flicker_smoothing_max_duration_seconds", 0.55))
     llm_cleanup = bool(payload.get("llm_cleanup", True))
     ocr_scope = _normalize_ocr_scope(payload.get("ocr_scope"))
+    ocr_extraction_mode = _normalize_ocr_extraction_mode(payload.get("ocr_extraction_mode") or "region")
+    ocr_shape_mode = _normalize_ocr_shape_mode(payload.get("ocr_shape_mode"), ocr_extraction_mode)
+    geometry_refinement = llm_cleanup and ocr_extraction_mode == "region_v3"
+    track_refinement = llm_cleanup and ocr_extraction_mode == "region"
     crop_top_ratio = _normalize_ocr_crop_top_ratio(payload.get("ocr_crop_top_ratio"), ocr_scope)
     crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(payload.get("ocr_crop_bottom_ratio"))
     crop_left_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_left_ratio"))
@@ -3039,6 +3312,26 @@ def ocr_development_job(payload: dict[str, Any]) -> Job:
     exclude_left_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_left_ratio", 0.76))
     exclude_right_ratio = _normalize_ocr_exclude_ratio(payload.get("ocr_exclude_right_ratio", 0.02))
     job_slug = _safe_slug(input_video.stem)[:80]
+    if geometry_refinement:
+        refinement_config = {
+            "mode": "llm_geometry",
+            "batch_size": 8,
+            "context_overlap": 2,
+            "text_batch_size": 12,
+            "window_padding_seconds": 0.50,
+            "max_boxes_per_frame": 16,
+            "layered_batch_size": 8,
+            "layered_context_overlap": 1,
+        }
+    elif track_refinement:
+        refinement_config = {
+            "mode": "llm_boxes",
+            "batch_size": 12,
+            "window_padding_seconds": 0.50,
+            "max_boxes_per_frame": 16,
+        }
+    else:
+        refinement_config = {"mode": "none"}
 
     def target(job_id: str) -> dict[str, Any]:
         out_dir = JOB_DIR / job_id
@@ -3068,7 +3361,8 @@ def ocr_development_job(payload: dict[str, Any]) -> Job:
                 "timing_refine_max_frames": 24,
                 "scan_full_frame": False,
                 "auto_trim_side_noise": False,
-                "extraction_mode": "region",
+                "extraction_mode": ocr_extraction_mode,
+                "shape_mode": ocr_shape_mode,
             },
             "subtitle": {
                 "merge_gap_seconds": 0.85,
@@ -3081,8 +3375,9 @@ def ocr_development_job(payload: dict[str, Any]) -> Job:
                 "flicker_smoothing_max_gap_seconds": 0.35,
             },
             "filters": {"ignored_texts": [], "ignored_contains": [], "ignored_patterns": []},
+            "ocr_refinement": refinement_config,
             "source_cleanup": {
-                "mode": "llm_context" if llm_cleanup else "none",
+                "mode": "none",
                 "batch_size": 18,
                 "overlap": 3,
                 "preserve_source": True,
@@ -3098,15 +3393,44 @@ def ocr_development_job(payload: dict[str, Any]) -> Job:
             "output_dir": str(out_dir),
             "config_path": str(config_path),
             "source_srt": str(out_dir / "source.srt"),
-            "cleaned_srt": str(out_dir / "source.cleaned.srt") if llm_cleanup else "",
+            "cleaned_srt": str(
+                out_dir / (
+                    "source.v3.layered.srt"
+                    if geometry_refinement
+                    else "source.refined.srt"
+                )
+            ) if llm_cleanup else "",
+            "refined_srt": str(out_dir / "source.refined.srt") if track_refinement else "",
+            "geometry_srt": str(out_dir / "source.geometry_refined.srt") if geometry_refinement else "",
+            "ocr_geometry": str(out_dir / "ocr_geometry.json") if geometry_refinement else "",
+            "v3_refined_srt": str(out_dir / "source.v3.refined.srt") if geometry_refinement else "",
+            "v3_layered_srt": str(out_dir / "source.v3.layered.srt") if geometry_refinement else "",
+            "ocr_v3_layers": str(out_dir / "ocr_v3_layers.json") if geometry_refinement else "",
             "ocr_boxes": str(out_dir / "ocr_boxes.json"),
             "ocr_sample_frames": str(out_dir / "ocr_sample_frames.json"),
+            "ocr_rejected_boxes": str(out_dir / "ocr_rejected_boxes.json") if (out_dir / "ocr_rejected_boxes.json").exists() else "",
             "tracks": str(out_dir / "tracks.json"),
+            "ocr_extraction_mode": ocr_extraction_mode,
+            "ocr_shape_mode": ocr_shape_mode,
             "refine_timing_boundaries": refine_timing_boundaries,
             "flicker_smoothing_max_duration_seconds": flicker_smoothing_max_duration_seconds,
             "llm_cleanup": llm_cleanup,
+            "ocr_refinement_mode": (
+                "llm_geometry" if geometry_refinement else "llm_boxes" if track_refinement else "none"
+            ),
         }
-        result.update(_materialize_ocr_debug_bundle(input_video, out_dir))
+        debug_variant = (
+            f"ocr3_{ocr_shape_mode}"
+            if ocr_extraction_mode == "region_v3"
+            else ""
+        )
+        result.update(
+            _materialize_ocr_debug_bundle(
+                input_video,
+                out_dir,
+                debug_variant=debug_variant,
+            )
+        )
         return result
 
     return start_job(f"OCR 开发测试 {job_slug}", target)
@@ -3183,6 +3507,247 @@ def rebuild_ocr_debug_with_llm_job(payload: dict[str, Any]) -> Job:
     return start_job(f"OCR JSON rebuild {_safe_slug(debug_dir.name)[:80]}", target)
 
 
+def refine_ocr_debug_layers_job(payload: dict[str, Any]) -> Job:
+    debug_dir = _resolve_project_path(_required_str(payload, "debug_dir"))
+    _ensure_under_root(debug_dir)
+    if not debug_dir.is_dir():
+        raise FileNotFoundError(f"Debug folder does not exist: {debug_dir}")
+    is_v3 = _ocr_debug_metadata(debug_dir).get("ocr_lab_version") == "v3"
+    boxes_path = debug_dir / "ocr_boxes.json"
+    if not boxes_path.exists():
+        raise FileNotFoundError("The debug folder must contain ocr_boxes.json.")
+    if is_v3:
+        source_srt = debug_dir / "source.v3.refined.srt"
+        if not source_srt.is_file():
+            raise FileNotFoundError("OCR 3.0 仅重跑分层需要先生成 source.v3.refined.srt。")
+        recovery_srt = debug_dir / "source.machine.srt"
+        if not recovery_srt.is_file():
+            raise FileNotFoundError("OCR 3.0 仅重跑分层需要 source.machine.srt 用于空窗恢复。")
+        geometry_json = debug_dir / "ocr_geometry.json"
+    else:
+        source_srt = _layered_debug_source_srt(debug_dir)
+        recovery_srt = next(
+            (
+                candidate
+                for candidate in (
+                    debug_dir / "source.before_cleanup.srt",
+                    debug_dir / "source.machine.srt",
+                )
+                if candidate.is_file() and candidate != source_srt
+            ),
+            None,
+        )
+        geometry_json = None
+
+    def target(job_id: str) -> dict[str, Any]:
+        out_dir = JOB_DIR / job_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        layered_name = "source.v3.layered.srt" if is_v3 else "source.layered.srt"
+        layers_name = "ocr_v3_layers.json" if is_v3 else "ocr_layers.json"
+        layered_srt = out_dir / layered_name
+        layers_json = out_dir / layers_name
+        _append_log(job_id, f"debug_dir: {debug_dir}")
+        _append_log(job_id, f"source_srt: {source_srt}")
+        _append_log(job_id, f"recovery_srt: {recovery_srt or '<none>'}")
+        _append_log(
+            job_id,
+            "layered_refine: using existing refined SRT/OCR boxes; video decoding is skipped; text refinement is skipped",
+        )
+        if is_v3:
+            refine_ocr_layers_with_llm(
+                source_srt,
+                boxes_path,
+                layered_srt,
+                layers_json,
+                recovery_srt=recovery_srt,
+                geometry_json=geometry_json if geometry_json.is_file() else None,
+                config=LayeredOCRRefinementConfig(pipeline_version="v3"),
+                progress_callback=lambda message: _append_log(job_id, message),
+            )
+        else:
+            refine_ocr_layers_with_llm(
+                source_srt,
+                boxes_path,
+                layered_srt,
+                layers_json,
+                recovery_srt=recovery_srt,
+                config=LayeredOCRRefinementConfig(),
+                progress_callback=lambda message: _append_log(job_id, message),
+            )
+        debug_layered_srt = debug_dir / layered_name
+        debug_layers_json = debug_dir / layers_name
+        shutil.copy2(layered_srt, debug_layered_srt)
+        shutil.copy2(layers_json, debug_layers_json)
+        result = {
+            "debug_dir": str(debug_dir),
+            "source_srt": str(source_srt),
+            "recovery_srt": str(recovery_srt) if recovery_srt else "",
+            "source_layered_srt": str(debug_layered_srt),
+            "ocr_boxes": str(boxes_path),
+        }
+        if is_v3:
+            result.update(
+                {
+                    "source_srt": str(debug_layered_srt),
+                    "source_v3_layered_srt": str(debug_layered_srt),
+                    "v3_layered_srt": str(debug_layered_srt),
+                    "ocr_v3_layers": str(debug_layers_json),
+                    "ocr_geometry": str(geometry_json) if geometry_json.is_file() else "",
+                    "v3_layered_only": True,
+                }
+            )
+        else:
+            result["ocr_layers"] = str(debug_layers_json)
+        return result
+
+    label = "OCR 3.0 layered refine" if is_v3 else "OCR layered refine"
+    return start_job(f"{label} {_safe_slug(debug_dir.name)[:80]}", target)
+
+
+def refine_ocr_debug_geometry_job(payload: dict[str, Any]) -> Job:
+    """Re-run only OCR 3.0's geometry/semantic stage from saved JSON."""
+
+    debug_dir = _resolve_project_path(_required_str(payload, "debug_dir"))
+    _ensure_under_root(debug_dir)
+    if not debug_dir.is_dir():
+        raise FileNotFoundError(f"Debug folder does not exist: {debug_dir}")
+    tracks_path = debug_dir / "tracks.json"
+    boxes_path = debug_dir / "ocr_boxes.json"
+    if not tracks_path.exists() or not boxes_path.exists():
+        raise FileNotFoundError("The debug folder must contain tracks.json and ocr_boxes.json.")
+    raw_boxes = json.loads(boxes_path.read_text(encoding="utf-8"))
+    if not isinstance(raw_boxes, list) or not any(
+        isinstance(item, dict) and (item.get("polygon") is not None or item.get("angle_degrees") is not None)
+        for item in raw_boxes
+    ):
+        raise ValueError("当前 Debug 数据没有 OCR 3.0 几何信息，请先用 OCR 3.0 重新提取一次。")
+
+    def target(job_id: str) -> dict[str, Any]:
+        out_dir = JOB_DIR / job_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        geometry_srt = out_dir / "source.geometry_refined.srt"
+        geometry_json = out_dir / "ocr_geometry.json"
+        _append_log(job_id, f"debug_dir: {debug_dir}")
+        _append_log(job_id, "ocr3_geometry_refine: using existing tracks/boxes; video decoding is skipped")
+        refine_ocr_geometry_with_llm(
+            tracks_path,
+            boxes_path,
+            geometry_srt,
+            geometry_json,
+            cue_timing=_debug_rebuild_timing(debug_dir),
+            config=GeometryRefinementConfig(batch_size=8, max_observations_per_track=10),
+            progress_callback=lambda message: _append_log(job_id, message),
+        )
+        debug_geometry_srt = debug_dir / "source.geometry_refined.srt"
+        debug_geometry_json = debug_dir / "ocr_geometry.json"
+        shutil.copy2(geometry_srt, debug_geometry_srt)
+        shutil.copy2(geometry_json, debug_geometry_json)
+        return {
+            "debug_dir": str(debug_dir),
+            "source_geometry_refined_srt": str(debug_geometry_srt),
+            "geometry_srt": str(debug_geometry_srt),
+            "ocr_geometry": str(debug_geometry_json),
+            "tracks": str(tracks_path),
+            "ocr_boxes": str(boxes_path),
+        }
+
+    return start_job(f"OCR 3.0 geometry refine {_safe_slug(debug_dir.name)[:80]}", target)
+
+
+def refine_ocr_debug_v3_job(payload: dict[str, Any]) -> Job:
+    """Build OCR 3.0's readable final SRT without decoding the video again."""
+
+    debug_dir = _resolve_project_path(_required_str(payload, "debug_dir"))
+    _ensure_under_root(debug_dir)
+    if not debug_dir.is_dir():
+        raise FileNotFoundError(f"Debug folder does not exist: {debug_dir}")
+    if _ocr_debug_metadata(debug_dir).get("ocr_lab_version") != "v3":
+        raise ValueError("3.0 成品精修只能用于 OCR 3.0 调试目录。")
+    machine_srt = debug_dir / "source.machine.srt"
+    boxes_path = debug_dir / "ocr_boxes.json"
+    geometry_json = debug_dir / "ocr_geometry.json"
+    if not machine_srt.is_file() or not boxes_path.is_file():
+        raise FileNotFoundError("OCR 3.0 调试目录必须包含 source.machine.srt 和 ocr_boxes.json。")
+
+    def target(job_id: str) -> dict[str, Any]:
+        out_dir = JOB_DIR / job_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        v3_refined_srt = out_dir / "source.v3.refined.srt"
+        v3_layered_srt = out_dir / "source.v3.layered.srt"
+        v3_layers_json = out_dir / "ocr_v3_layers.json"
+        _append_log(job_id, f"debug_dir: {debug_dir}")
+        _append_log(job_id, "ocr3_final_refine: using saved machine SRT/boxes; video decoding is skipped")
+        _append_log(
+            job_id,
+            f"ocr3_geometry_hints: {geometry_json if geometry_json.is_file() else '<none; text evidence only>'}",
+        )
+        refine_ocr_source_with_llm(
+            machine_srt,
+            boxes_path,
+            v3_refined_srt,
+            config=OCRRefinementConfig(
+                batch_size=12,
+                window_padding_seconds=0.50,
+                max_boxes_per_frame=16,
+            ),
+            progress_callback=lambda message: _append_log(job_id, message),
+        )
+        refine_ocr_layers_with_llm(
+            v3_refined_srt,
+            boxes_path,
+            v3_layered_srt,
+            v3_layers_json,
+            recovery_srt=machine_srt,
+            geometry_json=geometry_json if geometry_json.is_file() else None,
+            config=LayeredOCRRefinementConfig(pipeline_version="v3"),
+            progress_callback=lambda message: _append_log(job_id, message),
+        )
+        debug_v3_refined = debug_dir / "source.v3.refined.srt"
+        debug_v3_layered = debug_dir / "source.v3.layered.srt"
+        debug_v3_layers = debug_dir / "ocr_v3_layers.json"
+        shutil.copy2(v3_refined_srt, debug_v3_refined)
+        shutil.copy2(v3_layered_srt, debug_v3_layered)
+        shutil.copy2(v3_layers_json, debug_v3_layers)
+        return {
+            "debug_dir": str(debug_dir),
+            "source_srt": str(debug_v3_layered),
+            "source_v3_refined_srt": str(debug_v3_refined),
+            "source_v3_layered_srt": str(debug_v3_layered),
+            "v3_refined_srt": str(debug_v3_refined),
+            "v3_layered_srt": str(debug_v3_layered),
+            "ocr_v3_layers": str(debug_v3_layers),
+            "ocr_geometry": str(geometry_json) if geometry_json.is_file() else "",
+            "ocr_boxes": str(boxes_path),
+        }
+
+    return start_job(f"OCR 3.0 final refine {_safe_slug(debug_dir.name)[:80]}", target)
+
+
+def _layered_debug_source_srt(debug_dir: Path) -> Path:
+    preferred = [
+        debug_dir / "source.track_refined.srt",
+        debug_dir / "source.before_cleanup.srt",
+        debug_dir / "source.rebuilt.srt",
+        debug_dir / f"{debug_dir.name}.srt",
+        debug_dir / "source.srt",
+    ]
+    for candidate in preferred:
+        if candidate.is_file():
+            return candidate
+    generated_suffixes = (".cleaned", ".track_refined", ".layered")
+    fallback = next(
+        (
+            candidate
+            for candidate in sorted(debug_dir.glob("*.srt"))
+            if candidate.is_file() and not candidate.stem.endswith(generated_suffixes)
+        ),
+        None,
+    )
+    if fallback is None:
+        raise FileNotFoundError("The debug folder must contain a machine/source SRT file.")
+    return fallback
+
+
 def _debug_rebuild_timing(debug_dir: Path) -> CueTimingConfig:
     config_path = debug_dir / "run.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
@@ -3211,8 +3776,17 @@ def _debug_rebuild_timing(debug_dir: Path) -> CueTimingConfig:
     )
 
 
-def _materialize_ocr_debug_bundle(input_video: Path, output_dir: Path) -> dict[str, str]:
-    debug_dir = DOWNLOAD_DIR / "debug" / _filesystem_safe_title(input_video.stem)
+def _materialize_ocr_debug_bundle(
+    input_video: Path,
+    output_dir: Path,
+    *,
+    debug_variant: str = "",
+) -> dict[str, str]:
+    debug_name = _filesystem_safe_title(input_video.stem)
+    normalized_variant = _safe_slug(debug_variant) if debug_variant else ""
+    if normalized_variant:
+        debug_name = f"{debug_name}__{normalized_variant}"
+    debug_dir = DOWNLOAD_DIR / "debug" / debug_name
     debug_dir.mkdir(parents=True, exist_ok=True)
     debug_video = debug_dir / input_video.name
     _link_or_copy_debug_file(input_video, debug_video)
@@ -3222,9 +3796,17 @@ def _materialize_ocr_debug_bundle(input_video: Path, output_dir: Path) -> dict[s
     }
     artifact_names = {
         "source_srt": "source.srt",
+        "machine_source_srt": "source.machine.srt",
+        "track_refined_srt": "source.refined.srt",
         "cleaned_srt": "source.cleaned.srt",
+        "geometry_srt": "source.geometry_refined.srt",
+        "v3_refined_srt": "source.v3.refined.srt",
+        "v3_layered_srt": "source.v3.layered.srt",
         "source_before_cleanup": "source.before_cleanup.srt",
         "ocr_boxes": "ocr_boxes.json",
+        "ocr_geometry": "ocr_geometry.json",
+        "ocr_v3_layers": "ocr_v3_layers.json",
+        "ocr_rejected_boxes": "ocr_rejected_boxes.json",
         "ocr_sample_frames": "ocr_sample_frames.json",
         "tracks": "tracks.json",
         "tracks_debug": "tracks_debug.csv",
@@ -3232,16 +3814,37 @@ def _materialize_ocr_debug_bundle(input_video: Path, output_dir: Path) -> dict[s
     }
     for result_key, filename in artifact_names.items():
         source = output_dir / filename
-        if not source.exists():
-            continue
         if result_key == "source_srt":
             target = debug_video.with_suffix(".srt")
+        elif result_key == "track_refined_srt":
+            target = debug_dir / "source.track_refined.srt"
         elif result_key == "cleaned_srt":
             target = debug_video.with_name(f"{debug_video.stem}.cleaned.srt")
         else:
             target = debug_dir / filename
+        if not source.exists():
+            if result_key in {
+                "machine_source_srt",
+                "track_refined_srt",
+                "cleaned_srt",
+                "geometry_srt",
+                "v3_refined_srt",
+                "v3_layered_srt",
+                "source_before_cleanup",
+                "ocr_geometry",
+                "ocr_v3_layers",
+                "ocr_rejected_boxes",
+            } and target.exists():
+                target.unlink()
+            continue
         shutil.copy2(source, target)
         copied[f"debug_{result_key}"] = str(target)
+    # These files are derived from a previous debug baseline. Keeping them
+    # after replacing tracks/boxes would make a stale V2 result look current.
+    for stale_name in ("source.rebuilt.srt", "source.layered.srt", "ocr_layers.json"):
+        stale_path = debug_dir / stale_name
+        if stale_path.exists():
+            stale_path.unlink()
     return copied
 
 
@@ -3841,7 +4444,9 @@ def _ocr_config(
     preserve_timing: bool = False,
     ocr_scope: str = "bottom",
     ocr_extraction_mode: str = "auto",
+    ocr_shape_mode: str | None = None,
     ocr_refinement_mode: str = "none",
+    ocr_pipeline_version: str | None = None,
     ocr_crop_top_ratio: float | None = None,
     ocr_crop_bottom_ratio: float = 0.0,
     ocr_crop_left_ratio: float = 0.0,
@@ -3853,10 +4458,21 @@ def _ocr_config(
     ocr_exclude_right_ratio: float = 0.02,
     source_language: str = "korean",
 ) -> dict[str, Any]:
-    translation_mode = _normalize_ocr_translation_mode(translation_mode, preserve_timing)
+    pipeline = _resolve_ocr_pipeline(
+        ocr_pipeline_version,
+        extraction_mode=ocr_extraction_mode,
+        translation_mode=translation_mode,
+        refinement_mode=ocr_refinement_mode,
+        preserve_timing=preserve_timing,
+    )
+    ocr_pipeline_version = pipeline["version"]
+    translation_mode = pipeline["translation_mode"]
+    if ocr_pipeline_version == "v2":
+        ocr_scope = "bottom"
     ocr_settings = _ocr_scope_settings(ocr_scope)
-    ocr_extraction_mode = _normalize_ocr_extraction_mode(ocr_extraction_mode)
-    ocr_refinement_mode = _normalize_ocr_refinement_mode(ocr_refinement_mode)
+    ocr_extraction_mode = pipeline["extraction_mode"]
+    ocr_shape_mode = _normalize_ocr_shape_mode(ocr_shape_mode, ocr_extraction_mode)
+    ocr_refinement_mode = pipeline["refinement_mode"]
     crop_top_ratio = _normalize_ocr_crop_top_ratio(ocr_crop_top_ratio, ocr_scope)
     crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(ocr_crop_bottom_ratio)
     crop_left_ratio = _normalize_ocr_crop_ratio(ocr_crop_left_ratio)
@@ -3883,6 +4499,7 @@ def _ocr_config(
         "sample_fps": 3.0,
         **ocr_settings,
         "extraction_mode": ocr_extraction_mode,
+        "shape_mode": ocr_shape_mode,
         "crop_top_ratio": crop_top_ratio,
         "crop_bottom_ratio": crop_bottom_ratio,
         "crop_left_ratio": crop_left_ratio,
@@ -3895,9 +4512,29 @@ def _ocr_config(
         "auto_trim_side_noise": True,
     }
     subtitle_config = {"merge_gap_seconds": 0.85, "same_text_similarity": 0.88, "merge_same_start_seconds": 0.16, "merge_short_fragment_gap_seconds": 0.50, "short_fragment_max_chars": 14, "short_fragment_similarity": 0.55, "snapshot_similarity": 0.72, "snapshot_max_gap_seconds": None, "snapshot_min_confidence": 0.50, "end_padding_seconds": 0.35, "sample_end_extension_ratio": 0.75, "min_duration_seconds": 0.60, "max_next_overlap_seconds": 0.04, "enforce_no_overlap": True}
-    if ocr_extraction_mode == "region":
+    if ocr_extraction_mode in {"region", "region_v3"}:
         ocr_config.update({"sample_fps": 6.0, "scan_full_frame": False, "auto_trim_side_noise": False})
         subtitle_config.update({"same_text_similarity": 0.78, "merge_short_fragment_gap_seconds": 0.75, "short_fragment_similarity": 0.45, "snapshot_min_confidence": 0.35, "min_duration_seconds": 0.35})
+
+    refinement_config: dict[str, Any]
+    if ocr_refinement_mode == "llm_geometry":
+        refinement_config = {
+            "mode": "llm_geometry",
+            "batch_size": 8,
+            "max_observations_per_track": 10,
+            "text_batch_size": 12,
+            "window_padding_seconds": 0.50,
+            "max_boxes_per_frame": 16,
+            "layered_batch_size": 8,
+            "layered_context_overlap": 1,
+        }
+    else:
+        refinement_config = {
+            "mode": ocr_refinement_mode,
+            "batch_size": 12,
+            "window_padding_seconds": 0.50,
+            "max_boxes_per_frame": 16,
+        }
 
     return {
         "mode": "full",
@@ -3907,9 +4544,18 @@ def _ocr_config(
         "source_language": normalized_source_language,
         "target_language": "简体中文",
         "glossary": "",
+        "ocr_pipeline": {
+            "version": ocr_pipeline_version,
+            "label": pipeline["label"],
+            "extraction_mode": ocr_extraction_mode,
+            "scope": _normalize_ocr_scope(ocr_scope),
+            "refinement_mode": ocr_refinement_mode,
+            "source_cleanup_mode": pipeline["source_cleanup_mode"],
+            "translation_mode": translation_mode,
+        },
         "ocr": ocr_config,
-        "ocr_refinement": {"mode": ocr_refinement_mode, "batch_size": 12, "window_padding_seconds": 0.50, "max_boxes_per_frame": 16},
-        "source_cleanup": {"mode": "llm_context", "batch_size": 18, "overlap": 3},
+        "ocr_refinement": refinement_config,
+        "source_cleanup": {"mode": pipeline["source_cleanup_mode"], "batch_size": 18, "overlap": 3},
         "filters": {"ignored_texts": ["Disney+", "디즈니+"], "ignored_contains": [], "ignored_patterns": ["disn[e3][yp]?\\+?"]},
         "subtitle": subtitle_config,
         "translation": translation,
@@ -3923,7 +4569,8 @@ OCR_SCOPE_SETTINGS = {
     "smart_full": {"bottom_ratio": 0.42, "scan_full_frame": True},
 }
 
-OCR_EXTRACTION_MODES = {"auto", "region"}
+OCR_EXTRACTION_MODES = {"auto", "region", "region_v3"}
+OCR_SHAPE_MODES = {"unrestricted", "horizontal_preferred", "horizontal_strict"}
 
 
 def _normalize_ocr_scope(value: Any) -> str:
@@ -3943,6 +4590,16 @@ def _normalize_ocr_extraction_mode(value: Any) -> str:
     if mode not in OCR_EXTRACTION_MODES:
         raise ValueError(f"未知 OCR 提取方式: {mode}")
     return mode
+
+
+def _normalize_ocr_shape_mode(value: Any, extraction_mode: Any = "region_v3") -> str:
+    mode = _normalize_ocr_extraction_mode(extraction_mode)
+    if mode != "region_v3":
+        return "unrestricted"
+    shape_mode = str(value or "horizontal_preferred").strip()
+    if shape_mode not in OCR_SHAPE_MODES:
+        raise ValueError(f"未知 OCR 文字形态方式: {shape_mode}")
+    return shape_mode
 
 
 
@@ -4002,7 +4659,25 @@ def _normalize_ocr_flicker_smoothing_duration(value: Any) -> float:
     return round(max(0.0, min(2.0, duration)), 3)
 
 
-OCR_REFINEMENT_MODES = {"none", "llm_boxes"}
+OCR_REFINEMENT_MODES = {"none", "llm_boxes", "llm_geometry"}
+
+
+def _ocr_geometry_result_artifacts(output_dir: Path, refinement_mode: str) -> dict[str, str]:
+    if refinement_mode != "llm_geometry":
+        return {
+            "geometry_srt": "",
+            "ocr_geometry": "",
+            "v3_refined_srt": "",
+            "v3_layered_srt": "",
+            "ocr_v3_layers": "",
+        }
+    return {
+        "geometry_srt": str(output_dir / "source.geometry_refined.srt"),
+        "ocr_geometry": str(output_dir / "ocr_geometry.json"),
+        "v3_refined_srt": str(output_dir / "source.v3.refined.srt"),
+        "v3_layered_srt": str(output_dir / "source.v3.layered.srt"),
+        "ocr_v3_layers": str(output_dir / "ocr_v3_layers.json"),
+    }
 
 
 def _normalize_ocr_refinement_mode(value: Any) -> str:
@@ -4010,6 +4685,113 @@ def _normalize_ocr_refinement_mode(value: Any) -> str:
     if mode not in OCR_REFINEMENT_MODES:
         raise ValueError(f"未知 OCR 原文精修模式: {mode}")
     return mode
+
+
+OCR_PIPELINE_VERSION_ALIASES = {
+    "v1": "v1",
+    "1": "v1",
+    "1.0": "v1",
+    "legacy": "v1",
+    "ocr_v1": "v1",
+    "v2": "v2",
+    "2": "v2",
+    "2.0": "v2",
+    "ocr2": "v2",
+    "ocr_v2": "v2",
+    "v3": "v3",
+    "3": "v3",
+    "3.0": "v3",
+    "ocr3": "v3",
+    "ocr_v3": "v3",
+}
+
+
+def _normalize_agent_ocr_pipeline_version(value: Any, extraction_mode: Any = "auto") -> str:
+    raw = str(value or "").strip().lower()
+    if raw:
+        version = OCR_PIPELINE_VERSION_ALIASES.get(raw)
+        if not version:
+            raise ValueError(f"未知 OCR 流程版本: {raw}")
+        return version
+    extraction = _normalize_ocr_extraction_mode(extraction_mode)
+    if extraction == "region":
+        return "v2"
+    if extraction == "region_v3":
+        return "v3"
+    return "v1"
+
+
+def _cached_ocr_pipeline_version(value: Any, extraction_mode: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw == "custom":
+        return "custom"
+    if raw:
+        return OCR_PIPELINE_VERSION_ALIASES.get(raw, "")
+    try:
+        extraction = _normalize_ocr_extraction_mode(extraction_mode)
+    except ValueError:
+        return ""
+    # Missing metadata is safe only for the unchanged legacy auto pipeline.
+    return "v1" if extraction == "auto" else ""
+
+
+def _resolve_ocr_pipeline(
+    version: Any,
+    *,
+    extraction_mode: Any = "auto",
+    translation_mode: Any = "standard_cleanup",
+    refinement_mode: Any = "none",
+    preserve_timing: bool = False,
+) -> dict[str, str]:
+    """Resolve one coherent OCR workflow.
+
+    A non-empty version is authoritative. Calls without a version keep the
+    advanced/manual controls independent for backward compatibility; the Agent
+    always supplies a version.
+    """
+    requested_extraction = _normalize_ocr_extraction_mode(extraction_mode)
+    requested_translation = _normalize_ocr_translation_mode(translation_mode, preserve_timing)
+    requested_refinement = _normalize_ocr_refinement_mode(refinement_mode)
+    raw_version = str(version or "").strip()
+    if not raw_version or raw_version == "custom":
+        return {
+            "version": "custom",
+            "label": "自定义 OCR 流程",
+            "extraction_mode": requested_extraction,
+            "refinement_mode": requested_refinement,
+            "source_cleanup_mode": "llm_context",
+            "translation_mode": requested_translation,
+        }
+
+    normalized_version = _normalize_agent_ocr_pipeline_version(raw_version, requested_extraction)
+    if normalized_version == "v1":
+        return {
+            "version": "v1",
+            "label": "OCR 1.0（旧版）",
+            "extraction_mode": "auto",
+            "refinement_mode": "none",
+            "source_cleanup_mode": "llm_context",
+            "translation_mode": "standard_cleanup",
+        }
+    if normalized_version == "v2":
+        return {
+            "version": "v2",
+            "label": "OCR 2.0（区域增强）",
+            "extraction_mode": "region",
+            "refinement_mode": "llm_boxes",
+            "source_cleanup_mode": "none",
+            "translation_mode": "translate_only",
+        }
+    # OCR 3.0 remains isolated from the stable OCR 2.0 route. Geometry becomes
+    # a soft prior for independent V3 text and layered refinement artifacts.
+    return {
+        "version": "v3",
+        "label": "OCR 3.0（几何精修实验）",
+        "extraction_mode": "region_v3",
+        "refinement_mode": "llm_geometry",
+        "source_cleanup_mode": "none",
+        "translation_mode": "translate_only",
+    }
 
 
 OCR_TRANSLATION_MODES = {
@@ -4020,6 +4802,7 @@ OCR_TRANSLATION_MODES = {
             "llm_cleanup_translated": False,
             "cleanup_residual_fragments": False,
             "dedupe_translated": False,
+            "dedupe_exact_translated": False,
             "retime_translated": False,
         },
     },
@@ -4030,6 +4813,7 @@ OCR_TRANSLATION_MODES = {
             "llm_cleanup_translated": True,
             "cleanup_residual_fragments": True,
             "dedupe_translated": True,
+            "dedupe_exact_translated": True,
             "retime_translated": False,
         },
     },
@@ -4040,6 +4824,7 @@ OCR_TRANSLATION_MODES = {
             "llm_cleanup_translated": True,
             "cleanup_residual_fragments": True,
             "dedupe_translated": True,
+            "dedupe_exact_translated": True,
             "retime_translated": True,
         },
     },
@@ -4079,6 +4864,7 @@ def _ocr_translation_mode_config(mode: str, prompt: str) -> tuple[str, dict[str,
         "residual_max_gap_seconds": 3.0,
         "residual_short_text_chars": 6,
         "dedupe_translated": True,
+        "dedupe_exact_translated": True,
         "dedupe_similarity": 0.88,
         "dedupe_max_gap_seconds": 1.2,
         "retime_translated": False,
@@ -4661,7 +5447,7 @@ def _asset_entry(path: Path, *, kind: str) -> dict[str, Any]:
 def _download_project_entries(directory: Path, limit: int = 80) -> list[dict[str, Any]]:
     if not directory.exists():
         return []
-    projects = [_download_project_entry(path) for path in directory.iterdir() if path.is_dir()]
+    projects = [_download_project_entry(path) for path in directory.iterdir() if path.is_dir() and path.name != "debug"]
     projects = [project for project in projects if project]
     return sorted(projects, key=lambda item: item["modified_at"], reverse=True)[:limit]
 
@@ -4846,11 +5632,32 @@ def _ocr_debug_folder_entries(limit: int = 80) -> list[dict[str, Any]]:
         reverse=True,
     )
     for debug_dir in debug_dirs[:limit]:
+        debug_metadata = _ocr_debug_metadata(debug_dir)
         files = [path for path in debug_dir.iterdir() if _is_real_file(path)]
         subtitles = [path for path in files if path.suffix.lower() == ".srt"]
-        raw_subtitles = [path for path in subtitles if not path.stem.endswith(".cleaned")]
-        source_srt = next((path for path in raw_subtitles if path.stem == debug_dir.name), raw_subtitles[0] if raw_subtitles else None)
+        generated_suffixes = (
+            ".cleaned",
+            ".rebuilt",
+            ".track_refined",
+            ".layered",
+            ".machine",
+            ".geometry_refined",
+            ".v3.refined",
+            ".v3.layered",
+        )
+        raw_subtitles = [path for path in subtitles if not path.stem.endswith(generated_suffixes)]
+        source_srt = next(
+            (path for path in raw_subtitles if path.stem == debug_dir.name),
+            next((path for path in raw_subtitles if path.name == "source.srt"), raw_subtitles[0] if raw_subtitles else None),
+        )
         cleaned_srt = next((path for path in subtitles if path.stem.endswith(".cleaned")), None)
+        layered_srt = next((path for path in subtitles if path.name == "source.layered.srt"), None)
+        track_refined_srt = next((path for path in subtitles if path.name == "source.track_refined.srt"), None)
+        geometry_srt = next((path for path in subtitles if path.name == "source.geometry_refined.srt"), None)
+        v3_refined_srt = next((path for path in subtitles if path.name == "source.v3.refined.srt"), None)
+        v3_layered_srt = next((path for path in subtitles if path.name == "source.v3.layered.srt"), None)
+        if debug_metadata.get("ocr_lab_version") == "v3" and v3_layered_srt:
+            source_srt = v3_layered_srt
         videos = [path for path in files if path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}]
         modified_at = max((path.stat().st_mtime for path in files), default=debug_dir.stat().st_mtime)
         folders.append(
@@ -4863,10 +5670,56 @@ def _ocr_debug_folder_entries(limit: int = 80) -> list[dict[str, Any]]:
                 "modified_label": time.strftime("%Y-%m-%d %H:%M", time.localtime(modified_at)),
                 "source_srt": str(source_srt) if source_srt else "",
                 "cleaned_srt": str(cleaned_srt) if cleaned_srt else "",
+                "layered_srt": str(layered_srt) if layered_srt else "",
+                "track_refined_srt": str(track_refined_srt) if track_refined_srt else "",
+                "geometry_srt": str(geometry_srt) if geometry_srt else "",
+                "v3_refined_srt": str(v3_refined_srt) if v3_refined_srt else "",
+                "v3_layered_srt": str(v3_layered_srt) if v3_layered_srt else "",
+                "ocr_geometry": str(debug_dir / "ocr_geometry.json") if (debug_dir / "ocr_geometry.json").is_file() else "",
+                "ocr_v3_layers": str(debug_dir / "ocr_v3_layers.json") if (debug_dir / "ocr_v3_layers.json").is_file() else "",
+                **debug_metadata,
+                "has_ocr_boxes": (debug_dir / "ocr_boxes.json").is_file(),
+                "has_tracks": (debug_dir / "tracks.json").is_file(),
+                "has_machine_source": (debug_dir / "source.machine.srt").is_file(),
                 "video": str(videos[0]) if videos else "",
             }
         )
     return folders
+
+
+def _ocr_debug_metadata(debug_dir: Path) -> dict[str, str]:
+    config: dict[str, Any] = {}
+    config_path = debug_dir / "run.yaml"
+    if config_path.is_file():
+        try:
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            if isinstance(loaded, dict):
+                config = loaded
+        except (OSError, yaml.YAMLError):
+            config = {}
+    ocr = config.get("ocr") if isinstance(config.get("ocr"), dict) else {}
+    extraction_mode = str(ocr.get("extraction_mode") or "").strip().lower()
+    shape_mode = str(ocr.get("shape_mode") or "").strip().lower()
+    if not extraction_mode and (debug_dir / "ocr_geometry.json").is_file():
+        extraction_mode = "region_v3"
+    if extraction_mode == "region_v3":
+        version = "v3"
+        label = "OCR 3.0"
+    elif extraction_mode == "auto":
+        version = "v1"
+        label = "OCR 1.0"
+    else:
+        # Existing unsuffixed OCR Lab folders predate version metadata and are
+        # the stable region/OCR 2.0 experiments. Keep them in the V2 lane.
+        version = "v2"
+        label = "OCR 2.0"
+        extraction_mode = extraction_mode or "region"
+    return {
+        "ocr_lab_version": version,
+        "ocr_version_label": label,
+        "ocr_extraction_mode": extraction_mode,
+        "ocr_shape_mode": shape_mode,
+    }
 
 
 def _subtitle_role(path: Path) -> str:
@@ -4883,6 +5736,17 @@ def _is_real_file(path: Path) -> bool:
 
 
 def _run_command(job_id: str, args: list[str]) -> None:
+    uses_ocr_gpu = _command_uses_ocr_gpu(args)
+    if uses_ocr_gpu:
+        _begin_ocr_gpu_command()
+    try:
+        _run_command_process(job_id, args)
+    finally:
+        if uses_ocr_gpu:
+            _end_ocr_gpu_command()
+
+
+def _run_command_process(job_id: str, args: list[str]) -> None:
     _append_log(job_id, "$ " + " ".join(_quote_arg(arg) for arg in args))
     env = _child_process_env()
     process = subprocess.Popen(
@@ -4923,6 +5787,27 @@ def _run_command(job_id: str, args: list[str]) -> None:
         raise JobCancelled()
     if code != 0:
         raise RuntimeError(f"命令失败，退出码 {code}")
+
+
+def _command_uses_ocr_gpu(args: list[str]) -> bool:
+    return any(
+        marker in str(arg)
+        for arg in args
+        for marker in ("run_from_config.py", "video_translate.tools.hybrid_anchor_ocr")
+    )
+
+
+def _begin_ocr_gpu_command() -> None:
+    global _OCR_ACTIVE_COMMANDS
+    with _OCR_PREVIEW_LOCK:
+        _release_ocr_preview_model_locked()
+        _OCR_ACTIVE_COMMANDS += 1
+
+
+def _end_ocr_gpu_command() -> None:
+    global _OCR_ACTIVE_COMMANDS
+    with _OCR_PREVIEW_LOCK:
+        _OCR_ACTIVE_COMMANDS = max(0, _OCR_ACTIVE_COMMANDS - 1)
 
 
 def _child_process_env() -> dict[str, str]:
@@ -5123,6 +6008,12 @@ def ocr_preview_frame(payload: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError(f"无法读取视频帧: {input_video}")
     finally:
         capture.release()
+    ocr_analysis = _ocr_preview_analysis(
+        frame,
+        payload,
+        time_seconds=frame_index / fps if fps else float(time_seconds or 0),
+        frame_index=frame_index,
+    )
     ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 86])
     if not ok:
         raise RuntimeError("视频帧编码失败")
@@ -5155,7 +6046,106 @@ def ocr_preview_frame(payload: dict[str, Any]) -> dict[str, Any]:
         "crop_rect": rect,
         "exclude_rect": exclude_rect,
         "image_data_url": f"data:image/jpeg;base64,{image_base64}",
+        "ocr_analysis": ocr_analysis,
     }
+
+
+def _ocr_preview_analysis(
+    frame: Any,
+    payload: dict[str, Any],
+    *,
+    time_seconds: float,
+    frame_index: int,
+) -> dict[str, Any] | None:
+    extraction_mode = _normalize_ocr_extraction_mode(payload.get("ocr_extraction_mode"))
+    if extraction_mode != "region_v3" or not bool(payload.get("analyze_ocr", False)):
+        return None
+
+    shape_mode = _normalize_ocr_shape_mode(payload.get("ocr_shape_mode"), extraction_mode)
+    source_language = normalize_source_language(payload.get("source_language") or "korean")
+    requested_ocr_language = str(payload.get("ocr_language") or "auto").strip().lower()
+    ocr_language = ocr_language_for_source(
+        source_language if requested_ocr_language in {"", "auto"} else requested_ocr_language
+    )
+    min_confidence = _ocr_preview_min_confidence(payload.get("ocr_min_confidence"))
+    config = ExtractConfig(
+        crop_top_ratio=_normalize_ocr_crop_top_ratio(payload.get("ocr_crop_top_ratio"), payload.get("ocr_scope")),
+        crop_bottom_ratio=_normalize_ocr_vertical_crop_ratio(payload.get("ocr_crop_bottom_ratio")),
+        crop_left_ratio=_normalize_ocr_crop_ratio(payload.get("ocr_crop_left_ratio")),
+        crop_right_ratio=_normalize_ocr_crop_ratio(payload.get("ocr_crop_right_ratio")),
+        exclude_enabled=bool(payload.get("ocr_exclude_enabled", False)),
+        exclude_top_ratio=_normalize_ocr_exclude_ratio(payload.get("ocr_exclude_top_ratio", 0.04)),
+        exclude_bottom_ratio=_normalize_ocr_exclude_ratio(payload.get("ocr_exclude_bottom_ratio", 0.82)),
+        exclude_left_ratio=_normalize_ocr_exclude_ratio(payload.get("ocr_exclude_left_ratio", 0.76)),
+        exclude_right_ratio=_normalize_ocr_exclude_ratio(payload.get("ocr_exclude_right_ratio", 0.02)),
+        min_confidence=min_confidence,
+        scan_full_frame=False,
+        auto_trim_side_noise=False,
+        extraction_mode=extraction_mode,
+        shape_mode=shape_mode,
+    )
+    rejected: list[dict[str, Any]] = []
+    with _OCR_PREVIEW_LOCK:
+        if _OCR_ACTIVE_COMMANDS:
+            raise RuntimeError("完整 OCR 任务正在使用 GPU，请等待任务结束后再分析预览帧。")
+        ocr = _ocr_preview_model(ocr_language, config.device)
+        accepted = list(
+            _ocr_frame(
+                ocr,
+                frame,
+                time_seconds,
+                frame_index,
+                config,
+                rejected_boxes=rejected,
+            )
+        )
+    return {
+        "extraction_mode": extraction_mode,
+        "shape_mode": shape_mode,
+        "ocr_language": ocr_language,
+        "min_confidence": min_confidence,
+        "accepted": [box.to_dict() for box in accepted],
+        "rejected": rejected,
+    }
+
+
+def _ocr_preview_model(ocr_language: str, device: str) -> Any:
+    global _OCR_PREVIEW_MODEL_KEY, _OCR_PREVIEW_MODEL
+    device_key = str(os.environ.get("VIDEO_TRANSLATE_OCR_DEVICE") or device or "auto").strip().lower()
+    key = (ocr_language, device_key)
+    if _OCR_PREVIEW_MODEL is None or _OCR_PREVIEW_MODEL_KEY != key:
+        _OCR_PREVIEW_MODEL = _load_paddle_ocr(ocr_language, device)
+        _OCR_PREVIEW_MODEL_KEY = key
+    return _OCR_PREVIEW_MODEL
+
+
+def _release_ocr_preview_model_locked() -> None:
+    global _OCR_PREVIEW_MODEL_KEY, _OCR_PREVIEW_MODEL
+    if _OCR_PREVIEW_MODEL is None:
+        return
+    model = _OCR_PREVIEW_MODEL
+    _OCR_PREVIEW_MODEL = None
+    _OCR_PREVIEW_MODEL_KEY = None
+    del model
+    gc.collect()
+    try:
+        import paddle  # type: ignore
+
+        if paddle.device.is_compiled_with_cuda():
+            paddle.device.cuda.empty_cache()
+    except Exception:
+        # Releasing the Python model reference is sufficient for correctness;
+        # cache cleanup is best effort across Paddle versions and CPU installs.
+        pass
+
+
+def _ocr_preview_min_confidence(value: Any) -> float:
+    if value is None or value == "":
+        return 0.45
+    confidence = float(value)
+    if confidence > 1.0:
+        confidence /= 100.0
+    return max(0.0, min(1.0, confidence))
 
 
 def _load_cv2_for_preview():
@@ -5300,11 +6290,105 @@ def _api_path_segment(path: str, index: int) -> str:
     return unquote(parts[index])
 
 
+_FILE_STREAM_CHUNK_SIZE = 64 * 1024
+_SECRET_SETTINGS_MAX_BODY_BYTES = 64 * 1024
+
+
+def _is_loopback_address(value: Any) -> bool:
+    try:
+        return ipaddress.ip_address(str(value or "").split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
+
+
+def _url_origin(value: Any) -> tuple[str, str, int | None] | None:
+    parsed = urlparse(str(value or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    return parsed.scheme.lower(), parsed.hostname.lower(), port
+
+
+def _remote_provider_connection_update_allowed(
+    payload: dict[str, Any],
+    current: dict[str, Any],
+) -> bool:
+    """Allow write-only keys remotely, but never redirect an existing secret."""
+
+    if payload.get("clear_base_url"):
+        return False
+    current_origin = _url_origin(current.get("base_url"))
+    if "base_url" in payload and _url_origin(payload.get("base_url")) != current_origin:
+        return False
+    if "models_url" in payload and _url_origin(payload.get("models_url")) != current_origin:
+        return False
+    return True
+
+
+def _parse_single_byte_range(value: str, file_size: int) -> tuple[int, int]:
+    """Return an inclusive byte range for a single HTTP Range header."""
+    match = re.fullmatch(r"bytes=([0-9]*)-([0-9]*)", str(value or "").strip(), flags=re.IGNORECASE)
+    if not match or file_size <= 0:
+        raise ValueError("invalid or unsatisfiable byte range")
+
+    start_text, end_text = match.groups()
+    if not start_text and not end_text:
+        raise ValueError("invalid or unsatisfiable byte range")
+
+    if start_text:
+        start = int(start_text)
+        if start >= file_size:
+            raise ValueError("invalid or unsatisfiable byte range")
+        end = int(end_text) if end_text else file_size - 1
+        if end < start:
+            raise ValueError("invalid or unsatisfiable byte range")
+        return start, min(end, file_size - 1)
+
+    suffix_length = int(end_text)
+    if suffix_length <= 0:
+        raise ValueError("invalid or unsatisfiable byte range")
+    return max(0, file_size - suffix_length), file_size - 1
+
+
 class AgentHandler(BaseHTTPRequestHandler):
     server_version = "VideoTranslateAgent/0.1"
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/settings":
+            try:
+                result = get_app_settings_payload(root=ROOT)
+                result["capabilities"] = {
+                    "provider_management_allowed": True,
+                }
+                self._send_json(result)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path.startswith("/api/settings/providers/") and parsed.path.endswith("/connection"):
+            try:
+                provider_id = _api_path_segment(parsed.path, -2)
+                result = get_provider_connection_settings(provider_id, root=ROOT)
+                result["key_write_allowed"] = True
+                result["endpoint_origin_change_allowed"] = _is_loopback_address(self.client_address[0])
+                self._send_json(result)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path.startswith("/api/settings/providers/") and parsed.path.endswith("/models"):
+            try:
+                provider_id = _api_path_segment(parsed.path, -2)
+                query = parse_qs(parsed.query)
+                refresh = str((query.get("refresh") or [""])[0]).strip().lower() in {"1", "true", "yes"}
+                self._send_json(fetch_provider_models(provider_id, root=ROOT, refresh=refresh))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
         if parsed.path == "/api/agent":
             self._send_json({"sessions": list_agent_sessions()})
             return
@@ -5354,7 +6438,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             if not file_path.is_file():
                 self._send_json({"error": "file not found"}, status=HTTPStatus.NOT_FOUND)
                 return
-            self._send_file(file_path)
+            self._send_file(file_path, support_ranges=True)
             return
         asset = _frontend_asset_path(parsed.path)
         if asset:
@@ -5381,8 +6465,39 @@ class AgentHandler(BaseHTTPRequestHandler):
             if self.path == "/api/upload-project-cover":
                 self._send_json(self._read_project_cover_upload())
                 return
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/settings/providers":
+                payload = self._read_json(
+                    max_bytes=_SECRET_SETTINGS_MAX_BODY_BYTES,
+                    require_json_content_type=True,
+                )
+                result = create_provider_profile(payload, root=ROOT)
+                result["capabilities"] = {"provider_management_allowed": True}
+                self._send_json(result, status=HTTPStatus.CREATED)
+                return
+            if parsed.path.startswith("/api/settings/providers/") and parsed.path.endswith("/connection"):
+                payload = self._read_json(
+                    max_bytes=_SECRET_SETTINGS_MAX_BODY_BYTES,
+                    require_json_content_type=True,
+                )
+                provider_id = _api_path_segment(parsed.path, -2)
+                is_loopback = _is_loopback_address(self.client_address[0])
+                current = get_provider_connection_settings(provider_id, root=ROOT)
+                if not is_loopback and not _remote_provider_connection_update_allowed(payload, current):
+                    self._send_json(
+                        {"error": "远程网页可以写入 Key，但跨服务地址修改需要服务器本机或 SSH 端口转发"},
+                        status=HTTPStatus.FORBIDDEN,
+                    )
+                    return
+                result = update_provider_connection_settings(provider_id, payload, root=ROOT)
+                result["key_write_allowed"] = True
+                result["endpoint_origin_change_allowed"] = is_loopback
+                self._send_json(result)
+                return
             payload = self._read_json()
-            if self.path == "/api/agent/start":
+            if self.path == "/api/settings":
+                self._send_json(save_app_settings(payload, root=ROOT))
+            elif self.path == "/api/agent/start":
                 self._send_json(start_agent_session(payload).to_dict())
             elif self.path == "/api/agent/continue-glossary":
                 self._send_json(continue_agent_after_glossary_review(_required_str(payload, "glossary_path")).to_dict())
@@ -5453,6 +6568,12 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send_json(cleanup_existing_ocr_source_job(payload).to_dict())
             elif self.path == "/api/jobs/ocr-rebuild-refine":
                 self._send_json(rebuild_ocr_debug_with_llm_job(payload).to_dict())
+            elif self.path == "/api/jobs/ocr-layered-refine":
+                self._send_json(refine_ocr_debug_layers_job(payload).to_dict())
+            elif self.path == "/api/jobs/ocr-geometry-refine":
+                self._send_json(refine_ocr_debug_geometry_job(payload).to_dict())
+            elif self.path == "/api/jobs/ocr-v3-refine":
+                self._send_json(refine_ocr_debug_v3_job(payload).to_dict())
             elif self.path == "/api/jobs/hybrid-anchor-ocr":
                 self._send_json(hybrid_anchor_ocr_job(payload).to_dict())
             elif self.path == "/api/jobs/audio-local":
@@ -5484,11 +6605,61 @@ class AgentHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
 
+    def do_DELETE(self) -> None:
+        try:
+            parsed = urlparse(self.path)
+            if not re.fullmatch(r"/api/settings/providers/[^/]+/?", parsed.path):
+                self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            payload = self._read_json(
+                max_bytes=_SECRET_SETTINGS_MAX_BODY_BYTES,
+                require_json_content_type=True,
+            )
+            provider_id = _api_path_segment(parsed.path, -1)
+            replacement_provider_id = _required_str(payload, "replacement_provider_id")
+            result = delete_provider_profile(
+                provider_id,
+                replacement_provider_id,
+                root=ROOT,
+            )
+            result["capabilities"] = {"provider_management_allowed": True}
+            self._send_json(result)
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+    def do_PATCH(self) -> None:
+        try:
+            parsed = urlparse(self.path)
+            if not re.fullmatch(r"/api/settings/providers/[^/]+/?", parsed.path):
+                self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            payload = self._read_json(
+                max_bytes=_SECRET_SETTINGS_MAX_BODY_BYTES,
+                require_json_content_type=True,
+            )
+            provider_id = _api_path_segment(parsed.path, -1)
+            result = update_provider_profile(provider_id, payload, root=ROOT)
+            result["capabilities"] = {"provider_management_allowed": True}
+            self._send_json(result)
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
     def log_message(self, format: str, *args: Any) -> None:
         return
 
-    def _read_json(self) -> dict[str, Any]:
+    def _read_json(
+        self,
+        *,
+        max_bytes: int | None = None,
+        require_json_content_type: bool = False,
+    ) -> dict[str, Any]:
+        if require_json_content_type:
+            content_type = str(self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                raise ValueError("凭据设置请求必须使用 application/json")
         length = int(self.headers.get("Content-Length") or 0)
+        if length < 0 or (max_bytes is not None and length > max_bytes):
+            raise ValueError("请求体过大")
         raw = self.rfile.read(length).decode("utf-8") if length else "{}"
         data = json.loads(raw or "{}")
         if not isinstance(data, dict):
@@ -5545,6 +6716,7 @@ class AgentHandler(BaseHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(int(status))
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -5557,13 +6729,49 @@ class AgentHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_file(self, path: Path) -> None:
-        body = path.read_bytes()
-        self.send_response(HTTPStatus.OK)
+    def _send_file(self, path: Path, *, support_ranges: bool = False) -> None:
+        file_size = path.stat().st_size
+        start = 0
+        end = file_size - 1
+        status = HTTPStatus.OK
+        range_header = self.headers.get("Range") if support_ranges else None
+        if range_header is not None:
+            try:
+                start, end = _parse_single_byte_range(range_header, file_size)
+            except ValueError:
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Range", f"bytes */{file_size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            status = HTTPStatus.PARTIAL_CONTENT
+
+        content_length = file_size if status == HTTPStatus.OK else end - start + 1
+        self.send_response(status)
         self.send_header("Content-Type", _content_type_for_path(path))
-        self.send_header("Content-Length", str(len(body)))
+        if support_ranges:
+            self.send_header("Accept-Ranges", "bytes")
+        if status == HTTPStatus.PARTIAL_CONTENT:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+        self.send_header("Content-Length", str(content_length))
         self.end_headers()
-        self.wfile.write(body)
+        if content_length <= 0:
+            return
+        with path.open("rb") as source:
+            source.seek(start)
+            remaining = content_length
+            while remaining > 0:
+                chunk = source.read(min(_FILE_STREAM_CHUNK_SIZE, remaining))
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    # Browsers routinely cancel an old video range request
+                    # when the user seeks to a new position.
+                    return
+                remaining -= len(chunk)
 
 
 def _list_known_files(kind: str) -> list[str]:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
+import video_translate.llm_config as llm_config
 from video_translate.llm_config import LLMTaskConfig, load_llm_task_config
 
 
@@ -230,4 +232,257 @@ tasks:
         base_url="https://generic.example/v1",
         api_key="generic-key",
         provider="openai-compatible",
+    )
+
+
+def test_load_llm_task_config_accepts_both_env_field_spellings(tmp_path: Path, monkeypatch):
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    (config_dir / "llm.yaml").write_text(
+        """
+defaults:
+  model: default-model
+  base_url_env: DEFAULT_BASE_URL
+  api_key_env: DEFAULT_API_KEY
+tasks:
+  title_translation:
+    env_base_url: TASK_BASE_URL
+    env_api_key: TASK_API_KEY
+  glossary: {}
+""",
+        encoding="utf-8",
+    )
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("DEFAULT_BASE_URL", "https://default.example/v1")
+    monkeypatch.setenv("DEFAULT_API_KEY", "default-key")
+    monkeypatch.setenv("TASK_BASE_URL", "https://task.example/v1")
+    monkeypatch.setenv("TASK_API_KEY", "task-key")
+
+    title = load_llm_task_config("title_translation", root=tmp_path)
+    glossary = load_llm_task_config("glossary", root=tmp_path)
+
+    assert title.base_url == "https://task.example/v1"
+    assert title.api_key == "task-key"
+    assert glossary.base_url == "https://default.example/v1"
+    assert glossary.api_key == "default-key"
+
+
+def test_app_settings_task_overlay_selects_profile_and_clears_legacy_fallbacks(tmp_path: Path, monkeypatch):
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    (config_dir / "llm.yaml").write_text(
+        """
+defaults:
+  provider: openai-compatible
+  base_url: https://legacy.example/v1
+tasks:
+  subtitle_translation:
+    model: legacy-model
+    fallback_models:
+      - legacy-fallback
+""",
+        encoding="utf-8",
+    )
+    (config_dir / "app_settings.yaml").write_text(
+        """
+version: 1
+defaults:
+  provider_profile: default-profile
+tasks:
+  subtitle_translation:
+    provider_profile: selected-profile
+    model: selected-model
+""",
+        encoding="utf-8",
+    )
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("SELECTED_API_KEY", "selected-key")
+    profiles = {
+        "default-profile": SimpleNamespace(
+            base_url="https://default-profile.example/v1",
+            api_key_env="DEFAULT_PROFILE_API_KEY",
+            provider="openai-compatible",
+        ),
+        "selected-profile": SimpleNamespace(
+            base_url="https://selected-profile.example/v1",
+            api_key_env="SELECTED_API_KEY",
+            provider="openai-compatible",
+        ),
+    }
+    monkeypatch.setattr(llm_config, "_get_provider_profile", lambda profile_id, root: profiles.get(profile_id))
+
+    task = load_llm_task_config("subtitle_translation", root=tmp_path)
+
+    assert task == LLMTaskConfig(
+        model="selected-model",
+        base_url="https://selected-profile.example/v1",
+        api_key="selected-key",
+        provider="openai-compatible",
+        provider_profile="selected-profile",
+    )
+
+
+def test_app_settings_explicit_values_override_overlay_and_overlay_fallbacks_are_kept(tmp_path: Path, monkeypatch):
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    (config_dir / "llm.yaml").write_text(
+        "defaults:\n  model: legacy-model\n  base_url: https://legacy.example/v1\n",
+        encoding="utf-8",
+    )
+    (config_dir / "app_settings.yaml").write_text(
+        """
+version: 1
+tasks:
+  glossary:
+    provider_profile: selected-profile
+    model: selected-model
+    fallback_models:
+      - selected-fallback
+      - explicit-model
+""",
+        encoding="utf-8",
+    )
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setattr(
+        llm_config,
+        "_get_provider_profile",
+        lambda profile_id, root: {
+            "base_url": "https://profile.example/v1",
+            "api_key": "profile-key",
+            "provider": "openai-compatible",
+        } if profile_id == "selected-profile" else None,
+    )
+
+    task = load_llm_task_config(
+        "glossary",
+        root=tmp_path,
+        explicit_model="explicit-model",
+        explicit_base_url="https://explicit.example/v1",
+    )
+
+    assert task == LLMTaskConfig(
+        model="explicit-model",
+        base_url="https://explicit.example/v1",
+        api_key="profile-key",
+        provider="openai-compatible",
+        fallback_models=("selected-fallback",),
+        provider_profile="selected-profile",
+    )
+
+
+def test_invalid_task_profile_falls_back_to_default_profile_but_keeps_task_model(tmp_path: Path, monkeypatch):
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    (config_dir / "llm.yaml").write_text(
+        "defaults:\n  model: legacy-model\n  base_url: https://legacy.example/v1\n",
+        encoding="utf-8",
+    )
+    (config_dir / "app_settings.yaml").write_text(
+        """
+version: 1
+defaults:
+  provider_profile: working-profile
+tasks:
+  glossary:
+    provider_profile: missing-profile
+    model: overlay-model
+""",
+        encoding="utf-8",
+    )
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setattr(
+        llm_config,
+        "_get_provider_profile",
+        lambda profile_id, root: {
+            "base_url": "https://working.example/v1",
+            "api_key": "working-key",
+            "provider": "openai-compatible",
+        } if profile_id == "working-profile" else None,
+    )
+
+    task = load_llm_task_config("glossary", root=tmp_path)
+
+    assert task.model == "overlay-model"
+    assert task.base_url == "https://working.example/v1"
+    assert task.api_key == "working-key"
+    assert task.provider_profile == "working-profile"
+
+
+def test_missing_profiles_fall_back_to_legacy_connection_and_keep_overlay_model(tmp_path: Path, monkeypatch):
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    (config_dir / "llm.yaml").write_text(
+        """
+defaults:
+  model: legacy-model
+  base_url: https://legacy.example/v1
+  api_key_env: LEGACY_API_KEY
+""",
+        encoding="utf-8",
+    )
+    (config_dir / "app_settings.yaml").write_text(
+        """
+version: 1
+defaults:
+  provider_profile: also-missing
+tasks:
+  glossary:
+    provider_profile: missing-profile
+    model: overlay-model
+""",
+        encoding="utf-8",
+    )
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("LEGACY_API_KEY", "legacy-key")
+    monkeypatch.setattr(llm_config, "_get_provider_profile", lambda profile_id, root: None)
+
+    task = load_llm_task_config("glossary", root=tmp_path)
+
+    assert task == LLMTaskConfig(
+        model="overlay-model",
+        base_url="https://legacy.example/v1",
+        api_key="legacy-key",
+        provider="openai-compatible",
+    )
+
+
+def test_app_settings_overlay_integrates_with_provider_profile_files(tmp_path: Path, monkeypatch):
+    config_dir = tmp_path / "configs"
+    provider_dir = config_dir / "providers"
+    provider_dir.mkdir(parents=True)
+    (config_dir / "llm.yaml").write_text(
+        "defaults:\n  provider: openai-compatible\n  model: legacy-model\n",
+        encoding="utf-8",
+    )
+    (config_dir / "app_settings.yaml").write_text(
+        """
+version: 1
+defaults:
+  provider_profile: selected-profile
+tasks:
+  subtitle_translation:
+    model: provider-model
+""",
+        encoding="utf-8",
+    )
+    (provider_dir / "selected-profile.yml").write_text(
+        """
+api_key: SELECTED_PROFILE_API_KEY
+base_url: SELECTED_PROFILE_BASE_URL
+model_name: provider-model
+""",
+        encoding="utf-8",
+    )
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("SELECTED_PROFILE_API_KEY", "provider-key")
+    monkeypatch.setenv("SELECTED_PROFILE_BASE_URL", "https://provider.example/v1")
+
+    task = load_llm_task_config("subtitle_translation", root=tmp_path)
+
+    assert task == LLMTaskConfig(
+        model="provider-model",
+        base_url="https://provider.example/v1",
+        api_key="provider-key",
+        provider="openai-compatible",
+        provider_profile="selected-profile",
     )

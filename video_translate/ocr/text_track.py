@@ -89,15 +89,18 @@ def _deduplicate_tracks(tracks: list[TextTrack]) -> list[TextTrack]:
 
     merged: list[TextTrack] = []
     for candidates in grouped.values():
-        base = candidates[0]
-        for extra in candidates[1:]:
-            if extra.start - base.end <= 0.35 or base.start - extra.end <= 0.35:
+        ordered_candidates = sorted(candidates, key=lambda track: (track.start, track.end))
+        base = ordered_candidates[0]
+        for extra in ordered_candidates[1:]:
+            interval_gap = max(0.0, extra.start - base.end)
+            if interval_gap <= 0.35:
                 base.start = min(base.start, extra.start)
                 base.end = max(base.end, extra.end)
                 base.boxes.extend(extra.boxes)
                 base.text = choose_best_text([box.text for box in base.boxes])
             else:
-                merged.append(extra)
+                merged.append(base)
+                base = extra
         merged.append(base)
 
     merged.sort(key=lambda track: (track.start, track.end))

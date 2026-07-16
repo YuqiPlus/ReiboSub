@@ -144,6 +144,105 @@ def test_ocr_frame_filters_boxes_inside_exclude_region():
     assert [box.text for box in boxes] == ["정상 자막"]
 
 
+def test_region_v3_preferred_keeps_tilted_text_as_soft_geometry_candidate():
+    import numpy as np
+    from video_translate.ocr.extractor import ExtractConfig, _ocr_frame
+
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    fake = _FakeOCR([
+        ("정상 자막", 0.95, [(40, 8), (150, 8), (150, 28), (40, 28)]),
+        ("기울어진 글자", 0.95, [(40, 8), (140, 44), (136, 58), (36, 22)]),
+    ])
+    rejected = []
+
+    boxes = list(
+        _ocr_frame(
+            fake,
+            frame,
+            2.0,
+            4,
+            ExtractConfig(extraction_mode="region_v3", auto_trim_side_noise=False),
+            rejected_boxes=rejected,
+        )
+    )
+
+    assert [box.text for box in boxes] == ["정상 자막", "기울어진 글자"]
+    assert boxes[0].polygon == ((40.0, 66.0), (150.0, 66.0), (150.0, 86.0), (40.0, 86.0))
+    assert boxes[0].angle_degrees == 0.0
+    assert boxes[0].shape_hint == "horizontal_candidate"
+    assert boxes[1].angle_degrees > 15.0
+    assert boxes[1].shape_hint == "tilted_soft_candidate"
+    assert boxes[1].shape_limit_degrees == 15.0
+    assert rejected == []
+
+
+def test_region_v3_shape_modes_have_distinct_angle_policy():
+    import numpy as np
+    from video_translate.ocr.extractor import ExtractConfig, _ocr_frame
+
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    item = ("살짝 기울어진 자막", 0.95, [(30, 8), (150, 29), (147, 45), (27, 24)])
+
+    preferred = list(
+        _ocr_frame(
+            _FakeOCR([item]),
+            frame,
+            1.0,
+            3,
+            ExtractConfig(extraction_mode="region_v3", shape_mode="horizontal_preferred", auto_trim_side_noise=False),
+        )
+    )
+    strict_rejected = []
+    strict = list(
+        _ocr_frame(
+            _FakeOCR([item]),
+            frame,
+            1.0,
+            3,
+            ExtractConfig(extraction_mode="region_v3", shape_mode="horizontal_strict", auto_trim_side_noise=False),
+            rejected_boxes=strict_rejected,
+        )
+    )
+    unrestricted = list(
+        _ocr_frame(
+            _FakeOCR([item]),
+            frame,
+            1.0,
+            3,
+            ExtractConfig(extraction_mode="region_v3", shape_mode="unrestricted", auto_trim_side_noise=False),
+        )
+    )
+
+    assert len(preferred) == 1
+    assert strict == []
+    assert strict_rejected[0]["reason"] == "shape_angle_exceeds_horizontal_strict"
+    assert len(unrestricted) == 1
+
+
+def test_region_v2_ignores_shape_mode_and_preserves_legacy_json_shape():
+    import numpy as np
+    from video_translate.ocr.extractor import ExtractConfig, _ocr_frame
+
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    tilted = ("기울어진 글자", 0.95, [(40, 8), (140, 44), (136, 58), (36, 22)])
+
+    boxes = list(
+        _ocr_frame(
+            _FakeOCR([tilted]),
+            frame,
+            1.0,
+            3,
+            ExtractConfig(extraction_mode="region", shape_mode="horizontal_strict", auto_trim_side_noise=False),
+        )
+    )
+
+    assert len(boxes) == 1
+    assert boxes[0].polygon is None
+    assert boxes[0].angle_degrees is None
+    assert "polygon" not in boxes[0].to_dict()
+    assert "angle_degrees" not in boxes[0].to_dict()
+
+
 def test_timing_refinement_only_rescans_presence_boundaries():
     from video_translate.models import OCRBox
     from video_translate.ocr.extractor import _timing_refinement_frame_indexes
@@ -171,3 +270,50 @@ def test_timing_refinement_limits_large_sampling_gaps():
     indexes = _timing_refinement_frame_indexes({0: [], 60: visible}, frame_count=90, max_frames=24)
 
     assert indexes == list(range(61, 85))
+
+
+def test_timing_refinement_uses_sequential_decode_without_seeking(monkeypatch: pytest.MonkeyPatch):
+    import numpy as np
+
+    from video_translate.models import OCRBox
+    from video_translate.ocr import extractor
+
+    class _FakeCapture:
+        def __init__(self):
+            self.next_index = 0
+            self.read_indexes = []
+
+        def read(self):
+            index = self.next_index
+            self.next_index += 1
+            self.read_indexes.append(index)
+            return True, np.zeros((20, 40, 3), dtype=np.uint8)
+
+    visible = [OCRBox("안", (10, 10, 30, 30), 0.9, 0.0, 0, "bottom")]
+    frame_results = {
+        0: ([], "coarse"),
+        5: (visible, "coarse"),
+        10: (visible, "coarse"),
+        15: ([], "coarse"),
+    }
+    capture = _FakeCapture()
+    refined_indexes = []
+
+    def fake_ocr_frame(*args, **kwargs):
+        refined_indexes.append(args[3])
+        return []
+
+    monkeypatch.setattr(extractor, "_ocr_frame", fake_ocr_frame)
+
+    extractor._refine_timing_boundaries(
+        object(),
+        capture,
+        frame_results,
+        frame_count=20,
+        native_fps=30.0,
+        config=extractor.ExtractConfig(refine_timing_boundaries=True),
+    )
+
+    assert capture.read_indexes == list(range(15))
+    assert refined_indexes == [1, 2, 3, 4, 11, 12, 13, 14]
+    assert all(frame_results[index][1] == "timing_refine" for index in refined_indexes)

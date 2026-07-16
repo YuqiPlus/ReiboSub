@@ -372,6 +372,147 @@ def test_agent_can_download_video_for_ocr_preview_before_route_choice(monkeypatc
     assert snapshot["question"]["kind"] == "diagnose_ocr_asr"
     assert calls == ["video:https://www.youtube.com/watch?v=abc123"]
 
+
+def test_start_agent_session_maps_explicit_v2_as_one_coherent_pipeline(monkeypatch):
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    monkeypatch.setattr(web_agent, "_run_agent_async", lambda session_id, target: None)
+
+    session = web_agent.start_agent_session(
+        {
+            "url": "abc123",
+            "ocr_pipeline_version": "v2",
+            "ocr_extraction_mode": "auto",
+            "ocr_refinement_mode": "none",
+            "ocr_translation_mode": "standard_cleanup",
+            "ocr_shape_mode": "horizontal_strict",
+        }
+    )
+
+    assert session.payload["ocr_pipeline_version"] == "v2"
+    assert session.payload["ocr_extraction_mode"] == "region"
+    assert session.payload["ocr_refinement_mode"] == "llm_boxes"
+    assert session.payload["ocr_translation_mode"] == "translate_only"
+    assert session.payload["ocr_shape_mode"] == "unrestricted"
+
+
+def test_historical_unversioned_region_task_resumes_as_legacy_not_v2(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    source = tmp_path / "source.srt"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
+    task = {
+        "id": "legacy-region",
+        "url": "https://www.youtube.com/watch?v=abc123",
+        "title": "legacy",
+        "task_dir": str(tmp_path),
+        "payload": {
+            "ocr_extraction_mode": "region",
+            "ocr_refinement_mode": "none",
+            "ocr_translation_mode": "standard_cleanup",
+        },
+        "stages": {
+            "ocr": {
+                "status": "done",
+                "source_srt": str(source),
+                "ocr_extraction_mode": "region",
+                "ocr_refinement_mode": "none",
+            }
+        },
+    }
+
+    session = web_agent._agent_session_from_task(task)
+
+    assert session.payload["ocr_pipeline_version"] == "v1"
+    assert session.payload["ocr_extraction_mode"] == "auto"
+    assert session.payload["ocr_refinement_mode"] == "none"
+    assert session.payload["ocr_translation_mode"] == "standard_cleanup"
+
+
+def test_agent_answer_switches_to_v2_and_persists_pipeline_in_task(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    monkeypatch.setattr(web_agent, "_find_reusable_ocr_result", lambda **kwargs: None)
+    source = tmp_path / "source.srt"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"video")
+    glossary = tmp_path / "glossary.draft.yaml"
+    glossary.write_text("characters: []\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        web_agent,
+        "probe_video",
+        lambda url, **kwargs: {
+            "title": "demo",
+            "normalized_url": "https://www.youtube.com/watch?v=abc123",
+            "webpage_url": "https://www.youtube.com/watch?v=abc123",
+            "subtitles": [],
+            "agent_plan": {
+                "route": "ocr",
+                "selected_subtitle": None,
+                "requires_translation": True,
+                "confidence": 0.7,
+            },
+        },
+    )
+
+    def done_job(name, result):
+        return web_agent.Job(id=name, name=name, status="done", result=result)
+
+    def fake_ocr(payload):
+        captured.update(payload)
+        return done_job(
+            "ocr",
+            {"source_srt": str(source), "input_video": str(video), "output_dir": str(tmp_path)},
+        )
+
+    monkeypatch.setattr(web_agent, "ocr_extract_job", fake_ocr)
+    monkeypatch.setattr(
+        web_agent,
+        "generate_glossary_job",
+        lambda payload: done_job(
+            "glossary",
+            {"glossary_path": str(glossary), "content": "characters: []\n"},
+        ),
+    )
+
+    session = web_agent.start_agent_session(
+        {"url": "abc123", "embedded_subtitle_hint": "yes", "ocr_pipeline_version": "v1"}
+    )
+    _wait_agent_phase(session.id, "diagnose_ocr_asr")
+
+    web_agent.answer_agent_session(
+        session.id,
+        {
+            "action": "run_ocr",
+            "ocr_pipeline_version": "v2",
+            "ocr_extraction_mode": "auto",
+            "ocr_refinement_mode": "none",
+            "ocr_translation_mode": "standard_cleanup",
+            "ocr_shape_mode": "horizontal_strict",
+        },
+    )
+    snapshot = _wait_agent_phase(session.id, "review_glossary")
+    task = web_agent.get_agent_task(snapshot["result"]["task_id"])
+
+    expected_payload = {
+        "ocr_pipeline_version": "v2",
+        "ocr_extraction_mode": "region",
+        "ocr_refinement_mode": "llm_boxes",
+        "ocr_translation_mode": "translate_only",
+        "ocr_shape_mode": "unrestricted",
+    }
+    for key, value in expected_payload.items():
+        assert snapshot["payload"][key] == value
+        assert task["payload"][key] == value
+        assert captured[key if key != "ocr_translation_mode" else "translation_mode"] == value
+    assert task["stages"]["ocr"]["ocr_pipeline_version"] == "v2"
+    assert task["stages"]["ocr"]["ocr_extraction_mode"] == "region"
+    assert task["stages"]["ocr"]["ocr_refinement_mode"] == "llm_boxes"
+    assert task["stages"]["ocr"]["ocr_source_cleanup_mode"] == "none"
+    assert task["stages"]["ocr"]["ocr_translation_mode"] == "translate_only"
+    assert task["stages"]["ocr"]["ocr_shape_mode"] == "unrestricted"
+
+
 def test_agent_session_ocr_extracts_then_generates_glossary(monkeypatch, tmp_path):
     monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
     monkeypatch.setattr(web_agent, "_find_reusable_ocr_result", lambda **kwargs: None)
@@ -409,7 +550,7 @@ def test_agent_session_ocr_extracts_then_generates_glossary(monkeypatch, tmp_pat
     monkeypatch.setattr(
         web_agent,
         "ocr_extract_job",
-        lambda payload: calls.append(f"ocr:{payload['url']}") or done_job("ocr", {"source_srt": str(source), "input_video": str(video)}),
+        lambda payload: calls.append(f"ocr:{payload['url']}:{payload['ocr_extraction_mode']}:{payload['ocr_shape_mode']}") or done_job("ocr", {"source_srt": str(source), "input_video": str(video)}),
     )
     monkeypatch.setattr(
         web_agent,
@@ -417,7 +558,14 @@ def test_agent_session_ocr_extracts_then_generates_glossary(monkeypatch, tmp_pat
         lambda payload: calls.append(f"glossary:{payload['source_srt']}:{payload.get('source_language')}") or done_job("glossary", {"glossary_path": str(glossary), "content": "characters: []\n"}),
     )
 
-    session = web_agent.start_agent_session({"url": "abc123", "embedded_subtitle_hint": "yes"})
+    session = web_agent.start_agent_session(
+        {
+            "url": "abc123",
+            "embedded_subtitle_hint": "yes",
+            "ocr_extraction_mode": "region_v3",
+            "ocr_shape_mode": "horizontal_strict",
+        }
+    )
     snapshot = _wait_agent_phase(session.id, "diagnose_ocr_asr")
 
     assert snapshot["status"] == "waiting"
@@ -432,7 +580,7 @@ def test_agent_session_ocr_extracts_then_generates_glossary(monkeypatch, tmp_pat
     assert "OCR 原文字幕" in snapshot["question"]["message"]
     assert snapshot["result"]["source_kind"] == "ocr"
     assert Path(snapshot["result"]["source_srt"]).parts[-3:] == ("agent_tasks", "abc123_demo", "source.srt")
-    assert calls == ["ocr:https://www.youtube.com/watch?v=abc123", f"glossary:{snapshot['result']['source_srt']}:korean"]
+    assert calls == ["ocr:https://www.youtube.com/watch?v=abc123:region_v3:horizontal_strict", f"glossary:{snapshot['result']['source_srt']}:korean"]
 
 
 def test_agent_session_asr_generates_glossary(monkeypatch, tmp_path):
@@ -536,11 +684,19 @@ def test_agent_session_embedded_full_speech_runs_asr_with_ocr_reference(monkeypa
 
     monkeypatch.setattr(web_agent, "download_video_job", lambda payload: calls.append("video") or done_job("video", {"input_video": str(video)}))
     monkeypatch.setattr(web_agent, "audio_local_video_job", lambda payload: calls.append(f"asr:{payload['input_video']}") or done_job("asr", {"source_srt": str(asr_source), "input_video": str(video)}))
-    monkeypatch.setattr(web_agent, "ocr_local_video_job", lambda payload: calls.append(f"ocr_ref:{payload['input_video']}:{payload.get('extract_only')}") or done_job("ocr", {"source_srt": str(ocr_source), "input_video": str(video)}))
+    monkeypatch.setattr(web_agent, "ocr_local_video_job", lambda payload: calls.append(f"ocr_ref:{payload['input_video']}:{payload.get('extract_only')}:{payload['ocr_extraction_mode']}:{payload['ocr_shape_mode']}") or done_job("ocr", {"source_srt": str(ocr_source), "input_video": str(video)}))
     monkeypatch.setattr(web_agent, "correct_asr_subtitle_job", lambda payload: calls.append(f"correct:{payload['reference_srt']}") or done_job("correct", {"source_srt": str(corrected), "corrected_srt": str(corrected)}))
     monkeypatch.setattr(web_agent, "generate_glossary_job", lambda payload: calls.append(f"glossary:{payload['source_srt']}") or done_job("glossary", {"glossary_path": str(glossary), "content": "characters: []\n"}))
 
-    session = web_agent.start_agent_session({"url": "abc123", "embedded_subtitle_hint": "yes", "embedded_subtitle_goal": "full_speech"})
+    session = web_agent.start_agent_session(
+        {
+            "url": "abc123",
+            "embedded_subtitle_hint": "yes",
+            "embedded_subtitle_goal": "full_speech",
+            "ocr_extraction_mode": "region_v3",
+            "ocr_shape_mode": "horizontal_strict",
+        }
+    )
     snapshot = _wait_agent_phase(session.id, "diagnose_ocr_asr")
     assert any(option["action"] == "run_asr_with_ocr" for option in snapshot["question"]["options"])
 
@@ -549,7 +705,7 @@ def test_agent_session_embedded_full_speech_runs_asr_with_ocr_reference(monkeypa
 
     assert snapshot["result"]["source_kind"] == "asr_ocr_reference"
     assert Path(snapshot["result"]["source_srt"]).parts[-3:] == ("agent_tasks", "abc123_demo", "source.srt")
-    assert calls == ["video", f"asr:{video}", f"ocr_ref:{video}:True", f"correct:{ocr_source}", f"glossary:{snapshot['result']['source_srt']}"]
+    assert calls == ["video", f"asr:{video}", f"ocr_ref:{video}:True:region_v3:horizontal_strict", f"correct:{ocr_source}", f"glossary:{snapshot['result']['source_srt']}"]
 
 def test_agent_session_chinese_ocr_finishes_without_glossary(monkeypatch, tmp_path):
     monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
@@ -625,7 +781,15 @@ def test_ocr_full_job_chinese_ocr_uses_extract_mode(monkeypatch, tmp_path: Path)
 
     monkeypatch.setattr(web_agent, "_run_command", fake_run_command)
 
-    job = web_agent.ocr_full_job({"url": "abc123", "title": "demo", "ocr_language": "chinese"})
+    job = web_agent.ocr_full_job(
+        {
+            "url": "abc123",
+            "title": "demo",
+            "ocr_language": "chinese",
+            "ocr_extraction_mode": "region_v3",
+            "ocr_shape_mode": "horizontal_strict",
+        }
+    )
     deadline = time.time() + 2
     while job.status == "running" and time.time() < deadline:
         time.sleep(0.01)
@@ -635,6 +799,10 @@ def test_ocr_full_job_chinese_ocr_uses_extract_mode(monkeypatch, tmp_path: Path)
     config = yaml.safe_load(run_yaml.read_text(encoding="utf-8"))
     assert config["mode"] == "extract"
     assert config["source_language"] == "chinese"
+    assert config["ocr"]["extraction_mode"] == "region_v3"
+    assert config["ocr"]["shape_mode"] == "horizontal_strict"
+    assert config["agent_cache"]["ocr_shape_mode"] == "horizontal_strict"
+    assert job.result["ocr_shape_mode"] == "horizontal_strict"
     assert config["sidecar"]["copy_translated"] is False
     assert job.result["translated_srt"].endswith("zh.srt")
     assert Path(job.result["translated_srt"]).exists()
@@ -676,6 +844,324 @@ def test_agent_session_does_not_reuse_empty_task_ocr(monkeypatch, tmp_path):
     )
 
     assert cached is None
+
+
+def _write_cached_ocr_job(
+    jobs: Path,
+    *,
+    name: str,
+    input_video: Path,
+    cache: dict[str, object],
+) -> Path:
+    job_dir = jobs / name
+    job_dir.mkdir(parents=True)
+    source = job_dir / "source.srt"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
+    (job_dir / "run.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "mode": "extract",
+                "input_video": str(input_video),
+                "source_srt": str(source),
+                "agent_cache": cache,
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return source
+
+
+@pytest.mark.parametrize("matched_by", ["url", "title"])
+@pytest.mark.parametrize("legacy_refinement", ["none", "llm_boxes"])
+def test_v2_cache_rejects_unversioned_region_jobs_for_url_and_title_matches(
+    monkeypatch,
+    tmp_path: Path,
+    matched_by: str,
+    legacy_refinement: str,
+):
+    jobs = tmp_path / "jobs"
+    monkeypatch.setattr(web_agent, "JOB_DIR", jobs)
+    video = tmp_path / "Target Demo.mp4"
+    video.write_bytes(b"video")
+    cached_url = (
+        "https://www.youtube.com/watch?v=abc123"
+        if matched_by == "url"
+        else "https://www.youtube.com/watch?v=other123"
+    )
+    _write_cached_ocr_job(
+        jobs,
+        name=f"legacy-{matched_by}-{legacy_refinement}",
+        input_video=video,
+        cache={
+            "normalized_url": cached_url,
+            "ocr_translation_mode": "translate_only",
+            "ocr_scope": "bottom",
+            "ocr_extraction_mode": "region",
+            "ocr_refinement_mode": legacy_refinement,
+        },
+    )
+
+    cached = web_agent._find_reusable_ocr_result(
+        url="https://www.youtube.com/watch?v=abc123",
+        title="Target Demo",
+        translation_mode="standard_cleanup",
+        ocr_pipeline_version="v2",
+        ocr_scope="bottom",
+        ocr_extraction_mode="auto",
+        ocr_refinement_mode="none",
+    )
+
+    assert cached is None
+
+
+@pytest.mark.parametrize("matched_by", ["url", "title"])
+def test_v2_cache_reuses_only_versioned_v2_jobs(monkeypatch, tmp_path: Path, matched_by: str):
+    jobs = tmp_path / "jobs"
+    monkeypatch.setattr(web_agent, "JOB_DIR", jobs)
+    video = tmp_path / "Target Demo.mp4"
+    video.write_bytes(b"video")
+    cached_url = (
+        "https://www.youtube.com/watch?v=abc123"
+        if matched_by == "url"
+        else "https://www.youtube.com/watch?v=other123"
+    )
+    source = _write_cached_ocr_job(
+        jobs,
+        name=f"v2-{matched_by}",
+        input_video=video,
+        cache={
+            "normalized_url": cached_url,
+            "ocr_pipeline_version": "v2",
+            "ocr_translation_mode": "translate_only",
+            "ocr_source_cleanup_mode": "none",
+            "ocr_scope": "bottom",
+            "ocr_extraction_mode": "region",
+            "ocr_refinement_mode": "llm_boxes",
+        },
+    )
+
+    cached = web_agent._find_reusable_ocr_result(
+        url="https://www.youtube.com/watch?v=abc123",
+        title="Target Demo",
+        translation_mode="standard_cleanup",
+        ocr_pipeline_version="v2",
+        ocr_scope="bottom",
+        ocr_extraction_mode="auto",
+        ocr_refinement_mode="none",
+    )
+
+    assert cached is not None
+    assert cached["source_srt"] == str(source)
+    assert cached["matched_by"] == matched_by
+    assert cached["ocr_pipeline_version"] == "v2"
+    assert cached["ocr_source_cleanup_mode"] == "none"
+    assert cached["ocr_extraction_mode"] == "region"
+    assert cached["ocr_refinement_mode"] == "llm_boxes"
+    assert cached["ocr_translation_mode"] == "translate_only"
+
+
+def test_v1_cache_keeps_unversioned_legacy_auto_job_compatible(monkeypatch, tmp_path: Path):
+    jobs = tmp_path / "jobs"
+    monkeypatch.setattr(web_agent, "JOB_DIR", jobs)
+    video = tmp_path / "Legacy Demo.mp4"
+    video.write_bytes(b"video")
+    source = _write_cached_ocr_job(
+        jobs,
+        name="legacy-auto",
+        input_video=video,
+        cache={
+            "normalized_url": "https://www.youtube.com/watch?v=abc123",
+            "ocr_scope": "bottom",
+        },
+    )
+
+    cached = web_agent._find_reusable_ocr_result(
+        url="https://www.youtube.com/watch?v=abc123",
+        title="Legacy Demo",
+        translation_mode="translate_only",
+        ocr_pipeline_version="v1",
+        ocr_extraction_mode="region",
+        ocr_refinement_mode="llm_boxes",
+    )
+
+    assert cached is not None
+    assert cached["source_srt"] == str(source)
+    assert cached["ocr_pipeline_version"] == "v1"
+    assert cached["ocr_extraction_mode"] == "auto"
+    assert cached["ocr_refinement_mode"] == "none"
+    assert cached["ocr_translation_mode"] == "standard_cleanup"
+
+
+def test_v2_task_cache_requires_pipeline_version_metadata(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "missing-jobs")
+    task_dir = web_agent.TASK_DIR / "abc123_demo"
+    task_dir.mkdir(parents=True)
+    source = task_dir / "source.srt"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
+    task_path = task_dir / "task.yaml"
+    task_data = {
+        "id": "abc123_demo",
+        "url": "https://www.youtube.com/watch?v=abc123",
+        "title": "demo",
+        "stages": {
+            "ocr": {
+                "status": "done",
+                "source_srt": str(source),
+                "ocr_scope": "bottom",
+                "ocr_extraction_mode": "region",
+                "ocr_refinement_mode": "llm_boxes",
+            }
+        },
+    }
+    task_path.write_text(
+        yaml.safe_dump(task_data, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    query = {
+        "url": "https://www.youtube.com/watch?v=abc123",
+        "title": "demo",
+        "translation_mode": "standard_cleanup",
+        "ocr_pipeline_version": "v2",
+    }
+
+    assert web_agent._find_reusable_ocr_result(**query) is None
+
+    task_data["stages"]["ocr"]["ocr_pipeline_version"] = "v2"
+    task_data["stages"]["ocr"]["ocr_source_cleanup_mode"] = "none"
+    task_path.write_text(
+        yaml.safe_dump(task_data, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    cached = web_agent._find_reusable_ocr_result(**query)
+
+    assert cached is not None
+    assert cached["source_srt"] == str(source)
+    assert cached["ocr_pipeline_version"] == "v2"
+
+
+def test_reusable_ocr_job_cache_isolated_by_v3_shape_mode_and_keeps_old_region_compatible(monkeypatch, tmp_path):
+    jobs = tmp_path / "jobs"
+    monkeypatch.setattr(web_agent, "JOB_DIR", jobs)
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"video")
+
+    v3_dir = jobs / "v3"
+    v3_dir.mkdir(parents=True)
+    v3_source = v3_dir / "source.srt"
+    v3_source.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
+    (v3_dir / "run.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "mode": "extract",
+                "input_video": str(video),
+                "source_srt": str(v3_source),
+                "agent_cache": {
+                    "normalized_url": "https://www.youtube.com/watch?v=abc123",
+                    "ocr_scope": "bottom",
+                    "ocr_extraction_mode": "region_v3",
+                    "ocr_shape_mode": "horizontal_preferred",
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    assert web_agent._find_reusable_ocr_result(
+        url="https://www.youtube.com/watch?v=abc123",
+        title="demo",
+        translation_mode="standard_cleanup",
+        ocr_extraction_mode="region_v3",
+        ocr_shape_mode="horizontal_strict",
+    ) is None
+    cached_v3 = web_agent._find_reusable_ocr_result(
+        url="https://www.youtube.com/watch?v=abc123",
+        title="demo",
+        translation_mode="standard_cleanup",
+        ocr_extraction_mode="region_v3",
+        ocr_shape_mode="horizontal_preferred",
+    )
+    assert cached_v3 is not None
+    assert cached_v3["ocr_shape_mode"] == "horizontal_preferred"
+
+    old_dir = jobs / "old-region"
+    old_dir.mkdir()
+    old_source = old_dir / "source.srt"
+    old_source.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
+    (old_dir / "run.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "mode": "extract",
+                "input_video": str(video),
+                "source_srt": str(old_source),
+                "agent_cache": {
+                    "normalized_url": "https://www.youtube.com/watch?v=abc123",
+                    "ocr_scope": "bottom",
+                    "ocr_extraction_mode": "region",
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    cached_region = web_agent._find_reusable_ocr_result(
+        url="https://www.youtube.com/watch?v=abc123",
+        title="demo",
+        translation_mode="standard_cleanup",
+        ocr_extraction_mode="region",
+        ocr_shape_mode="horizontal_strict",
+    )
+    assert cached_region is not None
+    assert cached_region["ocr_shape_mode"] == "unrestricted"
+
+
+def test_reusable_ocr_task_cache_isolated_by_v3_shape_mode(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "missing-jobs")
+    task_dir = web_agent.TASK_DIR / "abc123_demo"
+    task_dir.mkdir(parents=True)
+    source = task_dir / "source.srt"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
+    (task_dir / "task.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "id": "abc123_demo",
+                "url": "https://www.youtube.com/watch?v=abc123",
+                "title": "demo",
+                "stages": {
+                    "ocr": {
+                        "status": "done",
+                        "source_srt": str(source),
+                        "ocr_scope": "bottom",
+                        "ocr_extraction_mode": "region_v3",
+                        "ocr_shape_mode": "horizontal_preferred",
+                        "ocr_refinement_mode": "none",
+                    }
+                },
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    assert web_agent._find_reusable_ocr_result(
+        url="https://www.youtube.com/watch?v=abc123",
+        title="demo",
+        translation_mode="standard_cleanup",
+        ocr_extraction_mode="region_v3",
+        ocr_shape_mode="horizontal_strict",
+    ) is None
+    cached = web_agent._find_reusable_ocr_result(
+        url="https://www.youtube.com/watch?v=abc123",
+        title="demo",
+        translation_mode="standard_cleanup",
+        ocr_extraction_mode="region_v3",
+        ocr_shape_mode="horizontal_preferred",
+    )
+    assert cached is not None
+    assert cached["ocr_shape_mode"] == "horizontal_preferred"
 
 
 def test_agent_session_reuses_cached_ocr_before_generating_glossary(monkeypatch, tmp_path):
@@ -1245,6 +1731,93 @@ def test_ocr_scope_settings_drive_generated_run_config(tmp_path: Path):
     assert web_agent._ocr_scope_settings("expanded") == {"bottom_ratio": 0.62, "scan_full_frame": False}
 
 
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        (
+            "v1",
+            {
+                "version": "v1",
+                "extraction_mode": "auto",
+                "refinement_mode": "none",
+                "source_cleanup_mode": "llm_context",
+                "translation_mode": "standard_cleanup",
+            },
+        ),
+        (
+            "v2",
+            {
+                "version": "v2",
+                "extraction_mode": "region",
+                "refinement_mode": "llm_boxes",
+                "source_cleanup_mode": "none",
+                "translation_mode": "translate_only",
+            },
+        ),
+        (
+            "v3",
+            {
+                "version": "v3",
+                "extraction_mode": "region_v3",
+                "refinement_mode": "llm_geometry",
+                "source_cleanup_mode": "none",
+                "translation_mode": "translate_only",
+            },
+        ),
+    ],
+)
+def test_explicit_ocr_pipeline_version_overrides_conflicting_advanced_settings(
+    tmp_path: Path,
+    version: str,
+    expected: dict[str, str],
+):
+    resolved = web_agent._resolve_ocr_pipeline(
+        version,
+        extraction_mode="region_v3",
+        refinement_mode="llm_boxes" if version == "v1" else "none",
+        translation_mode="readability_retime",
+        preserve_timing=version == "v1",
+    )
+    config = web_agent._ocr_config(
+        tmp_path / "demo.mp4",
+        tmp_path / version,
+        extra_hint="",
+        ocr_pipeline_version=version,
+        ocr_extraction_mode="region_v3",
+        ocr_refinement_mode="llm_boxes" if version == "v1" else "none",
+        translation_mode="readability_retime",
+        preserve_timing=version == "v1",
+    )
+
+    assert {key: resolved[key] for key in expected} == expected
+    assert {key: config["ocr_pipeline"][key] for key in expected} == expected
+    assert config["ocr"]["extraction_mode"] == expected["extraction_mode"]
+    assert config["ocr_refinement"]["mode"] == expected["refinement_mode"]
+    assert config["source_cleanup"]["mode"] == expected["source_cleanup_mode"]
+    assert config["translation"]["ocr_translation_mode"] == expected["translation_mode"]
+
+
+def test_unversioned_ocr_config_keeps_manual_advanced_settings_independent(tmp_path: Path):
+    config = web_agent._ocr_config(
+        tmp_path / "demo.mp4",
+        tmp_path / "custom",
+        extra_hint="",
+        ocr_extraction_mode="region",
+        ocr_refinement_mode="llm_boxes",
+        translation_mode="readability_retime",
+    )
+
+    expected = {
+        "version": "custom",
+        "label": "自定义 OCR 流程",
+        "extraction_mode": "region",
+        "refinement_mode": "llm_boxes",
+        "source_cleanup_mode": "llm_context",
+        "translation_mode": "readability_retime",
+    }
+    assert {key: config["ocr_pipeline"][key] for key in expected} == expected
+
+
 def test_ocr_config_region_extraction_mode_keeps_old_mode_separate(tmp_path: Path):
     config = web_agent._ocr_config(
         tmp_path / "demo.mp4",
@@ -1255,11 +1828,51 @@ def test_ocr_config_region_extraction_mode_keeps_old_mode_separate(tmp_path: Pat
     )
 
     assert config["ocr"]["extraction_mode"] == "region"
+    assert config["ocr"]["shape_mode"] == "unrestricted"
     assert config["ocr"]["sample_fps"] == 6.0
     assert config["ocr"]["scan_full_frame"] is False
     assert config["ocr"]["auto_trim_side_noise"] is False
     assert config["subtitle"]["snapshot_min_confidence"] == 0.35
     assert config["subtitle"]["min_duration_seconds"] == 0.35
+
+
+def test_ocr_config_region_v3_defaults_to_horizontal_preferred(tmp_path: Path):
+    config = web_agent._ocr_config(
+        tmp_path / "demo.mp4",
+        tmp_path / "job",
+        extra_hint="",
+        ocr_scope="smart_full",
+        ocr_extraction_mode="region_v3",
+    )
+
+    assert config["ocr"]["extraction_mode"] == "region_v3"
+    assert config["ocr"]["shape_mode"] == "horizontal_preferred"
+    assert config["ocr"]["sample_fps"] == 6.0
+    assert config["ocr"]["scan_full_frame"] is False
+    assert config["ocr"]["auto_trim_side_noise"] is False
+    assert config["subtitle"]["snapshot_min_confidence"] == 0.35
+
+
+def test_ocr_shape_mode_is_isolated_from_region_v2(tmp_path: Path):
+    v2 = web_agent._ocr_config(
+        tmp_path / "demo.mp4",
+        tmp_path / "v2",
+        extra_hint="",
+        ocr_extraction_mode="region",
+        ocr_shape_mode="horizontal_strict",
+    )
+    v3 = web_agent._ocr_config(
+        tmp_path / "demo.mp4",
+        tmp_path / "v3",
+        extra_hint="",
+        ocr_extraction_mode="region_v3",
+        ocr_shape_mode="horizontal_strict",
+    )
+
+    assert v2["ocr"]["shape_mode"] == "unrestricted"
+    assert v3["ocr"]["shape_mode"] == "horizontal_strict"
+    with pytest.raises(ValueError, match="未知 OCR 文字形态方式"):
+        web_agent._normalize_ocr_shape_mode("diagonal", "region_v3")
 
 
 
@@ -1301,7 +1914,7 @@ def test_ocr_config_includes_logo_exclude_region(tmp_path: Path):
     assert config["ocr"]["exclude_right_ratio"] == 0.04
 
 
-def test_ocr_development_job_writes_raw_region_ocr_config(monkeypatch, tmp_path):
+def test_ocr_development_job_runs_and_materializes_the_complete_v2_pipeline(monkeypatch, tmp_path):
     video = tmp_path / "demo.mp4"
     video.write_bytes(b"video")
     captured = {}
@@ -1315,7 +1928,7 @@ def test_ocr_development_job_writes_raw_region_ocr_config(monkeypatch, tmp_path)
         config = yaml.safe_load(Path(args[-1]).read_text(encoding="utf-8"))
         captured["config"] = config
         output_dir = Path(config["output_dir"])
-        for name in ["source.srt", "source.cleaned.srt", "source.before_cleanup.srt", "ocr_boxes.json", "ocr_sample_frames.json", "tracks.json"]:
+        for name in ["source.srt", "source.machine.srt", "source.refined.srt", "ocr_boxes.json", "ocr_sample_frames.json", "tracks.json"]:
             (output_dir / name).write_text("[]", encoding="utf-8")
 
     monkeypatch.setattr(web_agent, "_run_command", fake_run_command)
@@ -1340,22 +1953,199 @@ def test_ocr_development_job_writes_raw_region_ocr_config(monkeypatch, tmp_path)
     assert Path(snapshot["result"]["debug_video"]).exists()
     assert Path(snapshot["result"]["debug_source_srt"]).name == "demo.srt"
     assert Path(snapshot["result"]["debug_source_srt"]).read_text(encoding="utf-8") == "[]"
-    assert Path(snapshot["result"]["debug_cleaned_srt"]).name == "demo.cleaned.srt"
-    assert Path(snapshot["result"]["debug_cleaned_srt"]).read_text(encoding="utf-8") == "[]"
+    assert Path(snapshot["result"]["debug_machine_source_srt"]).name == "source.machine.srt"
+    assert Path(snapshot["result"]["debug_track_refined_srt"]).name == "source.track_refined.srt"
+    assert Path(snapshot["result"]["debug_track_refined_srt"]).read_text(encoding="utf-8") == "[]"
     assert captured["config"]["mode"] == "extract"
     assert captured["config"]["ocr"]["extraction_mode"] == "region"
+    assert captured["config"]["ocr"]["shape_mode"] == "unrestricted"
     assert captured["config"]["ocr"]["sample_fps"] == 8
     assert captured["config"]["ocr"]["min_confidence"] == 0.3
     assert captured["config"]["ocr"]["refine_timing_boundaries"] is True
     assert captured["config"]["subtitle"]["flicker_smoothing_max_duration_seconds"] == 0.8
     assert captured["config"]["ocr"]["auto_trim_side_noise"] is False
+    assert captured["config"]["ocr_refinement"]["mode"] == "llm_boxes"
+    assert snapshot["result"]["ocr_refinement_mode"] == "llm_boxes"
+    assert snapshot["result"]["refined_srt"].endswith("source.refined.srt")
     assert captured["config"]["source_cleanup"] == {
-        "mode": "llm_context",
+        "mode": "none",
         "batch_size": 18,
         "overlap": 3,
         "preserve_source": True,
     }
     assert captured["config"]["filters"] == {"ignored_texts": [], "ignored_contains": [], "ignored_patterns": []}
+
+
+def test_ocr_development_job_region_v3_enables_geometry_refinement_and_materializes_artifacts(monkeypatch, tmp_path):
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"video")
+    captured = {}
+
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "agent_jobs")
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "YoutubeDownloads")
+    monkeypatch.setattr(web_agent, "PYTHON", "/python")
+
+    def fake_run_command(job_id, args):
+        config = yaml.safe_load(Path(args[-1]).read_text(encoding="utf-8"))
+        captured["config"] = config
+        output_dir = Path(config["output_dir"])
+        artifacts = {
+            "source.srt": "v3 layered",
+            "source.machine.srt": "machine",
+            "source.geometry_refined.srt": "geometry refined",
+            "source.v3.refined.srt": "v3 text refined",
+            "source.v3.layered.srt": "v3 layered",
+            "ocr_geometry.json": '{"tracks": []}',
+            "ocr_v3_layers.json": '{"layers": []}',
+            "ocr_boxes.json": "[]",
+            "ocr_rejected_boxes.json": '{"boxes": []}',
+            "ocr_sample_frames.json": '{"frames": []}',
+            "tracks.json": "[]",
+        }
+        for name, content in artifacts.items():
+            (output_dir / name).write_text(content, encoding="utf-8")
+
+    monkeypatch.setattr(web_agent, "_run_command", fake_run_command)
+
+    job = web_agent.ocr_development_job(
+        {
+            "input_video": str(video),
+            "ocr_extraction_mode": "region_v3",
+            "ocr_shape_mode": "horizontal_preferred",
+            "llm_cleanup": True,
+        }
+    )
+    snapshot = _wait_job_status(job.id, "done")
+
+    config = captured["config"]
+    assert config["ocr"]["extraction_mode"] == "region_v3"
+    assert config["ocr"]["shape_mode"] == "horizontal_preferred"
+    assert config["ocr_refinement"] == {
+        "mode": "llm_geometry",
+        "batch_size": 8,
+        "context_overlap": 2,
+        "text_batch_size": 12,
+        "window_padding_seconds": 0.5,
+        "max_boxes_per_frame": 16,
+        "layered_batch_size": 8,
+        "layered_context_overlap": 1,
+    }
+    assert config["source_cleanup"]["mode"] == "none"
+    assert snapshot["result"]["ocr_refinement_mode"] == "llm_geometry"
+    assert snapshot["result"]["geometry_srt"].endswith("source.geometry_refined.srt")
+    assert snapshot["result"]["ocr_geometry"].endswith("ocr_geometry.json")
+    assert snapshot["result"]["v3_refined_srt"].endswith("source.v3.refined.srt")
+    assert snapshot["result"]["v3_layered_srt"].endswith("source.v3.layered.srt")
+    assert snapshot["result"]["ocr_v3_layers"].endswith("ocr_v3_layers.json")
+    assert snapshot["result"]["source_srt"].endswith("source.srt")
+    assert Path(snapshot["result"]["source_srt"]).read_text(encoding="utf-8") == "v3 layered"
+    assert Path(snapshot["result"]["debug_geometry_srt"]).read_text(encoding="utf-8") == "geometry refined"
+    assert Path(snapshot["result"]["debug_ocr_geometry"]).read_text(encoding="utf-8") == '{"tracks": []}'
+    assert Path(snapshot["result"]["debug_machine_source_srt"]).read_text(encoding="utf-8") == "machine"
+    assert Path(snapshot["result"]["debug_v3_refined_srt"]).read_text(encoding="utf-8") == "v3 text refined"
+    assert Path(snapshot["result"]["debug_v3_layered_srt"]).read_text(encoding="utf-8") == "v3 layered"
+    assert Path(snapshot["result"]["debug_ocr_v3_layers"]).read_text(encoding="utf-8") == '{"layers": []}'
+
+
+def test_ocr_development_job_region_v3_without_cleanup_skips_geometry_refinement(monkeypatch, tmp_path):
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"video")
+    captured = {}
+
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "agent_jobs")
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "YoutubeDownloads")
+    monkeypatch.setattr(web_agent, "PYTHON", "/python")
+
+    def fake_run_command(job_id, args):
+        config = yaml.safe_load(Path(args[-1]).read_text(encoding="utf-8"))
+        captured["config"] = config
+        output_dir = Path(config["output_dir"])
+        for name in ["source.srt", "ocr_boxes.json", "ocr_rejected_boxes.json", "ocr_sample_frames.json", "tracks.json"]:
+            (output_dir / name).write_text("[]", encoding="utf-8")
+
+    monkeypatch.setattr(web_agent, "_run_command", fake_run_command)
+
+    job = web_agent.ocr_development_job(
+        {
+            "input_video": str(video),
+            "ocr_extraction_mode": "region_v3",
+            "ocr_shape_mode": "horizontal_strict",
+            "llm_cleanup": False,
+        }
+    )
+    snapshot = _wait_job_status(job.id, "done")
+
+    assert captured["config"]["ocr"]["extraction_mode"] == "region_v3"
+    assert captured["config"]["ocr"]["shape_mode"] == "horizontal_strict"
+    assert captured["config"]["ocr_refinement"]["mode"] == "none"
+    assert captured["config"]["source_cleanup"]["mode"] == "none"
+    assert snapshot["result"]["ocr_extraction_mode"] == "region_v3"
+    assert snapshot["result"]["ocr_shape_mode"] == "horizontal_strict"
+    assert snapshot["result"]["ocr_refinement_mode"] == "none"
+    assert snapshot["result"]["geometry_srt"] == ""
+    assert snapshot["result"]["ocr_geometry"] == ""
+    assert Path(snapshot["result"]["debug_ocr_rejected_boxes"]).exists()
+
+
+def test_region_v2_debug_bundle_removes_stale_v3_geometry_artifacts(monkeypatch, tmp_path):
+    downloads = tmp_path / "YoutubeDownloads"
+    output_dir = tmp_path / "job"
+    output_dir.mkdir()
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"video")
+    (output_dir / "source.srt").write_text("", encoding="utf-8")
+    debug_dir = downloads / "debug" / "demo"
+    debug_dir.mkdir(parents=True)
+    stale_artifacts = [
+        debug_dir / "source.machine.srt",
+        debug_dir / "source.track_refined.srt",
+        debug_dir / "source.rebuilt.srt",
+        debug_dir / "source.layered.srt",
+        debug_dir / "ocr_layers.json",
+        debug_dir / "source.geometry_refined.srt",
+        debug_dir / "ocr_geometry.json",
+        debug_dir / "ocr_rejected_boxes.json",
+    ]
+    for stale in stale_artifacts:
+        stale.write_text("stale", encoding="utf-8")
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
+
+    result = web_agent._materialize_ocr_debug_bundle(video, output_dir)
+
+    assert all(not stale.exists() for stale in stale_artifacts)
+    assert "debug_machine_source_srt" not in result
+    assert "debug_geometry_srt" not in result
+    assert "debug_ocr_geometry" not in result
+    assert "debug_ocr_rejected_boxes" not in result
+
+
+def test_ocr3_debug_bundle_uses_a_separate_variant_folder_and_preserves_v2(monkeypatch, tmp_path):
+    downloads = tmp_path / "YoutubeDownloads"
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"video")
+    v2_output = tmp_path / "v2"
+    v3_output = tmp_path / "v3"
+    v2_output.mkdir()
+    v3_output.mkdir()
+    (v2_output / "source.srt").write_text("v2", encoding="utf-8")
+    (v3_output / "source.srt").write_text("v3", encoding="utf-8")
+    (v3_output / "source.geometry_refined.srt").write_text("v3", encoding="utf-8")
+    (v3_output / "ocr_geometry.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
+
+    v2 = web_agent._materialize_ocr_debug_bundle(video, v2_output)
+    v3 = web_agent._materialize_ocr_debug_bundle(
+        video,
+        v3_output,
+        debug_variant="ocr3_horizontal_preferred",
+    )
+
+    assert Path(v2["debug_dir"]) == downloads / "debug" / "demo"
+    assert Path(v3["debug_dir"]) == downloads / "debug" / "demo__ocr3_horizontal_preferred"
+    assert Path(v2["debug_source_srt"]).read_text(encoding="utf-8") == "v2"
+    assert Path(v3["debug_source_srt"]).read_text(encoding="utf-8") == "v3"
 
 
 
@@ -1399,6 +2189,142 @@ def test_ocr_exclude_preview_rect_uses_explicit_edges():
     assert rect["top"] == 4
     assert rect["width"] == 44
     assert rect["height"] == 14
+
+
+def test_ocr_v3_preferred_preview_keeps_tilted_text_as_soft_candidate(monkeypatch):
+    import numpy as np
+
+    class FakeOCR:
+        def predict(self, image, **kwargs):
+            return [
+                {
+                    "rec_texts": ["정상 자막", "기울어진 글자"],
+                    "rec_scores": [0.96, 0.94],
+                    "rec_polys": [
+                        [(20, 20), (150, 20), (150, 40), (20, 40)],
+                        [(20, 20), (140, 65), (135, 80), (15, 35)],
+                    ],
+                }
+            ]
+
+    monkeypatch.setattr(web_agent, "_ocr_preview_model", lambda language, device: FakeOCR())
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+
+    result = web_agent._ocr_preview_analysis(
+        frame,
+        {
+            "analyze_ocr": True,
+            "ocr_extraction_mode": "region_v3",
+            "ocr_shape_mode": "horizontal_preferred",
+            "ocr_crop_top_ratio": 0,
+            "ocr_crop_bottom_ratio": 0,
+            "ocr_crop_left_ratio": 0,
+            "ocr_crop_right_ratio": 0,
+            "ocr_min_confidence": 30,
+            "source_language": "korean",
+        },
+        time_seconds=1.25,
+        frame_index=30,
+    )
+
+    assert result is not None
+    assert result["shape_mode"] == "horizontal_preferred"
+    assert result["min_confidence"] == 0.3
+    assert [item["text"] for item in result["accepted"]] == ["정상 자막", "기울어진 글자"]
+    assert result["accepted"][0]["angle_degrees"] == 0.0
+    assert result["accepted"][0]["shape_hint"] == "horizontal_candidate"
+    assert result["accepted"][1]["shape_hint"] == "tilted_soft_candidate"
+    assert result["accepted"][1]["shape_limit_degrees"] == 15.0
+    assert result["rejected"] == []
+
+
+def test_ocr_v3_strict_preview_still_rejects_tilted_text(monkeypatch):
+    import numpy as np
+
+    class FakeOCR:
+        def predict(self, image, **kwargs):
+            return [
+                {
+                    "rec_texts": ["정상 자막", "기울어진 글자"],
+                    "rec_scores": [0.96, 0.94],
+                    "rec_polys": [
+                        [(20, 20), (150, 20), (150, 40), (20, 40)],
+                        [(20, 20), (140, 65), (135, 80), (15, 35)],
+                    ],
+                }
+            ]
+
+    monkeypatch.setattr(web_agent, "_ocr_preview_model", lambda language, device: FakeOCR())
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+
+    result = web_agent._ocr_preview_analysis(
+        frame,
+        {
+            "analyze_ocr": True,
+            "ocr_extraction_mode": "region_v3",
+            "ocr_shape_mode": "horizontal_strict",
+            "ocr_crop_top_ratio": 0,
+            "ocr_crop_bottom_ratio": 0,
+            "ocr_crop_left_ratio": 0,
+            "ocr_crop_right_ratio": 0,
+            "ocr_min_confidence": 30,
+            "source_language": "korean",
+        },
+        time_seconds=1.25,
+        frame_index=30,
+    )
+
+    assert result is not None
+    assert result["shape_mode"] == "horizontal_strict"
+    assert [item["text"] for item in result["accepted"]] == ["정상 자막"]
+    assert result["accepted"][0]["shape_hint"] == "horizontal_candidate"
+    assert [item["text"] for item in result["rejected"]] == ["기울어진 글자"]
+    assert result["rejected"][0]["reason"] == "shape_angle_exceeds_horizontal_strict"
+    assert result["rejected"][0]["shape_hint"] == "tilted_hard_reject"
+
+
+def test_ocr_v2_preview_does_not_load_ocr_model(monkeypatch):
+    monkeypatch.setattr(
+        web_agent,
+        "_ocr_preview_model",
+        lambda language, device: (_ for _ in ()).throw(AssertionError("OCR model should not load for 2.0 preview")),
+    )
+
+    result = web_agent._ocr_preview_analysis(
+        object(),
+        {"analyze_ocr": True, "ocr_extraction_mode": "region"},
+        time_seconds=0,
+        frame_index=0,
+    )
+
+    assert result is None
+
+
+def test_ocr_v3_preview_is_blocked_while_full_ocr_uses_gpu(monkeypatch):
+    monkeypatch.setattr(web_agent, "_OCR_ACTIVE_COMMANDS", 1)
+    monkeypatch.setattr(
+        web_agent,
+        "_ocr_preview_model",
+        lambda language, device: (_ for _ in ()).throw(AssertionError("preview model should remain unloaded")),
+    )
+
+    with pytest.raises(RuntimeError, match="完整 OCR 任务正在使用 GPU"):
+        web_agent._ocr_preview_analysis(
+            object(),
+            {
+                "analyze_ocr": True,
+                "ocr_extraction_mode": "region_v3",
+                "ocr_shape_mode": "horizontal_preferred",
+            },
+            time_seconds=0,
+            frame_index=0,
+        )
+
+
+def test_ocr_gpu_command_detection_covers_full_and_hybrid_runs():
+    assert web_agent._command_uses_ocr_gpu(["python", "/repo/run_from_config.py", "run.yaml"])
+    assert web_agent._command_uses_ocr_gpu(["python", "-m", "video_translate.tools.hybrid_anchor_ocr"])
+    assert not web_agent._command_uses_ocr_gpu(["python", "-m", "video_translate.tools.translate_subtitles"])
 
 
 def test_ocr_config_can_enable_llm_box_refinement(tmp_path: Path):
@@ -1976,6 +2902,14 @@ def test_list_local_assets_collects_videos_subtitles_and_ocr_jobs(tmp_path: Path
     run_yaml.write_text("mode: full\n", encoding="utf-8")
     (debug_dir / "demo-debug.srt").write_text("1\n", encoding="utf-8")
     (debug_dir / "demo-debug.cleaned.srt").write_text("1\n", encoding="utf-8")
+    (debug_dir / "source.layered.srt").write_text("1\n", encoding="utf-8")
+    (debug_dir / "source.machine.srt").write_text("machine\n", encoding="utf-8")
+    (debug_dir / "source.geometry_refined.srt").write_text("1\n", encoding="utf-8")
+    (debug_dir / "source.v3.refined.srt").write_text("v3 refined\n", encoding="utf-8")
+    (debug_dir / "source.v3.layered.srt").write_text("v3 layered\n", encoding="utf-8")
+    (debug_dir / "ocr_boxes.json").write_text("[]", encoding="utf-8")
+    (debug_dir / "ocr_geometry.json").write_text("{}", encoding="utf-8")
+    (debug_dir / "ocr_v3_layers.json").write_text("{}", encoding="utf-8")
     (downloads / "._demo.mp4").write_text("meta", encoding="utf-8")
 
     monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
@@ -1990,8 +2924,18 @@ def test_list_local_assets_collects_videos_subtitles_and_ocr_jobs(tmp_path: Path
     assert assets["projects"][0]["videos"][0]["path"] == str(video)
     assert assets["projects"][0]["subtitles"][0]["path"] == str(subtitle)
     assert assets["ocr_jobs"][0]["source_srt"].endswith("source.srt")
-    assert assets["ocr_debug_folders"][0]["source_srt"].endswith("demo-debug.srt")
+    assert assets["ocr_debug_folders"][0]["source_srt"].endswith("source.v3.layered.srt")
     assert assets["ocr_debug_folders"][0]["cleaned_srt"].endswith("demo-debug.cleaned.srt")
+    assert assets["ocr_debug_folders"][0]["layered_srt"].endswith("source.layered.srt")
+    assert assets["ocr_debug_folders"][0]["geometry_srt"].endswith("source.geometry_refined.srt")
+    assert assets["ocr_debug_folders"][0]["v3_refined_srt"].endswith("source.v3.refined.srt")
+    assert assets["ocr_debug_folders"][0]["v3_layered_srt"].endswith("source.v3.layered.srt")
+    assert assets["ocr_debug_folders"][0]["ocr_geometry"].endswith("ocr_geometry.json")
+    assert assets["ocr_debug_folders"][0]["ocr_v3_layers"].endswith("ocr_v3_layers.json")
+    assert assets["ocr_debug_folders"][0]["ocr_lab_version"] == "v3"
+    assert assets["ocr_debug_folders"][0]["ocr_version_label"] == "OCR 3.0"
+    assert assets["ocr_debug_folders"][0]["has_ocr_boxes"] is True
+    assert assets["ocr_debug_folders"][0]["has_machine_source"] is True
 
 
 
@@ -2117,7 +3061,14 @@ def test_ocr_extract_job_downloads_ocr_compatible_video(monkeypatch, tmp_path: P
 
     monkeypatch.setattr(web_agent, "_run_command", fake_run_command)
 
-    job = web_agent.ocr_extract_job({"url": "abc123", "title": "Target Video"})
+    job = web_agent.ocr_extract_job(
+        {
+            "url": "abc123",
+            "title": "Target Video",
+            "ocr_extraction_mode": "region_v3",
+            "ocr_shape_mode": "horizontal_strict",
+        }
+    )
     snapshot = _wait_job_status(job.id, "done")
 
     assert snapshot["status"] == "done"
@@ -2152,7 +3103,14 @@ def test_ocr_extract_job_uses_existing_file_matching_title(monkeypatch, tmp_path
 
     monkeypatch.setattr(web_agent, "_run_command", fake_run_command)
 
-    job = web_agent.ocr_extract_job({"url": "abc123", "title": "Target Video"})
+    job = web_agent.ocr_extract_job(
+        {
+            "url": "abc123",
+            "title": "Target Video",
+            "ocr_extraction_mode": "region_v3",
+            "ocr_shape_mode": "horizontal_strict",
+        }
+    )
     snapshot = _wait_job_status(job.id, "done")
 
     assert snapshot["result"]["input_video"] == str(target)
@@ -2161,6 +3119,10 @@ def test_ocr_extract_job_uses_existing_file_matching_title(monkeypatch, tmp_path
     config = yaml.safe_load(run_config.read_text(encoding="utf-8"))
     manifest = yaml.safe_load((target.parent / "project.yaml").read_text(encoding="utf-8"))
     assert config["input_video"] == str(target)
+    assert config["ocr"]["extraction_mode"] == "region_v3"
+    assert config["ocr"]["shape_mode"] == "horizontal_strict"
+    assert config["agent_cache"]["ocr_shape_mode"] == "horizontal_strict"
+    assert snapshot["result"]["ocr_shape_mode"] == "horizontal_strict"
     assert manifest["normalized_url"] == "https://www.youtube.com/watch?v=abc123"
 
 
@@ -2845,3 +3807,309 @@ def test_rebuild_ocr_debug_with_llm_uses_existing_json(monkeypatch, tmp_path):
     assert (debug_dir / "source.track_refined.srt").read_text(encoding="utf-8") == "refined"
     assert any("video decoding is skipped" in line for line in snapshot["logs"])
     assert "ocr_refine: 1 cues in 1 batches" in snapshot["logs"]
+
+
+def test_refine_ocr_debug_layers_uses_ocr2_refined_source_and_materializes_outputs(monkeypatch, tmp_path):
+    debug_dir = tmp_path / "YoutubeDownloads" / "debug" / "demo"
+    debug_dir.mkdir(parents=True)
+    raw_source = debug_dir / "source.machine.srt"
+    raw_source.write_text("machine", encoding="utf-8")
+    refined_source = debug_dir / "source.track_refined.srt"
+    refined_source.write_text("ocr2 refined", encoding="utf-8")
+    (debug_dir / "source.rebuilt.srt").write_text("rebuilt", encoding="utf-8")
+    boxes = debug_dir / "ocr_boxes.json"
+    boxes.write_text("[]", encoding="utf-8")
+    captured = {}
+
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "YoutubeDownloads")
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "agent_jobs")
+
+    def fake_refine(source, ocr_boxes, output, debug_json, *, recovery_srt, config, progress_callback):
+        captured.update(
+            {
+                "source": source,
+                "boxes": ocr_boxes,
+                "output": output,
+                "debug_json": debug_json,
+                "recovery_srt": recovery_srt,
+                "config": config,
+            }
+        )
+        progress_callback("layered_refine: 1 cues in 1 batches")
+        output.write_text("layered", encoding="utf-8")
+        debug_json.write_text("{}", encoding="utf-8")
+        return {"layered_srt": output, "layers_json": debug_json}
+
+    monkeypatch.setattr(web_agent, "refine_ocr_layers_with_llm", fake_refine)
+
+    job = web_agent.refine_ocr_debug_layers_job({"debug_dir": str(debug_dir)})
+    snapshot = _wait_job_status(job.id, "done")
+
+    assert captured["source"] == refined_source
+    assert captured["recovery_srt"] == raw_source
+    assert captured["boxes"] == boxes
+    assert isinstance(captured["config"], web_agent.LayeredOCRRefinementConfig)
+    assert (debug_dir / "source.layered.srt").read_text(encoding="utf-8") == "layered"
+    assert (debug_dir / "ocr_layers.json").read_text(encoding="utf-8") == "{}"
+    assert snapshot["result"]["source_layered_srt"] == str(debug_dir / "source.layered.srt")
+    assert snapshot["result"]["ocr_layers"] == str(debug_dir / "ocr_layers.json")
+    assert any("video decoding is skipped" in line for line in snapshot["logs"])
+    assert "layered_refine: 1 cues in 1 batches" in snapshot["logs"]
+
+
+def test_refine_ocr_debug_layers_reuses_v3_text_result_without_rerunning_earlier_stages(
+    monkeypatch,
+    tmp_path,
+):
+    debug_dir = (
+        tmp_path
+        / "YoutubeDownloads"
+        / "debug"
+        / "demo__ocr3_horizontal_preferred"
+    )
+    debug_dir.mkdir(parents=True)
+    (debug_dir / "run.yaml").write_text(
+        "ocr:\n  extraction_mode: region_v3\n  shape_mode: horizontal_preferred\n",
+        encoding="utf-8",
+    )
+    machine_source = debug_dir / "source.machine.srt"
+    machine_source.write_text("machine", encoding="utf-8")
+    refined_source = debug_dir / "source.v3.refined.srt"
+    refined_source.write_text("v3 refined", encoding="utf-8")
+    old_source = debug_dir / "source.srt"
+    old_source.write_text("old source stays", encoding="utf-8")
+    boxes = debug_dir / "ocr_boxes.json"
+    boxes.write_text("[]", encoding="utf-8")
+    geometry = debug_dir / "ocr_geometry.json"
+    geometry.write_text("{}", encoding="utf-8")
+    captured = {}
+
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "YoutubeDownloads")
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "agent_jobs")
+
+    def fake_refine(
+        source,
+        ocr_boxes,
+        output,
+        debug_json,
+        *,
+        recovery_srt,
+        geometry_json,
+        config,
+        progress_callback,
+    ):
+        captured.update(
+            {
+                "source": source,
+                "boxes": ocr_boxes,
+                "recovery_srt": recovery_srt,
+                "geometry_json": geometry_json,
+                "config": config,
+            }
+        )
+        progress_callback("layered_refine: 1 cues in 1 batches")
+        output.write_text("v3 layered", encoding="utf-8")
+        debug_json.write_text("{}", encoding="utf-8")
+        return {"layered_srt": output, "layers_json": debug_json}
+
+    monkeypatch.setattr(web_agent, "refine_ocr_layers_with_llm", fake_refine)
+
+    job = web_agent.refine_ocr_debug_layers_job({"debug_dir": str(debug_dir)})
+    snapshot = _wait_job_status(job.id, "done")
+
+    assert captured["source"] == refined_source
+    assert captured["boxes"] == boxes
+    assert captured["recovery_srt"] == machine_source
+    assert captured["geometry_json"] == geometry
+    assert captured["config"].pipeline_version == "v3"
+    assert old_source.read_text(encoding="utf-8") == "old source stays"
+    assert (debug_dir / "source.v3.layered.srt").read_text(encoding="utf-8") == "v3 layered"
+    assert (debug_dir / "ocr_v3_layers.json").read_text(encoding="utf-8") == "{}"
+    assert snapshot["result"]["source_v3_layered_srt"] == str(debug_dir / "source.v3.layered.srt")
+    assert snapshot["result"]["ocr_v3_layers"] == str(debug_dir / "ocr_v3_layers.json")
+    assert snapshot["result"]["v3_layered_only"] is True
+    assert any("text refinement is skipped" in line for line in snapshot["logs"])
+
+
+def test_refine_ocr_debug_geometry_uses_saved_polygon_json_without_video_decode(monkeypatch, tmp_path):
+    debug_dir = tmp_path / "YoutubeDownloads" / "debug" / "demo"
+    debug_dir.mkdir(parents=True)
+    tracks = debug_dir / "tracks.json"
+    tracks.write_text("[]", encoding="utf-8")
+    boxes = debug_dir / "ocr_boxes.json"
+    boxes.write_text(
+        '[{"text":"기울어진 글자","bbox":[20,20,140,80],"confidence":0.94,'
+        '"time":1.25,"frame_index":30,"region":"bottom",'
+        '"polygon":[[20,20],[140,65],[135,80],[15,35]],"angle_degrees":20.5,'
+        '"shape_hint":"tilted_soft_candidate"}]',
+        encoding="utf-8",
+    )
+    (debug_dir / "run.yaml").write_text(
+        "ocr:\n  sample_fps: 8\nsubtitle:\n  min_duration_seconds: 0.35\n",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "YoutubeDownloads")
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "agent_jobs")
+
+    def fake_refine(tracks_path, boxes_path, output, debug_json, *, cue_timing, config, progress_callback):
+        captured.update(
+            {
+                "tracks": tracks_path,
+                "boxes": boxes_path,
+                "output": output,
+                "debug_json": debug_json,
+                "timing": cue_timing,
+                "config": config,
+            }
+        )
+        progress_callback("ocr3_geometry_refine: 1 tracks in 1 batches")
+        output.write_text("geometry refined", encoding="utf-8")
+        debug_json.write_text('{"tracks": []}', encoding="utf-8")
+        return {"geometry_srt": output, "geometry_json": debug_json}
+
+    monkeypatch.setattr(web_agent, "refine_ocr_geometry_with_llm", fake_refine)
+
+    job = web_agent.refine_ocr_debug_geometry_job({"debug_dir": str(debug_dir)})
+    snapshot = _wait_job_status(job.id, "done")
+
+    assert captured["tracks"] == tracks
+    assert captured["boxes"] == boxes
+    assert captured["timing"].sample_interval_seconds == pytest.approx(1 / 8)
+    assert isinstance(captured["config"], web_agent.GeometryRefinementConfig)
+    assert captured["config"].batch_size == 8
+    assert captured["config"].max_observations_per_track == 10
+    assert not any(path.suffix.lower() in {".mp4", ".mkv", ".webm"} for path in debug_dir.iterdir())
+    assert (debug_dir / "source.geometry_refined.srt").read_text(encoding="utf-8") == "geometry refined"
+    assert (debug_dir / "ocr_geometry.json").read_text(encoding="utf-8") == '{"tracks": []}'
+    assert snapshot["result"]["source_geometry_refined_srt"] == str(debug_dir / "source.geometry_refined.srt")
+    assert snapshot["result"]["ocr_geometry"] == str(debug_dir / "ocr_geometry.json")
+    assert any("video decoding is skipped" in line for line in snapshot["logs"])
+    assert "ocr3_geometry_refine: 1 tracks in 1 batches" in snapshot["logs"]
+
+
+def test_refine_ocr_debug_geometry_rejects_legacy_boxes_without_geometry(monkeypatch, tmp_path):
+    debug_dir = tmp_path / "YoutubeDownloads" / "debug" / "demo"
+    debug_dir.mkdir(parents=True)
+    (debug_dir / "tracks.json").write_text("[]", encoding="utf-8")
+    (debug_dir / "ocr_boxes.json").write_text(
+        '[{"text":"일반 자막","bbox":[20,20,140,40],"confidence":0.95,'
+        '"time":1.25,"frame_index":30,"region":"bottom"}]',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "YoutubeDownloads")
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "agent_jobs")
+
+    with pytest.raises(ValueError, match="没有 OCR 3.0 几何信息"):
+        web_agent.refine_ocr_debug_geometry_job({"debug_dir": str(debug_dir)})
+
+
+@pytest.mark.parametrize("with_geometry", [True, False])
+def test_refine_ocr_debug_v3_reuses_saved_machine_boxes_and_writes_new_artifacts(
+    monkeypatch,
+    tmp_path,
+    with_geometry,
+):
+    debug_dir = tmp_path / "YoutubeDownloads" / "debug" / "demo__ocr3_horizontal_preferred"
+    debug_dir.mkdir(parents=True)
+    original_source = debug_dir / "source.srt"
+    original_source.write_text("old main source", encoding="utf-8")
+    machine = debug_dir / "source.machine.srt"
+    machine.write_text("machine baseline", encoding="utf-8")
+    boxes = debug_dir / "ocr_boxes.json"
+    boxes.write_text("[]", encoding="utf-8")
+    geometry = debug_dir / "ocr_geometry.json"
+    if with_geometry:
+        geometry.write_text('{"tracks": [{"id": 1}]}', encoding="utf-8")
+    (debug_dir / "run.yaml").write_text(
+        "ocr:\n  extraction_mode: region_v3\n  shape_mode: horizontal_preferred\n",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "YoutubeDownloads")
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "agent_jobs")
+
+    def fake_text_refine(source, ocr_boxes, output, *, config, progress_callback):
+        captured.update(
+            {
+                "text_source": source,
+                "text_boxes": ocr_boxes,
+                "text_config": config,
+            }
+        )
+        progress_callback("ocr_refine: v3 text")
+        output.write_text("v3 text refined", encoding="utf-8")
+        return {"refined_srt": output}
+
+    def fake_layered_refine(
+        source,
+        ocr_boxes,
+        output,
+        debug_json,
+        *,
+        recovery_srt,
+        geometry_json,
+        config,
+        progress_callback,
+    ):
+        captured.update(
+            {
+                "layered_source": source,
+                "layered_boxes": ocr_boxes,
+                "recovery_srt": recovery_srt,
+                "geometry_json": geometry_json,
+                "layered_config": config,
+            }
+        )
+        progress_callback("ocr_layered_refine: v3 final")
+        output.write_text("v3 layered final", encoding="utf-8")
+        debug_json.write_text('{"layers": []}', encoding="utf-8")
+        return {"layered_srt": output, "layers_json": debug_json}
+
+    monkeypatch.setattr(web_agent, "refine_ocr_source_with_llm", fake_text_refine)
+    monkeypatch.setattr(web_agent, "refine_ocr_layers_with_llm", fake_layered_refine)
+
+    job = web_agent.refine_ocr_debug_v3_job({"debug_dir": str(debug_dir)})
+    snapshot = _wait_job_status(job.id, "done")
+
+    assert captured["text_source"] == machine
+    assert captured["text_boxes"] == boxes
+    assert isinstance(captured["text_config"], web_agent.OCRRefinementConfig)
+    assert captured["layered_source"].name == "source.v3.refined.srt"
+    assert captured["layered_boxes"] == boxes
+    assert captured["recovery_srt"] == machine
+    assert captured["geometry_json"] == (geometry if with_geometry else None)
+    assert isinstance(captured["layered_config"], web_agent.LayeredOCRRefinementConfig)
+    assert captured["layered_config"].pipeline_version == "v3"
+    assert (debug_dir / "source.v3.refined.srt").read_text(encoding="utf-8") == "v3 text refined"
+    assert (debug_dir / "source.v3.layered.srt").read_text(encoding="utf-8") == "v3 layered final"
+    assert (debug_dir / "ocr_v3_layers.json").read_text(encoding="utf-8") == '{"layers": []}'
+    assert original_source.read_text(encoding="utf-8") == "old main source"
+    assert snapshot["result"]["source_srt"] == str(debug_dir / "source.v3.layered.srt")
+    assert snapshot["result"]["v3_refined_srt"] == str(debug_dir / "source.v3.refined.srt")
+    assert snapshot["result"]["v3_layered_srt"] == str(debug_dir / "source.v3.layered.srt")
+    assert snapshot["result"]["ocr_v3_layers"] == str(debug_dir / "ocr_v3_layers.json")
+    assert snapshot["result"]["ocr_geometry"] == (str(geometry) if with_geometry else "")
+    assert any("video decoding is skipped" in line for line in snapshot["logs"])
+
+
+def test_refine_ocr_debug_v3_rejects_v2_directory(monkeypatch, tmp_path):
+    debug_dir = tmp_path / "YoutubeDownloads" / "debug" / "demo"
+    debug_dir.mkdir(parents=True)
+    (debug_dir / "source.machine.srt").write_text("machine", encoding="utf-8")
+    (debug_dir / "ocr_boxes.json").write_text("[]", encoding="utf-8")
+    (debug_dir / "run.yaml").write_text("ocr:\n  extraction_mode: region\n", encoding="utf-8")
+
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "YoutubeDownloads")
+
+    with pytest.raises(ValueError, match="只能用于 OCR 3.0"):
+        web_agent.refine_ocr_debug_v3_job({"debug_dir": str(debug_dir)})

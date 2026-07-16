@@ -393,6 +393,11 @@ def build_ocr_refinement_payload(
         },
         ensure_ascii=False,
     )
+    angle_instruction = (
+        "若 token_candidates 包含 average_abs_angle_degrees，数值越大表示文字越倾斜，可作为 scene_text/noise 的视觉证据；"
+        if any(box.angle_degrees is not None for box in boxes)
+        else ""
+    )
     return {
         "model": model,
         "messages": [
@@ -406,6 +411,7 @@ def build_ocr_refinement_payload(
                     "真实台词、节目效果字幕、剧情说明即使字体夸张或识别略有错误也应保留。"
                     "evidence_strength=single_sample 的条目不可单独保留，只能与前后相关字幕合并，否则必须删除。"
                     "reading_candidates 是同一字幕在不同帧的完整候选，token_candidates 给出文字块跨帧支持度；"
+                    f"{angle_instruction}"
                     "候选之间不是前后相接的文本，绝对不要串接 machine_text 与候选。"
                     "重构时依据跨帧支持度和视觉顺序；少数帧若提供更符合原语言正字规则的近似写法，可保守校正一两个字符。"
                     "输出前检查重复词句、无证据扩写和低支持度乱码。每个 target_id 必须且只能被一个动作覆盖。"
@@ -454,6 +460,7 @@ def _cue_evidence_payload(cue: SubtitleCue, boxes: list[OCRBox], config: OCRRefi
     token_frames: dict[str, set[int]] = defaultdict(set)
     token_confidence: dict[str, list[float]] = defaultdict(list)
     token_boxes: dict[str, list[tuple[float, float, float, float]]] = defaultdict(list)
+    token_angles: dict[str, list[float]] = defaultdict(list)
     region_frames: dict[str, set[int]] = defaultdict(set)
     for box in cue_boxes:
         text = box.text.strip()
@@ -462,20 +469,26 @@ def _cue_evidence_payload(cue: SubtitleCue, boxes: list[OCRBox], config: OCRRefi
         token_frames[text].add(box.frame_index)
         token_confidence[text].append(box.confidence)
         token_boxes[text].append(box.bbox)
+        if box.angle_degrees is not None:
+            token_angles[text].append(box.angle_degrees)
         region_frames[box.region].add(box.frame_index)
 
     token_candidates = []
     for text in sorted(token_frames, key=lambda item: (len(token_frames[item]), sum(token_confidence[item]), len(item)), reverse=True):
         bboxes = token_boxes[text]
-        token_candidates.append(
-            {
-                "text": text,
-                "frames": len(token_frames[text]),
-                "support_ratio": round(len(token_frames[text]) / max(1, len(frames)), 3),
-                "average_confidence": round(sum(token_confidence[text]) / len(token_confidence[text]), 3),
-                "average_bbox": [round(sum(bbox[index] for bbox in bboxes) / len(bboxes), 1) for index in range(4)],
-            }
-        )
+        candidate = {
+            "text": text,
+            "frames": len(token_frames[text]),
+            "support_ratio": round(len(token_frames[text]) / max(1, len(frames)), 3),
+            "average_confidence": round(sum(token_confidence[text]) / len(token_confidence[text]), 3),
+            "average_bbox": [round(sum(bbox[index] for bbox in bboxes) / len(bboxes), 1) for index in range(4)],
+        }
+        if token_angles[text]:
+            candidate["average_abs_angle_degrees"] = round(
+                sum(abs(angle) for angle in token_angles[text]) / len(token_angles[text]),
+                3,
+            )
+        token_candidates.append(candidate)
         if len(token_candidates) >= config.max_token_candidates:
             break
 
