@@ -1,9 +1,12 @@
 .cache/
 models/
-.env
-.env.backup.*
+.env*
+!.env.example
 configs/run.yaml
 configs/llm.yaml
+configs/app_settings.yaml
+configs/provider_secrets.yaml
+configs/local_runtime.yaml
 outputs/
 frontend/node_modules/
 frontend/dist/
@@ -12,8 +15,35 @@ frontend/dist/
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 .vscode/
 docs/superpowers/plans/
+*.log
+*.pid
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.jks
+.netrc
+cookies*.txt
+credentials*.json
+service-account*.json
+*-service-account.json
+.agents/
+.codex/
+configs/*.bak
+configs/*.backup
+configs/provider_secrets.yaml.*
+configs/local_runtime.yaml.*
+configs/app_settings.yaml.*
+configs/providers/*.bak
+configs/providers/*.backup
 
 # Local downloaded media and generated subtitle/video artifacts
 YoutubeDownloads/
@@ -43,3 +73,6 @@ configs/glossaries/*
 !configs/glossaries/
 !configs/glossaries/examples/
 !configs/glossaries/examples/glossary.example.yaml
+configs/providers/*
+!configs/providers/README.md
+!configs/providers/*.yml.example
