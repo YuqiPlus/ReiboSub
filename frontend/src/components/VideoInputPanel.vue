@@ -70,12 +70,13 @@
     </div>
     <div class="mode-row">
       <label for="ocrTranslationMode">OCR 翻译处理模式</label>
-      <select id="ocrTranslationMode" :value="ocrTranslationMode" @change="$emit('update:ocrTranslationMode', $event.target.value)">
+      <select id="ocrTranslationMode" :value="ocrExtractionMode === 'region_v3' ? 'translate_only' : ocrTranslationMode" :disabled="ocrExtractionMode === 'region_v3'" @change="$emit('update:ocrTranslationMode', $event.target.value)">
         <option value="translate_only">锁定时间轴：只翻译文本</option>
         <option value="standard_cleanup">标准清理：去重复和残片</option>
         <option value="readability_retime">强力精修：优化阅读时长</option>
       </select>
-      <span class="muted">内嵌字幕稳定时选锁定时间轴；OCR 有闪字/残片时选标准或强力</span>
+      <span v-if="ocrExtractionMode === 'region_v3'" class="muted">OCR 3.0 固定锁定几何精修后的原时间轴，只翻译文本。</span>
+      <span v-else class="muted">内嵌字幕稳定时选锁定时间轴；OCR 有闪字/残片时选标准或强力</span>
     </div>
     <div class="mode-row">
       <label>OCR 模式</label>
@@ -90,8 +91,18 @@
       <div class="segmented">
         <button type="button" :class="{ active: ocrExtractionMode === 'auto' }" @click="$emit('update:ocrExtractionMode', 'auto')">自动主字幕</button>
         <button type="button" :class="{ active: ocrExtractionMode === 'region' }" @click="$emit('update:ocrExtractionMode', 'region')">区域 OCR</button>
+        <button type="button" :class="{ active: ocrExtractionMode === 'region_v3' }" @click="$emit('update:ocrExtractionMode', 'region_v3')">OCR 3.0（几何精修实验）</button>
       </div>
       <span class="muted">区域 OCR 会信任绿色裁剪框里的文字，不走原来的 logo/主字幕分类；旧自动模式不变。</span>
+    </div>
+    <div v-if="ocrExtractionMode === 'region_v3'" class="mode-row">
+      <label for="ocrShapeMode">文字形态策略</label>
+      <select id="ocrShapeMode" :value="ocrShapeMode" @change="$emit('update:ocrShapeMode', $event.target.value)">
+        <option value="unrestricted">不限形态（不按角度预判）</option>
+        <option value="horizontal_preferred">横向优先（推荐，软标记）</option>
+        <option value="horizontal_strict">严格近水平（硬过滤）</option>
+      </select>
+      <span class="muted">3.0 参考文字行角度：横向优先会保留倾斜候选并交给几何 LLM，严格近水平才会在识别阶段硬过滤。</span>
     </div>
     <div class="mode-row">
       <label>裁剪预设</label>
@@ -105,6 +116,10 @@
     <OcrCropControls
       :input-video="inputVideo"
       :ocr-scope="ocrScope"
+      :ocr-extraction-mode="ocrExtractionMode"
+      :ocr-shape-mode="ocrShapeMode"
+      :source-language="sourceLanguage"
+      :ocr-language="ocrLanguage"
       :ocr-crop-top-ratio="ocrCropTopRatio"
       :ocr-crop-bottom-ratio="ocrCropBottomRatio"
       :ocr-crop-left-ratio="ocrCropLeftRatio"
@@ -124,13 +139,18 @@
       @update:ocr-exclude-left-ratio="$emit('update:ocrExcludeLeftRatio', $event)"
       @update:ocr-exclude-right-ratio="$emit('update:ocrExcludeRightRatio', $event)"
     />
-    <div class="mode-row">
+    <div v-if="ocrExtractionMode !== 'region_v3'" class="mode-row">
       <label for="ocrRefinementMode">OCR 原文精修</label>
       <select id="ocrRefinementMode" :value="ocrRefinementMode" @change="$emit('update:ocrRefinementMode', $event.target.value)">
         <option value="none">关闭：使用当前机器分段</option>
         <option value="llm_boxes">新版：LLM 参考原始 OCR 框精修</option>
       </select>
       <span class="muted">新版会把逐帧文字框和机器分段一起交给 LLM，适合减少误换行、闪字和孤立噪声</span>
+    </div>
+    <div v-else class="mode-row">
+      <label>OCR 3.0 原文精修</label>
+      <b>专属几何 LLM（自动启用）</b>
+      <span class="muted">先按轨迹计算移动、缩放、旋转和透视证据，再由独立 3.0 策略保守决定；不会再接旧版文本去噪。</span>
     </div>
     <div class="status" :class="statusClass">{{ status }}</div>
   </section>
@@ -143,6 +163,7 @@ const props = defineProps({
   ocrTranslationMode: { type: String, default: 'standard_cleanup' },
   ocrScope: { type: String, default: 'bottom' },
   ocrExtractionMode: { type: String, default: 'auto' },
+  ocrShapeMode: { type: String, default: 'horizontal_preferred' },
   inputVideo: { type: String, default: '' },
   ocrCropTopRatio: { type: Number, default: 0.58 },
   ocrCropBottomRatio: { type: Number, default: 0 },
@@ -163,7 +184,7 @@ const props = defineProps({
   status: { type: String, default: '' },
   statusClass: { type: String, default: '' },
 })
-const emit = defineEmits(['update:url', 'update:ocrTranslationMode', 'update:ocrScope', 'update:ocrExtractionMode', 'update:ocrCropTopRatio', 'update:ocrCropBottomRatio', 'update:ocrCropLeftRatio', 'update:ocrCropRightRatio', 'update:ocrExcludeEnabled', 'update:ocrExcludeTopRatio', 'update:ocrExcludeBottomRatio', 'update:ocrExcludeLeftRatio', 'update:ocrExcludeRightRatio', 'update:ocrRefinementMode', 'update:embeddedSubtitleHint', 'update:sourceLanguage', 'update:ocrLanguage', 'update:thumbnailFormat', 'update:videoQuality', 'probe', 'download-video', 'download-thumbnail', 'ocr-full'])
+const emit = defineEmits(['update:url', 'update:ocrTranslationMode', 'update:ocrScope', 'update:ocrExtractionMode', 'update:ocrShapeMode', 'update:ocrCropTopRatio', 'update:ocrCropBottomRatio', 'update:ocrCropLeftRatio', 'update:ocrCropRightRatio', 'update:ocrExcludeEnabled', 'update:ocrExcludeTopRatio', 'update:ocrExcludeBottomRatio', 'update:ocrExcludeLeftRatio', 'update:ocrExcludeRightRatio', 'update:ocrRefinementMode', 'update:embeddedSubtitleHint', 'update:sourceLanguage', 'update:ocrLanguage', 'update:thumbnailFormat', 'update:videoQuality', 'probe', 'download-video', 'download-thumbnail', 'ocr-full'])
 
 function setOcrMode(mode) {
   emit('update:ocrScope', mode === 'smart_full' ? 'smart_full' : 'bottom')

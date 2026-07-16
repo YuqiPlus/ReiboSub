@@ -1,6 +1,51 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { uploadProjectCover, uploadVideoFile } from "./api.js"
+import { deleteJson, patchJson, uploadProjectCover, uploadVideoFile } from "./api.js"
+
+test("deleteJson sends a JSON DELETE request and surfaces API errors", async () => {
+  const previousFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (path, options) => {
+    calls.push({ path, options })
+    return new Response(JSON.stringify({ deleted_provider_id: "old" }), { status: 200 })
+  }
+
+  try {
+    const result = await deleteJson('/api/settings/providers/old', { replacement_provider_id: 'new' })
+    assert.equal(result.deleted_provider_id, 'old')
+    assert.equal(calls[0].options.method, 'DELETE')
+    assert.equal(calls[0].options.headers['Content-Type'], 'application/json')
+    assert.deepEqual(JSON.parse(calls[0].options.body), { replacement_provider_id: 'new' })
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+})
+
+test("patchJson sends provider metadata without changing the request shape", async () => {
+  const previousFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (path, options) => {
+    calls.push({ path, options })
+    return new Response(JSON.stringify({ provider: { id: 'existing', label: 'Updated' } }), { status: 200 })
+  }
+
+  try {
+    const result = await patchJson('/api/settings/providers/existing', {
+      label: 'Updated',
+      default_model: 'model-new',
+      models: ['model-extra'],
+    })
+    assert.equal(result.provider.label, 'Updated')
+    assert.equal(calls[0].options.method, 'PATCH')
+    assert.deepEqual(JSON.parse(calls[0].options.body), {
+      label: 'Updated',
+      default_model: 'model-new',
+      models: ['model-extra'],
+    })
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+})
 
 test("uploadVideoFile posts multipart form data without json content type", async () => {
   const calls = []

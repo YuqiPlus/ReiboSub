@@ -1,8 +1,20 @@
 export async function api(path, payload = {}) {
+  return requestJson(path, 'POST', payload)
+}
+
+export async function deleteJson(path, payload = {}) {
+  return requestJson(path, 'DELETE', payload)
+}
+
+export async function patchJson(path, payload = {}) {
+  return requestJson(path, 'PATCH', payload)
+}
+
+async function requestJson(path, method, payload) {
   const response = await fetch(path, {
-    method: 'POST',
+    method,
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(payload ?? {}),
   })
   const data = await response.json()
   if (!response.ok) {

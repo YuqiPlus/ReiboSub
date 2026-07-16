@@ -57,7 +57,7 @@
       </div>
       <div v-if="!projects.length" class="asset-list empty">暂无文件。</div>
       <div v-else class="project-list">
-        <details v-for="project in projects" :key="project.path" class="project-card" open>
+        <details v-for="project in projects" :key="project.path" class="project-card">
           <summary>
             <div>
               <div class="project-title">{{ project.name }}</div>
@@ -97,7 +97,7 @@
               <AssetList :items="project.subtitles || []" empty-text="无字幕。">
                 <template #actions="{ item }">
                   <button class="secondary mini" @click="$emit('use-subtitle', item.path)">设为源字幕</button>
-                  <button class="warning mini" @click="$emit('edit-subtitle', item.path)">精修</button>
+                  <button class="warning mini" @click="$emit('edit-subtitle', { path: item.path, videoPath: project.primary_video || project.videos?.[0]?.path || '' })">精修</button>
                   <button class="ghost mini" @click="copyPath(item.path)">复制路径</button>
                 </template>
               </AssetList>
@@ -119,8 +119,8 @@
       <AssetList :items="assets.ocr_jobs" empty-text="暂无文件。">
         <template #actions="{ item }">
           <button v-if="item.source_srt" class="secondary mini" @click="$emit('use-subtitle', item.source_srt)">使用 source.srt</button>
-          <button v-if="item.source_srt" class="warning mini" @click="$emit('edit-subtitle', item.source_srt)">精修 source</button>
-          <button v-if="item.translated_srt" class="warning mini" @click="$emit('edit-subtitle', item.translated_srt)">精修 zh</button>
+          <button v-if="item.source_srt" class="warning mini" @click="$emit('edit-subtitle', { path: item.source_srt, videoPath: item.input_video || '' })">精修 source</button>
+          <button v-if="item.translated_srt" class="warning mini" @click="$emit('edit-subtitle', { path: item.translated_srt, videoPath: item.input_video || '' })">精修 zh</button>
           <button v-if="item.translated_srt" class="ghost mini" @click="copyPath(item.translated_srt)">复制 zh.srt</button>
         </template>
       </AssetList>
@@ -163,7 +163,7 @@ function selectProjectCover(project, event) {
   const file = event.target.files?.[0] || null
   event.target.value = ''
   if (!file || !project?.path) return
-  __emit('upload-cover', { project, file })
+  emit('upload-cover', { project, file })
 }
 
 function selectUploadFile(event) {
@@ -180,7 +180,7 @@ function submitUploadAsrTranslate() {
 }
 
 function emitUploadAsrTranslate(file, title) {
-  __emit('upload-asr-translate', { file, title })
+  emit('upload-asr-translate', { file, title })
 }
 
 async function copyPath(path) {

@@ -8,6 +8,11 @@
       <span class="badge">{{ loading ? '加载中' : `${glossaryItems.length} 条` }}</span>
     </div>
 
+    <div v-if="agentReview" class="agent-review-context">
+      <b>这是 Agent 当前待办</b>
+      <span>审核完成后点击保存，系统会自动返回 Agent 并继续翻译，不需要再手动确认一次。</span>
+    </div>
+
     <div class="grid2">
       <div>
         <label for="glossaryPathReview">Glossary 路径</label>
@@ -45,7 +50,7 @@
     <div v-if="!loading && tab === 'review'">
       <div class="toolbar review-toolbar">
         <button class="secondary" @click="$emit('apply-all-suggestions')">应用全部推荐</button>
-        <button @click="$emit('save-glossary-review')">保存审核结果</button>
+        <button @click="$emit('save-glossary-review')">{{ agentReview ? '保存并继续 Agent 翻译' : '保存审核结果' }}</button>
       </div>
       <div v-if="!glossaryItems.length" class="empty">还没有加载 glossary。可以先到“字幕处理”生成草稿，或者在上方填路径后加载。</div>
       <div v-else-if="!visibleItems.length" class="empty">当前筛选下没有条目。</div>
@@ -110,7 +115,7 @@
 
     <div v-else-if="!loading">
       <div class="toolbar review-toolbar">
-        <button @click="$emit('save-glossary-text')">保存 YAML</button>
+        <button @click="$emit('save-glossary-text')">{{ agentReview ? '保存 YAML 并继续 Agent' : '保存 YAML' }}</button>
       </div>
       <textarea :value="glossaryEditor" placeholder="Glossary YAML 内容" @input="$emit('update:glossaryEditor', $event.target.value)" />
     </div>
@@ -128,6 +133,7 @@ const props = defineProps({
   status: { type: String, default: '' },
   statusClass: { type: String, default: '' },
   loading: { type: Boolean, default: false },
+  agentReview: { type: Boolean, default: false },
 })
 
 const emit = defineEmits([

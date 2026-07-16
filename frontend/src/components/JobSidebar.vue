@@ -57,7 +57,7 @@ const props = defineProps({
 defineEmits(['select-job', 'cancel-job', 'clear-log'])
 
 const jobList = computed(() => Object.values(props.jobs).sort((a, b) => (b.created_at || 0) - (a.created_at || 0)))
-const activeJob = computed(() => props.jobs[props.activeJobId] || jobList.value[0] || null)
+const activeJob = computed(() => props.activeJobId ? props.jobs[props.activeJobId] || null : null)
 const activeLog = computed(() => activeJob.value ? (activeJob.value.logs || []).join('\n') : '')
 const outputRows = computed(() => {
   const result = activeJob.value?.result || {}

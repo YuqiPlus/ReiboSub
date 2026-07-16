@@ -9,7 +9,7 @@
         :metrics="topbarMetrics"
       />
 
-      <main class="workspace">
+      <main class="workspace" :class="{ 'workspace-single': activeView !== 'jobs' }">
         <section class="workspace-main">
           <div v-if="activeView === 'agent'" class="page-stack">
             <AgentSessionPanel
@@ -19,7 +19,7 @@
               v-model:source-language="sourceLanguage"
               v-model:ocr-language="ocrLanguage"
               v-model:ocr-scope="ocrScope"
-              v-model:ocr-extraction-mode="ocrExtractionMode"
+              v-model:ocr-pipeline-version="agentOcrPipelineVersion"
               v-model:ocr-crop-top-ratio="ocrCropTopRatio"
               v-model:ocr-crop-bottom-ratio="ocrCropBottomRatio"
               v-model:ocr-crop-left-ratio="ocrCropLeftRatio"
@@ -30,7 +30,6 @@
               v-model:ocr-exclude-left-ratio="ocrExcludeLeftRatio"
               v-model:ocr-exclude-right-ratio="ocrExcludeRightRatio"
               :input-video="agentPreviewVideo"
-              v-model:ocr-refinement-mode="ocrRefinementMode"
               v-model:extra-hint="extraHint"
               :session="agentSession"
               :sessions="agentSessions"
@@ -60,6 +59,7 @@
               v-model:ocr-language="ocrLanguage"
               v-model:ocr-scope="ocrScope"
               v-model:ocr-extraction-mode="ocrExtractionMode"
+              v-model:ocr-shape-mode="ocrShapeMode"
               v-model:ocr-crop-top-ratio="ocrCropTopRatio"
               v-model:ocr-crop-bottom-ratio="ocrCropBottomRatio"
               v-model:ocr-crop-left-ratio="ocrCropLeftRatio"
@@ -147,6 +147,8 @@
               v-model:source-srt="sourceSrt"
               :debug-folders="assets.ocr_debug_folders"
               :ocr-scope="ocrScope"
+              v-model:ocr-extraction-mode="ocrDevExtractionMode"
+              v-model:ocr-shape-mode="ocrDevShapeMode"
               v-model:ocr-crop-top-ratio="ocrCropTopRatio"
               v-model:ocr-crop-bottom-ratio="ocrCropBottomRatio"
               v-model:ocr-crop-left-ratio="ocrCropLeftRatio"
@@ -163,6 +165,9 @@
               @run="runOcrDevelopmentTest"
               @run-cleanup="runExistingOcrSourceCleanup"
               @rebuild-track-refine="runOcrJsonRebuild"
+              @geometry-refine="runOcrGeometryRefine"
+              @v3-refine="runOcrV3Refine"
+              @layered-refine="runOcrLayeredRefine"
               @refresh-debug-assets="loadAssets"
             />
           </div>
@@ -188,6 +193,7 @@
           <div v-else-if="activeView === 'subtitle-edit'" class="page-stack">
             <SubtitleEditorPanel
               v-model:subtitle-path="subtitleEditorPath"
+              v-model:video-path="subtitleEditorVideoPath"
               :cues="subtitleEditorCues"
               :loading="subtitleEditorLoading"
               :dirty="subtitleEditorDirty"
@@ -197,11 +203,19 @@
               :pair-issues="subtitlePairIssues"
               :focused-cue-uid="subtitleFocusedCueUid"
               :can-undo="subtitleEditorUndoStack.length > 0"
+              :undo-count="subtitleEditorUndoStack.length"
               @update:prefix-names="subtitlePrefixNames = $event"
               @load-subtitle="loadSubtitleEditor"
               @save-subtitle="saveSubtitleEditor(true)"
               @save-subtitle-as="saveSubtitleEditor(false)"
+              @begin-cue-edit="beginSubtitleEditorCueEdit"
+              @end-cue-edit="endSubtitleEditorCueEdit"
               @update-cue="updateSubtitleEditorCue"
+              @add-cue-at-time="addSubtitleEditorCueAtTime"
+              @insert-cue="insertSubtitleEditorCue"
+              @set-cue-boundary="setSubtitleEditorCueBoundary"
+              @nudge-cue="nudgeSubtitleEditorCue"
+              @snap-cue="snapSubtitleEditorCue"
               @delete-cue="deleteSubtitleEditorCue"
               @merge-prev="mergeSubtitleEditorCue($event, 'prev')"
               @merge-next="mergeSubtitleEditorCue($event, 'next')"
@@ -224,6 +238,7 @@
               v-model:glossary-editor="glossaryEditor"
               :glossary-items="glossaryItems"
               :loading="glossaryLoading"
+              :agent-review="agentSession?.status === 'waiting' && agentSession?.phase === 'review_glossary'"
               :status="flowStatus.text"
               :status-class="flowStatus.class"
               @load-glossary="loadGlossary"
@@ -233,6 +248,34 @@
               @update-glossary-zh="updateGlossaryZh"
               @set-glossary-reviewed="setGlossaryReviewed"
               @use-suggestion="useSuggestion"
+            />
+          </div>
+
+          <div v-else-if="activeView === 'settings'" class="page-stack">
+            <SettingsPanel
+              :settings="settingsEditor"
+              :providers="settingsProviders"
+              :models-by-provider="settingsModelsByProvider"
+              :model-errors="settingsModelErrors"
+              :loading="settingsLoading"
+              :saving="settingsSaving"
+              :fetching-provider-id="settingsFetchingProviderId"
+              :selected-provider-id="settingsConnectionProviderId"
+              :provider-management-allowed="settingsCapabilities.provider_management_allowed === true"
+              :provider-managing="settingsProviderManaging"
+              :connection="settingsProviderConnection"
+              :connection-loading="settingsConnectionLoading"
+              :connection-saving="settingsConnectionSaving"
+              :connection-error="settingsConnectionError"
+              :status="settingsStatus.text"
+              :status-class="settingsStatus.class"
+              @save-settings="saveAppSettings"
+              @fetch-models="fetchProviderModels"
+              @select-provider="loadProviderConnection"
+              @save-connection="saveProviderConnection"
+              @create-provider="createSettingsProvider"
+              @update-provider="updateSettingsProvider"
+              @delete-provider="deleteSettingsProvider"
             />
           </div>
 
@@ -252,6 +295,7 @@
         </section>
 
         <JobSidebar
+          v-if="activeView === 'jobs'"
           class="task-drawer"
           :jobs="jobs"
           :active-job-id="activeJobId"
@@ -266,7 +310,7 @@
 
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { api, getJson, uploadProjectCover, uploadVideoFile } from './api'
+import { api, deleteJson, getJson, patchJson, uploadProjectCover, uploadVideoFile } from './api'
 import SideNav from './components/SideNav.vue'
 import HeaderBar from './components/HeaderBar.vue'
 import AgentSessionPanel from './components/AgentSessionPanel.vue'
@@ -279,10 +323,19 @@ import AssetLibrary from './components/AssetLibrary.vue'
 import VideoOverlayPanel from './components/VideoOverlayPanel.vue'
 import OcrDevPanel from './components/OcrDevPanel.vue'
 import JobSidebar from './components/JobSidebar.vue'
+import SettingsPanel from './components/SettingsPanel.vue'
 import { copyText } from './clipboard.js'
 import { createAgentSessionPoller } from './agentSessionPolling.js'
+import { buildAgentOcrPipelinePayload, inferAgentOcrPipelineVersion } from './agentOcrPipeline.js'
 import { findGlossaryReviewSession, glossaryReviewKey } from './glossaryReviewFlow.js'
 import { detectCuePairSymbolIssues, parsePrefixNames, stripCueSpeakerPrefixes, stripCueTrailingCommas } from './subtitlePrefixTools.js'
+import {
+  insertSubtitleCueAtTime,
+  insertSubtitleCueRelative,
+  parseSrtTime,
+  renumberSubtitleCues,
+  setSubtitleCueBoundary,
+} from './subtitleEditorTools.js'
 
 const url = ref('')
 const probe = ref(null)
@@ -290,11 +343,14 @@ const probing = ref(false)
 const titleBox = ref('')
 const sourceSrt = ref('')
 const subtitleEditorPath = ref('')
+const subtitleEditorVideoPath = ref('')
 const subtitleEditorCues = ref([])
 const subtitlePrefixNames = ref('')
 const subtitlePairIssues = ref([])
 const subtitleFocusedCueUid = ref('')
 const subtitleEditorUndoStack = ref([])
+const subtitleEditorSavedCues = ref([])
+const subtitleEditorPendingFieldEdit = ref(null)
 const subtitleEditorLoading = ref(false)
 const subtitleEditorDirty = ref(false)
 const glossaryPath = ref('')
@@ -307,6 +363,9 @@ const subtitleConvertFormat = ref('bcc')
 const ocrTranslationMode = ref('standard_cleanup')
 const ocrScope = ref('bottom')
 const ocrExtractionMode = ref('auto')
+const ocrShapeMode = ref('horizontal_preferred')
+const agentOcrPipelineVersion = ref('v2')
+const agentRestoredOcrSettings = ref({})
 const ocrCropTopRatio = ref(0.58)
 const ocrCropBottomRatio = ref(0)
 const ocrCropLeftRatio = ref(0)
@@ -317,6 +376,8 @@ const ocrExcludeBottomRatio = ref(0.82)
 const ocrExcludeLeftRatio = ref(0.76)
 const ocrExcludeRightRatio = ref(0.02)
 const ocrDevSourceLanguage = ref('korean')
+const ocrDevExtractionMode = ref('region')
+const ocrDevShapeMode = ref('horizontal_preferred')
 const ocrDevSampleFps = ref(6)
 const ocrDevMinConfidence = ref(30)
 const ocrDevRefineTimingBoundaries = ref(true)
@@ -328,7 +389,7 @@ const thumbnailFormat = ref('jpg')
 const videoQuality = ref('1080p')
 const embeddedSubtitleHint = ref('unknown')
 const embeddedSubtitleGoal = ref('screen_subtitle')
-const sourceLanguage = ref('auto')
+const sourceLanguage = ref('korean')
 const ocrLanguage = ref('auto')
 const localVideo = ref('')
 const audioLanguage = ref('auto')
@@ -340,7 +401,22 @@ const agentSessions = ref([])
 const agentTasks = ref([])
 const agentStarting = ref(false)
 const openedGlossaryReviewKey = ref('')
+const openingGlossaryReviewKey = ref('')
 const mobileUploadBusy = ref(false)
+const settingsEditor = ref(null)
+const settingsProviders = ref([])
+const settingsModelsByProvider = ref({})
+const settingsModelErrors = ref({})
+const settingsLoading = ref(false)
+const settingsSaving = ref(false)
+const settingsFetchingProviderId = ref('')
+const settingsProviderConnection = ref(null)
+const settingsConnectionProviderId = ref('')
+const settingsConnectionLoading = ref(false)
+const settingsConnectionSaving = ref(false)
+const settingsConnectionError = ref('')
+const settingsCapabilities = ref({})
+const settingsProviderManaging = ref(false)
 
 const assets = reactive({ videos: [], subtitles: [], projects: [], ocr_jobs: [], ocr_debug_folders: [] })
 const jobs = reactive({})
@@ -353,18 +429,19 @@ const subtitleEditorStatus = reactive({ text: '', class: '' })
 const ocrDevStatus = reactive({ text: '', class: '' })
 const assetStatus = reactive({ text: '', class: '' })
 const agentStatus = reactive({ text: '', class: '' })
+const settingsStatus = reactive({ text: '', class: '' })
 
 const pages = {
   agent: {
-    title: 'Agent Cockpit',
-    description: '输入链接，确认路线，审核术语，交付字幕。',
+    title: 'Agent 字幕流程',
+    description: '自动判断字幕来源，提取原文，审核术语并完成翻译。',
   },
   'new-task': {
     title: '链接工具',
     description: '手动检测字幕、下载视频或进入 OCR 全流程。',
   },
   assets: {
-    title: '素材',
+    title: '素材库',
     description: '管理已下载视频、字幕文件、OCR 和音频识别输出。',
   },
   'video-overlay': {
@@ -372,7 +449,7 @@ const pages = {
     description: '给当前视频叠加水印或遮 Logo，输出新视频。',
   },
   subtitles: {
-    title: '字幕工具',
+    title: '字幕处理',
     description: '选择源字幕，生成 glossary，翻译为中文外挂字幕。',
   },
   'subtitle-edit': {
@@ -380,12 +457,20 @@ const pages = {
     description: '逐条修改、合并、删除已生成字幕。',
   },
   glossary: {
-    title: '审核',
+    title: '术语审核',
     description: '集中审核人名、昵称、作品名和固定术语。',
   },
   jobs: {
     title: '任务日志',
     description: '查看运行状态、失败原因、输出路径，并终止误点任务。',
+  },
+  'ocr-dev': {
+    title: 'OCR Lab',
+    description: '独立维护 OCR V2 / V3，裁框、复跑并比较调试结果。',
+  },
+  settings: {
+    title: '设置中心',
+    description: '保存新任务默认语言，选择模型服务配置，并为每个 LLM 模块绑定模型。',
   },
 }
 
@@ -402,26 +487,38 @@ const topbarMetrics = computed(() => ({
   subtitles: assets.subtitles.length,
   jobs: jobList.value.length,
 }))
-const agentPreviewVideo = computed(() => agentSession.value?.result?.input_video || localVideo.value || '')
+const agentPreviewVideo = computed(() => (
+  agentSession.value
+    ? (agentSession.value.result?.input_video || '')
+    : (localVideo.value || '')
+))
 
+let skipNextOcrScopeCropReset = false
 watch(ocrScope, (scope) => {
+  if (skipNextOcrScopeCropReset) {
+    skipNextOcrScopeCropReset = false
+    return
+  }
   ocrCropTopRatio.value = OCR_SCOPE_TOP_DEFAULTS[scope] ?? 0.58
   ocrCropBottomRatio.value = 0
 })
 
 const navItems = computed(() => [
-  { id: 'agent', label: 'Agent', hint: '自动编排', icon: 'A', badge: waitingAgentCount.value ? `${waitingAgentCount.value} 待确认` : runningAgentCount.value || '' },
-  { id: 'ocr-dev', label: 'OCR Lab', hint: '原始提取测试', icon: 'O', badge: '' },
-  { id: 'assets', label: '素材', hint: '视频与字幕', icon: 'M', badge: assets.videos.length + assets.subtitles.length || '' },
-  { id: 'video-overlay', label: '贴图', hint: '水印与遮 Logo', icon: 'V', badge: localVideo.value ? '已选' : '' },
-  { id: 'glossary', label: '审核', hint: 'Glossary', icon: 'G', badge: glossaryItems.value.length || '' },
-  { id: 'subtitles', label: '字幕工具', hint: '翻译与转换', icon: 'S', badge: sourceSrt.value ? '已选' : '' },
-  { id: 'subtitle-edit', label: '精修', hint: '编辑 SRT', icon: 'E', badge: subtitleEditorCues.value.length || '' },
-  { id: 'new-task', label: '链接工具', hint: '检测与下载', icon: 'L', badge: probe.value?.subtitles?.length || '' },
-  { id: 'jobs', label: '任务', hint: '日志与输出', icon: 'J', badge: runningJobCount.value || failedJobCount.value || '' },
+  { id: 'agent', group: '日常流程', label: 'Agent 路线', hint: '自动完成字幕', icon: 'A', badge: waitingAgentCount.value ? `${waitingAgentCount.value} 待确认` : runningAgentCount.value || '' },
+  { id: 'assets', group: '日常流程', label: '素材库', hint: '项目、视频与字幕', icon: 'M', badge: assets.videos.length + assets.subtitles.length || '' },
+  { id: 'subtitle-edit', group: '字幕制作', label: '字幕精修', hint: '新增与微调 SRT', icon: 'E', badge: subtitleEditorCues.value.length || '' },
+  { id: 'glossary', group: '字幕制作', label: '术语审核', hint: '人名与固定译法', icon: 'G', badge: glossaryItems.value.length || '' },
+  { id: 'subtitles', group: '字幕制作', label: '翻译与转换', hint: '字幕后续处理', icon: 'S', badge: sourceSrt.value ? '已选' : '' },
+  { id: 'ocr-dev', group: '实验室', label: 'OCR Lab', hint: 'V2 / V3 独立测试', icon: 'O', badge: '' },
+  { id: 'new-task', group: '其他工具', label: '链接检测', hint: '手动下载与 OCR', icon: 'L', badge: probe.value?.subtitles?.length || '' },
+  { id: 'video-overlay', group: '其他工具', label: '视频贴图', hint: '水印与遮 Logo', icon: 'V', badge: localVideo.value ? '已选' : '' },
+  { id: 'settings', group: '系统', label: '设置', hint: '语言、服务与模型', icon: '⚙', badge: '' },
+  { id: 'jobs', group: '系统', label: '任务日志', hint: '进度、错误与输出', icon: 'J', badge: runningJobCount.value || failedJobCount.value || '' },
 ])
 
-onMounted(() => {
+onMounted(async () => {
+  window.addEventListener('keydown', onSubtitleEditorUndoShortcut)
+  await loadAppSettings({ applyDefaults: true })
   loadAssets()
   loadJobs()
   loadAgentSessions()
@@ -429,8 +526,234 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  window.removeEventListener('keydown', onSubtitleEditorUndoShortcut)
   agentPoller.cancelAll()
 })
+
+async function loadAppSettings({ applyDefaults = false } = {}) {
+  settingsLoading.value = true
+  try {
+    const result = await getJson('/api/settings')
+    settingsEditor.value = result.settings || null
+    settingsProviders.value = result.providers || []
+    settingsCapabilities.value = result.capabilities || {}
+    // This map tracks lists already fetched from provider endpoints. Static
+    // profile models remain available through SettingsPanel's provider data.
+    settingsModelsByProvider.value = {}
+    settingsModelErrors.value = {}
+    if (applyDefaults) applyAppSettingDefaults(settingsEditor.value)
+    const defaultProviderId = String(settingsEditor.value?.defaults?.provider_profile || '').trim()
+    if (defaultProviderId) await loadProviderConnection(defaultProviderId, { quiet: true })
+    setStatus(settingsStatus, '设置已加载。', 'ok')
+  } catch (error) {
+    setStatus(settingsStatus, `设置加载失败：${error.message}`, 'bad')
+  } finally {
+    settingsLoading.value = false
+  }
+}
+
+function applyAppSettingDefaults(settings) {
+  const defaults = settings?.defaults || {}
+  if (defaults.source_language) {
+    sourceLanguage.value = defaults.source_language
+    if (audioLanguage.value === 'auto') audioLanguage.value = defaults.source_language
+  }
+  if (defaults.ocr_language) ocrLanguage.value = defaults.ocr_language
+}
+
+async function saveAppSettings(settings) {
+  settingsSaving.value = true
+  setStatus(settingsStatus, '正在保存设置...', '')
+  try {
+    const result = await api('/api/settings', settings || {})
+    settingsEditor.value = result.settings || settings
+    settingsProviders.value = result.providers || settingsProviders.value
+    if (result.capabilities) settingsCapabilities.value = result.capabilities
+    const activeProviderIds = new Set(settingsProviders.value.map((provider) => provider.id))
+    settingsModelsByProvider.value = Object.fromEntries(
+      Object.entries(settingsModelsByProvider.value).filter(([providerId]) => activeProviderIds.has(providerId)),
+    )
+    applyAppSettingDefaults(settingsEditor.value)
+    const defaultProviderId = String(settingsEditor.value?.defaults?.provider_profile || '').trim()
+    if (defaultProviderId && defaultProviderId !== settingsConnectionProviderId.value) {
+      await loadProviderConnection(defaultProviderId, { quiet: true })
+    }
+    setStatus(settingsStatus, '设置已保存；之后发起的任务会使用新的默认语言和模型。', 'ok')
+  } catch (error) {
+    setStatus(settingsStatus, error.message, 'bad')
+  } finally {
+    settingsSaving.value = false
+  }
+}
+
+async function loadProviderConnection(providerId, { quiet = false } = {}) {
+  const id = String(providerId || '').trim()
+  settingsConnectionProviderId.value = id
+  settingsProviderConnection.value = null
+  settingsConnectionError.value = ''
+  if (!id) return
+
+  settingsConnectionLoading.value = true
+  try {
+    const result = await getJson(`/api/settings/providers/${encodeURIComponent(id)}/connection`)
+    if (settingsConnectionProviderId.value !== id) return
+    settingsProviderConnection.value = result.connection || result
+  } catch (error) {
+    if (settingsConnectionProviderId.value !== id) return
+    settingsConnectionError.value = error.message
+    if (!quiet) setStatus(settingsStatus, `连接配置读取失败：${error.message}`, 'bad')
+  } finally {
+    if (settingsConnectionProviderId.value === id) settingsConnectionLoading.value = false
+  }
+}
+
+async function refreshSettingsProviderMetadata() {
+  const result = await getJson('/api/settings')
+  settingsProviders.value = result.providers || []
+  settingsCapabilities.value = result.capabilities || settingsCapabilities.value
+  const activeProviderIds = new Set(settingsProviders.value.map((provider) => provider.id))
+  settingsModelsByProvider.value = Object.fromEntries(
+    Object.entries(settingsModelsByProvider.value).filter(([providerId]) => activeProviderIds.has(providerId)),
+  )
+}
+
+async function createSettingsProvider(payload = {}) {
+  if (settingsProviderManaging.value) return
+  const requestedId = String(payload?.id || '').trim()
+  const hadProviders = settingsProviders.value.length > 0
+  settingsProviderManaging.value = true
+  setStatus(settingsStatus, `正在创建服务商 ${requestedId || ''}…`, '')
+  try {
+    const result = await api('/api/settings/providers', payload)
+    settingsProviders.value = result.providers || settingsProviders.value
+    if (!hadProviders && result.settings) settingsEditor.value = result.settings
+    if (result.capabilities) settingsCapabilities.value = result.capabilities
+    const createdId = String(result.provider?.id || requestedId).trim()
+    settingsModelsByProvider.value = { ...settingsModelsByProvider.value }
+    delete settingsModelsByProvider.value[createdId]
+    settingsModelErrors.value = { ...settingsModelErrors.value, [createdId]: '' }
+    await loadProviderConnection(createdId, { quiet: true })
+    setStatus(settingsStatus, `${createdId} 已创建；可以继续获取模型或绑定到具体模块。`, 'ok')
+  } catch (error) {
+    setStatus(settingsStatus, error.message, 'bad')
+  } finally {
+    settingsProviderManaging.value = false
+  }
+}
+
+async function deleteSettingsProvider({ providerId, replacementProviderId } = {}) {
+  const id = String(providerId || '').trim()
+  const replacementId = String(replacementProviderId || '').trim()
+  if (!id || !replacementId || settingsProviderManaging.value) return
+  settingsProviderManaging.value = true
+  setStatus(settingsStatus, `正在删除 ${id} 并迁移配置…`, '')
+  try {
+    const result = await deleteJson(
+      `/api/settings/providers/${encodeURIComponent(id)}`,
+      { replacement_provider_id: replacementId },
+    )
+    settingsEditor.value = result.settings || settingsEditor.value
+    settingsProviders.value = result.providers || settingsProviders.value.filter((provider) => provider.id !== id)
+    if (result.capabilities) settingsCapabilities.value = result.capabilities
+    settingsModelsByProvider.value = { ...settingsModelsByProvider.value }
+    settingsModelErrors.value = { ...settingsModelErrors.value }
+    delete settingsModelsByProvider.value[id]
+    delete settingsModelErrors.value[id]
+    await loadProviderConnection(replacementId, { quiet: true })
+    const affectedCount = Array.isArray(result.affected_tasks) ? result.affected_tasks.length : 0
+    setStatus(
+      settingsStatus,
+      `${id} 已删除；${affectedCount ? `${affectedCount} 个模块及相关默认值已` : '相关配置已'}切换到 ${replacementId}。`,
+      'ok',
+    )
+  } catch (error) {
+    setStatus(settingsStatus, error.message, 'bad')
+  } finally {
+    settingsProviderManaging.value = false
+  }
+}
+
+async function updateSettingsProvider({ providerId, payload } = {}) {
+  const id = String(providerId || '').trim()
+  if (!id || settingsProviderManaging.value) return
+  settingsProviderManaging.value = true
+  setStatus(settingsStatus, `正在更新服务商 ${id}…`, '')
+  try {
+    const result = await patchJson(
+      `/api/settings/providers/${encodeURIComponent(id)}`,
+      payload || {},
+    )
+    settingsProviders.value = result.providers || settingsProviders.value
+    if (result.capabilities) settingsCapabilities.value = result.capabilities
+    settingsModelsByProvider.value = { ...settingsModelsByProvider.value }
+    settingsModelErrors.value = { ...settingsModelErrors.value, [id]: '' }
+    delete settingsModelsByProvider.value[id]
+    if (settingsConnectionProviderId.value === id) {
+      await loadProviderConnection(id, { quiet: true })
+    }
+    setStatus(settingsStatus, `${id} 的服务商资料已更新；已有模块绑定未被改写。`, 'ok')
+  } catch (error) {
+    setStatus(settingsStatus, `${id} 更新失败：${error.message}`, 'bad')
+  } finally {
+    settingsProviderManaging.value = false
+  }
+}
+
+async function saveProviderConnection({ providerId, payload } = {}) {
+  const id = String(providerId || '').trim()
+  if (!id || settingsConnectionSaving.value) return
+
+  settingsConnectionSaving.value = true
+  settingsConnectionError.value = ''
+  setStatus(settingsStatus, `正在保存 ${id} 的本地连接…`, '')
+  try {
+    await api(`/api/settings/providers/${encodeURIComponent(id)}/connection`, payload || {})
+    await refreshSettingsProviderMetadata()
+    await loadProviderConnection(id, { quiet: true })
+    // A changed credential or endpoint may produce a different remote list.
+    settingsModelsByProvider.value = { ...settingsModelsByProvider.value }
+    delete settingsModelsByProvider.value[id]
+    settingsModelErrors.value = { ...settingsModelErrors.value, [id]: '' }
+    setStatus(settingsStatus, `${id} 的本地连接已保存。`, 'ok')
+  } catch (error) {
+    settingsConnectionError.value = error.message
+    setStatus(settingsStatus, error.message, 'bad')
+  } finally {
+    settingsConnectionSaving.value = false
+  }
+}
+
+async function fetchProviderModels(providerId) {
+  const id = String(providerId || '').trim()
+  if (!id) return
+  settingsFetchingProviderId.value = id
+  settingsModelErrors.value = { ...settingsModelErrors.value, [id]: '' }
+  setStatus(settingsStatus, `正在向 ${id} 获取可用模型...`, '')
+  try {
+    const result = await getJson(`/api/settings/providers/${encodeURIComponent(id)}/models?refresh=1`)
+    if (!settingsProviders.value.some((provider) => String(provider?.id || '') === id)) return
+    settingsModelsByProvider.value = {
+      ...settingsModelsByProvider.value,
+      [id]: result.models || [],
+    }
+    settingsModelErrors.value = {
+      ...settingsModelErrors.value,
+      [id]: result.warning || '',
+    }
+    setStatus(
+      settingsStatus,
+      result.warning
+        ? `远端模型获取失败，已保留本地模型：${result.warning}`
+        : `已从 ${id} 获取 ${result.models?.length || 0} 个模型。`,
+      result.warning ? 'bad' : 'ok',
+    )
+  } catch (error) {
+    settingsModelErrors.value = { ...settingsModelErrors.value, [id]: error.message }
+    setStatus(settingsStatus, error.message, 'bad')
+  } finally {
+    settingsFetchingProviderId.value = ''
+  }
+}
 
 async function startAgent() {
   if (!url.value.trim()) {
@@ -440,6 +763,7 @@ async function startAgent() {
   agentStarting.value = true
   setStatus(agentStatus, 'Agent 正在启动...', '')
   try {
+    const agentOcrPipeline = buildAgentOcrPipelinePayload(agentOcrPipelineVersion.value, { ocrScope: ocrScope.value })
     const session = await api('/api/agent/start', {
       url: url.value.trim(),
       embedded_subtitle_hint: embeddedSubtitleHint.value,
@@ -448,9 +772,7 @@ async function startAgent() {
       ocr_language: ocrLanguage.value,
       target_language: 'zh',
       extra_hint: extraHint.value,
-      ocr_translation_mode: ocrTranslationMode.value,
-      ocr_scope: ocrScope.value,
-      ocr_extraction_mode: ocrExtractionMode.value,
+      ...agentOcrPipeline,
       ocr_crop_top_ratio: ocrCropTopRatio.value,
       ocr_crop_bottom_ratio: ocrCropBottomRatio.value,
       ocr_crop_left_ratio: ocrCropLeftRatio.value,
@@ -460,7 +782,6 @@ async function startAgent() {
       ocr_exclude_bottom_ratio: ocrExcludeBottomRatio.value,
       ocr_exclude_left_ratio: ocrExcludeLeftRatio.value,
       ocr_exclude_right_ratio: ocrExcludeRightRatio.value,
-      ocr_refinement_mode: ocrRefinementMode.value,
     })
     agentSession.value = session
     await loadAgentSessions()
@@ -476,12 +797,21 @@ async function startAgent() {
 
 async function answerAgent(action) {
   if (!agentSession.value?.id) return
-  setStatus(agentStatus, '已提交回答，Agent 继续处理...', '')
+  setStatus(
+    agentStatus,
+    action === 'download_video_for_preview'
+      ? '正在准备或下载视频；完成后会自动加载首帧并显示位置操作。'
+      : '已提交回答，Agent 继续处理...',
+    '',
+  )
   try {
+    const agentOcrPipeline = buildAgentOcrPipelinePayload(agentOcrPipelineVersion.value, {
+      ocrScope: ocrScope.value,
+      restoredSettings: agentRestoredOcrSettings.value,
+    })
     const session = await api(`/api/agent/${agentSession.value.id}/answer`, {
       action,
-      ocr_scope: ocrScope.value,
-      ocr_extraction_mode: ocrExtractionMode.value,
+      ...agentOcrPipeline,
       ocr_crop_top_ratio: ocrCropTopRatio.value,
       ocr_crop_bottom_ratio: ocrCropBottomRatio.value,
       ocr_crop_left_ratio: ocrCropLeftRatio.value,
@@ -562,7 +892,9 @@ async function pollAgent(sessionId) {
     const selected = isSelectedAgentSession(sessionId)
     let openedGlossaryReview = false
     if (selected) {
+      const isNewSelection = !agentSession.value?.id || agentSession.value.id !== session.id
       agentSession.value = session
+      if (isNewSelection) restoreAgentOcrPipeline(session)
       if (session.result?.source_srt) sourceSrt.value = session.result.source_srt
       if (session.result?.translated_srt) setStatus(agentStatus, `Agent 完成：${session.result.translated_srt}`, 'ok')
       openedGlossaryReview = await openGlossaryReviewForSession(session)
@@ -600,6 +932,12 @@ async function loadAgentSessions() {
     agentSessions.value = result.sessions || []
     syncAgentSessionPolls()
     await openWaitingGlossaryReviewFromSessions()
+    if (!agentSession.value?.id && agentSessions.value.length) {
+      const preferred = agentSessions.value.find((session) => ['waiting', 'running'].includes(session.status))
+        || agentSessions.value[0]
+      agentSession.value = preferred
+      restoreAgentOcrPipeline(preferred)
+    }
   } catch {
     agentSessions.value = agentSessions.value || []
   }
@@ -612,6 +950,7 @@ async function openWaitingGlossaryReviewFromSessions() {
   if (currentSession?.status === 'running' && currentSession.id !== reviewSession.id) return false
   if (!currentSession?.id || currentSession.id !== reviewSession.id) {
     agentSession.value = reviewSession
+    restoreAgentOcrPipeline(reviewSession)
   }
   return openGlossaryReviewForSession(reviewSession)
 }
@@ -629,11 +968,14 @@ async function selectAgentSession(sessionId) {
   try {
     const session = await getJson(`/api/agent/${sessionId}`)
     agentSession.value = session
+    restoreAgentOcrPipeline(session)
     setStatus(agentStatus, `已切换到 Agent 任务：${session.id}`, '')
-    await openGlossaryReviewForSession(session)
+    const openedGlossaryReview = await openGlossaryReviewForSession(session)
     if (session.status === 'running') scheduleAgentPoll(session.id, 500)
+    return openedGlossaryReview
   } catch (error) {
     setStatus(agentStatus, error.message, 'bad')
+    return false
   }
 }
 
@@ -642,6 +984,7 @@ async function continueAgentTask(taskId) {
   try {
     const session = await api(`/api/agent-tasks/${taskId}/continue`, {})
     agentSession.value = session
+    restoreAgentOcrPipeline(session)
     await loadAgentSessions()
     await loadAgentTasks()
     scheduleAgentPoll(session.id, 500)
@@ -650,11 +993,41 @@ async function continueAgentTask(taskId) {
   }
 }
 
+function restoreAgentOcrPipeline(session) {
+  const payload = session?.payload || {}
+  agentRestoredOcrSettings.value = { ...payload }
+  agentOcrPipelineVersion.value = inferAgentOcrPipelineVersion(payload)
+  if (['bottom', 'expanded', 'smart_full'].includes(payload.ocr_scope) && payload.ocr_scope !== ocrScope.value) {
+    skipNextOcrScopeCropReset = true
+    ocrScope.value = payload.ocr_scope
+  }
+  const ratioBindings = [
+    ['ocr_crop_top_ratio', ocrCropTopRatio],
+    ['ocr_crop_bottom_ratio', ocrCropBottomRatio],
+    ['ocr_crop_left_ratio', ocrCropLeftRatio],
+    ['ocr_crop_right_ratio', ocrCropRightRatio],
+    ['ocr_exclude_top_ratio', ocrExcludeTopRatio],
+    ['ocr_exclude_bottom_ratio', ocrExcludeBottomRatio],
+    ['ocr_exclude_left_ratio', ocrExcludeLeftRatio],
+    ['ocr_exclude_right_ratio', ocrExcludeRightRatio],
+  ]
+  for (const [key, target] of ratioBindings) {
+    if (payload[key] === undefined || payload[key] === null || payload[key] === '') continue
+    const value = Number(payload[key])
+    if (Number.isFinite(value)) target.value = value
+  }
+  if (typeof payload.ocr_exclude_enabled === 'boolean') ocrExcludeEnabled.value = payload.ocr_exclude_enabled
+  if (payload.source_language) sourceLanguage.value = payload.source_language
+  if (payload.ocr_language) ocrLanguage.value = payload.ocr_language
+  if (payload.embedded_subtitle_goal) embeddedSubtitleGoal.value = payload.embedded_subtitle_goal
+}
+
 async function rerunAgentTask({ taskId, stage }) {
   setStatus(agentStatus, `正在重跑 ${stage} 阶段...`, '')
   try {
     const session = await api(`/api/agent-tasks/${taskId}/rerun`, { stage })
     agentSession.value = session
+    restoreAgentOcrPipeline(session)
     await loadAgentSessions()
     await loadAgentTasks()
     scheduleAgentPoll(session.id, 500)
@@ -708,7 +1081,7 @@ async function deleteAgentTask(task) {
 async function openGlossaryFromAgent(payload) {
   const path = typeof payload === 'string' ? payload : payload?.path
   const sessionId = typeof payload === 'object' ? payload?.sessionId : ''
-  if (sessionId) await selectAgentSession(sessionId)
+  if (sessionId && await selectAgentSession(sessionId)) return
   glossaryPath.value = path || ''
   activeView.value = 'glossary'
   await loadGlossary()
@@ -720,7 +1093,11 @@ async function openGlossaryReviewForSession(session) {
     if (openedGlossaryReviewKey.value.startsWith(`${session?.id || ''}:`)) openedGlossaryReviewKey.value = ''
     return false
   }
-  if (openedGlossaryReviewKey.value === reviewKey) return false
+  if (openedGlossaryReviewKey.value === reviewKey || openingGlossaryReviewKey.value === reviewKey) {
+    activeView.value = 'glossary'
+    return true
+  }
+  openingGlossaryReviewKey.value = reviewKey
   glossaryPath.value = session.question.glossary_path || session.result.glossary_path
   activeView.value = 'glossary'
   try {
@@ -731,6 +1108,8 @@ async function openGlossaryReviewForSession(session) {
     return true
   } catch {
     return false
+  } finally {
+    if (openingGlossaryReviewKey.value === reviewKey) openingGlossaryReviewKey.value = ''
   }
 }
 
@@ -835,9 +1214,11 @@ async function runOcrFull() {
       url: value,
       title: probe.value?.title || titleBox.value || '',
       extra_hint: extraHint.value,
+      ocr_pipeline_version: ocrExtractionMode.value === 'region_v3' ? 'v3' : 'custom',
       translation_mode: ocrTranslationMode.value,
       ocr_scope: ocrScope.value,
       ocr_extraction_mode: ocrExtractionMode.value,
+      ocr_shape_mode: ocrShapeMode.value,
       ocr_crop_top_ratio: ocrCropTopRatio.value,
       ocr_crop_bottom_ratio: ocrCropBottomRatio.value,
       ocr_crop_left_ratio: ocrCropLeftRatio.value,
@@ -866,9 +1247,11 @@ async function runLocalOcr() {
     const job = await api('/api/jobs/ocr-local', {
       input_video: localVideo.value.trim(),
       extra_hint: extraHint.value,
+      ocr_pipeline_version: ocrExtractionMode.value === 'region_v3' ? 'v3' : 'custom',
       translation_mode: ocrTranslationMode.value,
       ocr_scope: ocrScope.value,
       ocr_extraction_mode: ocrExtractionMode.value,
+      ocr_shape_mode: ocrShapeMode.value,
       ocr_crop_top_ratio: ocrCropTopRatio.value,
       ocr_crop_bottom_ratio: ocrCropBottomRatio.value,
       ocr_crop_left_ratio: ocrCropLeftRatio.value,
@@ -905,6 +1288,8 @@ async function runOcrDevelopmentTest() {
       flicker_smoothing_max_duration_seconds: ocrDevFlickerSmoothingMaxDurationSeconds.value,
       llm_cleanup: ocrDevLlmCleanup.value,
       ocr_scope: ocrScope.value,
+      ocr_extraction_mode: ocrDevExtractionMode.value,
+      ocr_shape_mode: ocrDevShapeMode.value,
       ocr_crop_top_ratio: ocrCropTopRatio.value,
       ocr_crop_bottom_ratio: ocrCropBottomRatio.value,
       ocr_crop_left_ratio: ocrCropLeftRatio.value,
@@ -955,6 +1340,78 @@ async function runOcrJsonRebuild(debugDir) {
     watchJob(job)
     activeView.value = 'jobs'
     setStatus(ocrDevStatus, 'JSON 重建已启动；不会重新读取视频。', 'ok')
+  } catch (error) {
+    setStatus(ocrDevStatus, error.message, 'bad')
+  } finally {
+    ocrDevRunning.value = false
+  }
+}
+
+async function runOcrLayeredRefine(debugDir) {
+  if (!debugDir) {
+    setStatus(ocrDevStatus, '请选择包含 ocr_boxes.json 的调试文件夹。', 'bad')
+    return
+  }
+  const isV3 = assets.ocr_debug_folders.some(
+    (folder) => folder.path === debugDir && folder.ocr_lab_version === 'v3',
+  )
+  ocrDevRunning.value = true
+  setStatus(
+    ocrDevStatus,
+    isV3
+      ? '正在复用 3.0 文字精修稿，仅重跑画面字/对白分层…'
+      : '正在根据 OCR 文字框分层精修画面字与下方对白…',
+    '',
+  )
+  try {
+    const job = await api('/api/jobs/ocr-layered-refine', { debug_dir: debugDir })
+    watchJob(job)
+    activeView.value = 'jobs'
+    setStatus(
+      ocrDevStatus,
+      isV3
+        ? '3.0 分层复跑已启动；不会重新运行 OCR 或文字精修。'
+        : '分层精修已启动；完成后将自动选中分层字幕。',
+      'ok',
+    )
+  } catch (error) {
+    setStatus(ocrDevStatus, error.message, 'bad')
+  } finally {
+    ocrDevRunning.value = false
+  }
+}
+
+async function runOcrGeometryRefine(debugDir) {
+  if (!debugDir) {
+    setStatus(ocrDevStatus, '请选择包含字幕和 ocr_boxes.json 的调试文件夹。', 'bad')
+    return
+  }
+  ocrDevRunning.value = true
+  setStatus(ocrDevStatus, '正在复用已有 OCR 结果进行 3.0 几何 LLM 精修…', '')
+  try {
+    const job = await api('/api/jobs/ocr-geometry-refine', { debug_dir: debugDir })
+    watchJob(job)
+    activeView.value = 'jobs'
+    setStatus(ocrDevStatus, '几何精修已启动；不会重新运行 OCR。', 'ok')
+  } catch (error) {
+    setStatus(ocrDevStatus, error.message, 'bad')
+  } finally {
+    ocrDevRunning.value = false
+  }
+}
+
+async function runOcrV3Refine(debugDir) {
+  if (!debugDir) {
+    setStatus(ocrDevStatus, '请选择包含现有 OCR 数据的 3.0 调试文件夹。', 'bad')
+    return
+  }
+  ocrDevRunning.value = true
+  setStatus(ocrDevStatus, '正在复用现有 OCR、轨迹和几何数据，执行 3.0 文字 + 分层精修…', '')
+  try {
+    const job = await api('/api/jobs/ocr-v3-refine', { debug_dir: debugDir })
+    watchJob(job)
+    activeView.value = 'jobs'
+    setStatus(ocrDevStatus, '3.0 成品精修已启动；只复用现有数据，不会重新运行 OCR。', 'ok')
   } catch (error) {
     setStatus(ocrDevStatus, error.message, 'bad')
   } finally {
@@ -1153,6 +1610,7 @@ async function continueAfterGlossarySave() {
     setStatus(flowStatus, 'Glossary 已保存，正在让 Agent 继续处理...', '')
     const session = await api('/api/agent/continue-glossary', { glossary_path: path })
     agentSession.value = session
+    restoreAgentOcrPipeline(session)
     openedGlossaryReviewKey.value = ''
     activeView.value = 'agent'
     setStatus(agentStatus, 'Glossary 已保存，Agent 继续处理翻译...', 'ok')
@@ -1327,6 +1785,25 @@ function applyJobResult(job) {
   if (result.subtitle_path) sourceSrt.value = result.subtitle_path
   if (result.source_srt) sourceSrt.value = result.source_srt
   if (result.source_track_refined_srt) sourceSrt.value = result.source_track_refined_srt
+  if (result.source_layered_srt) {
+    sourceSrt.value = result.source_layered_srt
+    setStatus(ocrDevStatus, `分层精修完成：${result.source_layered_srt}`, 'ok')
+  }
+  const geometrySrt = result.source_geometry_refined_srt || result.geometry_srt
+  if (geometrySrt) {
+    sourceSrt.value = geometrySrt
+    setStatus(ocrDevStatus, `几何精修完成：${geometrySrt}`, 'ok')
+  }
+  const v3RefinedSrt = result.source_v3_refined_srt || result.v3_refined_srt
+  const v3LayeredSrt = result.source_v3_layered_srt || result.v3_layered_srt
+  if (v3RefinedSrt) {
+    sourceSrt.value = v3RefinedSrt
+    setStatus(ocrDevStatus, `3.0 文字精修完成：${v3RefinedSrt}`, 'ok')
+  }
+  if (v3LayeredSrt) {
+    sourceSrt.value = v3LayeredSrt
+    setStatus(ocrDevStatus, `3.0 文字 + 分层精修完成：${v3LayeredSrt}`, 'ok')
+  }
   if (result.input_video) localVideo.value = result.input_video
   if (result.output_video) {
     localVideo.value = result.output_video
@@ -1381,12 +1858,27 @@ function useSubtitle(path) {
   setStatus(flowStatus, `已选择源字幕：${path}`, 'ok')
 }
 
-async function editSubtitle(path) {
-  subtitleEditorPath.value = path || sourceSrt.value || ''
+async function editSubtitle(payload) {
+  const path = typeof payload === 'object' ? payload?.path : payload
+  const videoPath = typeof payload === 'object' ? payload?.videoPath : ''
+  const nextSubtitlePath = path || sourceSrt.value || ''
+  const isSameSubtitle = nextSubtitlePath === subtitleEditorPath.value
+  subtitleEditorPath.value = nextSubtitlePath
+  subtitleEditorVideoPath.value = videoPath || inferVideoForSubtitle(nextSubtitlePath) || (isSameSubtitle ? subtitleEditorVideoPath.value : '')
   activeView.value = 'subtitle-edit'
   if (subtitleEditorPath.value) {
     await loadSubtitleEditor()
   }
+}
+
+function inferVideoForSubtitle(path) {
+  const subtitlePath = String(path || '')
+  if (!subtitlePath) return ''
+  const project = (assets.projects || []).find((item) => subtitlePath.startsWith(`${item.path}/`) || subtitlePath === item.path)
+  if (project?.primary_video) return project.primary_video
+  if (project?.videos?.[0]?.path) return project.videos[0].path
+  const ocrJob = (assets.ocr_jobs || []).find((item) => [item.source_srt, item.translated_srt].includes(subtitlePath))
+  return ocrJob?.input_video || ''
 }
 
 async function loadSubtitleEditor() {
@@ -1399,14 +1891,14 @@ async function loadSubtitleEditor() {
   try {
     const result = await api('/api/subtitle/read', { path: subtitleEditorPath.value.trim() })
     subtitleEditorPath.value = result.path
-    subtitleEditorCues.value = (result.cues || []).map((cue, index) => ({
-      ...cue,
-      uid: `${Date.now()}-${index}`,
-    }))
+    subtitleEditorCues.value = renumberSubtitleCues(result.cues || [])
+    subtitleEditorSavedCues.value = cloneSubtitleEditorCues(subtitleEditorCues.value)
+    if (!subtitleEditorVideoPath.value) subtitleEditorVideoPath.value = inferVideoForSubtitle(result.path)
     subtitleEditorDirty.value = false
     subtitlePairIssues.value = []
     subtitleFocusedCueUid.value = ''
     subtitleEditorUndoStack.value = []
+    subtitleEditorPendingFieldEdit.value = null
     setStatus(subtitleEditorStatus, `已加载 ${result.count || 0} 条字幕。`, 'ok')
   } catch (error) {
     setStatus(subtitleEditorStatus, error.message, 'bad')
@@ -1420,24 +1912,35 @@ async function saveSubtitleEditor(overwrite) {
     setStatus(subtitleEditorStatus, '先加载字幕。', 'bad')
     return
   }
+  const emptyCueIndex = subtitleEditorCues.value.findIndex((cue) => !String(cue.text || '').trim())
+  if (emptyCueIndex >= 0) {
+    setStatus(subtitleEditorStatus, `第 ${emptyCueIndex + 1} 条字幕还是空的，请填写文字或删除后再保存。`, 'bad')
+    await focusSubtitleEditorCue(subtitleEditorCues.value[emptyCueIndex].uid)
+    return
+  }
+  let normalizedCues
+  try {
+    normalizedCues = renumberSubtitleCues(subtitleEditorCues.value)
+  } catch (error) {
+    setStatus(subtitleEditorStatus, error.message, 'bad')
+    return
+  }
   subtitleEditorLoading.value = true
   setStatus(subtitleEditorStatus, overwrite ? '正在覆盖保存字幕...' : '正在另存 edited 字幕...', '')
   try {
     const result = await api('/api/subtitle/write', {
       path: subtitleEditorPath.value.trim(),
       overwrite,
-      cues: subtitleEditorCues.value,
+      cues: normalizedCues,
     })
     subtitleEditorPath.value = result.path
     sourceSrt.value = result.path
-    subtitleEditorCues.value = (result.cues || []).map((cue, index) => ({
-      ...cue,
-      uid: `${Date.now()}-${index}`,
-    }))
+    subtitleEditorCues.value = renumberSubtitleCues(result.cues || [])
+    subtitleEditorSavedCues.value = cloneSubtitleEditorCues(subtitleEditorCues.value)
     subtitleEditorDirty.value = false
     subtitlePairIssues.value = []
     subtitleFocusedCueUid.value = ''
-    subtitleEditorUndoStack.value = []
+    subtitleEditorPendingFieldEdit.value = null
     setStatus(subtitleEditorStatus, `已保存 ${result.count || 0} 条字幕：${result.path}`, 'ok')
     await loadAssets()
   } catch (error) {
@@ -1447,18 +1950,163 @@ async function saveSubtitleEditor(overwrite) {
   }
 }
 
+function beginSubtitleEditorCueEdit({ uid, field }) {
+  if (!subtitleEditorCues.value.some((cue) => cue.uid === uid)) return
+  if (!['start_time', 'end_time', 'text'].includes(field)) return
+  const key = `${uid}:${field}`
+  if (subtitleEditorPendingFieldEdit.value?.key === key) return
+  subtitleEditorPendingFieldEdit.value = {
+    key,
+    uid,
+    field,
+    label: subtitleEditorFieldEditLabel(field),
+    cues: cloneSubtitleEditorCues(subtitleEditorCues.value),
+    recorded: false,
+  }
+}
+
+function endSubtitleEditorCueEdit({ uid, field }) {
+  if (subtitleEditorPendingFieldEdit.value?.key === `${uid}:${field}`) {
+    subtitleEditorPendingFieldEdit.value = null
+  }
+}
+
 function updateSubtitleEditorCue({ uid, patch }) {
-  subtitleEditorCues.value = subtitleEditorCues.value.map((cue) => (
-    cue.uid === uid ? { ...cue, ...patch } : cue
-  ))
-  subtitleEditorDirty.value = true
+  const target = subtitleEditorCues.value.find((cue) => cue.uid === uid)
+  if (!target || !patch || typeof patch !== 'object') return
+  const changedFields = Object.keys(patch).filter((field) => target[field] !== patch[field])
+  if (!changedFields.length) return
+
+  const pending = subtitleEditorPendingFieldEdit.value
+  if (pending && pending.uid === uid && changedFields.includes(pending.field)) {
+    if (!pending.recorded) {
+      pushSubtitleEditorUndo(pending.label, pending.cues)
+      pending.recorded = true
+    }
+  } else {
+    pushSubtitleEditorUndo(subtitleEditorFieldEditLabel(changedFields[0]))
+  }
+
+  subtitleEditorCues.value = subtitleEditorCues.value.map((cue) => {
+    if (cue.uid !== uid) return cue
+    const nextCue = { ...cue, ...patch }
+    if (Object.prototype.hasOwnProperty.call(patch, 'start_time')) {
+      try {
+        nextCue.start = parseSrtTime(patch.start_time)
+      } catch {
+        // Keep the raw value while the user is still typing; save validates it.
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'end_time')) {
+      try {
+        nextCue.end = parseSrtTime(patch.end_time)
+      } catch {
+        // Keep the raw value while the user is still typing; save validates it.
+      }
+    }
+    return nextCue
+  })
+  refreshSubtitleEditorDirty()
+  subtitlePairIssues.value = []
+}
+
+function subtitleEditorFieldEditLabel(field) {
+  if (field === 'start_time') return '修改开始时间'
+  if (field === 'end_time') return '修改结束时间'
+  return '修改字幕文字'
+}
+
+async function addSubtitleEditorCueAtTime(currentTime) {
+  try {
+    pushSubtitleEditorUndo('新增字幕')
+    const result = insertSubtitleCueAtTime(subtitleEditorCues.value, currentTime)
+    applySubtitleEditorMutation(result.cues, result.cueUid)
+    setStatus(subtitleEditorStatus, `已在 ${result.cue.start_time} 新增字幕，请填写文字并设置结束时间。`, 'ok')
+    await focusSubtitleEditorCue(result.cueUid)
+  } catch (error) {
+    discardLastSubtitleEditorUndo()
+    setStatus(subtitleEditorStatus, error.message, 'bad')
+  }
+}
+
+async function insertSubtitleEditorCue(uid, direction) {
+  try {
+    pushSubtitleEditorUndo(direction === 'before' ? '前插字幕' : '后插字幕')
+    const result = insertSubtitleCueRelative(subtitleEditorCues.value, uid, direction)
+    applySubtitleEditorMutation(result.cues, result.cueUid)
+    setStatus(subtitleEditorStatus, `已${direction === 'before' ? '前插' : '后插'}一条字幕，请填写文字。`, 'ok')
+    await focusSubtitleEditorCue(result.cueUid)
+  } catch (error) {
+    discardLastSubtitleEditorUndo()
+    setStatus(subtitleEditorStatus, error.message, 'bad')
+  }
+}
+
+function setSubtitleEditorCueBoundary(uid, boundary, currentTime) {
+  try {
+    pushSubtitleEditorUndo(boundary === 'start' ? '设置开始时间' : '设置结束时间')
+    const result = setSubtitleCueBoundary(subtitleEditorCues.value, uid, boundary, currentTime)
+    applySubtitleEditorMutation(result.cues, uid)
+    setStatus(subtitleEditorStatus, `已用播放器当前时间设置${boundary === 'start' ? '开始' : '结束'}。`, 'ok')
+  } catch (error) {
+    discardLastSubtitleEditorUndo()
+    setStatus(subtitleEditorStatus, error.message, 'bad')
+  }
+}
+
+function nudgeSubtitleEditorCue(uid, boundary, delta) {
+  const cue = subtitleEditorCues.value.find((item) => item.uid === uid)
+  if (!cue) return
+  let undoPushed = false
+  try {
+    const current = parseSrtTime(boundary === 'start' ? cue.start_time : cue.end_time)
+    pushSubtitleEditorUndo(`微调${boundary === 'start' ? '开始' : '结束'}时间`)
+    undoPushed = true
+    const result = setSubtitleCueBoundary(subtitleEditorCues.value, uid, boundary, current + Number(delta || 0))
+    applySubtitleEditorMutation(result.cues, uid)
+  } catch (error) {
+    if (undoPushed) discardLastSubtitleEditorUndo()
+    setStatus(subtitleEditorStatus, error.message, 'bad')
+  }
+}
+
+function snapSubtitleEditorCue(uid, boundary, direction) {
+  const index = subtitleEditorCues.value.findIndex((cue) => cue.uid === uid)
+  const neighbor = direction === 'prev' ? subtitleEditorCues.value[index - 1] : subtitleEditorCues.value[index + 1]
+  if (index < 0 || !neighbor) return
+  let undoPushed = false
+  try {
+    const targetTime = parseSrtTime(direction === 'prev' ? neighbor.end_time : neighbor.start_time)
+    pushSubtitleEditorUndo(boundary === 'start' ? '开始时间接上条' : '结束时间接下条')
+    undoPushed = true
+    const result = setSubtitleCueBoundary(subtitleEditorCues.value, uid, boundary, targetTime)
+    applySubtitleEditorMutation(result.cues, uid)
+  } catch (error) {
+    if (undoPushed) discardLastSubtitleEditorUndo()
+    setStatus(subtitleEditorStatus, error.message, 'bad')
+  }
+}
+
+function applySubtitleEditorMutation(cues, focusedUid = '') {
+  subtitleEditorCues.value = renumberSubtitleCues(cues)
+  refreshSubtitleEditorDirty()
+  subtitlePairIssues.value = []
+  subtitleFocusedCueUid.value = focusedUid
+}
+
+function discardLastSubtitleEditorUndo() {
+  subtitleEditorUndoStack.value = subtitleEditorUndoStack.value.slice(0, -1)
 }
 
 function deleteSubtitleEditorCue(uid) {
   if (!subtitleEditorCues.value.some((cue) => cue.uid === uid)) return
-  pushSubtitleEditorUndo('删除字幕')
-  subtitleEditorCues.value = subtitleEditorCues.value.filter((cue) => cue.uid !== uid)
-  subtitleEditorDirty.value = true
+  try {
+    pushSubtitleEditorUndo('删除字幕')
+    applySubtitleEditorMutation(subtitleEditorCues.value.filter((cue) => cue.uid !== uid))
+  } catch (error) {
+    discardLastSubtitleEditorUndo()
+    setStatus(subtitleEditorStatus, error.message, 'bad')
+  }
 }
 
 function mergeSubtitleEditorCue(uid, direction) {
@@ -1466,21 +2114,25 @@ function mergeSubtitleEditorCue(uid, direction) {
   if (index < 0) return
   const targetIndex = direction === 'prev' ? index - 1 : index + 1
   if (targetIndex < 0 || targetIndex >= subtitleEditorCues.value.length) return
-  pushSubtitleEditorUndo('合并字幕')
-  const firstIndex = Math.min(index, targetIndex)
-  const secondIndex = Math.max(index, targetIndex)
-  const first = subtitleEditorCues.value[firstIndex]
-  const second = subtitleEditorCues.value[secondIndex]
-  const merged = {
-    ...first,
-    end: second.end,
-    end_time: second.end_time,
-    text: joinSubtitleText(first.text, second.text),
+  try {
+    pushSubtitleEditorUndo('合并字幕')
+    const firstIndex = Math.min(index, targetIndex)
+    const secondIndex = Math.max(index, targetIndex)
+    const first = subtitleEditorCues.value[firstIndex]
+    const second = subtitleEditorCues.value[secondIndex]
+    const merged = {
+      ...first,
+      end: parseSrtTime(second.end_time),
+      end_time: second.end_time,
+      text: joinSubtitleText(first.text, second.text),
+    }
+    const next = [...subtitleEditorCues.value]
+    next.splice(firstIndex, 2, merged)
+    applySubtitleEditorMutation(next, merged.uid)
+  } catch (error) {
+    discardLastSubtitleEditorUndo()
+    setStatus(subtitleEditorStatus, error.message, 'bad')
   }
-  const next = [...subtitleEditorCues.value]
-  next.splice(firstIndex, 2, merged)
-  subtitleEditorCues.value = next
-  subtitleEditorDirty.value = true
 }
 
 function stripSubtitleEditorBreaks(uid) {
@@ -1492,7 +2144,7 @@ function stripSubtitleEditorBreaks(uid) {
   subtitleEditorCues.value = subtitleEditorCues.value.map((cue) => (
     cue.uid === uid ? { ...cue, text: normalized } : cue
   ))
-  subtitleEditorDirty.value = true
+  refreshSubtitleEditorDirty()
 }
 
 function stripAllSubtitleEditorBreaks() {
@@ -1503,15 +2155,14 @@ function stripAllSubtitleEditorBreaks() {
   if (!subtitleCuesChanged(subtitleEditorCues.value, next)) return
   pushSubtitleEditorUndo('全部去异常换行')
   subtitleEditorCues.value = next
-  subtitleEditorDirty.value = true
+  refreshSubtitleEditorDirty()
 }
 
 function removeEmptySubtitleEditorCues() {
   const next = subtitleEditorCues.value.filter((cue) => String(cue.text || '').trim())
   if (next.length === subtitleEditorCues.value.length) return
   pushSubtitleEditorUndo('删除空字幕')
-  subtitleEditorCues.value = next
-  subtitleEditorDirty.value = true
+  applySubtitleEditorMutation(next)
 }
 
 function stripSubtitleEditorTrailingCommas() {
@@ -1522,7 +2173,7 @@ function stripSubtitleEditorTrailingCommas() {
   }
   pushSubtitleEditorUndo('删除结尾逗号')
   subtitleEditorCues.value = result.cues
-  subtitleEditorDirty.value = true
+  refreshSubtitleEditorDirty()
   setStatus(subtitleEditorStatus, `已处理 ${result.changedCueCount} 条字幕，删除 ${result.removedCommaCount} 个结尾逗号。`, 'ok')
 }
 
@@ -1582,25 +2233,48 @@ function stripSubtitleEditorPrefixes() {
   }
   pushSubtitleEditorUndo('删除名前缀')
   subtitleEditorCues.value = result.cues
-  subtitleEditorDirty.value = true
+  refreshSubtitleEditorDirty()
   setStatus(subtitleEditorStatus, `已处理 ${result.changedCueCount} 条字幕，删除 ${result.removedPrefixCount} 个名前缀。`, 'ok')
 }
 
-function pushSubtitleEditorUndo(label) {
+function pushSubtitleEditorUndo(label, cues = subtitleEditorCues.value) {
   subtitleEditorUndoStack.value = [
     ...subtitleEditorUndoStack.value,
-    { label, cues: cloneSubtitleEditorCues(subtitleEditorCues.value) },
-  ].slice(-25)
+    {
+      label,
+      cues: cloneSubtitleEditorCues(cues),
+      focusedCueUid: subtitleFocusedCueUid.value,
+    },
+  ].slice(-50)
 }
 
 function undoSubtitleEditorChange() {
   const stack = [...subtitleEditorUndoStack.value]
   const snapshot = stack.pop()
   if (!snapshot) return
+  subtitleEditorPendingFieldEdit.value = null
   subtitleEditorUndoStack.value = stack
   subtitleEditorCues.value = cloneSubtitleEditorCues(snapshot.cues)
-  subtitleEditorDirty.value = true
+  subtitlePairIssues.value = []
+  subtitleFocusedCueUid.value = subtitleEditorCues.value.some((cue) => cue.uid === snapshot.focusedCueUid)
+    ? snapshot.focusedCueUid
+    : ''
+  refreshSubtitleEditorDirty()
   setStatus(subtitleEditorStatus, `已撤销：${snapshot.label}`, 'ok')
+}
+
+function onSubtitleEditorUndoShortcut(event) {
+  if (activeView.value !== 'subtitle-edit' || subtitleEditorLoading.value) return
+  if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'z' || event.shiftKey || event.altKey) return
+  const target = event.target
+  if (target instanceof HTMLElement && (target.matches('input, textarea, [contenteditable="true"]') || target.closest('[contenteditable="true"]'))) return
+  if (!subtitleEditorUndoStack.value.length) return
+  event.preventDefault()
+  undoSubtitleEditorChange()
+}
+
+function refreshSubtitleEditorDirty() {
+  subtitleEditorDirty.value = subtitleCuesChanged(subtitleEditorSavedCues.value, subtitleEditorCues.value)
 }
 
 function cloneSubtitleEditorCues(cues) {
@@ -1608,8 +2282,10 @@ function cloneSubtitleEditorCues(cues) {
 }
 
 function subtitleCuesChanged(left, right) {
-  if (left.length !== right.length) return true
-  return left.some((cue, index) => cue.text !== right[index]?.text || cue.start_time !== right[index]?.start_time || cue.end_time !== right[index]?.end_time)
+  const leftCues = left || []
+  const rightCues = right || []
+  if (leftCues.length !== rightCues.length) return true
+  return leftCues.some((cue, index) => cue.text !== rightCues[index]?.text || cue.start_time !== rightCues[index]?.start_time || cue.end_time !== rightCues[index]?.end_time)
 }
 
 function normalizeSubtitleLine(text) {

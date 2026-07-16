@@ -10,7 +10,7 @@
           {{ ocrExcludeEnabled ? '关闭排除框' : '添加 Logo 排除框' }}
         </button>
         <button class="secondary mini" type="button" :disabled="loading || !inputVideo" @click="loadPreview">
-          {{ preview.image_data_url ? (loading ? '换帧中' : '换一帧') : (loading ? '抽帧中' : '抽一帧预览') }}
+          {{ previewButtonLabel }}
         </button>
       </div>
     </div>
@@ -112,12 +112,39 @@
           <span class="crop-window-label">排除</span>
           <span class="crop-resize-handle" @pointerdown.stop.prevent="startDrag('exclude', 'resize', $event)"></span>
         </div>
+        <svg
+          v-if="preview.ocr_analyzed && preview.width && preview.height"
+          class="ocr-candidate-overlay"
+          :viewBox="`0 0 ${preview.width} ${preview.height}`"
+          :style="{ '--ocr-candidate-font-size': `${candidateFontSize}px` }"
+          preserveAspectRatio="none"
+          aria-label="OCR 3.0 候选框预览"
+        >
+          <g v-for="(candidate, index) in preview.accepted" :key="`accepted-${index}`">
+            <polygon :points="candidatePoints(candidate)" :class="acceptedCandidateBoxClass(candidate)" />
+            <text :x="candidateLabelX(candidate)" :y="candidateLabelY(candidate)" :class="acceptedCandidateLabelClass(candidate)">
+              {{ candidateLabel(candidate, acceptedCandidateStatus(candidate)) }}
+            </text>
+          </g>
+          <g v-for="(candidate, index) in preview.rejected" :key="`rejected-${index}`">
+            <polygon :points="candidatePoints(candidate)" class="ocr-candidate-box rejected" />
+            <text :x="candidateLabelX(candidate)" :y="candidateLabelY(candidate)" class="ocr-candidate-label rejected">
+              {{ candidateLabel(candidate, '硬排除') }}
+            </text>
+          </g>
+        </svg>
       </div>
       <div class="crop-preview-meta">
         <span>预览帧 {{ previewTimeLabel }}</span>
         <span v-if="ocrExcludeEnabled">红框内 OCR 会被忽略</span>
+        <span v-if="preview.ocr_analyzed" class="ocr-preview-summary">
+          <b class="kept">普通候选 {{ regularCandidateCount }}</b>
+          <b v-if="softCandidateCount" class="caution">待几何精修 {{ softCandidateCount }}</b>
+          <b class="removed">硬排除 {{ preview.rejected.length }}</b>
+        </span>
         <span v-if="preview.width && preview.height">{{ preview.width }} × {{ preview.height }}</span>
       </div>
+      <div v-if="preview.ocr_analyzed" class="muted crop-note">单帧预览只显示几何预筛；最终是否进入字幕由跨帧证据和几何 LLM 精修决定。</div>
     </div>
     <div v-if="error" class="status bad">{{ error }}</div>
   </div>
@@ -131,6 +158,11 @@ const props = defineProps({
   title: { type: String, default: 'OCR 裁剪区域' },
   inputVideo: { type: String, default: '' },
   ocrScope: { type: String, default: 'bottom' },
+  ocrExtractionMode: { type: String, default: 'region' },
+  ocrShapeMode: { type: String, default: 'horizontal_preferred' },
+  sourceLanguage: { type: String, default: 'korean' },
+  ocrLanguage: { type: String, default: 'auto' },
+  ocrMinConfidence: { type: Number, default: 0.45 },
   ocrCropTopRatio: { type: Number, default: 0.58 },
   ocrCropBottomRatio: { type: Number, default: 0 },
   ocrCropLeftRatio: { type: Number, default: 0 },
@@ -140,6 +172,7 @@ const props = defineProps({
   ocrExcludeBottomRatio: { type: Number, default: 0.82 },
   ocrExcludeLeftRatio: { type: Number, default: 0.76 },
   ocrExcludeRightRatio: { type: Number, default: 0.02 },
+  autoLoadPreview: { type: Boolean, default: false },
 })
 
 const emit = defineEmits([
@@ -154,7 +187,17 @@ const emit = defineEmits([
   'update:ocrExcludeRightRatio',
 ])
 
-const preview = reactive({ image_data_url: '', time_seconds: 0, duration_seconds: 0, width: 0, height: 0 })
+const preview = reactive({
+  image_data_url: '',
+  time_seconds: 0,
+  duration_seconds: 0,
+  width: 0,
+  height: 0,
+  ocr_analyzed: false,
+  ocr_stale: false,
+  accepted: [],
+  rejected: [],
+})
 const previewEl = ref(null)
 const loading = ref(false)
 const error = ref('')
@@ -162,6 +205,7 @@ const nudgeSteps = [0.01, 0.03, 0.05]
 const nudgeStep = ref(0.03)
 const cropStatus = ref('调整后会自动保存到当前 OCR 参数。')
 const dragState = ref(null)
+const lastAutoLoadedVideo = ref('')
 
 const topPct = computed(() => ratioToPercent(props.ocrCropTopRatio))
 const bottomPct = computed(() => ratioToPercent(props.ocrCropBottomRatio))
@@ -195,8 +239,23 @@ const excludeWindowStyle = computed(() => ({
   height: `${Math.max(0, excludeKeepBottom.value - excludeTopPct.value)}%`,
 }))
 const previewTimeLabel = computed(() => formatTime(preview.time_seconds))
+const candidateFontSize = computed(() => Math.max(18, Number(preview.width || 0) * 0.018))
+const softCandidateCount = computed(() => preview.accepted.filter(isSoftGeometryCandidate).length)
+const regularCandidateCount = computed(() => Math.max(0, preview.accepted.length - softCandidateCount.value))
+const previewButtonLabel = computed(() => {
+  const analyze = props.ocrExtractionMode === 'region_v3'
+  if (loading.value) return analyze ? 'OCR 分析中' : (preview.image_data_url ? '换帧中' : '抽帧中')
+  if (analyze && preview.image_data_url && preview.ocr_stale) return '按当前设置重新分析'
+  if (preview.image_data_url) return analyze ? '换一帧并分析' : '换一帧'
+  return analyze ? '抽一帧并分析' : '抽一帧预览'
+})
 const cropKey = computed(() => [
   props.ocrScope,
+  props.ocrExtractionMode,
+  props.ocrShapeMode,
+  props.sourceLanguage,
+  props.ocrLanguage,
+  Number(props.ocrMinConfidence || 0).toFixed(4),
   Number(props.ocrCropTopRatio || 0).toFixed(4),
   Number(props.ocrCropBottomRatio || 0).toFixed(4),
   Number(props.ocrCropLeftRatio || 0).toFixed(4),
@@ -207,11 +266,33 @@ const cropKey = computed(() => [
   Number(props.ocrExcludeLeftRatio || 0).toFixed(4),
   Number(props.ocrExcludeRightRatio || 0).toFixed(4),
 ].join('|'))
+const previewRequestKey = computed(() => [props.inputVideo, cropKey.value].join('|'))
 
 watch(cropKey, (_next, previous) => {
   if (!previous) return
   cropStatus.value = '已自动保存当前裁剪设置，下一次 OCR 会使用。'
+  preview.ocr_analyzed = false
+  preview.ocr_stale = props.ocrExtractionMode === 'region_v3' && Boolean(preview.image_data_url)
+  preview.accepted = []
+  preview.rejected = []
 })
+
+watch(
+  () => props.inputVideo,
+  (inputVideo, previousVideo) => {
+    const nextVideo = String(inputVideo || '').trim()
+    const previous = String(previousVideo || '').trim()
+    if (nextVideo !== previous) resetPreview()
+    if (!nextVideo) {
+      lastAutoLoadedVideo.value = ''
+      return
+    }
+    if (!props.autoLoadPreview || lastAutoLoadedVideo.value === nextVideo) return
+    lastAutoLoadedVideo.value = nextVideo
+    void loadPreview()
+  },
+  { immediate: true },
+)
 
 onUnmounted(() => {
   window.removeEventListener('pointerup', endDrag)
@@ -473,6 +554,65 @@ function formatTime(value) {
   return `${minutes}:${rest}`
 }
 
+function candidatePolygon(candidate) {
+  if (Array.isArray(candidate?.polygon) && candidate.polygon.length >= 3) return candidate.polygon
+  const bbox = Array.isArray(candidate?.bbox) ? candidate.bbox : [0, 0, 0, 0]
+  return [[bbox[0], bbox[1]], [bbox[2], bbox[1]], [bbox[2], bbox[3]], [bbox[0], bbox[3]]]
+}
+
+function candidatePoints(candidate) {
+  return candidatePolygon(candidate).map(point => `${Number(point[0] || 0)},${Number(point[1] || 0)}`).join(' ')
+}
+
+function candidateLabelX(candidate) {
+  return Math.max(4, Math.min(...candidatePolygon(candidate).map(point => Number(point[0] || 0))))
+}
+
+function candidateLabelY(candidate) {
+  const top = Math.min(...candidatePolygon(candidate).map(point => Number(point[1] || 0)))
+  return Math.max(candidateFontSize.value, top - candidateFontSize.value * 0.22)
+}
+
+function candidateLabel(candidate, status) {
+  const rawAngle = candidate?.angle_degrees
+  const angle = rawAngle === null || rawAngle === undefined ? Number.NaN : Number(rawAngle)
+  const angleLabel = Number.isFinite(angle) ? ` ${angle.toFixed(1)}°` : ''
+  const text = String(candidate?.text || '').trim()
+  return `${status}${angleLabel}${text ? ` · ${text}` : ''}`
+}
+
+function isSoftGeometryCandidate(candidate) {
+  return String(candidate?.shape_hint || '').trim() === 'tilted_soft_candidate'
+}
+
+function acceptedCandidateStatus(candidate) {
+  return isSoftGeometryCandidate(candidate) ? '待几何精修' : '普通候选'
+}
+
+function acceptedCandidateBoxClass(candidate) {
+  return isSoftGeometryCandidate(candidate) ? 'ocr-candidate-box caution' : 'ocr-candidate-box accepted'
+}
+
+function acceptedCandidateLabelClass(candidate) {
+  return isSoftGeometryCandidate(candidate) ? 'ocr-candidate-label caution' : 'ocr-candidate-label accepted'
+}
+
+function resetPreview() {
+  preview.image_data_url = ''
+  preview.time_seconds = 0
+  preview.duration_seconds = 0
+  preview.width = 0
+  preview.height = 0
+  preview.ocr_analyzed = false
+  preview.ocr_stale = false
+  preview.accepted = []
+  preview.rejected = []
+  error.value = ''
+  cropStatus.value = props.inputVideo
+    ? '视频已就绪，正在自动抽取预览帧…'
+    : '调整后会自动保存到当前 OCR 参数。'
+}
+
 async function loadPreview() {
   if (!props.inputVideo) {
     error.value = '先下载或选择一个本地视频。'
@@ -480,11 +620,23 @@ async function loadPreview() {
   }
   loading.value = true
   error.value = ''
+  cropStatus.value = props.ocrExtractionMode === 'region_v3'
+    ? '正在抽帧并分析 OCR 候选…'
+    : '正在抽取预览帧…'
   try {
-    const requestedTime = nextPreviewTime()
+    const requestKey = previewRequestKey.value
+    const requestedTime = props.ocrExtractionMode === 'region_v3' && preview.ocr_stale
+      ? Number(preview.time_seconds || 0)
+      : nextPreviewTime()
     const payload = {
       input_video: props.inputVideo,
       ocr_scope: props.ocrScope,
+      ocr_extraction_mode: props.ocrExtractionMode,
+      ocr_shape_mode: props.ocrShapeMode,
+      source_language: props.sourceLanguage,
+      ocr_language: props.ocrLanguage,
+      ocr_min_confidence: props.ocrMinConfidence,
+      analyze_ocr: props.ocrExtractionMode === 'region_v3',
       ocr_crop_top_ratio: props.ocrCropTopRatio,
       ocr_crop_bottom_ratio: props.ocrCropBottomRatio,
       ocr_crop_left_ratio: props.ocrCropLeftRatio,
@@ -497,13 +649,21 @@ async function loadPreview() {
     }
     if (requestedTime !== undefined) payload.time_seconds = requestedTime
     const result = await api('/api/ocr-preview-frame', payload)
+    if (requestKey !== previewRequestKey.value) return
     preview.image_data_url = result.image_data_url || ''
     preview.time_seconds = result.time_seconds || 0
     preview.duration_seconds = result.duration_seconds || preview.duration_seconds || 0
     preview.width = result.width || 0
     preview.height = result.height || 0
+    const analysis = result.ocr_analysis
+    preview.ocr_analyzed = Boolean(analysis)
+    preview.ocr_stale = false
+    preview.accepted = Array.isArray(analysis?.accepted) ? analysis.accepted : []
+    preview.rejected = Array.isArray(analysis?.rejected) ? analysis.rejected : []
+    cropStatus.value = '预览已就绪，拖动绿色框即可调整；修改会自动保存。'
   } catch (err) {
     error.value = err.message || String(err)
+    cropStatus.value = '视频已就绪，但抽帧失败；可以点击按钮重试。'
   } finally {
     loading.value = false
   }
