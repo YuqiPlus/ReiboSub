@@ -132,7 +132,7 @@ tar -xaf ocr-debug-handoff.tar.gz \
 
 ```bash
 conda env create -f environment.yml
-conda activate video-translate
+conda activate reibosub
 cd frontend
 npm ci
 npm run build

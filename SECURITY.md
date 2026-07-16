@@ -2,7 +2,7 @@
 
 ## Local-first deployment
 
-Video Translate is a trusted-user, local workflow tool. The Web UI does not
+ReiboSub is a trusted-user, local workflow tool. The Web UI does not
 provide accounts, login, tenant isolation, or authorization. It can start
 downloads and processing jobs and can write files under configured project
 directories.

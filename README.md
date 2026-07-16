@@ -1,8 +1,8 @@
-# Video Translate
+# ReiboSub
 
 [中文说明](README.zh-CN.md)
 
-Video Translate is a YouTube/video subtitle production assistant. It can download YouTube videos, subtitles, and thumbnails; extract embedded hard subtitles with OCR; transcribe speech with ASR; generate and review glossary drafts; translate subtitles with an OpenAI-compatible LLM; edit and convert subtitle files; and copy playable sidecar subtitles next to the video.
+ReiboSub is a YouTube/video subtitle production assistant. It can download YouTube videos, subtitles, and thumbnails; extract embedded hard subtitles with OCR; transcribe speech with ASR; generate and review glossary drafts; translate subtitles with an OpenAI-compatible LLM; edit and convert subtitle files; and copy playable sidecar subtitles next to the video.
 
 The project is designed for a human-in-the-loop workflow: the Agent can run multiple video flows at the same time, pause when it needs your decision, and continue after you review glossary terms.
 
@@ -37,10 +37,10 @@ Install system tools first:
 Clone and create a Python environment:
 
 ```bash
-git clone https://github.com/YuqiPlus/Video_Translate.git
-cd Video_Translate
-conda create -n video-translate python=3.11 -y
-conda activate video-translate
+git clone https://github.com/YuqiPlus/ReiboSub.git
+cd ReiboSub
+conda create -n reibosub python=3.11 -y
+conda activate reibosub
 python -m pip install -U pip
 python -m pip install -e ".[dev,asr]"
 ```
@@ -49,7 +49,7 @@ If you prefer one conda command, use the provided environment file:
 
 ```bash
 conda env create -f environment.yml
-conda activate video-translate
+conda activate reibosub
 ```
 
 For a smaller install without ASR/test dependencies:
@@ -208,7 +208,7 @@ Model caches default to the project-local `models/` directory. You can override 
 
 ```yaml
 environment:
-  VIDEO_TRANSLATE_CACHE_DIR: /srv/video-translate-models
+  VIDEO_TRANSLATE_CACHE_DIR: /srv/reibosub-models
 ```
 
 For PaddleOCR GPU support, install a PaddlePaddle GPU build that matches your CUDA runtime. Example for CUDA 12.6:
@@ -288,10 +288,22 @@ cp configs/llm.example.yaml configs/llm.yaml
 cp configs/run.example.yaml configs/run.yaml
 ```
 
+The public command is `reibosub`. The legacy `video-translate` command, the
+internal `video_translate` Python module, and the `VIDEO_TRANSLATE_*`
+configuration keys remain available for compatibility.
+
+If this environment installed the project before the rename, refresh its
+editable package metadata once:
+
+```bash
+python -m pip uninstall -y video-translate
+python -m pip install --no-deps -e .
+```
+
 Probe dependencies and cache paths:
 
 ```bash
-python -m video_translate doctor
+reibosub doctor
 ```
 
 Run from `configs/run.yaml`:
@@ -299,25 +311,25 @@ Run from `configs/run.yaml`:
 ```bash
 python run_from_config.py
 # or
-video-translate run-config configs/run.yaml
+reibosub run-config configs/run.yaml
 ```
 
 Extract hard subtitles from a local video:
 
 ```bash
-python -m video_translate extract "input.mp4" --lang korean --out "outputs/demo"
+reibosub extract "input.mp4" --lang korean --out "outputs/demo"
 ```
 
 Extract with full-screen assist:
 
 ```bash
-python -m video_translate extract "input.mp4" --lang korean --out "outputs/demo" --scan-full-frame
+reibosub extract "input.mp4" --lang korean --out "outputs/demo" --scan-full-frame
 ```
 
 Translate an existing SRT with the configured OpenAI-compatible provider:
 
 ```bash
-python -m video_translate translate-volcengine "outputs/demo/source.srt" \
+reibosub translate-volcengine "outputs/demo/source.srt" \
   --glossary "configs/glossaries/examples/glossary.example.yaml" \
   --out "outputs/demo/zh.srt"
 ```
@@ -396,7 +408,7 @@ This repository does not ship user videos, subtitles, model caches, or real cred
 ## Troubleshooting
 
 - **The page says the frontend is not built**: run `cd frontend && npm ci && npm run build`, then refresh.
-- **You cannot find the Conda environment**: run `conda info --envs` and `conda config --show envs_dirs`, or choose a path explicitly with `conda env create -p /path/to/envs/video-translate -f environment.yml`.
+- **You cannot find the Conda environment**: run `conda info --envs` and `conda config --show envs_dirs`, or choose a path explicitly with `conda env create -p /path/to/envs/reibosub -f environment.yml`.
 - **A CPU Paddle build cannot use the GPU**: select `cpu`/`auto`, or uninstall `paddlepaddle` and install a `paddlepaddle-gpu` build matching your CUDA version. Do not keep both packages.
 - **Provider model discovery fails**: many compatible APIs do not expose `/models`; maintain static model IDs in Settings and continue normally.
 - **YouTube cannot connect**: configure `YTDLP_PROXY` for downloads only instead of applying a global proxy to OCR/ASR.

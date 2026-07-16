@@ -1,8 +1,8 @@
-# Video Translate 中文说明
+# ReiboSub 中文说明
 
 [English README](README.md)
 
-Video Translate 是一个面向 YouTube 和本地视频的字幕制作 Agent。它可以下载视频、字幕和封面；用 OCR 提取内嵌硬字幕；用 ASR 从音频识别字幕；生成并审核 glossary；调用 OpenAI-compatible 大模型翻译字幕；精修和转换字幕格式；并把可播放的外挂字幕复制到视频同目录。
+ReiboSub 是一个面向 YouTube 和本地视频的字幕制作 Agent。它可以下载视频、字幕和封面；用 OCR 提取内嵌硬字幕；用 ASR 从音频识别字幕；生成并审核 glossary；调用 OpenAI-compatible 大模型翻译字幕；精修和转换字幕格式；并把可播放的外挂字幕复制到视频同目录。
 
 这个项目的核心思路是“人机协作”：Agent 可以同时推进多个视频流程，遇到需要你判断的地方会暂停，等你审核 glossary 或确认路线后继续。
 
@@ -37,10 +37,10 @@ Agent 路线的设计说明见：[docs/youtube_agent_workflows.md](docs/youtube_
 克隆项目并创建 Python 环境：
 
 ```bash
-git clone https://github.com/YuqiPlus/Video_Translate.git
-cd Video_Translate
-conda create -n video-translate python=3.11 -y
-conda activate video-translate
+git clone https://github.com/YuqiPlus/ReiboSub.git
+cd ReiboSub
+conda create -n reibosub python=3.11 -y
+conda activate reibosub
 python -m pip install -U pip
 python -m pip install -e ".[dev,asr]"
 ```
@@ -49,7 +49,7 @@ python -m pip install -e ".[dev,asr]"
 
 ```bash
 conda env create -f environment.yml
-conda activate video-translate
+conda activate reibosub
 ```
 
 如果只想最小安装，不需要 ASR 和测试依赖：
@@ -208,7 +208,7 @@ defaults:
 
 ```yaml
 environment:
-  VIDEO_TRANSLATE_CACHE_DIR: /srv/video-translate-models
+  VIDEO_TRANSLATE_CACHE_DIR: /srv/reibosub-models
 ```
 
 如果要用 PaddleOCR GPU，请安装匹配 CUDA 的 PaddlePaddle GPU 版本。例如 CUDA 12.6：
@@ -288,10 +288,20 @@ cp configs/llm.example.yaml configs/llm.yaml
 cp configs/run.example.yaml configs/run.yaml
 ```
 
+新的公开命令是 `reibosub`。旧命令 `video-translate`、内部 Python
+模块名 `video_translate` 以及 `VIDEO_TRANSLATE_*` 配置键继续保留，避免已有脚本和本机配置失效。
+
+如果当前环境在改名前安装过本项目，执行一次下面的命令刷新 editable 包元数据：
+
+```bash
+python -m pip uninstall -y video-translate
+python -m pip install --no-deps -e .
+```
+
 检查依赖和缓存路径：
 
 ```bash
-python -m video_translate doctor
+reibosub doctor
 ```
 
 读取 `configs/run.yaml` 运行：
@@ -299,25 +309,25 @@ python -m video_translate doctor
 ```bash
 python run_from_config.py
 # 或
-video-translate run-config configs/run.yaml
+reibosub run-config configs/run.yaml
 ```
 
 从本地视频 OCR 提取字幕：
 
 ```bash
-python -m video_translate extract "input.mp4" --lang korean --out "outputs/demo"
+reibosub extract "input.mp4" --lang korean --out "outputs/demo"
 ```
 
 开启全屏辅助 OCR：
 
 ```bash
-python -m video_translate extract "input.mp4" --lang korean --out "outputs/demo" --scan-full-frame
+reibosub extract "input.mp4" --lang korean --out "outputs/demo" --scan-full-frame
 ```
 
 翻译已有 SRT：
 
 ```bash
-python -m video_translate translate-volcengine "outputs/demo/source.srt" \
+reibosub translate-volcengine "outputs/demo/source.srt" \
   --glossary "configs/glossaries/examples/glossary.example.yaml" \
   --out "outputs/demo/zh.srt"
 ```
@@ -402,7 +412,7 @@ git diff --cached --name-only
 ## 常见问题
 
 - **页面提示前端未构建**：运行 `cd frontend && npm ci && npm run build`，然后刷新页面。
-- **不知道 Conda 环境装到哪里**：运行 `conda info --envs` 和 `conda config --show envs_dirs`；也可以用 `conda env create -p /path/to/envs/video-translate -f environment.yml` 显式指定位置。
+- **不知道 Conda 环境装到哪里**：运行 `conda info --envs` 和 `conda config --show envs_dirs`；也可以用 `conda env create -p /path/to/envs/reibosub -f environment.yml` 显式指定位置。
 - **提示安装的是 CPU 版 Paddle，无法用 GPU**：把 OCR 设备改为 `cpu`/`auto`，或先卸载 `paddlepaddle`，再按 CUDA 版本安装匹配的 `paddlepaddle-gpu`；不要同时保留 CPU/GPU 两个包。
 - **服务商获取不到模型**：很多兼容接口没有 `/models`；在设置页维护静态模型 ID，仍然可以正常发起任务。
 - **YouTube 无法连接**：只为下载链路配置 `YTDLP_PROXY`，不要为了下载给整个 OCR/ASR 进程设置全局代理。
