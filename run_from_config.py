@@ -10,7 +10,7 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "run.yaml"
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run Video_Translate from a YAML config.")
+    parser = argparse.ArgumentParser(description="Run ReiboSub from a YAML config.")
     parser.add_argument("config", nargs="?", type=Path, default=DEFAULT_CONFIG_PATH)
     args = parser.parse_args()
     run_config(args.config)

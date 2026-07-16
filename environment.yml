@@ -1,4 +1,4 @@
-name: video-translate
+name: reibosub
 channels:
   - conda-forge
 dependencies:

@@ -1,5 +1,5 @@
 [project]
-name = "video-translate"
+name = "reibosub"
 version = "0.1.0"
 description = "Human-in-the-loop OCR, ASR, glossary, translation, and subtitle refinement for video."
 readme = "README.md"
@@ -35,12 +35,13 @@ dev = [
 ]
 
 [project.scripts]
+reibosub = "video_translate.cli:main"
 video-translate = "video_translate.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/YuqiPlus/Video_Translate"
-Repository = "https://github.com/YuqiPlus/Video_Translate.git"
-Issues = "https://github.com/YuqiPlus/Video_Translate/issues"
+Homepage = "https://github.com/YuqiPlus/ReiboSub"
+Repository = "https://github.com/YuqiPlus/ReiboSub.git"
+Issues = "https://github.com/YuqiPlus/ReiboSub/issues"
 
 [build-system]
 requires = ["setuptools>=77.0.3"]

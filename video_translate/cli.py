@@ -13,7 +13,7 @@ from video_translate.subtitle.retime import align_srt_timing
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(prog="video-translate")
+    parser = argparse.ArgumentParser(prog="reibosub")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     extract = subparsers.add_parser("extract", help="从视频 OCR 提取硬字幕")

@@ -1,10 +1,10 @@
 <template>
   <nav class="side-nav" aria-label="主导航">
     <div class="side-brand">
-      <div class="brand-mark">VT</div>
+      <div class="brand-mark">RS</div>
       <div>
-        <strong>Video Translate</strong>
-        <span>Agent Studio</span>
+        <strong>ReiboSub</strong>
+        <span>Subtitle Studio</span>
       </div>
     </div>
 

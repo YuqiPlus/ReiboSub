@@ -16,7 +16,7 @@
 <script setup>
 defineProps({
   eyebrow: { type: String, default: '' },
-  title: { type: String, default: 'Video Translate Agent' },
+  title: { type: String, default: 'ReiboSub Agent' },
   description: { type: String, default: '下载、提取、纠错、术语审核和字幕翻译工作台。' },
   metrics: { type: Object, default: () => ({ videos: 0, subtitles: 0, jobs: 0 }) },
 })

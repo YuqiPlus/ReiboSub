@@ -156,7 +156,7 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
     JOB_DIR.mkdir(parents=True, exist_ok=True)
     TASK_DIR.mkdir(parents=True, exist_ok=True)
     server = ThreadingHTTPServer((host, port), AgentHandler)
-    print(f"Video Translate Agent UI listening on {host}:{port}", flush=True)
+    print(f"ReiboSub UI listening on {host}:{port}", flush=True)
     for url in _browse_urls(host, port):
         print(f"  {url}", flush=True)
     server.serve_forever()
@@ -6356,7 +6356,7 @@ def _parse_single_byte_range(value: str, file_size: int) -> tuple[int, int]:
 
 
 class AgentHandler(BaseHTTPRequestHandler):
-    server_version = "VideoTranslateAgent/0.1"
+    server_version = "ReiboSub/0.1"
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -6819,9 +6819,9 @@ def _content_type_for_path(path: Path) -> str:
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><title>Video Translate Agent</title></head>
+<head><meta charset="utf-8"><title>ReiboSub</title></head>
 <body>
-  <h1>Video Translate Agent</h1>
+  <h1>ReiboSub</h1>
   <p>前端还没有构建。请在项目根目录运行 <code>cd frontend && npm install && npm run build</code>。</p>
 </body>
 </html>
