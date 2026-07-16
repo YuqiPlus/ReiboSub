@@ -5,7 +5,7 @@
 # translate: 只翻译已有 source_srt
 mode: full
 
-input_video: "E:/Videos/demo.mp4"
+input_video: "path/to/input.mp4"
 source_srt: "outputs/demo/source.srt"
 output_dir: "outputs/demo"
 
@@ -50,7 +50,7 @@ subtitle:
 translation:
   provider: "openai-compatible"
   batch_size: 40
-  # 不建议把 API Key 写在这里。放到 .env 的 LLM_API_KEY。
+  # 不建议把 API Key 写在这里；请在 Web UI 设置页保存到私密配置。
   model: null
   base_url: null
 

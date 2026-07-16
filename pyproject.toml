@@ -1,8 +1,19 @@
 [project]
 name = "video-translate"
 version = "0.1.0"
-description = "Extract hard subtitles from videos, filter overlay noise, and prepare translated subtitle files."
+description = "Human-in-the-loop OCR, ASR, glossary, translation, and subtitle refinement for video."
+readme = "README.md"
 requires-python = ">=3.10"
+keywords = ["subtitle", "ocr", "asr", "translation", "video"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Multimedia :: Video :: Conversion",
+]
 dependencies = [
     "opencv-python>=4.8,<5",
     "paddleocr>=3.0,<4",
@@ -23,6 +34,11 @@ dev = [
 
 [project.scripts]
 video-translate = "video_translate.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/YuqiPlus/Video_Translate"
+Repository = "https://github.com/YuqiPlus/Video_Translate.git"
+Issues = "https://github.com/YuqiPlus/Video_Translate/issues"
 
 [build-system]
 requires = ["setuptools>=68"]
