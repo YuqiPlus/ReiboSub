@@ -8,6 +8,8 @@ configs/app_settings.yaml
 configs/provider_secrets.yaml
 configs/local_runtime.yaml
 outputs/
+/build/
+/dist/
 frontend/node_modules/
 frontend/dist/
 .idea/
