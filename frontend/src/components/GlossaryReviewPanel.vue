@@ -16,17 +16,24 @@
     <div class="grid2">
       <div>
         <label for="glossaryPathReview">Glossary 路径</label>
-        <input id="glossaryPathReview" :value="glossaryPath" placeholder="configs/glossaries/xxx.draft.yaml" @input="$emit('update:glossaryPath', $event.target.value)" />
+        <input id="glossaryPathReview" :value="glossaryPath" :disabled="loading || continueBusy" placeholder="configs/glossaries/xxx.draft.yaml" @input="$emit('update:glossaryPath', $event.target.value)" />
       </div>
       <div class="field-actions">
         <label>操作</label>
         <div class="toolbar">
-          <button class="secondary" :disabled="loading" @click="$emit('load-glossary')">{{ loading ? '加载中' : '加载' }}</button>
+          <button class="secondary" :disabled="loading || continueBusy" @click="$emit('load-glossary')">{{ loading ? '加载中' : '加载' }}</button>
         </div>
       </div>
     </div>
 
     <div class="status" :class="statusClass">{{ status }}</div>
+    <div class="glossary-save-state" :class="textDirty ? 'dirty' : saveState" role="status" aria-live="polite">
+      <span aria-hidden="true"></span>
+      <b>{{ textDirty ? 'YAML 有未保存修改' : saveStateLabel }}</b>
+      <button v-if="saveState === 'error'" class="secondary mini" type="button" :disabled="continueBusy" @click="$emit('retry-glossary-save')">重试保存</button>
+    </div>
+
+    <div v-if="!loading && !reviewReady" class="empty">当前路径尚未成功加载。请点击“加载”后再编辑或保存，避免把另一份审核结果写错文件。</div>
 
     <div v-if="loading" class="empty loading-box">正在读取 glossary，并生成盲翻候选。完成后会一次性显示待确认列表。</div>
 
@@ -43,14 +50,14 @@
     </div>
 
     <div v-if="!loading" class="tabs">
-      <button class="tab" :class="{ active: tab === 'review' }" @click="tab = 'review'">审核表</button>
-      <button class="tab" :class="{ active: tab === 'yaml' }" @click="tab = 'yaml'">YAML</button>
+      <button class="tab" :class="{ active: tab === 'review' }" :disabled="tab === 'yaml' && textDirty" @click="tab = 'review'">审核表</button>
+      <button class="tab" :class="{ active: tab === 'yaml' }" :disabled="!reviewReady || ['dirty', 'saving', 'error'].includes(saveState)" @click="tab = 'yaml'">YAML</button>
     </div>
 
     <div v-if="!loading && tab === 'review'">
       <div class="toolbar review-toolbar">
-        <button class="secondary" @click="$emit('apply-all-suggestions')">应用全部推荐</button>
-        <button @click="$emit('save-glossary-review')">{{ agentReview ? '保存并继续 Agent 翻译' : '保存审核结果' }}</button>
+        <button class="secondary" :disabled="continueBusy || !reviewReady" @click="$emit('apply-all-suggestions')">应用全部推荐</button>
+        <button :disabled="continueBusy || !reviewReady || (agentReview && pendingCount > 0)" @click="$emit('save-glossary-review')">{{ primarySaveLabel }}</button>
       </div>
       <div v-if="!glossaryItems.length" class="empty">还没有加载 glossary。可以先到“字幕处理”生成草稿，或者在上方填路径后加载。</div>
       <div v-else-if="!visibleItems.length" class="empty">当前筛选下没有条目。</div>
@@ -80,6 +87,7 @@
               <input
                 :ref="(el) => setReviewInputRef(el, index)"
                 :value="item.zh"
+                :disabled="continueBusy || !reviewReady"
                 :placeholder="item.suggested_zh || item.romanized || '填写中文译名'"
                 @input="$emit('update-glossary-zh', { index, zh: $event.target.value })"
                 @compositionstart="isComposing = true"
@@ -87,11 +95,11 @@
                 @keydown.enter="handleReviewEnter($event, index)"
               />
             </div>
-            <button class="secondary" :disabled="!item.suggested_zh" @click="$emit('use-suggestion', index)">
+            <button class="secondary" :disabled="!item.suggested_zh || continueBusy || !reviewReady" @click="$emit('use-suggestion', index)">
               {{ item.suggested_zh ? `用推荐：${item.suggested_zh}` : '无推荐' }}
             </button>
-            <button v-if="item.reviewed" class="secondary" @click="$emit('set-glossary-reviewed', { index, reviewed: false })">撤回</button>
-            <button v-else @click="$emit('set-glossary-reviewed', { index, reviewed: true })">确认</button>
+            <button v-if="item.reviewed" class="secondary" :disabled="continueBusy || !reviewReady" @click="$emit('set-glossary-reviewed', { index, reviewed: false })">撤回</button>
+            <button v-else :disabled="continueBusy || !reviewReady" @click="$emit('set-glossary-reviewed', { index, reviewed: true })">确认</button>
           </div>
           <div v-if="!item.suggested_zh && (item.context_text || item.english_reference_text || item.blind_candidate_zh)" class="context-box">
             <div v-if="item.context_text" class="context-line">
@@ -105,7 +113,7 @@
             <div v-if="item.blind_candidate_zh" class="context-line candidate-line">
               <span>盲翻候选</span>
               <p><template v-for="(part, partIndex) in highlightParts(item.blind_candidate_zh, item.zh || item.suggested_zh || item.source)" :key="partIndex"><mark v-if="part.hit">{{ part.text }}</mark><template v-else>{{ part.text }}</template></template></p>
-              <button class="secondary mini" @click="$emit('update-glossary-zh', { index, zh: item.blind_candidate_zh })">填入候选</button>
+              <button class="secondary mini" :disabled="continueBusy || !reviewReady" @click="$emit('update-glossary-zh', { index, zh: item.blind_candidate_zh })">填入候选</button>
             </div>
             <div v-else-if="item.blind_candidate_error" class="context-error">候选生成失败：{{ item.blind_candidate_error }}</div>
           </div>
@@ -115,9 +123,9 @@
 
     <div v-else-if="!loading">
       <div class="toolbar review-toolbar">
-        <button @click="$emit('save-glossary-text')">{{ agentReview ? '保存 YAML 并继续 Agent' : '保存 YAML' }}</button>
+        <button :disabled="continueBusy || !reviewReady" @click="$emit('save-glossary-text')">{{ continueBusy ? (agentReview ? '正在保存并继续...' : '正在保存...') : (agentReview ? '保存 YAML 并继续 Agent' : '保存 YAML') }}</button>
       </div>
-      <textarea :value="glossaryEditor" placeholder="Glossary YAML 内容" @input="$emit('update:glossaryEditor', $event.target.value)" />
+      <textarea :value="glossaryEditor" :disabled="continueBusy || !reviewReady" placeholder="Glossary YAML 内容" @input="$emit('update:glossaryEditor', $event.target.value)" />
     </div>
   </section>
 </template>
@@ -134,12 +142,17 @@ const props = defineProps({
   statusClass: { type: String, default: '' },
   loading: { type: Boolean, default: false },
   agentReview: { type: Boolean, default: false },
+  reviewReady: { type: Boolean, default: false },
+  saveState: { type: String, default: 'idle' },
+  textDirty: { type: Boolean, default: false },
+  continueBusy: { type: Boolean, default: false },
 })
 
 const emit = defineEmits([
   'update:glossaryPath', 'update:glossaryEditor', 'load-glossary',
   'apply-all-suggestions', 'save-glossary-review', 'save-glossary-text',
   'update-glossary-zh', 'set-glossary-reviewed', 'use-suggestion',
+  'retry-glossary-save',
 ])
 
 const tab = ref('review')
@@ -150,6 +163,18 @@ const reviewInputRefs = new Map()
 const indexedItems = computed(() => props.glossaryItems.map((item, index) => ({ item, index })))
 const pendingCount = computed(() => props.glossaryItems.filter((item) => !item.reviewed).length)
 const confirmedCount = computed(() => props.glossaryItems.length - pendingCount.value)
+const primarySaveLabel = computed(() => {
+  if (props.continueBusy) return props.agentReview ? '正在保存并继续...' : '正在保存...'
+  if (props.agentReview && pendingCount.value > 0) return `还有 ${pendingCount.value} 条待确认`
+  return props.agentReview ? '全部已确认，保存并开始翻译' : '保存审核结果'
+})
+const saveStateLabel = computed(() => ({
+  idle: '审核表中的逐条修改会自动保存',
+  dirty: '审核表有未保存修改',
+  saving: '正在自动保存审核表进度…',
+  saved: '审核表进度已保存',
+  error: '审核表自动保存失败，修改仍保留在当前页面',
+}[props.saveState] || '审核表中的逐条修改会自动保存'))
 const visibleItems = computed(() => {
   const sorted = [...indexedItems.value].sort((left, right) => {
     const leftDone = left.item.reviewed ? 1 : 0

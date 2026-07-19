@@ -226,7 +226,8 @@ def test_agent_session_hybrid_downloads_anchor_video_and_generates_glossary(monk
     def fake_generate_glossary(payload):
         calls.append(f"glossary:{payload['source_srt']}:{payload.get('out', '')}")
         assert Path(payload["out"]).name == "glossary.draft.yaml"
-        assert Path(payload["out"]).parent.parent == web_agent.TASK_DIR
+        assert web_agent.TASK_DIR in Path(payload["out"]).parents
+        assert ".work" in Path(payload["out"]).parts
         return done_job("glossary", {"glossary_path": str(glossary), "content": "characters: []\n"})
 
     monkeypatch.setattr(web_agent, "generate_glossary_job", fake_generate_glossary)
@@ -266,6 +267,8 @@ def test_agent_session_hybrid_downloads_anchor_video_and_generates_glossary(monk
 
 def test_agent_session_dual_reference_downloads_source_and_reference_subtitles(monkeypatch, tmp_path):
     monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"video")
     ko = tmp_path / "demo.ko.srt"
     ko.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
     en = tmp_path / "demo.en.srt"
@@ -283,6 +286,7 @@ def test_agent_session_dual_reference_downloads_source_and_reference_subtitles(m
             "title": "demo",
             "normalized_url": "https://www.youtube.com/watch?v=abc123",
             "webpage_url": "https://www.youtube.com/watch?v=abc123",
+            "existing_project": {"path": str(tmp_path), "primary_video": str(video)},
             "subtitles": [
                 {"lang": "ko", "kind": "manual", "label": "ko · 人工字幕"},
                 {"lang": "en", "kind": "manual", "label": "en · 人工字幕"},
@@ -308,14 +312,15 @@ def test_agent_session_dual_reference_downloads_source_and_reference_subtitles(m
         return done_job("subtitle", {"subtitle_path": str(ko if payload["lang"] == "ko" else en)})
 
     monkeypatch.setattr(web_agent, "download_subtitle_job", fake_download)
-    monkeypatch.setattr(
-        web_agent,
-        "dual_subtitle_reference_job",
-        lambda payload: calls.append(f"dual:{payload['source_srt']}:{payload['reference_srt']}") or done_job(
+    def fake_dual(payload):
+        assert payload["input_video"] == str(video)
+        calls.append(f"dual:{payload['source_srt']}:{payload['reference_srt']}")
+        return done_job(
             "dual",
             {"source_srt": str(dual), "context_srt": str(tmp_path / "dual.context.srt"), "debug_json": str(tmp_path / "dual.debug.json")},
-        ),
-    )
+        )
+
+    monkeypatch.setattr(web_agent, "dual_subtitle_reference_job", fake_dual)
     monkeypatch.setattr(
         web_agent,
         "generate_glossary_job",
@@ -425,6 +430,22 @@ def test_historical_unversioned_region_task_resumes_as_legacy_not_v2(monkeypatch
     assert session.payload["ocr_extraction_mode"] == "auto"
     assert session.payload["ocr_refinement_mode"] == "none"
     assert session.payload["ocr_translation_mode"] == "standard_cleanup"
+
+
+def test_agent_session_from_task_preserves_run_generation(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    task = {
+        "id": "generation-task",
+        "task_dir": str(tmp_path),
+        "url": "https://www.youtube.com/watch?v=abc123",
+        "run_generation": 7,
+        "payload": {},
+        "stages": {},
+    }
+
+    session = web_agent._agent_session_from_task(task)
+
+    assert session.result["run_generation"] == 7
 
 
 def test_agent_answer_switches_to_v2_and_persists_pipeline_in_task(monkeypatch, tmp_path):
@@ -1256,6 +1277,7 @@ def test_agent_session_reuses_cached_ocr_before_generating_glossary(monkeypatch,
 
 def test_agent_task_persists_glossary_review_and_can_continue(monkeypatch, tmp_path):
     monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    monkeypatch.setattr(web_agent, "_ensure_under_root", lambda path: None)
     source = tmp_path / "source.srt"
     glossary = tmp_path / "glossary.draft.yaml"
     translated = tmp_path / "zh.srt"
@@ -1302,14 +1324,361 @@ def test_agent_task_persists_glossary_review_and_can_continue(monkeypatch, tmp_p
     assert task["stages"]["ocr"]["status"] == "done"
     assert task["stages"]["glossary"]["status"] == "waiting_review"
 
-    continued = web_agent.continue_agent_task(task_id)
+    restored = web_agent.continue_agent_task(task_id)
+    assert restored.status == "waiting"
+    assert restored.phase == "review_glossary"
+    reviewed_glossary = snapshot["result"]["glossary_path"]
+    continued = web_agent.continue_agent_after_glossary_review(reviewed_glossary)
     snapshot = _wait_agent_status(continued.id, "done")
 
     task = web_agent.get_agent_task(task_id)
     assert task["current_stage"] == "done"
     assert task["stages"]["translate"]["status"] == "done"
-    assert calls == [f"translate:{task['stages']['ocr']['source_srt']}:{glossary}"]
+    assert len(calls) == 1
+    assert calls[0].startswith(f"translate:{task['stages']['ocr']['source_srt']}:")
+    assert Path(calls[0].rsplit(":", 1)[1]).read_text(encoding="utf-8") == Path(reviewed_glossary).read_text(encoding="utf-8")
     assert snapshot["result"]["translated_srt"].endswith("zh.srt")
+
+
+def test_same_video_new_agent_run_clears_stale_downstream_stages(tmp_path):
+    url = "https://www.youtube.com/watch?v=abc123"
+    first = web_agent._ensure_agent_task(normalized_url=url, title="demo", payload={"url": url})
+    stale_zh = Path(first["task_dir"]) / "zh.srt"
+    old_source = Path(first["task_dir"]) / "source.srt"
+    old_source.write_text("old OCR source", encoding="utf-8")
+    stale_zh.write_text("old translation", encoding="utf-8")
+    web_agent._update_task_stage(first["id"], "ocr", "done", source_srt=str(old_source), ocr_pipeline_version="v2")
+    web_agent._update_task_stage(first["id"], "glossary", "waiting_review", glossary_path=str(Path(first["task_dir"]) / "glossary.draft.yaml"))
+    web_agent._update_task_stage(first["id"], "translate", "done", current_stage="done", translated_srt=str(stale_zh))
+
+    restarted = web_agent._ensure_agent_task(normalized_url=url, title="demo", payload={"url": url})
+
+    assert restarted["id"] == first["id"]
+    assert restarted["run_generation"] == 2
+    assert restarted["current_stage"] == "created"
+    assert restarted["workflow_status"] == "active"
+    assert restarted["stages"] == {}
+    assert restarted["ocr_cache"][0]["source_srt"] != str(old_source)
+    assert Path(restarted["ocr_cache"][0]["source_srt"]).read_text(encoding="utf-8") == "old OCR source"
+    old_source.write_text("new OCR source", encoding="utf-8")
+    assert Path(restarted["ocr_cache"][0]["source_srt"]).read_text(encoding="utf-8") == "old OCR source"
+    assert "completed_at" not in restarted
+
+
+def test_old_generation_stage_update_does_not_mutate_new_task(tmp_path):
+    task_dir = web_agent.TASK_DIR / "task1"
+    task_dir.mkdir(parents=True)
+    task_yaml = task_dir / "task.yaml"
+    task_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "id": "task1",
+                "task_dir": str(task_dir),
+                "run_generation": 2,
+                "current_stage": "translate",
+                "stages": {"translate": {"status": "running", "marker": "new generation"}},
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+
+    changed = web_agent._update_task_stage(
+        "task1",
+        "translate",
+        "failed",
+        current_stage="translate_failed",
+        expected_generation=1,
+        error="stale worker failed",
+    )
+
+    persisted = web_agent.get_agent_task("task1")
+    assert changed is False
+    assert persisted["run_generation"] == 2
+    assert persisted["current_stage"] == "translate"
+    assert persisted["stages"]["translate"] == {"status": "running", "marker": "new generation"}
+
+
+def test_old_generation_cannot_bind_after_newer_agent_start(monkeypatch):
+    task_dir = web_agent.TASK_DIR / "task1"
+    task_dir.mkdir(parents=True)
+    task_yaml = task_dir / "task.yaml"
+    task_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "id": "task1",
+                "task_dir": str(task_dir),
+                "run_generation": 2,
+                "current_stage": "probe_done",
+                "stages": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    old = web_agent.AgentSession(id="old", result={"task_id": "task1", "run_generation": 1})
+    new = web_agent.AgentSession(id="new", result={"task_id": "task1", "run_generation": 2})
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {old.id: old, new.id: new})
+
+    with pytest.raises(RuntimeError, match="更新的一轮"):
+        web_agent._bind_session_to_task_run(
+            old.id,
+            {"id": "task1", "task_dir": str(task_dir), "run_generation": 1},
+        )
+
+    assert old.status == "cancelled"
+    assert new.status == "running"
+    assert new.result["run_generation"] == 2
+
+
+def test_old_generation_materialize_does_not_overwrite_new_artifact(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_agent, "_ensure_under_root", lambda path: None)
+    task_dir = web_agent.TASK_DIR / "task1"
+    task_dir.mkdir(parents=True)
+    (task_dir / "task.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "id": "task1",
+                "task_dir": str(task_dir),
+                "run_generation": 2,
+                "current_stage": "translate",
+                "stages": {"translate": {"status": "running"}},
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    destination = task_dir / "zh.srt"
+    destination.write_text("new generation translation", encoding="utf-8")
+    stale_source = tmp_path / "stale-translation.srt"
+    stale_source.write_text("stale generation translation", encoding="utf-8")
+    session = web_agent.AgentSession(
+        id="stale-session",
+        phase="translate",
+        result={"task_id": "task1", "task_dir": str(task_dir), "run_generation": 1},
+    )
+
+    try:
+        web_agent._materialize_task_artifact(session, str(stale_source), "zh.srt")
+    except RuntimeError:
+        # Rejecting the stale worker explicitly is also a valid implementation.
+        pass
+
+    assert destination.read_text(encoding="utf-8") == "new generation translation"
+
+
+def test_old_generation_failure_does_not_mark_new_task_failed(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    task_dir = web_agent.TASK_DIR / "task1"
+    task_dir.mkdir(parents=True)
+    (task_dir / "task.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "id": "task1",
+                "task_dir": str(task_dir),
+                "run_generation": 2,
+                "current_stage": "translate",
+                "stages": {"translate": {"status": "running", "marker": "new generation"}},
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    stale_session = web_agent.AgentSession(
+        id="stale-session",
+        phase="translate",
+        result={"task_id": "task1", "task_dir": str(task_dir), "run_generation": 1},
+    )
+    web_agent._AGENT_SESSIONS[stale_session.id] = stale_session
+
+    web_agent._agent_fail(stale_session.id, RuntimeError("stale worker failed"))
+
+    persisted = web_agent.get_agent_task("task1")
+    assert persisted["run_generation"] == 2
+    assert persisted["current_stage"] == "translate"
+    assert persisted["stages"]["translate"] == {"status": "running", "marker": "new generation"}
+
+
+def test_atomic_glossary_save_rejects_pending_review_without_overwrite_or_translation(monkeypatch):
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    monkeypatch.setattr(web_agent, "_ensure_under_root", lambda path: None)
+    task_dir = web_agent.TASK_DIR / "task1"
+    task_dir.mkdir(parents=True)
+    source = task_dir / "source.srt"
+    glossary = task_dir / "glossary.draft.yaml"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
+    original = "characters:\n- source: 박보영\n  zh: ''\n  reviewed: false\n"
+    glossary.write_text(original, encoding="utf-8")
+    (task_dir / "task.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "id": "task1",
+                "task_dir": str(task_dir),
+                "run_generation": 1,
+                "current_stage": "glossary_review",
+                "stages": {
+                    "glossary": {
+                        "status": "waiting_review",
+                        "source_srt": str(source),
+                        "glossary_path": str(glossary),
+                    }
+                },
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    translate_calls = []
+    monkeypatch.setattr(
+        web_agent,
+        "translate_subtitle_job",
+        lambda payload: translate_calls.append(payload),
+    )
+
+    with pytest.raises(ValueError, match="还有 1 条未审核"):
+        web_agent.save_glossary_review_and_continue(
+            {
+                "path": str(glossary),
+                "items": [{"section": "characters", "index": 0, "zh": "朴宝英", "reviewed": False}],
+            }
+        )
+
+    assert glossary.read_text(encoding="utf-8") == original
+    assert translate_calls == []
+    persisted = web_agent.get_agent_task("task1")
+    assert persisted["current_stage"] == "glossary_review"
+    assert persisted["stages"]["glossary"]["status"] == "waiting_review"
+    assert "translate" not in persisted["stages"]
+
+
+def test_atomic_glossary_save_and_continue_is_idempotent_while_translation_runs(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    monkeypatch.setattr(web_agent, "_ensure_under_root", lambda path: None)
+    task_dir = web_agent.TASK_DIR / "task1"
+    task_dir.mkdir(parents=True)
+    source = task_dir / "dual.source.srt"
+    glossary = task_dir / "glossary.draft.yaml"
+    translated = tmp_path / "translated.srt"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\n韩文原文：안녕\n英文参考：Hi\n", encoding="utf-8")
+    glossary.write_text("characters:\n- source: 박보영\n  zh: ''\n  reviewed: false\n", encoding="utf-8")
+    (task_dir / "task.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "id": "task1",
+                "task_dir": str(task_dir),
+                "current_stage": "glossary_review",
+                "stages": {
+                    "glossary": {
+                        "status": "waiting_review",
+                        "source_srt": str(source),
+                        "source_kind": "dual_subtitle_reference",
+                        "glossary_path": str(glossary),
+                    }
+                },
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    child = web_agent.Job(id="translate1", name="translate", status="running")
+    calls = []
+
+    def fake_translate(payload):
+        calls.append(payload)
+        return child
+
+    monkeypatch.setattr(web_agent, "translate_subtitle_job", fake_translate)
+    payload = {
+        "path": str(glossary),
+        "items": [{"section": "characters", "index": 0, "zh": "朴宝英", "reviewed": True}],
+    }
+
+    waiting = web_agent.continue_agent_task("task1")
+    assert waiting.status == "waiting"
+    assert waiting.phase == "review_glossary"
+    first = web_agent.save_glossary_review_and_continue(payload)
+    deadline = time.time() + 2
+    while len(calls) < 1 and time.time() < deadline:
+        time.sleep(0.01)
+    second = web_agent.save_glossary_review_and_continue(payload)
+
+    assert first["saved"] is True
+    assert first["review_summary"]["all_reviewed"] is True
+    assert first["session"]["id"] == waiting.id
+    assert first["session"]["id"] == second["session"]["id"]
+    assert len(calls) == 1
+    assert not any(
+        session.status == "waiting" and session.phase == "review_glossary"
+        for session in web_agent._AGENT_SESSIONS.values()
+    )
+    persisted = web_agent.get_agent_task("task1")
+    assert persisted["stages"]["glossary"]["status"] == "reviewed"
+    assert persisted["current_stage"] in {"translate_pending", "translate_running"}
+
+    translated.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8")
+    child.result = {"translated_srt": str(translated)}
+    child.status = "done"
+    _wait_agent_status(first["session"]["id"], "done")
+    completed_retry = web_agent.save_glossary_review_and_continue(payload)
+    assert completed_retry["session"]["id"] == first["session"]["id"]
+    assert completed_retry["session"]["status"] == "done"
+    assert len(calls) == 1
+
+
+def test_restart_restores_dual_source_kind_and_copies_translated_sidecar(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    monkeypatch.setattr(web_agent, "_ensure_under_root", lambda path: None)
+    task_dir = web_agent.TASK_DIR / "task1"
+    task_dir.mkdir(parents=True)
+    project_dir = tmp_path / "YoutubeDownloads" / "demo"
+    project_dir.mkdir(parents=True)
+    video = project_dir / "demo.mp4"
+    source = task_dir / "dual.source.srt"
+    glossary = task_dir / "glossary.draft.yaml"
+    translated = tmp_path / "dual.source.zh.srt"
+    video.write_bytes(b"video")
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\n韩文原文：안녕\n英文参考：Hi\n", encoding="utf-8")
+    glossary.write_text("characters: []\n", encoding="utf-8")
+    translated.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8")
+    (task_dir / "task.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "id": "task1",
+                "task_dir": str(task_dir),
+                "current_stage": "translate_pending",
+                "stages": {
+                    "glossary": {
+                        "status": "reviewed",
+                        "source_srt": str(source),
+                        "source_kind": "dual_subtitle_reference",
+                        "glossary_path": str(glossary),
+                        "input_video": str(video),
+                        "project_dir": str(project_dir),
+                    },
+                    "translate": {"status": "queued", "source_srt": str(source), "glossary_path": str(glossary)},
+                },
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def done_job(name, result):
+        return web_agent.Job(id=name, name=name, status="done", result=result)
+
+    def fake_translate(payload):
+        captured.update(payload)
+        return done_job("translate", {"translated_srt": str(translated)})
+
+    monkeypatch.setattr(web_agent, "translate_subtitle_job", fake_translate)
+
+    session = web_agent.continue_agent_task("task1")
+    snapshot = _wait_agent_status(session.id, "done")
+
+    assert snapshot["result"]["source_kind"] == "dual_subtitle_reference"
+    assert "dual reference" in captured["extra_prompt"]
+    assert Path(snapshot["result"]["translated_sidecar"]) == project_dir / "demo.zh.srt"
+    assert (project_dir / "demo.zh.srt").exists()
 
 
 def test_api_path_segment_decodes_percent_encoded_task_id():
@@ -1619,7 +1988,8 @@ def test_agent_session_downloads_generates_glossary_then_waits(monkeypatch, tmp_
     def fake_glossary(payload):
         calls.append(f"glossary:{payload['source_srt']}:{payload.get('out', '')}")
         assert Path(payload["out"]).name == "glossary.draft.yaml"
-        assert Path(payload["out"]).parent.parent == web_agent.TASK_DIR
+        assert web_agent.TASK_DIR in Path(payload["out"]).parents
+        assert ".work" in Path(payload["out"]).parts
         return done_job("glossary", {"glossary_path": str(glossary), "content": "characters: []\n"})
 
     monkeypatch.setattr(web_agent, "download_subtitle_job", fake_download)
@@ -1631,7 +2001,9 @@ def test_agent_session_downloads_generates_glossary_then_waits(monkeypatch, tmp_
     assert snapshot["status"] == "waiting"
     assert snapshot["question"]["kind"] == "review_glossary"
     assert snapshot["result"]["source_srt"] == str(source)
-    assert snapshot["result"]["glossary_path"] == str(glossary)
+    assert Path(snapshot["result"]["glossary_path"]).name == "glossary.draft.yaml"
+    assert Path(snapshot["result"]["glossary_path"]).parent.parent == web_agent.TASK_DIR
+    assert Path(snapshot["result"]["glossary_path"]).read_text(encoding="utf-8") == glossary.read_text(encoding="utf-8")
     assert calls[0] == "download:ko:manual"
     assert calls[1].startswith(f"glossary:{source}:")
 
@@ -1680,6 +2052,8 @@ def test_agent_translate_after_glossary_exposes_sidecar_paths(monkeypatch, tmp_p
     glossary = tmp_path / "glossary.yaml"
     translated = tmp_path / "source.zh.srt"
     sidecar = tmp_path / "video.zh.srt"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
+    glossary.write_text("characters: []\n", encoding="utf-8")
     session = web_agent.AgentSession(
         id="agent1",
         status="waiting",
@@ -3587,7 +3961,9 @@ def test_continue_after_glossary_path_reruns_completed_translation(monkeypatch, 
     snapshot = _wait_agent_status(session.id, 'done')
     task = web_agent.get_agent_task('task_done')
 
-    assert calls and calls[0]['glossary'] == str(glossary)
+    assert calls
+    assert calls[0]['glossary'] != str(glossary)
+    assert Path(calls[0]['glossary']).read_text(encoding='utf-8') == glossary.read_text(encoding='utf-8')
     assert task['current_stage'] == 'done'
     assert task['workflow_status'] == 'completed'
     assert task['stages']['translate']['translated_srt'] == str(task_dir / 'zh.srt')
@@ -3624,6 +4000,7 @@ def test_completed_glossary_review_task_continues_as_active(monkeypatch, tmp_pat
     )
     monkeypatch.setattr(web_agent, 'TASK_DIR', tasks)
     monkeypatch.setattr(web_agent, '_AGENT_SESSIONS', {})
+    monkeypatch.setattr(web_agent, '_ensure_under_root', lambda path: None)
 
     def done_job(name, result):
         return web_agent.Job(id=name, name=name, status='done', result=result)
@@ -3634,7 +4011,10 @@ def test_completed_glossary_review_task_continues_as_active(monkeypatch, tmp_pat
         lambda payload: done_job('translate', {'translated_srt': str(translated)}),
     )
 
-    session = web_agent.continue_agent_task('task1')
+    restored = web_agent.continue_agent_task('task1')
+    assert restored.status == 'waiting'
+    assert restored.phase == 'review_glossary'
+    session = web_agent.continue_agent_after_glossary_review(str(glossary))
     snapshot = _wait_agent_status(session.id, 'done')
     task = web_agent.get_agent_task('task1')
 

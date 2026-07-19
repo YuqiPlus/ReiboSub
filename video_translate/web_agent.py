@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import gc
+import hashlib
 import ipaddress
 import json
 import mimetypes
@@ -144,6 +145,8 @@ def _module_command(module: str, *args: object) -> list[str]:
 _JOBS: dict[str, Job] = {}
 _AGENT_SESSIONS: dict[str, AgentSession] = {}
 _LOCK = threading.Lock()
+_TASK_FILE_LOCK = threading.RLock()
+_AGENT_TRANSLATION_START_LOCK = threading.RLock()
 _OCR_PREVIEW_LOCK = threading.Lock()
 _OCR_PREVIEW_MODEL_KEY: tuple[str, str] | None = None
 _OCR_PREVIEW_MODEL: Any = None
@@ -428,11 +431,16 @@ def get_agent_task(task_id: str) -> dict[str, Any] | None:
 
 def continue_agent_task(task_id: str) -> AgentSession:
     task = _read_task(task_id)
-    session = _agent_session_from_task(task)
     stage = str(task.get("current_stage") or "")
-    if stage in {"glossary_review", "translate_failed"} and _task_stage_path(task, "glossary", "glossary_path"):
-        _run_agent_async(session.id, lambda item: _agent_translate_after_glossary(item, use_glossary=True))
-    elif _task_stage_path(task, "ocr", "source_srt"):
+    glossary_status = str(_task_stage_value(task, "glossary", "status") or "")
+    if stage == "glossary_review" and glossary_status == "waiting_review":
+        return _restore_agent_glossary_review(task)
+    if stage in {"glossary_reviewed", "translate_pending", "translate_running", "translate_failed", "translate_rerun"} and _task_stage_path(
+        task, "glossary", "glossary_path"
+    ):
+        return _start_agent_translation(task)
+    session = _agent_session_from_task(task)
+    if _task_stage_path(task, "ocr", "source_srt"):
         _run_agent_async(session.id, lambda item: _agent_generate_glossary_review(item, str(item.result.get("source_srt") or "")))
     else:
         _run_agent_async(session.id, _agent_start)
@@ -442,30 +450,182 @@ def continue_agent_task(task_id: str) -> AgentSession:
 def continue_agent_after_glossary_review(glossary_path: str) -> AgentSession:
     path = _resolve_project_path(glossary_path)
     _ensure_under_root(path)
-    waiting_session_id = _find_waiting_glossary_session(path)
-    if waiting_session_id:
-        return answer_agent_session(waiting_session_id, {"action": "continue_after_glossary"})
     task = _find_agent_task_by_glossary_path(path)
     if not task:
         raise KeyError("agent task not found for glossary")
     task_id = str(task.get("id") or "").strip()
     if not task_id:
         raise KeyError("agent task not found for glossary")
-    if _task_stage_path(task, "glossary", "glossary_path"):
-        _invalidate_task_after(task_id, "translate")
+    review_summary = _glossary_review_summary(_glossary_items(_load_yaml_file(path)))
+    if not bool(review_summary["all_reviewed"]):
+        pending = int(review_summary["total"]) - int(review_summary["reviewed"])
+        raise ValueError(f"Glossary 还有 {pending} 条未审核，不能开始翻译")
+    waiting_session_id = _find_waiting_glossary_session(path, int(task.get("run_generation") or 0))
+    return _start_agent_translation(task, waiting_session_id=waiting_session_id)
+
+
+def _restore_agent_glossary_review(task: dict[str, Any]) -> AgentSession:
+    glossary_path = _task_stage_path(task, "glossary", "glossary_path")
+    if not glossary_path:
+        raise RuntimeError("Glossary 文件不存在，无法恢复审核")
+    waiting_session_id = _find_waiting_glossary_session(
+        Path(glossary_path),
+        int(task.get("run_generation") or 0),
+    )
+    if waiting_session_id:
+        waiting = get_agent_session(waiting_session_id)
+        if waiting:
+            return waiting
+    session = _agent_session_from_task(task)
+    _agent_wait(
+        session.id,
+        "review_glossary",
+        {
+            "kind": "review_glossary",
+            "title": "请审核 Glossary",
+            "message": "Glossary 草稿仍在等待审核。保存审核结果后，Agent 才会开始翻译。",
+            "glossary_path": glossary_path,
+            "options": [
+                {"action": "continue_after_glossary", "label": "我已审核，继续翻译"},
+                {"action": "skip_glossary", "label": "跳过 glossary 直接翻译"},
+            ],
+        },
+    )
+    return session
+
+
+def _start_agent_translation(
+    task: dict[str, Any],
+    *,
+    waiting_session_id: str = "",
+    use_glossary: bool = True,
+) -> AgentSession:
+    task_id = str(task.get("id") or "").strip()
+    if not task_id:
+        raise KeyError("agent task not found for glossary")
+    with _AGENT_TRANSLATION_START_LOCK:
         task = _read_task(task_id)
-        session = _agent_session_from_task(task)
-        _run_agent_async(session.id, lambda item: _agent_translate_after_glossary(item, use_glossary=True))
+        run_generation = int(task.get("run_generation") or 0)
+        active = _find_active_task_translation_session(task_id, run_generation)
+        if active:
+            return active
+        glossary_path = _task_stage_path(task, "glossary", "glossary_path")
+        source_srt = _task_stage_path(task, "glossary", "source_srt") or _task_stage_path(task, "ocr", "source_srt")
+        if use_glossary and not glossary_path:
+            raise RuntimeError("Glossary 文件不存在，无法继续翻译")
+        if not source_srt:
+            raise RuntimeError("源字幕文件不存在，无法继续翻译")
+        session = get_agent_session(waiting_session_id) if waiting_session_id else None
+        if (
+            not session
+            or str(session.result.get("task_id") or "") != task_id
+            or _session_run_generation(session) != run_generation
+            or session.status != "waiting"
+        ):
+            session = _agent_session_from_task(task)
+        attempt_id = uuid.uuid4().hex
+        glossary_digest = ""
+        translation_glossary_path = ""
+        if use_glossary:
+            glossary_file = Path(glossary_path).expanduser().resolve()
+            if not glossary_file.is_file():
+                raise RuntimeError("Glossary 文件不存在，无法继续翻译")
+            glossary_bytes = glossary_file.read_bytes()
+            glossary_digest = hashlib.sha256(glossary_bytes).hexdigest()
+            snapshot = _agent_workspace(session) / f"glossary.{attempt_id}.yaml"
+            snapshot.write_bytes(glossary_bytes)
+            translation_glossary_path = str(snapshot)
+            if not _mark_task_glossary_reviewed(
+                task_id,
+                glossary_file,
+                expected_generation=run_generation,
+            ):
+                raise RuntimeError("任务已被新一轮处理替代，未启动翻译")
+        if not _mark_task_translation_pending(
+            task_id,
+            source_srt=source_srt,
+            glossary_path=glossary_path if use_glossary else "",
+            attempt_id=attempt_id,
+            glossary_digest=glossary_digest,
+            expected_generation=run_generation,
+        ):
+            raise RuntimeError("任务已被新一轮处理替代，未启动翻译")
+        with _LOCK:
+            current = _AGENT_SESSIONS.get(session.id)
+            if current:
+                current.status = "running"
+                current.phase = "translate_pending"
+                current.question = {}
+                current.error = ""
+                current.result["translation_pending"] = True
+                current.result["translation_attempt_id"] = attempt_id
+                current.result["translation_glossary_path"] = translation_glossary_path
+                current.result["glossary_digest"] = glossary_digest
+                current.result["run_generation"] = run_generation
+                current.updated_at = time.time()
+                session = current
+        _run_agent_async(session.id, lambda item: _agent_translate_after_glossary(item, use_glossary=use_glossary))
         return session
-    return continue_agent_task(task_id)
 
 
-def _find_waiting_glossary_session(glossary_path: Path) -> str:
+def _find_active_task_translation_session(task_id: str, run_generation: int | None = None) -> AgentSession | None:
+    with _LOCK:
+        sessions = sorted(_AGENT_SESSIONS.values(), key=lambda item: item.updated_at, reverse=True)
+        for session in sessions:
+            if str(session.result.get("task_id") or "") != task_id or session.status != "running":
+                continue
+            if run_generation is not None and _session_run_generation(session) != run_generation:
+                continue
+            if session.phase in {"translate_pending", "translate"} or bool(session.result.get("translation_pending")):
+                return session
+    return None
+
+
+def _completed_task_translation_session(
+    task: dict[str, Any],
+    glossary_digest: str,
+) -> AgentSession | None:
+    task_id = str(task.get("id") or "").strip()
+    run_generation = int(task.get("run_generation") or 0)
+    if str(_task_stage_value(task, "translate", "status") or "") != "done":
+        return None
+    if str(_task_stage_value(task, "translate", "glossary_digest") or "") != glossary_digest:
+        return None
+    translated_srt = _task_stage_path(task, "translate", "translated_srt")
+    if not translated_srt:
+        return None
+    with _LOCK:
+        sessions = sorted(_AGENT_SESSIONS.values(), key=lambda item: item.updated_at, reverse=True)
+        for session in sessions:
+            if str(session.result.get("task_id") or "") != task_id:
+                continue
+            if _session_run_generation(session) != run_generation or session.status != "done":
+                continue
+            if str(session.result.get("glossary_digest") or "") == glossary_digest:
+                return session
+    session = _agent_session_from_task(task)
+    with _LOCK:
+        current = _AGENT_SESSIONS.get(session.id)
+        if not current:
+            return None
+        current.status = "done"
+        current.phase = "done"
+        current.result["glossary_digest"] = glossary_digest
+        current.result["translation_attempt_id"] = str(_task_stage_value(task, "translate", "attempt_id") or "")
+        current.result["translation_pending"] = False
+        current.logs.append("agent_translation_already_completed")
+        current.updated_at = time.time()
+        return current
+
+
+def _find_waiting_glossary_session(glossary_path: Path, run_generation: int | None = None) -> str:
     target = glossary_path.resolve()
     with _LOCK:
         sessions = sorted(_AGENT_SESSIONS.values(), key=lambda item: item.updated_at, reverse=True)
         for session in sessions:
             if session.status != "waiting" or session.phase != "review_glossary":
+                continue
+            if run_generation is not None and _session_run_generation(session) != run_generation:
                 continue
             for value in (
                 session.result.get("glossary_path"),
@@ -502,24 +662,45 @@ def _same_existing_path(value: Any, target: Path) -> bool:
 
 def rerun_agent_task_stage(task_id: str, stage: str) -> AgentSession:
     task = _read_task(task_id)
+    run_generation = int(task.get("run_generation") or 0)
     stage = str(stage or "").strip()
+    if stage not in {"ocr", "glossary", "translate"}:
+        raise ValueError(f"未知可重跑阶段: {stage}")
     session = _agent_session_from_task(task)
+    superseded_jobs: list[str] = []
+    with _LOCK:
+        for other in _AGENT_SESSIONS.values():
+            if other.id == session.id or str(other.result.get("task_id") or "") != task_id:
+                continue
+            if other.status not in {"running", "waiting"}:
+                continue
+            other.status = "cancelled"
+            other.phase = "cancelled"
+            other.logs.append(f"agent_stage_rerun: {stage}")
+            other.updated_at = time.time()
+            if other.result.get("current_job_id"):
+                superseded_jobs.append(str(other.result["current_job_id"]))
+    for job_id in superseded_jobs:
+        cancel_job(job_id)
     if stage == "ocr":
-        _invalidate_task_after(task_id, "ocr")
+        if not _invalidate_task_after(task_id, "ocr", expected_generation=run_generation):
+            raise RuntimeError("任务已被新一轮处理替代，无法重跑 OCR")
         _run_agent_async(session.id, lambda item: _agent_run_ocr(item, force=True))
     elif stage == "glossary":
         source_srt = str(session.result.get("source_srt") or "")
         if not source_srt:
             raise RuntimeError("没有可用于重新生成 glossary 的 OCR 原文")
-        _invalidate_task_after(task_id, "glossary")
+        if not _invalidate_task_after(task_id, "glossary", expected_generation=run_generation):
+            raise RuntimeError("任务已被新一轮处理替代，无法重跑 Glossary")
         _run_agent_async(session.id, lambda item: _agent_generate_glossary_review(item, source_srt))
     elif stage == "translate":
         if not session.result.get("glossary_path"):
             raise RuntimeError("没有 glossary，不能重新翻译")
-        _invalidate_task_after(task_id, "translate")
-        _run_agent_async(session.id, lambda item: _agent_translate_after_glossary(item, use_glossary=True))
-    else:
-        raise ValueError(f"未知可重跑阶段: {stage}")
+        if not _invalidate_task_after(task_id, "translate", expected_generation=run_generation):
+            raise RuntimeError("任务已被新一轮处理替代，无法重跑翻译")
+        with _LOCK:
+            _AGENT_SESSIONS.pop(session.id, None)
+        return _start_agent_translation(_read_task(task_id), use_glossary=True)
     return session
 
 
@@ -655,6 +836,27 @@ def answer_agent_session(session_id: str, answer: dict[str, Any]) -> AgentSessio
     session = get_agent_session(session_id)
     if not session:
         raise KeyError("agent session not found")
+    action = str(answer.get("action") or "")
+    if session.status == "waiting" and session.phase == "review_glossary" and action in {
+        "continue_after_glossary",
+        "skip_glossary",
+    }:
+        task_id = str(session.result.get("task_id") or "").strip()
+        if not task_id:
+            raise KeyError("agent task not found for glossary")
+        if action == "continue_after_glossary":
+            glossary_path = Path(str(session.result.get("glossary_path") or "")).expanduser().resolve()
+            if not glossary_path.is_file():
+                raise RuntimeError("Glossary 文件不存在，无法继续翻译")
+            summary = _glossary_review_summary(_glossary_items(_load_yaml_file(glossary_path)))
+            if not bool(summary["all_reviewed"]):
+                pending = int(summary["total"]) - int(summary["reviewed"])
+                raise ValueError(f"Glossary 还有 {pending} 条未审核，不能开始翻译")
+        return _start_agent_translation(
+            _read_task(task_id),
+            waiting_session_id=session.id,
+            use_glossary=action != "skip_glossary",
+        )
     with _LOCK:
         if session.status != "waiting":
             raise RuntimeError("agent session is not waiting for input")
@@ -727,14 +929,22 @@ def _agent_start(session: AgentSession) -> None:
         detected_source_language=detected_source_language,
         embedded_subtitle_hint=str(payload.get("embedded_subtitle_hint") or "unknown"),
     )
-    _agent_update_result(session.id, {"probe": probe, "normalized_url": probe.get("normalized_url")})
+    existing_project = probe.get("existing_project") if isinstance(probe.get("existing_project"), dict) else {}
+    project_dir = str(existing_project.get("path") or "")
+    input_video = _project_video_path(project_dir, existing_project.get("primary_video"))
+    probe_result: dict[str, Any] = {"probe": probe, "normalized_url": probe.get("normalized_url")}
+    if project_dir:
+        probe_result["project_dir"] = project_dir
+    if input_video:
+        probe_result["input_video"] = input_video
+    _agent_update_result(session.id, probe_result)
     title = str(probe.get("title") or "")
     task = _ensure_agent_task(
         normalized_url=str(probe.get("normalized_url") or ""),
         title=title,
         payload=payload,
     )
-    _agent_update_result(session.id, {"task_id": task["id"], "task_dir": task["task_dir"]})
+    _bind_session_to_task_run(session.id, task)
     _update_task_stage(
         task["id"],
         "probe",
@@ -745,12 +955,19 @@ def _agent_start(session: AgentSession) -> None:
         webpage_url=probe.get("webpage_url"),
         subtitles=probe.get("subtitles") or [],
         agent_plan=probe.get("agent_plan") or {},
+        project_dir=project_dir,
+        input_video=input_video,
+        expected_generation=int(task.get("run_generation") or 0),
     )
     if title and bool(payload.get("translate_title", False)):
         try:
             translated = translate_title_text(title)
             _agent_update_result(session.id, {"zh_title": translated.get("zh_title", "")})
-            _update_task_fields(task["id"], {"zh_title": translated.get("zh_title", "")})
+            _update_task_fields(
+                task["id"],
+                {"zh_title": translated.get("zh_title", "")},
+                expected_generation=int(task.get("run_generation") or 0),
+            )
         except Exception as exc:
             _agent_log(session.id, f"title_translation_skipped: {exc}")
     plan = probe.get("agent_plan") or {}
@@ -797,9 +1014,6 @@ def _agent_continue(session: AgentSession, answer: dict[str, Any]) -> None:
         return
     if session.phase == "confirm_hybrid_ocr_settings" and action == "start_hybrid_anchor_ocr":
         _agent_run_hybrid_anchor_ocr(session)
-        return
-    if session.phase == "review_glossary" and action in {"continue_after_glossary", "skip_glossary"}:
-        _agent_translate_after_glossary(session, use_glossary=action != "skip_glossary")
         return
     raise RuntimeError(f"未知 Agent 回答: {action}")
 
@@ -923,10 +1137,16 @@ def _agent_update_ocr_settings_from_answer(session: AgentSession, answer: dict[s
             session.payload.update(updates)
     task_id = str(session.result.get("task_id") or "")
     if task_id:
-        task = _read_task(task_id)
-        task_payload = dict(task.get("payload") if isinstance(task.get("payload"), dict) else {})
-        task_payload.update(updates)
-        _update_task_fields(task_id, {"payload": task_payload})
+        with _TASK_FILE_LOCK:
+            task = _read_task(task_id)
+            task_payload = dict(task.get("payload") if isinstance(task.get("payload"), dict) else {})
+            task_payload.update(updates)
+            if not _update_task_fields(
+                task_id,
+                {"payload": task_payload},
+                expected_generation=_session_run_generation(session),
+            ):
+                raise RuntimeError("任务已被新一轮处理替代，未保存 OCR 设置")
 
 
 def _agent_prepare_hybrid_ocr_settings(session: AgentSession) -> None:
@@ -1004,7 +1224,7 @@ def _agent_retry_current_phase(session: AgentSession) -> None:
             return
         _agent_generate_glossary_review(session, source_srt)
         return
-    if phase == "translate":
+    if phase in {"translate_pending", "translate"}:
         _agent_translate_after_glossary(session, use_glossary=bool(session.result.get("glossary_path")))
         return
     if phase == "ocr_full":
@@ -1063,7 +1283,8 @@ def _agent_use_recommended_subtitle(session: AgentSession) -> None:
     )
     subtitle_result = _wait_for_job(subtitle_job, session_id=session.id)
     source_srt = str(subtitle_result.get("subtitle_path") or "")
-    _agent_update_result(session.id, {"source_srt": source_srt, "download_subtitle": subtitle_result})
+    project_context = _agent_project_context(subtitle_result)
+    _agent_update_result(session.id, {"source_srt": source_srt, "download_subtitle": subtitle_result, **project_context})
     if not plan.get("requires_translation", True):
         _agent_done(session.id, {"subtitle_path": source_srt, "message": "已下载目标语言字幕。"})
         return
@@ -1073,6 +1294,8 @@ def _agent_use_recommended_subtitle(session: AgentSession) -> None:
 
 
 def _agent_generate_glossary_review(session: AgentSession, source_srt: str) -> None:
+    if not _session_task_is_current(session):
+        raise RuntimeError("任务已被新一轮处理替代，停止生成 Glossary")
     _agent_set_phase(session.id, "generate_glossary")
     is_hybrid = session.result.get("source_kind") == "hybrid_anchor_ocr"
     is_dual_reference = session.result.get("source_kind") == "dual_subtitle_reference"
@@ -1088,18 +1311,29 @@ def _agent_generate_glossary_review(session: AgentSession, source_srt: str) -> N
     )
     glossary_result = _wait_for_job(glossary_job, session_id=session.id)
     glossary_path = str(glossary_result.get("glossary_path") or "")
-    _agent_update_result(session.id, {"glossary_path": glossary_path, "generate_glossary": glossary_result})
     task_id = str(session.result.get("task_id") or "")
     if task_id:
-        _update_task_stage(
+        glossary_path = _materialize_task_artifact(session, glossary_path, "glossary.draft.yaml")
+        if not glossary_path:
+            raise RuntimeError("Glossary 生成完成，但没有可保存的产物")
+        glossary_result["glossary_path"] = glossary_path
+    _agent_update_result(session.id, {"glossary_path": glossary_path, "generate_glossary": glossary_result})
+    if task_id:
+        input_video = _agent_input_video_path(session)
+        if not _update_task_stage(
             task_id,
             "glossary",
             "waiting_review",
             current_stage="glossary_review",
             glossary_path=glossary_path,
             source_srt=source_srt,
+            source_kind=str(session.result.get("source_kind") or _infer_source_kind_from_session(session)),
+            input_video=str(input_video) if input_video else "",
+            project_dir=str(session.result.get("project_dir") or ""),
             job_result=glossary_result,
-        )
+            expected_generation=_session_run_generation(session),
+        ):
+            raise RuntimeError("任务已被新一轮处理替代，停止保存 Glossary")
     message = "Glossary 草稿已生成。审核人名、昵称和专有词后继续翻译。"
     if is_hybrid:
         message = "Hybrid 源字幕已生成：时间轴来自英文人工字幕，原文优先使用原声 OCR。审核 glossary 后继续翻译。"
@@ -1138,8 +1372,56 @@ def _agent_source_language_for_glossary(session: AgentSession, prefer_source: bo
 
 
 def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool) -> None:
+    if not _session_task_is_current(session):
+        raise RuntimeError("任务已被新一轮处理替代，停止旧翻译")
     source_srt = str(session.result.get("source_srt") or "")
     glossary_path = str(session.result.get("glossary_path") or "") if use_glossary else ""
+    translation_glossary_path = (
+        str(session.result.get("translation_glossary_path") or glossary_path) if use_glossary else ""
+    )
+    if not source_srt or not Path(source_srt).exists():
+        raise RuntimeError("源字幕文件不存在，无法开始翻译")
+    if use_glossary and (not translation_glossary_path or not Path(translation_glossary_path).exists()):
+        raise RuntimeError("Glossary 文件不存在，无法开始翻译")
+    task_id = str(session.result.get("task_id") or "")
+    run_generation = _session_run_generation(session)
+    attempt_id = str(session.result.get("translation_attempt_id") or "")
+    if task_id:
+        if not attempt_id:
+            attempt_id = uuid.uuid4().hex
+            _agent_update_result(session.id, {"translation_attempt_id": attempt_id})
+            if not _mark_task_translation_pending(
+                task_id,
+                source_srt=source_srt,
+                glossary_path=glossary_path,
+                attempt_id=attempt_id,
+                glossary_digest=str(session.result.get("glossary_digest") or ""),
+                expected_generation=run_generation,
+            ):
+                raise RuntimeError("任务已被新一轮处理替代，停止旧翻译")
+        if use_glossary:
+            if not _mark_task_glossary_reviewed(
+                task_id,
+                Path(glossary_path),
+                expected_generation=run_generation,
+            ):
+                raise RuntimeError("任务已被新一轮处理替代，停止旧翻译")
+        if not _replace_task_stage(
+            task_id,
+            "translate",
+            "running",
+            current_stage="translate_running",
+            source_srt=source_srt,
+            glossary_path=glossary_path,
+            source_kind=str(session.result.get("source_kind") or ""),
+            input_video=str(_agent_input_video_path(session) or ""),
+            attempt_id=attempt_id,
+            glossary_digest=str(session.result.get("glossary_digest") or ""),
+            started_at=time.time(),
+            expected_generation=run_generation,
+            expected_attempt_id=attempt_id,
+        ):
+            raise RuntimeError("翻译尝试已被更新的请求替代")
     extra_prompt = ""
     translation_mode = "translate_only"
     ocr_pipeline_version = ""
@@ -1165,9 +1447,11 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
     job = translate_subtitle_job(
         {
             "source_srt": source_srt,
-            "glossary": glossary_path,
+            "glossary": translation_glossary_path,
             "translation_mode": translation_mode,
             "extra_prompt": extra_prompt,
+            "out": str(_agent_workspace(session) / f"translated.{attempt_id or session.id}.srt"),
+            "copy_sidecar": False,
         }
     )
     translated = _wait_for_job(job, session_id=session.id)
@@ -1182,22 +1466,27 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
     for key in ("translated_sidecar", "source_sidecar"):
         if translated.get(key):
             done_result[key] = translated.get(key)
-    task_id = str(session.result.get("task_id") or "")
-    if task_id:
-        _update_task_stage(
-            task_id,
-            "translate",
-            "done",
-            current_stage="done",
-            translated_srt=translated.get("translated_srt"),
-            translated_sidecar=translated.get("translated_sidecar"),
-            glossary_path=glossary_path,
-            source_srt=source_srt,
-            ocr_pipeline_version=ocr_pipeline_version,
-            translation_mode=translation_mode,
-            job_result=translated,
-        )
-    _agent_done(session.id, done_result)
+    with _AGENT_TRANSLATION_START_LOCK:
+        if task_id:
+            if not _update_task_stage(
+                task_id,
+                "translate",
+                "done",
+                current_stage="done",
+                translated_srt=translated.get("translated_srt"),
+                translated_sidecar=translated.get("translated_sidecar"),
+                glossary_path=glossary_path,
+                source_srt=source_srt,
+                ocr_pipeline_version=ocr_pipeline_version,
+                translation_mode=translation_mode,
+                attempt_id=attempt_id,
+                glossary_digest=str(session.result.get("glossary_digest") or ""),
+                job_result=translated,
+                expected_generation=run_generation,
+                expected_attempt_id=attempt_id,
+            ):
+                raise RuntimeError("翻译结果已被更新的请求替代")
+        _agent_done(session.id, done_result)
 
 
 def _agent_continue_route_without_subtitle(session_id: str, plan: dict[str, Any]) -> None:
@@ -1445,6 +1734,7 @@ def _agent_run_ocr(session: AgentSession, *, force: bool = False) -> None:
             ocr_language=ocr_language,
             job_result=result,
             reused=False,
+            expected_generation=_session_run_generation(session),
         )
     if _agent_should_finish_ocr_without_translation(session):
         _agent_finish_ocr_without_translation(session, source_srt)
@@ -1497,6 +1787,7 @@ def _agent_use_cached_ocr(session: AgentSession, cached: dict[str, Any]) -> None
             source_language=cached.get("source_language") or _session_source_language(session),
             job_result=cached,
             reused=True,
+            expected_generation=_session_run_generation(session),
         )
     if _agent_should_finish_ocr_without_translation(session):
         _agent_finish_ocr_without_translation(session, source_srt)
@@ -1531,6 +1822,7 @@ def _agent_finish_ocr_without_translation(session: AgentSession, source_srt: str
             translated_sidecar=done_result.get("translated_sidecar"),
             source_srt=source_srt,
             job_result={"mode": "ocr_extract_only", **done_result},
+            expected_generation=_session_run_generation(session),
         )
     _agent_done(session.id, done_result)
 
@@ -1596,7 +1888,11 @@ def _agent_run_dual_subtitle_reference(session: AgentSession) -> None:
         session_id=session.id,
     )
     source_srt = str(source_result.get("subtitle_path") or "")
-    _agent_update_result(session.id, {"primary_subtitle_srt": source_srt, "download_subtitle": source_result})
+    project_context = _agent_project_context(source_result)
+    _agent_update_result(
+        session.id,
+        {"primary_subtitle_srt": source_srt, "download_subtitle": source_result, **project_context},
+    )
 
     _agent_set_phase(session.id, "download_reference_subtitle")
     reference_result = _wait_for_job(
@@ -1607,6 +1903,7 @@ def _agent_run_dual_subtitle_reference(session: AgentSession) -> None:
     _agent_update_result(session.id, {"reference_subtitle_srt": reference_srt, "download_reference_subtitle": reference_result})
 
     _agent_set_phase(session.id, "dual_subtitle_reference")
+    input_video = str((get_agent_session(session.id) or session).result.get("input_video") or "")
     dual_result = _wait_for_job(
         dual_subtitle_reference_job(
             {
@@ -1614,6 +1911,7 @@ def _agent_run_dual_subtitle_reference(session: AgentSession) -> None:
                 "reference_srt": reference_srt,
                 "title": probe.get("title") or "",
                 "source_language": _session_source_language(session),
+                "input_video": input_video,
             }
         ),
         session_id=session.id,
@@ -1625,6 +1923,7 @@ def _agent_run_dual_subtitle_reference(session: AgentSession) -> None:
             "source_srt": dual_source,
             "source_kind": "dual_subtitle_reference",
             "dual_subtitle_reference": dual_result,
+            **({"input_video": input_video} if input_video else {}),
         },
     )
     _agent_generate_glossary_review(session, dual_source)
@@ -1664,6 +1963,7 @@ def _agent_run_asr(session: AgentSession) -> None:
             input_video=input_video,
             output_dir=asr_result.get("output_dir"),
             job_result=asr_result,
+            expected_generation=_session_run_generation(session),
         )
     _agent_generate_glossary_review(session, source_srt)
 
@@ -1769,6 +2069,7 @@ def _agent_run_asr_with_ocr_reference(session: AgentSession) -> None:
             input_video=input_video,
             output_dir=asr_result.get("output_dir"),
             job_result={"asr": asr_result, "ocr_reference": ocr_result, "correction": corrected_result},
+            expected_generation=_session_run_generation(session),
         )
     _agent_generate_glossary_review(session, source_srt)
 
@@ -1871,18 +2172,18 @@ def _agent_set_phase(session_id: str, phase: str) -> None:
 
 
 def _agent_workspace(session: AgentSession) -> Path:
-    path = JOB_DIR / session.id
+    task_dir = str(session.result.get("task_dir") or "").strip()
+    if task_dir:
+        root = Path(task_dir).expanduser().resolve()
+        _ensure_under_root(root)
+        path = root / ".work" / session.id
+    else:
+        path = JOB_DIR / session.id
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def _agent_glossary_path(session: AgentSession) -> Path:
-    task_dir = str(session.result.get("task_dir") or "")
-    if task_dir:
-        path = Path(task_dir).expanduser().resolve()
-        _ensure_under_root(path)
-        path.mkdir(parents=True, exist_ok=True)
-        return path / "glossary.draft.yaml"
     return _agent_workspace(session) / "glossary.draft.yaml"
 
 
@@ -1895,23 +2196,126 @@ def _ensure_agent_task(*, normalized_url: str, title: str, payload: dict[str, An
     task_dir.mkdir(parents=True, exist_ok=True)
     path = task_dir / "task.yaml"
     now = time.time()
-    data = _read_task_file(path) if path.exists() else {}
-    data.update(
-        {
-            "id": task_dir.name,
-            "video_key": video_key,
-            "url": normalized,
-            "title": title or data.get("title") or "",
-            "task_dir": str(task_dir),
-            "payload": {**(data.get("payload") if isinstance(data.get("payload"), dict) else {}), **dict(payload)},
-            "created_at": data.get("created_at") or now,
-            "updated_at": now,
-        }
-    )
-    data.setdefault("current_stage", "created")
-    data.setdefault("stages", {})
-    _write_task_file(path, data)
-    return data
+    with _TASK_FILE_LOCK:
+        data = _read_task_file(path) if path.exists() else {}
+        previous_generation = int(data.get("run_generation") or 0)
+        previous_stages = data.get("stages") if isinstance(data.get("stages"), dict) else {}
+        previous_ocr = previous_stages.get("ocr") if isinstance(previous_stages.get("ocr"), dict) else {}
+        raw_cache = data.get("ocr_cache")
+        ocr_cache = [dict(item) for item in raw_cache if isinstance(item, dict)] if isinstance(raw_cache, list) else []
+        previous_source = str(previous_ocr.get("source_srt") or "").strip()
+        if previous_ocr.get("status") == "done" and previous_source and Path(previous_source).is_file():
+            cache_dir = task_dir / "ocr_cache" / f"generation_{previous_generation}_{int(now * 1000)}"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cached_source = cache_dir / "source.srt"
+            shutil.copy2(Path(previous_source).expanduser().resolve(), cached_source)
+            cache_entry = {
+                **{key: _task_serializable(value) for key, value in previous_ocr.items()},
+                "source_srt": str(cached_source),
+                "run_generation": previous_generation,
+                "cached_at": now,
+            }
+            cache_key = (
+                str(cache_entry.get("source_srt") or ""),
+                str(cache_entry.get("ocr_pipeline_version") or ""),
+                str(cache_entry.get("ocr_extraction_mode") or ""),
+            )
+            ocr_cache = [
+                item
+                for item in ocr_cache
+                if (
+                    str(item.get("source_srt") or ""),
+                    str(item.get("ocr_pipeline_version") or ""),
+                    str(item.get("ocr_extraction_mode") or ""),
+                )
+                != cache_key
+            ]
+            ocr_cache.insert(0, cache_entry)
+        data.update(
+            {
+                "id": task_dir.name,
+                "video_key": video_key,
+                "url": normalized,
+                "title": title or data.get("title") or "",
+                "task_dir": str(task_dir),
+                "payload": {**(data.get("payload") if isinstance(data.get("payload"), dict) else {}), **dict(payload)},
+                "created_at": data.get("created_at") or now,
+                "run_generation": int(data.get("run_generation") or 0) + 1,
+                "run_started_at": now,
+                "current_stage": "created",
+                "workflow_status": "active",
+                # A new run for the same video must never inherit a previous
+                # OCR/glossary/translation completion state. Reusable OCR is
+                # discovered independently from its immutable job artifacts.
+                "stages": {},
+                "ocr_cache": ocr_cache[:5],
+                "updated_at": now,
+            }
+        )
+        data.pop("completed_at", None)
+        _write_task_file(path, data)
+        return data
+
+
+def _bind_session_to_task_run(session_id: str, task: dict[str, Any]) -> None:
+    task_id = str(task.get("id") or "")
+    generation = int(task.get("run_generation") or 0)
+    superseded_jobs: list[str] = []
+    with _TASK_FILE_LOCK:
+        persisted = _read_task_file(_task_yaml_path(task_id))
+        if int(persisted.get("run_generation") or 0) != generation:
+            with _LOCK:
+                stale = _AGENT_SESSIONS.get(session_id)
+                if stale:
+                    stale.status = "cancelled"
+                    stale.phase = "cancelled"
+                    stale.logs.append(f"agent_superseded_before_bind: generation {generation}")
+                    stale.updated_at = time.time()
+            raise RuntimeError("任务已被更新的一轮处理替代")
+        with _LOCK:
+            current = _AGENT_SESSIONS.get(session_id)
+            if not current or current.status == "cancelled":
+                raise RuntimeError("agent session cancelled")
+            for other in _AGENT_SESSIONS.values():
+                if other.id == session_id or str(other.result.get("task_id") or "") != task_id:
+                    continue
+                if other.status not in {"running", "waiting"}:
+                    continue
+                if _session_run_generation(other) >= generation:
+                    continue
+                other.status = "cancelled"
+                other.phase = "cancelled"
+                other.result["superseded_by_generation"] = generation
+                other.logs.append(f"agent_superseded: generation {generation}")
+                other.updated_at = time.time()
+                child_job_id = str(other.result.get("current_job_id") or "")
+                if child_job_id:
+                    superseded_jobs.append(child_job_id)
+            current.result.update(
+                {
+                    "task_id": task_id,
+                    "task_dir": str(persisted.get("task_dir") or task.get("task_dir") or ""),
+                    "run_generation": generation,
+                }
+            )
+            current.updated_at = time.time()
+    for job_id in superseded_jobs:
+        cancel_job(job_id)
+
+
+def _session_run_generation(session: AgentSession) -> int:
+    return int(session.result.get("run_generation") or 0)
+
+
+def _session_task_is_current(session: AgentSession) -> bool:
+    task_id = str(session.result.get("task_id") or "")
+    if not task_id:
+        return True
+    try:
+        task = _read_task(task_id)
+    except Exception:
+        return False
+    return int(task.get("run_generation") or 0) == _session_run_generation(session)
 
 
 def _import_legacy_agent_jobs() -> None:
@@ -2016,6 +2420,7 @@ def _agent_session_from_task(task: dict[str, Any]) -> AgentSession:
     result = {
         "task_id": task.get("id"),
         "task_dir": task.get("task_dir"),
+        "run_generation": int(task.get("run_generation") or 0),
         "normalized_url": task.get("url"),
         "probe": {
             "title": task.get("title") or "",
@@ -2025,15 +2430,37 @@ def _agent_session_from_task(task: dict[str, Any]) -> AgentSession:
         },
         "agent_plan": _task_stage_value(task, "probe", "agent_plan") or {},
     }
-    source_srt = _task_stage_path(task, "ocr", "source_srt") or _task_stage_path(task, "glossary", "source_srt")
-    input_video = _task_stage_path(task, "ocr", "input_video")
+    source_srt = (
+        _task_stage_path(task, "glossary", "source_srt")
+        or _task_stage_path(task, "ocr", "source_srt")
+        or _task_stage_path(task, "asr", "source_srt")
+    )
     glossary_path = _task_stage_path(task, "glossary", "glossary_path")
-    translated_srt = _task_stage_path(task, "translate", "translated_srt")
-    translated_sidecar = _task_stage_path(task, "translate", "translated_sidecar")
+    translate_done = str(_task_stage_value(task, "translate", "status") or "") == "done"
+    translated_srt = _task_stage_path(task, "translate", "translated_srt") if translate_done else ""
+    translated_sidecar = _task_stage_path(task, "translate", "translated_sidecar") if translate_done else ""
+    source_kind = str(
+        _task_stage_value(task, "glossary", "source_kind")
+        or _task_stage_value(task, "translate", "source_kind")
+        or _task_stage_value(task, "ocr", "source_kind")
+        or _task_stage_value(task, "asr", "source_kind")
+        or ""
+    ).strip()
+    if not source_kind:
+        route = str((result.get("agent_plan") or {}).get("route") or "")
+        source_kind = {
+            "dual_subtitle_reference": "dual_subtitle_reference",
+            "hybrid_anchor_ocr": "hybrid_anchor_ocr",
+            "ocr": "ocr",
+            "asr": "asr",
+        }.get(route, "source_subtitle")
     if source_srt:
-        result.update({"source_srt": source_srt, "source_kind": "ocr"})
-    if input_video:
-        result["input_video"] = input_video
+        result.update({"source_srt": source_srt, "source_kind": source_kind})
+    for stage_name in ("glossary", "probe", "ocr", "asr", "translate"):
+        project_dir = str(_task_stage_value(task, stage_name, "project_dir") or "").strip()
+        if project_dir:
+            result["project_dir"] = project_dir
+            break
     if glossary_path:
         result["glossary_path"] = glossary_path
     if translated_srt:
@@ -2043,6 +2470,9 @@ def _agent_session_from_task(task: dict[str, Any]) -> AgentSession:
     with _LOCK:
         session.result.update(result)
         _AGENT_SESSIONS[session.id] = session
+    input_video = _agent_input_video_path(session)
+    if input_video:
+        _agent_update_result(session.id, {"input_video": str(input_video)})
     return session
 
 
@@ -2050,7 +2480,8 @@ def _read_task(task_id: str) -> dict[str, Any]:
     path = _task_yaml_path(task_id)
     if not path.exists():
         raise KeyError("agent task not found")
-    return _read_task_file(path)
+    with _TASK_FILE_LOCK:
+        return _read_task_file(path)
 
 
 def _task_yaml_path(task_id: str) -> Path:
@@ -2118,71 +2549,185 @@ def _read_task_file(path: Path) -> dict[str, Any]:
 
 
 def _write_task_file(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data["updated_at"] = time.time()
-    tmp = path.with_suffix(".yaml.tmp")
-    tmp.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    tmp.replace(path)
+    with _TASK_FILE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data["updated_at"] = time.time()
+        tmp = path.with_suffix(".yaml.tmp")
+        tmp.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        tmp.replace(path)
 
 
-def _update_task_fields(task_id: str, values: dict[str, Any]) -> None:
+def _update_task_fields(task_id: str, values: dict[str, Any], *, expected_generation: int | None = None) -> bool:
     if not task_id:
-        return
+        return False
     path = _task_yaml_path(task_id)
     if not path.exists():
-        return
-    data = _read_task_file(path)
-    data.update(values)
-    _write_task_file(path, data)
+        return False
+    with _TASK_FILE_LOCK:
+        data = _read_task_file(path)
+        if expected_generation is not None and int(data.get("run_generation") or 0) != expected_generation:
+            return False
+        data.update(values)
+        _write_task_file(path, data)
+        return True
 
 
-def _update_task_stage(task_id: str, stage: str, status: str, *, current_stage: str | None = None, **values: Any) -> None:
+def _update_task_stage(
+    task_id: str,
+    stage: str,
+    status: str,
+    *,
+    current_stage: str | None = None,
+    expected_generation: int | None = None,
+    expected_attempt_id: str | None = None,
+    **values: Any,
+) -> bool:
     if not task_id:
-        return
+        return False
     path = _task_yaml_path(task_id)
     if not path.exists():
-        return
-    data = _read_task_file(path)
-    stages = data.setdefault("stages", {})
-    if not isinstance(stages, dict):
-        stages = {}
-        data["stages"] = stages
-    item = stages.setdefault(stage, {})
-    if not isinstance(item, dict):
-        item = {}
-        stages[stage] = item
-    item.update({key: _task_serializable(value) for key, value in values.items() if value is not None and value != ""})
-    item["status"] = status
-    item["updated_at"] = time.time()
-    if current_stage:
-        data["current_stage"] = current_stage
-        if current_stage == "done":
-            data["workflow_status"] = "completed"
-            data.setdefault("completed_at", time.time())
-        elif data.get("workflow_status") == "completed":
-            data["workflow_status"] = "active"
-            data.pop("completed_at", None)
-    _write_task_file(path, data)
+        return False
+    with _TASK_FILE_LOCK:
+        data = _read_task_file(path)
+        if expected_generation is not None and int(data.get("run_generation") or 0) != expected_generation:
+            return False
+        stages = data.setdefault("stages", {})
+        if not isinstance(stages, dict):
+            stages = {}
+            data["stages"] = stages
+        current_item = stages.get(stage)
+        if expected_attempt_id is not None:
+            if not isinstance(current_item, dict) or str(current_item.get("attempt_id") or "") != expected_attempt_id:
+                return False
+        item = stages.setdefault(stage, {})
+        if not isinstance(item, dict):
+            item = {}
+            stages[stage] = item
+        item.update({key: _task_serializable(value) for key, value in values.items() if value is not None and value != ""})
+        item["status"] = status
+        item["updated_at"] = time.time()
+        if current_stage:
+            data["current_stage"] = current_stage
+            if current_stage == "done":
+                data["workflow_status"] = "completed"
+                data.setdefault("completed_at", time.time())
+            elif data.get("workflow_status") == "completed":
+                data["workflow_status"] = "active"
+                data.pop("completed_at", None)
+        _write_task_file(path, data)
+        return True
 
 
-def _invalidate_task_after(task_id: str, stage: str) -> None:
+def _replace_task_stage(
+    task_id: str,
+    stage: str,
+    status: str,
+    *,
+    current_stage: str | None = None,
+    expected_generation: int | None = None,
+    expected_attempt_id: str | None = None,
+    **values: Any,
+) -> bool:
+    if not task_id:
+        return False
+    path = _task_yaml_path(task_id)
+    if not path.exists():
+        return False
+    with _TASK_FILE_LOCK:
+        data = _read_task_file(path)
+        if expected_generation is not None and int(data.get("run_generation") or 0) != expected_generation:
+            return False
+        stages = data.setdefault("stages", {})
+        if not isinstance(stages, dict):
+            stages = {}
+            data["stages"] = stages
+        current_item = stages.get(stage)
+        if expected_attempt_id is not None:
+            if not isinstance(current_item, dict) or str(current_item.get("attempt_id") or "") != expected_attempt_id:
+                return False
+        stages[stage] = {
+            **{key: _task_serializable(value) for key, value in values.items() if value is not None and value != ""},
+            "status": status,
+            "updated_at": time.time(),
+        }
+        if current_stage:
+            data["current_stage"] = current_stage
+        data["workflow_status"] = "active"
+        data.pop("completed_at", None)
+        _write_task_file(path, data)
+        return True
+
+
+def _mark_task_glossary_reviewed(
+    task_id: str,
+    glossary_path: Path,
+    *,
+    review_summary: dict[str, Any] | None = None,
+    expected_generation: int | None = None,
+) -> bool:
+    values: dict[str, Any] = {
+        "glossary_path": str(glossary_path),
+        "reviewed_at": time.time(),
+    }
+    if review_summary:
+        values["review_summary"] = review_summary
+    return _update_task_stage(
+        task_id,
+        "glossary",
+        "reviewed",
+        current_stage="glossary_reviewed",
+        expected_generation=expected_generation,
+        **values,
+    )
+
+
+def _mark_task_translation_pending(
+    task_id: str,
+    *,
+    source_srt: str,
+    glossary_path: str,
+    attempt_id: str,
+    glossary_digest: str,
+    expected_generation: int | None = None,
+) -> bool:
+    # Replace rather than update so an old translated_srt/sidecar can never be
+    # mistaken for the output of the newly queued translation.
+    return _replace_task_stage(
+        task_id,
+        "translate",
+        "queued",
+        current_stage="translate_pending",
+        source_srt=source_srt,
+        glossary_path=glossary_path,
+        attempt_id=attempt_id,
+        glossary_digest=glossary_digest,
+        queued_at=time.time(),
+        expected_generation=expected_generation,
+    )
+
+
+def _invalidate_task_after(task_id: str, stage: str, *, expected_generation: int | None = None) -> bool:
     order = ["ocr", "glossary", "translate"]
     if stage not in order:
-        return
+        return False
     path = _task_yaml_path(task_id)
     if not path.exists():
-        return
-    data = _read_task_file(path)
-    stages = data.get("stages") if isinstance(data.get("stages"), dict) else {}
-    for name in order[order.index(stage):]:
-        item = stages.get(name)
-        if isinstance(item, dict):
-            item["status"] = "invalidated" if name != stage else "rerunning"
-            item["updated_at"] = time.time()
-    data["current_stage"] = f"{stage}_rerun"
-    data["workflow_status"] = "active"
-    data.pop("completed_at", None)
-    _write_task_file(path, data)
+        return False
+    with _TASK_FILE_LOCK:
+        data = _read_task_file(path)
+        if expected_generation is not None and int(data.get("run_generation") or 0) != expected_generation:
+            return False
+        stages = data.get("stages") if isinstance(data.get("stages"), dict) else {}
+        for name in order[order.index(stage):]:
+            item = stages.get(name)
+            if isinstance(item, dict):
+                item["status"] = "invalidated" if name != stage else "rerunning"
+                item["updated_at"] = time.time()
+        data["current_stage"] = f"{stage}_rerun"
+        data["workflow_status"] = "active"
+        data.pop("completed_at", None)
+        _write_task_file(path, data)
+        return True
 
 
 def _materialize_task_artifact(session: AgentSession, source: str, filename: str) -> str:
@@ -2194,11 +2739,28 @@ def _materialize_task_artifact(session: AgentSession, source: str, filename: str
         return ""
     dst_dir = Path(task_dir).expanduser().resolve()
     _ensure_under_root(dst_dir)
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    dst = dst_dir / filename
-    if src != dst:
-        shutil.copy2(src, dst)
-    return str(dst)
+    task_id = str(session.result.get("task_id") or "").strip()
+    with _TASK_FILE_LOCK:
+        if task_id:
+            path = _task_yaml_path(task_id)
+            if not path.exists():
+                raise RuntimeError("Agent 任务不存在，停止写入产物")
+            task = _read_task_file(path)
+            if int(task.get("run_generation") or 0) != _session_run_generation(session):
+                raise RuntimeError("任务已被新一轮处理替代，停止写入旧产物")
+            persisted_dir = Path(str(task.get("task_dir") or "")).expanduser().resolve()
+            if persisted_dir != dst_dir:
+                raise RuntimeError("Agent 任务目录已变化，停止写入产物")
+            attempt_id = str(session.result.get("translation_attempt_id") or "")
+            if attempt_id:
+                current_attempt = str(_task_stage_value(task, "translate", "attempt_id") or "")
+                if current_attempt != attempt_id:
+                    raise RuntimeError("翻译尝试已被更新的请求替代，停止写入旧产物")
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst = dst_dir / filename
+        if src != dst:
+            shutil.copy2(src, dst)
+        return str(dst)
 
 
 def _copy_agent_translated_sidecar(session: AgentSession, source_srt: str, translated_srt: str) -> dict[str, Path]:
@@ -2209,21 +2771,30 @@ def _copy_agent_translated_sidecar(session: AgentSession, source_srt: str, trans
     if not input_video:
         return {}
     source = Path(str(source_srt or "")).expanduser()
-    copied = copy_sidecar_subtitles(
-        input_video,
-        source_srt=source if source.exists() else None,
-        translated_srt=translated,
-        config=SidecarConfig(enabled=True, copy_source=False, copy_translated=True, source_suffix=".source", translated_suffix=".zh"),
-    )
-    return copied
+    with _TASK_FILE_LOCK:
+        if not _session_task_is_current(session):
+            raise RuntimeError("任务已被新一轮处理替代，停止写入字幕副本")
+        task_id = str(session.result.get("task_id") or "").strip()
+        attempt_id = str(session.result.get("translation_attempt_id") or "")
+        if task_id and attempt_id:
+            task = _read_task_file(_task_yaml_path(task_id))
+            if str(_task_stage_value(task, "translate", "attempt_id") or "") != attempt_id:
+                raise RuntimeError("翻译尝试已被更新的请求替代，停止写入字幕副本")
+        return copy_sidecar_subtitles(
+            input_video,
+            source_srt=source if source.exists() else None,
+            translated_srt=translated,
+            config=SidecarConfig(enabled=True, copy_source=False, copy_translated=True, source_suffix=".source", translated_suffix=".zh"),
+        )
 
 
 def _agent_input_video_path(session: AgentSession) -> Path | None:
-    raw = str(session.result.get("input_video") or "").strip()
-    if raw:
-        path = Path(raw).expanduser().resolve()
-        if path.exists():
-            return path
+    direct = _existing_video_path(session.result.get("input_video"))
+    if direct:
+        return Path(direct)
+    project_video = _primary_video_for_project(session.result.get("project_dir"))
+    if project_video:
+        return project_video
     task_id = str(session.result.get("task_id") or "").strip()
     if not task_id:
         return None
@@ -2231,14 +2802,98 @@ def _agent_input_video_path(session: AgentSession) -> Path | None:
         task = _read_task(task_id)
     except Exception:
         return None
-    for stage in ("ocr", "glossary", "translate"):
-        raw = str(_task_stage_value(task, stage, "input_video") or "").strip()
-        if not raw:
-            continue
-        path = Path(raw).expanduser().resolve()
-        if path.exists():
-            return path
+    for stage in ("probe", "ocr", "asr", "glossary", "translate"):
+        direct = _existing_video_path(_task_stage_value(task, stage, "input_video"))
+        if direct:
+            return Path(direct)
+        project_video = _primary_video_for_project(_task_stage_value(task, stage, "project_dir"))
+        if project_video:
+            return project_video
     return None
+
+
+def _agent_project_context(result: dict[str, Any]) -> dict[str, str]:
+    project_dir = str(result.get("project_dir") or "").strip()
+    input_video = _project_video_path(project_dir, result.get("input_video")) if project_dir else _existing_video_path(result.get("input_video"))
+    if not input_video and project_dir:
+        primary = _primary_video_for_project(project_dir)
+        input_video = str(primary) if primary else ""
+    context: dict[str, str] = {}
+    if project_dir:
+        context["project_dir"] = project_dir
+    if input_video:
+        context["input_video"] = input_video
+    return context
+
+
+def _primary_video_for_project(project_dir: Any) -> Path | None:
+    raw = str(project_dir or "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser().resolve()
+    if not path.exists() or not path.is_dir():
+        return None
+    try:
+        manifest = infer_project_manifest(path)
+    except Exception:
+        manifest = {}
+    manifest_primary = manifest.get("primary_video") if isinstance(manifest, dict) else ""
+    if isinstance(manifest, dict) and str(manifest.get("source_type") or "") == "local":
+        direct = _existing_video_path(manifest_primary)
+    else:
+        direct = _project_video_path(path, manifest_primary)
+    if direct:
+        return Path(direct)
+    candidates = [
+        item
+        for item in path.iterdir()
+        if item.is_file() and item.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+    ]
+    # A directory with multiple videos is ambiguous. Guessing the newest file
+    # can silently attach subtitles to the wrong source video.
+    return candidates[0].resolve() if len(candidates) == 1 else None
+
+
+def _project_video_path(project_dir: Any, value: Any) -> str:
+    raw_project = str(project_dir or "").strip()
+    direct = _existing_video_path(value)
+    if not raw_project or not direct:
+        return ""
+    project = Path(raw_project).expanduser().resolve()
+    video = Path(direct)
+    if not project.is_dir() or not _is_relative_to(video, project):
+        return ""
+    return str(video)
+
+
+def _existing_video_path(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    path = Path(raw).expanduser().resolve()
+    if not path.exists() or not path.is_file():
+        return ""
+    if path.suffix.lower() not in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}:
+        return ""
+    return str(path)
+
+
+def _infer_source_kind_from_session(session: AgentSession) -> str:
+    explicit = str(session.result.get("source_kind") or "").strip()
+    if explicit:
+        return explicit
+    route = str((session.result.get("agent_plan") or {}).get("route") or "")
+    if route == "dual_subtitle_reference":
+        return "dual_subtitle_reference"
+    if route == "hybrid_anchor_ocr":
+        return "hybrid_anchor_ocr"
+    if session.result.get("ocr"):
+        return "ocr"
+    if session.result.get("asr_ocr_correction"):
+        return "asr_ocr_reference"
+    if session.result.get("asr"):
+        return "asr"
+    return "source_subtitle"
 
 
 def _task_stage_value(task: dict[str, Any], stage: str, key: str) -> Any:
@@ -2464,96 +3119,101 @@ def _reusable_ocr_from_tasks(*, normalized_url: str, title_key: str, mode: str, 
         task = _read_task_file(task_yaml)
         if exclude_session_id and task.get("id") == exclude_session_id:
             continue
-        source_srt = _task_stage_path(task, "ocr", "source_srt")
-        if not source_srt:
-            continue
-        source_path = Path(source_srt)
-        if not source_path.exists() or source_path.stat().st_size <= 1:
-            continue
         task_url = str(task.get("url") or "")
         task_title_key = _filename_match_key(str(task.get("title") or ""))
         exact_url_match = bool(normalized_url and task_url == normalized_url)
         title_match = bool(title_key and task_title_key and (title_key in task_title_key or task_title_key in title_key or SequenceMatcher(None, title_key, task_title_key).ratio() >= 0.86))
         if not exact_url_match and not title_match:
             continue
-        cached_scope = _normalize_ocr_scope(_task_stage_value(task, "ocr", "ocr_scope") or "bottom")
-        if cached_scope != scope:
-            continue
-        cached_extraction_mode = _normalize_ocr_extraction_mode(_task_stage_value(task, "ocr", "ocr_extraction_mode") or "auto")
-        if cached_extraction_mode != extraction_mode:
-            continue
-        cached_pipeline_version = _cached_ocr_pipeline_version(
-            _task_stage_value(task, "ocr", "ocr_pipeline_version"),
-            cached_extraction_mode,
-        )
-        if pipeline_version and cached_pipeline_version != pipeline_version:
-            continue
-        cached_source_cleanup_mode = str(
-            _task_stage_value(task, "ocr", "ocr_source_cleanup_mode")
-            or ({"v1": "llm_context", "v2": "none"}.get(cached_pipeline_version, ""))
-        ).strip()
-        if source_cleanup_mode and cached_source_cleanup_mode != source_cleanup_mode:
-            continue
-        cached_shape_mode = _normalize_ocr_shape_mode(_task_stage_value(task, "ocr", "ocr_shape_mode"), cached_extraction_mode)
-        if cached_shape_mode != shape_mode:
-            continue
-        cached_refinement_mode = _normalize_ocr_refinement_mode(_task_stage_value(task, "ocr", "ocr_refinement_mode") or "none")
-        if cached_refinement_mode != refinement_mode:
-            continue
-        cached_crop_top_ratio = _normalize_ocr_crop_top_ratio(_task_stage_value(task, "ocr", "ocr_crop_top_ratio"), cached_scope)
-        cached_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(_task_stage_value(task, "ocr", "ocr_crop_bottom_ratio"))
-        cached_crop_left_ratio = _normalize_ocr_crop_ratio(_task_stage_value(task, "ocr", "ocr_crop_left_ratio"))
-        cached_crop_right_ratio = _normalize_ocr_crop_ratio(_task_stage_value(task, "ocr", "ocr_crop_right_ratio"))
-        cached_exclude_enabled = bool(_task_stage_value(task, "ocr", "ocr_exclude_enabled") or False)
-        cached_exclude_top_ratio = _normalize_ocr_exclude_ratio(_task_stage_value(task, "ocr", "ocr_exclude_top_ratio") or 0.04)
-        cached_exclude_bottom_ratio = _normalize_ocr_exclude_ratio(_task_stage_value(task, "ocr", "ocr_exclude_bottom_ratio") or 0.82)
-        cached_exclude_left_ratio = _normalize_ocr_exclude_ratio(_task_stage_value(task, "ocr", "ocr_exclude_left_ratio") or 0.76)
-        cached_exclude_right_ratio = _normalize_ocr_exclude_ratio(_task_stage_value(task, "ocr", "ocr_exclude_right_ratio") or 0.02)
-        cached_source_language = normalize_source_language(_task_stage_value(task, "ocr", "source_language") or "auto")
-        if source_language != "auto" and cached_source_language != source_language:
-            continue
-        if (
-            cached_crop_top_ratio != crop_top_ratio
-            or cached_crop_bottom_ratio != crop_bottom_ratio
-            or cached_crop_left_ratio != crop_left_ratio
-            or cached_crop_right_ratio != crop_right_ratio
-            or cached_exclude_enabled != exclude_enabled
-            or (exclude_enabled and (
-                cached_exclude_top_ratio != exclude_top_ratio
-                or cached_exclude_bottom_ratio != exclude_bottom_ratio
-                or cached_exclude_left_ratio != exclude_left_ratio
-                or cached_exclude_right_ratio != exclude_right_ratio
-            ))
-        ):
-            continue
-        results.append(
-            {
-                "source_srt": source_srt,
-                "input_video": _task_stage_value(task, "ocr", "input_video") or "",
-                "output_dir": str(task_yaml.parent),
-                "job_id": str(task.get("id") or task_yaml.parent.name),
-                "matched_by": "url" if exact_url_match else "title",
-                "created_at": float(_task_stage_value(task, "ocr", "updated_at") or task.get("updated_at") or task_yaml.stat().st_mtime),
-                "ocr_pipeline_version": cached_pipeline_version or "custom",
-                "ocr_source_cleanup_mode": cached_source_cleanup_mode,
-                "ocr_translation_mode": mode,
-                "ocr_scope": cached_scope,
-                "ocr_extraction_mode": cached_extraction_mode,
-                "ocr_shape_mode": cached_shape_mode,
-                "ocr_refinement_mode": cached_refinement_mode,
-                "ocr_crop_top_ratio": cached_crop_top_ratio,
-                "ocr_crop_bottom_ratio": cached_crop_bottom_ratio,
-                "ocr_crop_left_ratio": cached_crop_left_ratio,
-                "ocr_crop_right_ratio": cached_crop_right_ratio,
-                "ocr_exclude_enabled": cached_exclude_enabled,
-                "ocr_exclude_top_ratio": cached_exclude_top_ratio,
-                "ocr_exclude_bottom_ratio": cached_exclude_bottom_ratio,
-                "ocr_exclude_left_ratio": cached_exclude_left_ratio,
-                "ocr_exclude_right_ratio": cached_exclude_right_ratio,
-                "source_language": cached_source_language,
-            }
-        )
-    return results
+        stages = task.get("stages") if isinstance(task.get("stages"), dict) else {}
+        records: list[dict[str, Any]] = []
+        current_ocr = stages.get("ocr") if isinstance(stages.get("ocr"), dict) else None
+        if current_ocr:
+            records.append(current_ocr)
+        raw_cache = task.get("ocr_cache")
+        if isinstance(raw_cache, list):
+            records.extend(item for item in raw_cache if isinstance(item, dict))
+
+        for record in records:
+            source_srt = str(record.get("source_srt") or "").strip()
+            source_path = Path(source_srt).expanduser() if source_srt else None
+            if source_path is None or not source_path.exists() or source_path.stat().st_size <= 1:
+                continue
+            cached_scope = _normalize_ocr_scope(record.get("ocr_scope") or "bottom")
+            cached_extraction_mode = _normalize_ocr_extraction_mode(record.get("ocr_extraction_mode") or "auto")
+            cached_pipeline_version = _cached_ocr_pipeline_version(record.get("ocr_pipeline_version"), cached_extraction_mode)
+            cached_source_cleanup_mode = str(
+                record.get("ocr_source_cleanup_mode") or ({"v1": "llm_context", "v2": "none"}.get(cached_pipeline_version, ""))
+            ).strip()
+            cached_shape_mode = _normalize_ocr_shape_mode(record.get("ocr_shape_mode"), cached_extraction_mode)
+            cached_refinement_mode = _normalize_ocr_refinement_mode(record.get("ocr_refinement_mode") or "none")
+            cached_crop_top_ratio = _normalize_ocr_crop_top_ratio(record.get("ocr_crop_top_ratio"), cached_scope)
+            cached_crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(record.get("ocr_crop_bottom_ratio"))
+            cached_crop_left_ratio = _normalize_ocr_crop_ratio(record.get("ocr_crop_left_ratio"))
+            cached_crop_right_ratio = _normalize_ocr_crop_ratio(record.get("ocr_crop_right_ratio"))
+            cached_exclude_enabled = bool(record.get("ocr_exclude_enabled") or False)
+            cached_exclude_top_ratio = _normalize_ocr_exclude_ratio(record.get("ocr_exclude_top_ratio") or 0.04)
+            cached_exclude_bottom_ratio = _normalize_ocr_exclude_ratio(record.get("ocr_exclude_bottom_ratio") or 0.82)
+            cached_exclude_left_ratio = _normalize_ocr_exclude_ratio(record.get("ocr_exclude_left_ratio") or 0.76)
+            cached_exclude_right_ratio = _normalize_ocr_exclude_ratio(record.get("ocr_exclude_right_ratio") or 0.02)
+            cached_source_language = normalize_source_language(record.get("source_language") or "auto")
+            if (
+                cached_scope != scope
+                or cached_extraction_mode != extraction_mode
+                or (pipeline_version and cached_pipeline_version != pipeline_version)
+                or (source_cleanup_mode and cached_source_cleanup_mode != source_cleanup_mode)
+                or cached_shape_mode != shape_mode
+                or cached_refinement_mode != refinement_mode
+                or (source_language != "auto" and cached_source_language != source_language)
+                or cached_crop_top_ratio != crop_top_ratio
+                or cached_crop_bottom_ratio != crop_bottom_ratio
+                or cached_crop_left_ratio != crop_left_ratio
+                or cached_crop_right_ratio != crop_right_ratio
+                or cached_exclude_enabled != exclude_enabled
+                or (
+                    exclude_enabled
+                    and (
+                        cached_exclude_top_ratio != exclude_top_ratio
+                        or cached_exclude_bottom_ratio != exclude_bottom_ratio
+                        or cached_exclude_left_ratio != exclude_left_ratio
+                        or cached_exclude_right_ratio != exclude_right_ratio
+                    )
+                )
+            ):
+                continue
+            results.append(
+                {
+                    "source_srt": str(source_path),
+                    "input_video": record.get("input_video") or "",
+                    "output_dir": str(task_yaml.parent),
+                    "job_id": str(task.get("id") or task_yaml.parent.name),
+                    "matched_by": "url" if exact_url_match else "title",
+                    "created_at": float(record.get("updated_at") or record.get("cached_at") or task.get("updated_at") or task_yaml.stat().st_mtime),
+                    "ocr_pipeline_version": cached_pipeline_version or "custom",
+                    "ocr_source_cleanup_mode": cached_source_cleanup_mode,
+                    "ocr_translation_mode": mode,
+                    "ocr_scope": cached_scope,
+                    "ocr_extraction_mode": cached_extraction_mode,
+                    "ocr_shape_mode": cached_shape_mode,
+                    "ocr_refinement_mode": cached_refinement_mode,
+                    "ocr_crop_top_ratio": cached_crop_top_ratio,
+                    "ocr_crop_bottom_ratio": cached_crop_bottom_ratio,
+                    "ocr_crop_left_ratio": cached_crop_left_ratio,
+                    "ocr_crop_right_ratio": cached_crop_right_ratio,
+                    "ocr_exclude_enabled": cached_exclude_enabled,
+                    "ocr_exclude_top_ratio": cached_exclude_top_ratio,
+                    "ocr_exclude_bottom_ratio": cached_exclude_bottom_ratio,
+                    "ocr_exclude_left_ratio": cached_exclude_left_ratio,
+                    "ocr_exclude_right_ratio": cached_exclude_right_ratio,
+                    "source_language": cached_source_language,
+                }
+            )
+    unique: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for item in results:
+        key = (item["source_srt"], item["ocr_pipeline_version"], item["ocr_extraction_mode"], item["ocr_shape_mode"])
+        if key not in unique or float(item["created_at"]) > float(unique[key]["created_at"]):
+            unique[key] = item
+    return list(unique.values())
 
 
 def _resolve_cached_source_srt(job_dir: Path, config: dict[str, Any]) -> Path | None:
@@ -2596,7 +3256,7 @@ def _agent_log(session_id: str, line: str) -> None:
 def _agent_wait(session_id: str, phase: str, question: dict[str, Any]) -> None:
     with _LOCK:
         session = _AGENT_SESSIONS.get(session_id)
-        if not session:
+        if not session or session.status == "cancelled":
             return
         session.phase = phase
         session.status = "waiting"
@@ -2608,9 +3268,23 @@ def _agent_wait(session_id: str, phase: str, question: dict[str, Any]) -> None:
 def _agent_done(session_id: str, values: dict[str, Any]) -> None:
     with _LOCK:
         session = _AGENT_SESSIONS.get(session_id)
-        if not session:
+        if not session or session.status == "cancelled":
+            return
+    if not _session_task_is_current(session):
+        with _LOCK:
+            current = _AGENT_SESSIONS.get(session_id)
+            if current and current.status != "cancelled":
+                current.status = "cancelled"
+                current.phase = "cancelled"
+                current.logs.append("agent_superseded_before_done")
+                current.updated_at = time.time()
+        return
+    with _LOCK:
+        session = _AGENT_SESSIONS.get(session_id)
+        if not session or session.status == "cancelled":
             return
         session.result.update(values)
+        session.result["translation_pending"] = False
         session.status = "done"
         session.phase = "done"
         session.question = {}
@@ -2621,13 +3295,32 @@ def _agent_done(session_id: str, values: dict[str, Any]) -> None:
 def _agent_fail(session_id: str, exc: Exception) -> None:
     task_id = ""
     phase = ""
+    generation = 0
+    attempt_id = ""
     with _LOCK:
         session = _AGENT_SESSIONS.get(session_id)
-        if not session:
+        if not session or session.status == "cancelled":
             return
         task_id = str(session.result.get("task_id") or "")
         phase = session.phase
+        generation = _session_run_generation(session)
+        attempt_id = str(session.result.get("translation_attempt_id") or "")
+    if task_id and not _session_task_is_current(session):
+        with _LOCK:
+            current = _AGENT_SESSIONS.get(session_id)
+            if current and current.status != "cancelled":
+                current.status = "cancelled"
+                current.phase = "cancelled"
+                current.result["translation_pending"] = False
+                current.logs.append(f"agent_superseded: {exc}")
+                current.updated_at = time.time()
+        return
+    with _LOCK:
+        session = _AGENT_SESSIONS.get(session_id)
+        if not session or session.status == "cancelled":
+            return
         session.status = "failed"
+        session.result["translation_pending"] = False
         session.error = str(exc)
         session.question = {}
         session.logs.append(f"agent_failed: {exc}")
@@ -2635,7 +3328,23 @@ def _agent_fail(session_id: str, exc: Exception) -> None:
     if task_id:
         stage = _task_stage_for_phase(phase)
         if stage:
-            _update_task_stage(task_id, stage, "failed", current_stage=f"{stage}_failed", error=str(exc))
+            updated = _update_task_stage(
+                task_id,
+                stage,
+                "failed",
+                current_stage=f"{stage}_failed",
+                error=str(exc),
+                expected_generation=generation,
+                expected_attempt_id=attempt_id if stage == "translate" and attempt_id else None,
+            )
+            if not updated:
+                with _LOCK:
+                    current = _AGENT_SESSIONS.get(session_id)
+                    if current:
+                        current.status = "cancelled"
+                        current.phase = "cancelled"
+                        current.logs.append("agent_failure_not_persisted_superseded")
+                        current.updated_at = time.time()
 
 
 def _task_stage_for_phase(phase: str) -> str:
@@ -2643,7 +3352,7 @@ def _task_stage_for_phase(phase: str) -> str:
         return "ocr"
     if phase in {"generate_glossary", "review_glossary"}:
         return "glossary"
-    if phase == "translate":
+    if phase in {"translate_pending", "translate"}:
         return "translate"
     if phase == "probe":
         return "probe"
@@ -2726,6 +3435,7 @@ def translate_subtitle_job(payload: dict[str, Any]) -> Job:
     glossary = _resolve_project_path(glossary_value) if glossary_value else None
     translation_mode = _normalize_subtitle_translation_mode(payload.get("translation_mode"))
     extra_prompt = str(payload.get("extra_prompt") or "")
+    copy_sidecar = bool(payload.get("copy_sidecar", True))
     out = _resolve_project_path(payload.get("out") or str(source_srt.with_name(source_srt.stem + ".zh.srt")))
     _ensure_under_root(out)
 
@@ -2746,7 +3456,8 @@ def translate_subtitle_job(payload: dict[str, Any]) -> Job:
             args.extend(["--extra-prompt", extra_prompt.strip()])
         _run_command(job_id, args)
         result = {"translated_srt": str(out), "translation_mode": translation_mode}
-        result.update({name: str(path) for name, path in _copy_translated_sidecar_for_source(source_srt, out).items()})
+        if copy_sidecar:
+            result.update({name: str(path) for name, path in _copy_translated_sidecar_for_source(source_srt, out).items()})
         result.update(subtitle_pair_issues(out))
         return result
 
@@ -3977,6 +4688,12 @@ def dual_subtitle_reference_job(payload: dict[str, Any]) -> Job:
         raise FileNotFoundError(f"主字幕文件不存在: {source_srt}")
     if not reference_srt.exists():
         raise FileNotFoundError(f"参考字幕文件不存在: {reference_srt}")
+    input_video_value = str(payload.get("input_video") or "").strip()
+    input_video = _resolve_project_path(input_video_value) if input_video_value else None
+    if input_video is not None:
+        _ensure_under_root(input_video)
+        if not input_video.exists() or not input_video.is_file():
+            raise FileNotFoundError(f"关联视频文件不存在: {input_video}")
     job_slug = _safe_slug(payload.get("title") or source_srt.stem)[:80]
     min_overlap = float(payload.get("min_overlap_seconds") or 0.10)
     source_language = normalize_source_language(payload.get("source_language") or "korean")
@@ -3998,6 +4715,8 @@ def dual_subtitle_reference_job(payload: dict[str, Any]) -> Job:
             "dual_reference": {"min_overlap_seconds": min_overlap},
             "sidecar": {"enabled": True, "copy_source": False, "copy_translated": True, "source_suffix": ".source", "translated_suffix": ".zh"},
         }
+        if input_video is not None:
+            config["input_video"] = str(input_video)
         config_path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
         _append_log(job_id, f"source_subtitle: {source_srt}")
         _append_log(job_id, f"reference_subtitle: {reference_srt}")
@@ -4009,7 +4728,10 @@ def dual_subtitle_reference_job(payload: dict[str, Any]) -> Job:
             min_overlap_seconds=min_overlap,
             source_language=source_language,
         )
-        return {name: str(path) for name, path in result_paths.items()}
+        result = {name: str(path) for name, path in result_paths.items()}
+        if input_video is not None:
+            result["input_video"] = str(input_video)
+        return result
 
     return start_job(f"原声主字幕 + 英文参考 {job_slug}", target)
 
@@ -5061,7 +5783,28 @@ def write_glossary_items(payload: dict[str, Any]) -> dict[str, Any]:
     original_text = path.read_text(encoding="utf-8")
     source_srt = _source_srt_from_glossary_text(original_text, path)
     data = _load_yaml_text(original_text, path)
-    for item in payload.get("items") or []:
+    _apply_glossary_item_updates(data, payload.get("items"))
+    text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False, width=120)
+    if source_srt is not None:
+        text = f"# source_srt: {source_srt}\n{text}"
+    _atomic_write_text(path, text)
+    items = _glossary_items(data)
+    review_summary = _glossary_review_summary(items)
+    task_id = _record_glossary_review_save(path, review_summary)
+    return {
+        "path": str(path),
+        "saved": True,
+        "content": text,
+        "items": items,
+        "review_summary": review_summary,
+        "task_id": task_id,
+    }
+
+
+def _apply_glossary_item_updates(data: dict[str, Any], raw_items: Any) -> None:
+    if raw_items is not None and not isinstance(raw_items, list):
+        raise ValueError("Glossary items 必须是数组")
+    for item in raw_items or []:
         if not isinstance(item, dict):
             continue
         section = str(item.get("section") or "")
@@ -5075,11 +5818,141 @@ def write_glossary_items(payload: dict[str, Any]) -> dict[str, Any]:
             if isinstance(data[section][index], dict):
                 data[section][index]["zh"] = zh
                 data[section][index]["reviewed"] = reviewed
-    text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False, width=120)
-    if source_srt is not None:
-        text = f"# source_srt: {source_srt}\n{text}"
-    path.write_text(text, encoding="utf-8")
-    return {"path": str(path), "saved": True, "content": text, "items": _glossary_items(data)}
+
+
+def save_glossary_review_and_continue(payload: dict[str, Any]) -> dict[str, Any]:
+    path = _resolve_project_path(_required_str(payload, "path"))
+    _ensure_under_root(path)
+    _ensure_writable_glossary_path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Glossary 文件不存在: {path}")
+    task = _find_agent_task_by_glossary_path(path)
+    if not task:
+        raise KeyError("agent task not found for glossary")
+    task_id = str(task.get("id") or "").strip()
+    with _AGENT_TRANSLATION_START_LOCK:
+        task = _read_task(task_id)
+        run_generation = int(task.get("run_generation") or 0)
+        if not _same_existing_path(_task_stage_path(task, "glossary", "glossary_path"), path):
+            raise RuntimeError("Glossary 已不属于当前任务轮次，请刷新后重试")
+
+        has_content = "content" in payload
+        has_items = "items" in payload
+        if has_content == has_items:
+            raise ValueError("必须且只能提交 content 或 items 其中一种")
+        original_text = path.read_text(encoding="utf-8")
+        if has_content:
+            content = payload.get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("Glossary content 必须是非空字符串")
+            data = _load_yaml_text(content, path)
+            text = content
+        else:
+            data = _load_yaml_text(original_text, path)
+            _apply_glossary_item_updates(data, payload.get("items"))
+            text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False, width=120)
+            source_srt = _source_srt_from_glossary_text(original_text, path)
+            if source_srt is not None:
+                text = f"# source_srt: {source_srt}\n{text}"
+
+        items = _glossary_items(data)
+        review_summary = _glossary_review_summary(items)
+        if not bool(review_summary["all_reviewed"]):
+            pending = int(review_summary["total"]) - int(review_summary["reviewed"])
+            raise ValueError(f"Glossary 还有 {pending} 条未审核，不能开始翻译")
+
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        active = _find_active_task_translation_session(task_id, run_generation)
+        if active:
+            if str(active.result.get("glossary_digest") or "") != digest:
+                raise RuntimeError("翻译已经开始，不能再修改本次 Glossary")
+            return {
+                "path": str(path),
+                "saved": True,
+                "content": text,
+                "items": items,
+                "review_summary": review_summary,
+                "task_id": task_id,
+                "session": active.to_dict(),
+            }
+
+        task = _read_task(task_id)
+        if int(task.get("run_generation") or 0) != run_generation:
+            raise RuntimeError("任务已被新一轮处理替代，请刷新后重试")
+        completed = _completed_task_translation_session(task, digest)
+        if completed:
+            return {
+                "path": str(path),
+                "saved": True,
+                "content": text,
+                "items": items,
+                "review_summary": review_summary,
+                "task_id": task_id,
+                "session": completed.to_dict(),
+            }
+
+        _atomic_write_text(path, text)
+        _record_glossary_review_save(path, review_summary)
+        waiting_session_id = _find_waiting_glossary_session(path, run_generation)
+        session = _start_agent_translation(
+            task,
+            waiting_session_id=waiting_session_id,
+            use_glossary=True,
+        )
+        return {
+            "path": str(path),
+            "saved": True,
+            "content": text,
+            "items": items,
+            "review_summary": review_summary,
+            "task_id": task_id,
+            "session": session.to_dict(),
+        }
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _glossary_review_summary(items: list[dict[str, Any]]) -> dict[str, int | bool]:
+    total = len(items)
+    reviewed = sum(1 for item in items if bool(item.get("reviewed")))
+    filled = sum(1 for item in items if str(item.get("zh") or "").strip())
+    return {
+        "total": total,
+        "reviewed": reviewed,
+        "filled": filled,
+        "all_reviewed": total == 0 or reviewed == total,
+    }
+
+
+def _record_glossary_review_save(path: Path, review_summary: dict[str, Any]) -> str:
+    task = _find_agent_task_by_glossary_path(path)
+    if not task:
+        return ""
+    task_id = str(task.get("id") or "").strip()
+    if not task_id:
+        return ""
+    status = str(_task_stage_value(task, "glossary", "status") or "waiting_review")
+    _update_task_stage(
+        task_id,
+        "glossary",
+        status,
+        glossary_path=str(path),
+        review_saved_at=time.time(),
+        review_summary=review_summary,
+        expected_generation=int(task.get("run_generation") or 0),
+    )
+    return task_id
 
 
 def _ensure_writable_glossary_path(path: Path) -> None:
@@ -5457,9 +6330,13 @@ def _download_project_entry(project_dir: Path) -> dict[str, Any]:
     _backfill_project_manifest_from_tasks(project_dir)
     manifest = infer_project_manifest(project_dir)
     files = [path for path in project_dir.iterdir() if _is_real_file(path) and path.name != PROJECT_MANIFEST_NAME] if project_dir.exists() else []
-    primary_video = Path(str(manifest.get("primary_video") or "")).expanduser()
-    if str(primary_video) and primary_video.exists() and primary_video.is_file() and primary_video not in files:
-        files.insert(0, primary_video.resolve())
+    if str(manifest.get("source_type") or "") == "local":
+        primary_video_value = _existing_video_path(manifest.get("primary_video"))
+    else:
+        primary_video_value = _project_video_path(project_dir, manifest.get("primary_video"))
+    primary_video = Path(primary_video_value) if primary_video_value else None
+    if primary_video is not None and primary_video not in files:
+        files.insert(0, primary_video)
     thumbnail = Path(str(manifest.get("thumbnail") or "")).expanduser()
     if str(thumbnail) and thumbnail.exists() and thumbnail.is_file() and thumbnail not in files:
         files.append(thumbnail.resolve())
@@ -5484,7 +6361,7 @@ def _download_project_entry(project_dir: Path) -> dict[str, Any]:
         "source_url": str(manifest.get("source_url") or ""),
         "normalized_url": str(manifest.get("normalized_url") or ""),
         "video_id": str(manifest.get("video_id") or ""),
-        "primary_video": str(manifest.get("primary_video") or (videos[0]["path"] if videos else "")),
+        "primary_video": str(primary_video or (videos[0]["path"] if len(videos) == 1 else "")),
         "thumbnail": str(manifest.get("thumbnail") or (images[0]["path"] if images else "")),
         "manifest_path": str(project_dir / PROJECT_MANIFEST_NAME),
         "manifest": manifest,
@@ -6292,6 +7169,7 @@ def _api_path_segment(path: str, index: int) -> str:
 
 _FILE_STREAM_CHUNK_SIZE = 64 * 1024
 _SECRET_SETTINGS_MAX_BODY_BYTES = 64 * 1024
+_AGENT_GLOSSARY_MAX_BODY_BYTES = 2 * 1024 * 1024
 
 
 def _is_loopback_address(value: Any) -> bool:
@@ -6494,6 +7372,23 @@ class AgentHandler(BaseHTTPRequestHandler):
                 result["endpoint_origin_change_allowed"] = is_loopback
                 self._send_json(result)
                 return
+            if parsed.path == "/api/agent/save-glossary-and-continue":
+                payload = self._read_json(
+                    max_bytes=_AGENT_GLOSSARY_MAX_BODY_BYTES,
+                    require_json_content_type=True,
+                )
+                self._send_json(save_glossary_review_and_continue(payload))
+                return
+            if parsed.path in {"/api/write-glossary-items", "/api/write-text"}:
+                payload = self._read_json(
+                    max_bytes=_AGENT_GLOSSARY_MAX_BODY_BYTES,
+                    require_json_content_type=True,
+                )
+                if parsed.path == "/api/write-glossary-items":
+                    self._send_json(write_glossary_items(payload))
+                else:
+                    self._send_json(write_text_file(payload))
+                return
             payload = self._read_json()
             if self.path == "/api/settings":
                 self._send_json(save_app_settings(payload, root=ROOT))
@@ -6656,10 +7551,18 @@ class AgentHandler(BaseHTTPRequestHandler):
         if require_json_content_type:
             content_type = str(self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
             if content_type != "application/json":
-                raise ValueError("凭据设置请求必须使用 application/json")
-        length = int(self.headers.get("Content-Length") or 0)
+                raise ValueError("请求必须使用 application/json")
+        raw_length = self.headers.get("Content-Length")
+        if require_json_content_type and raw_length is None:
+            raise ValueError("缺少 Content-Length")
+        try:
+            length = int(raw_length or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Content-Length 无效") from exc
         if length < 0 or (max_bytes is not None and length > max_bytes):
             raise ValueError("请求体过大")
+        if require_json_content_type and length == 0:
+            raise ValueError("请求体不能为空")
         raw = self.rfile.read(length).decode("utf-8") if length else "{}"
         data = json.loads(raw or "{}")
         if not isinstance(data, dict):

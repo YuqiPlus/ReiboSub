@@ -308,11 +308,11 @@
             </div>
           </div>
           <div class="agent-task-stages">
-            <div v-for="stage in task.stage_items || []" :key="stage.id" class="agent-task-stage" :class="stage.status || 'pending'">
+            <div v-for="stage in task.stage_items || []" :key="stage.id" class="agent-task-stage" :class="taskStageStatusClass(stage, task)">
               <span>{{ taskStageDisplayLabel(stage) }}</span>
               <b>{{ stageStatusLabel(stage, task) }}</b>
               <div class="agent-task-actions">
-                <button v-if="stage.id === 'glossary' && stage.glossary_path" class="secondary mini" type="button" @click="$emit('open-glossary', stage.glossary_path)">{{ taskGlossaryActionLabel(task) }}</button>
+                <button v-if="stage.id === 'glossary' && stage.glossary_path" class="secondary mini" type="button" @click="$emit('open-glossary', taskGlossaryPayload(task, stage))">{{ taskGlossaryActionLabel(task) }}</button>
                 <button v-if="canRerun(stage)" class="secondary mini" type="button" @click="$emit('rerun-task', { taskId: task.id, stage: stage.id })">重跑</button>
               </div>
             </div>
@@ -340,11 +340,11 @@
             </div>
           </div>
           <div class="agent-task-stages">
-            <div v-for="stage in task.stage_items || []" :key="stage.id" class="agent-task-stage" :class="stage.status || 'pending'">
+            <div v-for="stage in task.stage_items || []" :key="stage.id" class="agent-task-stage" :class="taskStageStatusClass(stage, task)">
               <span>{{ taskStageDisplayLabel(stage) }}</span>
               <b>{{ stageStatusLabel(stage, task) }}</b>
               <div class="agent-task-actions">
-                <button v-if="stage.id === 'glossary' && stage.glossary_path" class="secondary mini" type="button" @click="$emit('open-glossary', stage.glossary_path)">{{ taskGlossaryActionLabel(task) }}</button>
+                <button v-if="stage.id === 'glossary' && stage.glossary_path" class="secondary mini" type="button" @click="$emit('open-glossary', taskGlossaryPayload(task, stage))">{{ taskGlossaryActionLabel(task) }}</button>
                 <button v-if="canRerun(stage)" class="secondary mini" type="button" @click="$emit('rerun-task', { taskId: task.id, stage: stage.id })">重跑</button>
               </div>
             </div>
@@ -419,6 +419,7 @@ import {
   sessionPhaseLabel,
   shouldShowAgentOcrWorkbench,
 } from '../agentFlowPresentation.js'
+import { effectiveTaskStageStatus, taskGlossaryOpenPayload, taskHasCurrentTranslation } from '../glossaryReviewFlow.js'
 
 const props = defineProps({
   url: { type: String, default: '' },
@@ -571,15 +572,8 @@ function taskStageDisplayLabel(stage) {
 }
 
 function stageStatusLabel(stage, task) {
-  if (stage?.id === 'glossary' && stage?.status === 'waiting_review' && taskHasDoneTranslation(task)) {
-    return '已用于翻译'
-  }
-  let status = stage?.status
-  if (stage?.id === 'ocr' && (!status || status === 'pending')) {
-    const asrStage = task?.stages?.asr
-    if (asrStage?.status) status = asrStage.status
-    else if (task?.stages?.glossary?.source_srt) status = 'done'
-  }
+  const status = resolvedTaskStageStatus(stage, task)
+  if (stage?.id === 'glossary' && status === 'done' && stage?.status === 'waiting_review') return '已用于翻译'
   const labels = {
     pending: '未开始',
     done: '完成',
@@ -591,14 +585,27 @@ function stageStatusLabel(stage, task) {
   return labels[status] || status || '未开始'
 }
 
-function taskGlossaryActionLabel(task) {
-  return taskHasDoneTranslation(task) ? '查看' : '审核'
+function resolvedTaskStageStatus(stage, task) {
+  if (stage?.id === 'glossary' && stage?.status === 'waiting_review' && taskHasCurrentTranslation(task)) return 'done'
+  let status = effectiveTaskStageStatus(stage, task)
+  if (stage?.id === 'ocr' && (!status || status === 'pending')) {
+    const asrStage = task?.stages?.asr
+    if (asrStage?.status) status = asrStage.status
+    else if (task?.stages?.glossary?.source_srt) status = 'done'
+  }
+  return status || 'pending'
 }
 
-function taskHasDoneTranslation(task) {
-  const stages = task?.stages || {}
-  if (stages.translate?.status === 'done' || stages.translate?.translated_srt) return true
-  return (task?.stage_items || []).some((stage) => stage.id === 'translate' && stage.status === 'done')
+function taskStageStatusClass(stage, task) {
+  return resolvedTaskStageStatus(stage, task)
+}
+
+function taskGlossaryActionLabel(task) {
+  return taskHasCurrentTranslation(task) ? '查看' : '审核'
+}
+
+function taskGlossaryPayload(task, stage) {
+  return taskGlossaryOpenPayload(task, stage)
 }
 
 function canRerun(stage) {

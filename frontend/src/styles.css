@@ -942,6 +942,31 @@ details.more-subtitles summary { display: flex; justify-content: space-between; 
 }
 .agent-review-context b { color: var(--amber); font-size: 13px; }
 .agent-review-context span { color: var(--ink); font-size: 12px; line-height: 1.5; }
+.glossary-save-state {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 28px;
+  margin: 4px 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.glossary-save-state > span {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--line-strong);
+}
+.glossary-save-state b { font-weight: 650; }
+.glossary-save-state.dirty { color: var(--amber); }
+.glossary-save-state.dirty > span { background: var(--amber); }
+.glossary-save-state.saving { color: var(--teal); }
+.glossary-save-state.saving > span { background: var(--teal); animation: glossary-save-pulse 1s ease-in-out infinite; }
+.glossary-save-state.saved { color: var(--green); }
+.glossary-save-state.saved > span { background: var(--green); }
+.glossary-save-state.error { color: var(--red); }
+.glossary-save-state.error > span { background: var(--red); }
+@keyframes glossary-save-pulse { 50% { opacity: .35; transform: scale(.8); } }
 .filter-chip {
   display: inline-flex;
   align-items: center;

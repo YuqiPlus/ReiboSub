@@ -235,19 +235,25 @@
           <div v-else-if="activeView === 'glossary'" class="page-stack">
             <GlossaryReviewPanel
               v-model:glossary-path="glossaryPath"
-              v-model:glossary-editor="glossaryEditor"
+              :glossary-editor="glossaryEditor"
               :glossary-items="glossaryItems"
               :loading="glossaryLoading"
-              :agent-review="agentSession?.status === 'waiting' && agentSession?.phase === 'review_glossary'"
+              :agent-review="agentGlossaryReviewActive"
+              :review-ready="glossaryReviewReady"
+              :save-state="glossarySaveState"
+              :text-dirty="glossaryTextDirty"
+              :continue-busy="glossaryContinueBusy"
               :status="flowStatus.text"
               :status-class="flowStatus.class"
               @load-glossary="loadGlossary"
               @apply-all-suggestions="applyAllSuggestions"
               @save-glossary-review="saveGlossaryReview"
               @save-glossary-text="saveGlossaryText"
+              @update:glossary-editor="updateGlossaryEditor"
               @update-glossary-zh="updateGlossaryZh"
               @set-glossary-reviewed="setGlossaryReviewed"
               @use-suggestion="useSuggestion"
+              @retry-glossary-save="retryGlossaryAutosave"
             />
           </div>
 
@@ -327,7 +333,13 @@ import SettingsPanel from './components/SettingsPanel.vue'
 import { copyText } from './clipboard.js'
 import { createAgentSessionPoller } from './agentSessionPolling.js'
 import { buildAgentOcrPipelinePayload, inferAgentOcrPipelineVersion } from './agentOcrPipeline.js'
-import { findGlossaryReviewSession, glossaryReviewKey } from './glossaryReviewFlow.js'
+import { createGlossaryReviewAutosave } from './glossaryReviewAutosave.js'
+import {
+  canReuseOpenedGlossaryReview,
+  findGlossaryReviewSession,
+  glossaryReviewKey,
+  isGlossaryReviewPathForSession,
+} from './glossaryReviewFlow.js'
 import { detectCuePairSymbolIssues, parsePrefixNames, stripCueSpeakerPrefixes, stripCueTrailingCommas } from './subtitlePrefixTools.js'
 import {
   insertSubtitleCueAtTime,
@@ -358,6 +370,11 @@ const extraHint = ref('')
 const glossaryEditor = ref('')
 const glossaryItems = ref([])
 const glossaryLoading = ref(false)
+const loadedGlossaryPath = ref('')
+const glossaryTextDirty = ref(false)
+const glossarySaveState = ref('idle')
+const glossaryContinueBusy = ref(false)
+let glossaryLoadGeneration = 0
 const subtitleTranslationMode = ref('translate_only')
 const subtitleConvertFormat = ref('bcc')
 const ocrTranslationMode = ref('standard_cleanup')
@@ -431,6 +448,17 @@ const assetStatus = reactive({ text: '', class: '' })
 const agentStatus = reactive({ text: '', class: '' })
 const settingsStatus = reactive({ text: '', class: '' })
 
+const glossaryAutosave = createGlossaryReviewAutosave({
+  save: saveGlossaryAutosavePayload,
+  onState: ({ state, error }) => {
+    glossarySaveState.value = state
+    if (state === 'error') setStatus(flowStatus, `自动保存审核进度失败：${error}`, 'bad')
+    if (state === 'saved' && flowStatus.text.startsWith('自动保存审核进度失败')) {
+      setStatus(flowStatus, 'Glossary 审核进度已自动保存。', 'ok')
+    }
+  },
+})
+
 const pages = {
   agent: {
     title: 'Agent 字幕流程',
@@ -476,6 +504,12 @@ const pages = {
 
 const OCR_SCOPE_TOP_DEFAULTS = { bottom: 0.58, expanded: 0.38, smart_full: 0.58 }
 const activePage = computed(() => pages[activeView.value] || pages['new-task'])
+const glossaryReviewReady = computed(() => Boolean(
+  loadedGlossaryPath.value && loadedGlossaryPath.value === glossaryPath.value.trim(),
+))
+const agentGlossaryReviewActive = computed(() => (
+  glossaryReviewReady.value && isGlossaryReviewPathForSession(agentSession.value, loadedGlossaryPath.value)
+))
 const jobList = computed(() => Object.values(jobs))
 const runningJobCount = computed(() => jobList.value.filter((job) => ['running', 'cancel_requested'].includes(job.status)).length)
 const failedJobCount = computed(() => jobList.value.filter((job) => job.status === 'failed').length)
@@ -518,6 +552,7 @@ const navItems = computed(() => [
 
 onMounted(async () => {
   window.addEventListener('keydown', onSubtitleEditorUndoShortcut)
+  window.addEventListener('beforeunload', onGlossaryBeforeUnload)
   await loadAppSettings({ applyDefaults: true })
   loadAssets()
   loadJobs()
@@ -527,6 +562,8 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener('keydown', onSubtitleEditorUndoShortcut)
+  window.removeEventListener('beforeunload', onGlossaryBeforeUnload)
+  glossaryAutosave.destroy()
   agentPoller.cancelAll()
 })
 
@@ -987,9 +1024,12 @@ async function continueAgentTask(taskId) {
     restoreAgentOcrPipeline(session)
     await loadAgentSessions()
     await loadAgentTasks()
-    scheduleAgentPoll(session.id, 500)
+    const openedGlossaryReview = await openGlossaryReviewForSession(session)
+    if (session.status === 'running') scheduleAgentPoll(session.id, 500)
+    return { session, openedGlossaryReview }
   } catch (error) {
     setStatus(agentStatus, error.message, 'bad')
+    return null
   }
 }
 
@@ -1081,7 +1121,12 @@ async function deleteAgentTask(task) {
 async function openGlossaryFromAgent(payload) {
   const path = typeof payload === 'string' ? payload : payload?.path
   const sessionId = typeof payload === 'object' ? payload?.sessionId : ''
+  const taskId = typeof payload === 'object' ? payload?.taskId : ''
   if (sessionId && await selectAgentSession(sessionId)) return
+  if (taskId) {
+    const continued = await continueAgentTask(taskId)
+    if (continued?.openedGlossaryReview) return
+  }
   glossaryPath.value = path || ''
   activeView.value = 'glossary'
   await loadGlossary()
@@ -1093,12 +1138,22 @@ async function openGlossaryReviewForSession(session) {
     if (openedGlossaryReviewKey.value.startsWith(`${session?.id || ''}:`)) openedGlossaryReviewKey.value = ''
     return false
   }
-  if (openedGlossaryReviewKey.value === reviewKey || openingGlossaryReviewKey.value === reviewKey) {
+  const reviewPath = session.question.glossary_path || session.result.glossary_path
+  if (canReuseOpenedGlossaryReview(
+    session,
+    openedGlossaryReviewKey.value,
+    loadedGlossaryPath.value,
+    glossaryPath.value,
+  )) {
+    activeView.value = 'glossary'
+    return true
+  }
+  if (openingGlossaryReviewKey.value === reviewKey && glossaryPath.value.trim() === reviewPath) {
     activeView.value = 'glossary'
     return true
   }
   openingGlossaryReviewKey.value = reviewKey
-  glossaryPath.value = session.question.glossary_path || session.result.glossary_path
+  glossaryPath.value = reviewPath
   activeView.value = 'glossary'
   try {
     const loaded = await loadGlossary()
@@ -1542,75 +1597,124 @@ async function correctAsrSubtitle() {
 }
 
 async function loadGlossary() {
-  if (!glossaryPath.value.trim()) {
+  const requestedPath = glossaryPath.value.trim()
+  if (!requestedPath) {
     setStatus(flowStatus, '先填写 glossary 路径。', 'bad')
     return false
   }
+  if (glossaryTextDirty.value && !window.confirm('当前 YAML 有未保存修改。确定放弃这些修改并重新加载吗？')) {
+    return false
+  }
+  const loadGeneration = ++glossaryLoadGeneration
   activeView.value = 'glossary'
   glossaryLoading.value = true
-  glossaryItems.value = []
   setStatus(flowStatus, '正在加载 glossary，并生成盲翻候选...', '')
   try {
+    await glossaryAutosave.flush()
+    if (loadGeneration !== glossaryLoadGeneration) return false
     const [text, review] = await Promise.all([
-      api('/api/read-text', { path: glossaryPath.value.trim() }),
-      api('/api/read-glossary-items', { path: glossaryPath.value.trim(), include_blind_candidates: true }),
+      api('/api/read-text', { path: requestedPath }),
+      api('/api/read-glossary-items', { path: requestedPath, include_blind_candidates: true }),
     ])
+    if (loadGeneration !== glossaryLoadGeneration || glossaryPath.value.trim() !== requestedPath) return false
     glossaryEditor.value = text.content || ''
     glossaryItems.value = review.items || []
+    loadedGlossaryPath.value = requestedPath
+    glossaryTextDirty.value = false
+    glossaryAutosave.reset('idle')
     setStatus(flowStatus, `已加载 ${glossaryItems.value.length} 条 glossary。`, 'ok')
     activeView.value = 'glossary'
     return true
   } catch (error) {
-    setStatus(flowStatus, error.message, 'bad')
+    if (loadGeneration === glossaryLoadGeneration) setStatus(flowStatus, error.message, 'bad')
     return false
   } finally {
-    glossaryLoading.value = false
+    if (loadGeneration === glossaryLoadGeneration) glossaryLoading.value = false
   }
 }
 
 async function saveGlossaryReview() {
-  if (!glossaryPath.value.trim()) {
-    setStatus(flowStatus, '先填写 glossary 路径。', 'bad')
+  const path = loadedGlossaryPath.value
+  if (!glossaryReviewReady.value || !path) {
+    setStatus(flowStatus, '请先成功加载当前路径的 glossary，再保存审核结果。', 'bad')
     return
   }
+  const items = cloneGlossaryItems(glossaryItems.value)
+  if (agentGlossaryReviewActive.value) {
+    await saveAndContinueGlossary({ path, items })
+    return
+  }
+  glossaryContinueBusy.value = true
   try {
+    try {
+      await glossaryAutosave.flush()
+    } catch {
+      // The explicit save below retries the complete current snapshot.
+    }
     const result = await api('/api/write-glossary-items', {
-      path: glossaryPath.value.trim(),
-      items: glossaryItems.value,
+      path,
+      items,
     })
     glossaryEditor.value = result.content || glossaryEditor.value
     glossaryItems.value = result.items || glossaryItems.value
-    await continueAfterGlossarySave()
+    glossaryAutosave.reset()
+    setStatus(flowStatus, 'Glossary 审核结果已保存。', 'ok')
   } catch (error) {
-    setStatus(flowStatus, error.message, 'bad')
+    setStatus(flowStatus, `保存 Glossary 失败：${error.message}`, 'bad')
+  } finally {
+    glossaryContinueBusy.value = false
   }
 }
 
 async function saveGlossaryText() {
-  if (!glossaryPath.value.trim()) {
-    setStatus(flowStatus, '先填写 glossary 路径。', 'bad')
+  const path = loadedGlossaryPath.value
+  if (!glossaryReviewReady.value || !path) {
+    setStatus(flowStatus, '请先成功加载当前路径的 glossary，再保存 YAML。', 'bad')
     return
   }
+  const content = glossaryEditor.value
+  if (agentGlossaryReviewActive.value) {
+    await saveAndContinueGlossary({ path, content })
+    return
+  }
+  glossaryContinueBusy.value = true
   try {
+    try {
+      await glossaryAutosave.flush()
+    } catch {
+      // The explicit save below retries the complete current snapshot.
+    }
     await api('/api/write-text', {
-      path: glossaryPath.value.trim(),
-      content: glossaryEditor.value,
+      path,
+      content,
     })
+    glossaryTextDirty.value = false
+    glossaryAutosave.reset()
     await loadGlossary()
-    await continueAfterGlossarySave()
+    setStatus(flowStatus, 'Glossary YAML 已保存。', 'ok')
   } catch (error) {
-    setStatus(flowStatus, error.message, 'bad')
+    setStatus(flowStatus, `保存 Glossary 失败：${error.message}`, 'bad')
+  } finally {
+    glossaryContinueBusy.value = false
   }
 }
 
-async function continueAfterGlossarySave() {
-  const path = glossaryPath.value.trim()
-  if (!path) return false
+async function saveAndContinueGlossary(payload) {
+  glossaryContinueBusy.value = true
   try {
-    setStatus(flowStatus, 'Glossary 已保存，正在让 Agent 继续处理...', '')
-    const session = await api('/api/agent/continue-glossary', { glossary_path: path })
+    try {
+      await glossaryAutosave.flush()
+    } catch {
+      // The atomic endpoint below receives the latest complete snapshot.
+    }
+    setStatus(flowStatus, '正在保存 Glossary 并启动翻译...', '')
+    const response = await api('/api/agent/save-glossary-and-continue', payload)
+    const session = response.session
+    if (!session?.id) throw new Error('服务未返回继续后的 Agent 会话')
     agentSession.value = session
     restoreAgentOcrPipeline(session)
+    glossaryTextDirty.value = false
+    glossaryAutosave.reset()
     openedGlossaryReviewKey.value = ''
     activeView.value = 'agent'
     setStatus(agentStatus, 'Glossary 已保存，Agent 继续处理翻译...', 'ok')
@@ -1619,9 +1723,52 @@ async function continueAfterGlossarySave() {
     scheduleAgentPoll(session.id, 500)
     return true
   } catch (error) {
-    setStatus(flowStatus, `Glossary 已保存；没有匹配到可继续的 Agent 流程：${error.message}`, 'ok')
+    activeView.value = 'glossary'
+    setStatus(flowStatus, `无法保存并继续翻译：${error.message}。修改仍保留在当前页面。`, 'bad')
+    setStatus(agentStatus, `Glossary 继续失败：${error.message}`, 'bad')
     return false
+  } finally {
+    glossaryContinueBusy.value = false
   }
+}
+
+async function saveGlossaryAutosavePayload(payload) {
+  const result = await api('/api/write-glossary-items', { path: payload.path, items: payload.items })
+  const stillLatest = payload.path === loadedGlossaryPath.value
+    && JSON.stringify(payload.items) === JSON.stringify(glossaryItems.value)
+  if (stillLatest && !glossaryTextDirty.value && result.content) glossaryEditor.value = result.content
+  return result
+}
+
+function cloneGlossaryItems(items) {
+  return JSON.parse(JSON.stringify(items || []))
+}
+
+function currentGlossaryItemsPayload() {
+  const path = loadedGlossaryPath.value
+  if (!path || !glossaryReviewReady.value) return null
+  return { path, items: cloneGlossaryItems(glossaryItems.value) }
+}
+
+function scheduleGlossaryItemsAutosave() {
+  const payload = currentGlossaryItemsPayload()
+  if (payload && !glossaryLoading.value && !glossaryContinueBusy.value) glossaryAutosave.markDirty(payload)
+}
+
+function retryGlossaryAutosave() {
+  if (glossaryContinueBusy.value) return
+  glossaryAutosave.retry()
+}
+
+function onGlossaryBeforeUnload(event) {
+  if (!glossaryTextDirty.value && !['dirty', 'saving', 'error'].includes(glossarySaveState.value)) return
+  event.preventDefault()
+  event.returnValue = ''
+}
+
+function updateGlossaryEditor(value) {
+  glossaryEditor.value = value
+  glossaryTextDirty.value = true
 }
 
 async function translateSubtitle() {
@@ -2298,10 +2445,12 @@ function joinSubtitleText(left, right) {
 
 function updateGlossaryZh({ index, zh }) {
   glossaryItems.value = glossaryItems.value.map((item, itemIndex) => itemIndex === index ? { ...item, zh } : item)
+  scheduleGlossaryItemsAutosave()
 }
 
 function setGlossaryReviewed({ index, reviewed }) {
   glossaryItems.value = glossaryItems.value.map((item, itemIndex) => itemIndex === index ? { ...item, reviewed } : item)
+  scheduleGlossaryItemsAutosave()
 }
 
 function useSuggestion(index) {
@@ -2310,6 +2459,7 @@ function useSuggestion(index) {
   glossaryItems.value = glossaryItems.value.map((entry, itemIndex) => (
     itemIndex === index ? { ...entry, zh: item.suggested_zh, reviewed: true } : entry
   ))
+  scheduleGlossaryItemsAutosave()
 }
 
 function applyAllSuggestions() {
@@ -2319,6 +2469,7 @@ function applyAllSuggestions() {
     }
     return item
   })
+  scheduleGlossaryItemsAutosave()
 }
 
 function appendTitleHint() {
