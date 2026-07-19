@@ -1681,6 +1681,149 @@ def test_restart_restores_dual_source_kind_and_copies_translated_sidecar(monkeyp
     assert (project_dir / "demo.zh.srt").exists()
 
 
+def test_restart_recovers_youtube_project_for_legacy_task_and_copies_translated_sidecar(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    monkeypatch.setattr(web_agent, "_ensure_under_root", lambda path: None)
+    downloads = tmp_path / "YoutubeDownloads"
+    project_dir = downloads / "Legacy Demo"
+    task_dir = web_agent.TASK_DIR / "task1"
+    project_dir.mkdir(parents=True)
+    task_dir.mkdir(parents=True)
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
+    video = project_dir / "Legacy Demo.mp4"
+    source = task_dir / "dual.source.srt"
+    glossary = task_dir / "glossary.draft.yaml"
+    translated = tmp_path / "translated.srt"
+    video.write_bytes(b"video")
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\n韩文原文：안녕\n英文参考：Hi\n", encoding="utf-8")
+    glossary.write_text("characters: []\n", encoding="utf-8")
+    translated.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8")
+    web_agent.update_youtube_project_manifest(
+        video,
+        source_url="https://www.youtube.com/watch?v=legacy123",
+        title="Legacy Demo",
+    )
+    (task_dir / "task.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "id": "task1",
+                "url": "https://www.youtube.com/watch?v=legacy123",
+                "title": "Legacy Demo",
+                "task_dir": str(task_dir),
+                "current_stage": "translate_pending",
+                "stages": {
+                    "glossary": {
+                        "status": "reviewed",
+                        "source_srt": str(source),
+                        "source_kind": "dual_subtitle_reference",
+                        "glossary_path": str(glossary),
+                    },
+                    "translate": {
+                        "status": "queued",
+                        "source_srt": str(source),
+                        "glossary_path": str(glossary),
+                    },
+                },
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        web_agent,
+        "translate_subtitle_job",
+        lambda payload: web_agent.Job(
+            id="translate",
+            name="translate",
+            status="done",
+            result={"translated_srt": str(translated)},
+        ),
+    )
+
+    session = web_agent.continue_agent_task("task1")
+    snapshot = _wait_agent_status(session.id, "done")
+
+    expected_sidecar = project_dir / "Legacy Demo.zh.srt"
+    assert expected_sidecar.read_text(encoding="utf-8").endswith("你好\n")
+    assert snapshot["result"]["input_video"] == str(video)
+    assert snapshot["result"]["project_dir"] == str(project_dir)
+    assert snapshot["result"]["translated_sidecar"] == str(expected_sidecar)
+    persisted = web_agent.get_agent_task("task1")
+    assert persisted["stages"]["translate"]["input_video"] == str(video)
+    assert persisted["stages"]["translate"]["project_dir"] == str(project_dir)
+    assert persisted["stages"]["translate"]["translated_sidecar"] == str(expected_sidecar)
+
+
+def test_legacy_source_run_metadata_recovers_project_video(tmp_path):
+    project_dir = tmp_path / "YoutubeDownloads" / "demo"
+    job_dir = tmp_path / "agent_jobs" / "job1"
+    project_dir.mkdir(parents=True)
+    job_dir.mkdir(parents=True)
+    video = project_dir / "demo.mp4"
+    source_subtitle = project_dir / "demo.ko.srt"
+    generated_source = job_dir / "dual.source.srt"
+    video.write_bytes(b"video")
+    source_subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
+    generated_source.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
+    (job_dir / "run.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "mode": "dual_subtitle_reference",
+                "source_subtitle": str(source_subtitle),
+                "source_srt": str(generated_source),
+            }
+        ),
+        encoding="utf-8",
+    )
+    task = {
+        "id": "legacy",
+        "stages": {"glossary": {"source_srt": str(generated_source)}},
+    }
+    session = web_agent.AgentSession(
+        id="legacy-session",
+        result={"source_srt": str(generated_source)},
+    )
+
+    assert web_agent._agent_input_video_from_source_metadata(session, task) == video
+
+
+def test_find_or_bind_youtube_project_ignores_debug_video(monkeypatch, tmp_path):
+    downloads = tmp_path / "YoutubeDownloads"
+    debug_dir = downloads / "debug"
+    debug_dir.mkdir(parents=True)
+    debug_video = debug_dir / "Target Video.mp4"
+    debug_video.write_bytes(b"debug video")
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
+
+    project = web_agent._find_or_bind_youtube_project(
+        "https://www.youtube.com/watch?v=target123",
+        "Target Video",
+    )
+
+    assert project == {}
+    assert not (debug_dir / "project.yaml").exists()
+
+
+def test_find_or_bind_youtube_project_rejects_ambiguous_title_matches(monkeypatch, tmp_path):
+    downloads = tmp_path / "YoutubeDownloads"
+    first = downloads / "first"
+    second = downloads / "second"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "Target Video.mp4").write_bytes(b"first")
+    (second / "Target Video.mp4").write_bytes(b"second")
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
+
+    project = web_agent._find_or_bind_youtube_project(
+        "https://www.youtube.com/watch?v=target123",
+        "Target Video",
+    )
+
+    assert project == {}
+    assert not (first / "project.yaml").exists()
+    assert not (second / "project.yaml").exists()
+
+
 def test_api_path_segment_decodes_percent_encoded_task_id():
     task_id = "yqmrauhwt3w_금빛_대장정"
     encoded = "yqmrauhwt3w_%EA%B8%88%EB%B9%9B_%EB%8C%80%EC%9E%A5%EC%A0%95"

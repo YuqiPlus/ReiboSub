@@ -1386,6 +1386,15 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
     task_id = str(session.result.get("task_id") or "")
     run_generation = _session_run_generation(session)
     attempt_id = str(session.result.get("translation_attempt_id") or "")
+    input_video = _agent_input_video_path(session)
+    if input_video:
+        project_dir = str(session.result.get("project_dir") or "").strip()
+        if not project_dir or not _primary_video_for_project(project_dir):
+            project_dir = str(input_video.parent)
+        _agent_update_result(
+            session.id,
+            {"input_video": str(input_video), "project_dir": project_dir},
+        )
     if task_id:
         if not attempt_id:
             attempt_id = uuid.uuid4().hex
@@ -1414,7 +1423,8 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
             source_srt=source_srt,
             glossary_path=glossary_path,
             source_kind=str(session.result.get("source_kind") or ""),
-            input_video=str(_agent_input_video_path(session) or ""),
+            input_video=str(input_video or ""),
+            project_dir=str(session.result.get("project_dir") or ""),
             attempt_id=attempt_id,
             glossary_digest=str(session.result.get("glossary_digest") or ""),
             started_at=time.time(),
@@ -1475,8 +1485,11 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
                 current_stage="done",
                 translated_srt=translated.get("translated_srt"),
                 translated_sidecar=translated.get("translated_sidecar"),
+                translated_sidecar_warning=str(session.result.get("translated_sidecar_warning") or ""),
                 glossary_path=glossary_path,
                 source_srt=source_srt,
+                input_video=str(input_video or ""),
+                project_dir=str(session.result.get("project_dir") or ""),
                 ocr_pipeline_version=ocr_pipeline_version,
                 translation_mode=translation_mode,
                 attempt_id=attempt_id,
@@ -2472,7 +2485,13 @@ def _agent_session_from_task(task: dict[str, Any]) -> AgentSession:
         _AGENT_SESSIONS[session.id] = session
     input_video = _agent_input_video_path(session)
     if input_video:
-        _agent_update_result(session.id, {"input_video": str(input_video)})
+        project_dir = str(session.result.get("project_dir") or "").strip()
+        if not project_dir or not _primary_video_for_project(project_dir):
+            project_dir = str(input_video.parent)
+        _agent_update_result(
+            session.id,
+            {"input_video": str(input_video), "project_dir": project_dir},
+        )
     return session
 
 
@@ -2769,6 +2788,9 @@ def _copy_agent_translated_sidecar(session: AgentSession, source_srt: str, trans
         return {}
     input_video = _agent_input_video_path(session)
     if not input_video:
+        warning = "未找到关联视频，中文字幕已保留在任务目录，但没有复制到素材目录"
+        _agent_update_result(session.id, {"translated_sidecar_warning": warning})
+        _agent_log(session.id, f"translated_sidecar_skipped: {warning}")
         return {}
     source = Path(str(source_srt or "")).expanduser()
     with _TASK_FILE_LOCK:
@@ -2809,7 +2831,88 @@ def _agent_input_video_path(session: AgentSession) -> Path | None:
         project_video = _primary_video_for_project(_task_stage_value(task, stage, "project_dir"))
         if project_video:
             return project_video
+    recovered = _agent_input_video_from_youtube_task(task)
+    if recovered:
+        return recovered
+    recovered = _agent_input_video_from_source_metadata(session, task)
+    if recovered:
+        return recovered
     return None
+
+
+def _agent_input_video_from_youtube_task(task: dict[str, Any]) -> Path | None:
+    payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+    url = str(
+        task.get("url")
+        or payload.get("url")
+        or _task_stage_value(task, "probe", "normalized_url")
+        or ""
+    ).strip()
+    title = str(task.get("title") or _task_stage_value(task, "probe", "title") or "").strip()
+    if not url:
+        return None
+    try:
+        project = _find_or_bind_youtube_project(url, title)
+    except Exception:
+        return None
+    direct = (
+        _project_video_path(project.get("path"), project.get("primary_video"))
+        if project
+        else ""
+    )
+    return Path(direct) if direct else None
+
+
+def _agent_input_video_from_source_metadata(session: AgentSession, task: dict[str, Any]) -> Path | None:
+    source_values = [session.result.get("source_srt")]
+    source_values.extend(
+        _task_stage_value(task, stage, "source_srt")
+        for stage in ("translate", "glossary", "ocr", "asr")
+    )
+    visited: set[Path] = set()
+    for raw_source in source_values:
+        raw = str(raw_source or "").strip()
+        if not raw:
+            continue
+        source = Path(raw).expanduser()
+        if not source.is_absolute():
+            source = (ROOT / source).resolve()
+        else:
+            source = source.resolve()
+        run_yaml = source.parent / "run.yaml"
+        if run_yaml in visited or not run_yaml.exists():
+            continue
+        visited.add(run_yaml)
+        try:
+            config = yaml.safe_load(run_yaml.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        if not isinstance(config, dict):
+            continue
+        direct = _existing_video_path(_run_metadata_path(run_yaml, config.get("input_video")))
+        if direct:
+            return Path(direct)
+        project_video = _primary_video_for_project(_run_metadata_path(run_yaml, config.get("project_dir")))
+        if project_video:
+            return project_video
+        for key in ("source_subtitle", "reference_subtitle", "anchor_srt"):
+            related = _run_metadata_path(run_yaml, config.get(key))
+            if not related:
+                continue
+            project_video = _primary_video_for_project(Path(related).parent)
+            if project_video:
+                return project_video
+    return None
+
+
+def _run_metadata_path(run_yaml: Path, value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = run_yaml.parent / path
+    return str(path.resolve())
 
 
 def _agent_project_context(result: dict[str, Any]) -> dict[str, str]:
@@ -6431,13 +6534,28 @@ def _find_or_bind_youtube_project(normalized_url: str, title: str) -> dict[str, 
     if not DOWNLOAD_DIR.exists():
         return {}
     normalized_url = normalize_youtube_url(normalized_url) if normalized_url else ""
-    for project_dir in sorted([path for path in DOWNLOAD_DIR.iterdir() if path.is_dir()], key=lambda path: path.stat().st_mtime, reverse=True):
+    project_dirs = [
+        path
+        for path in DOWNLOAD_DIR.iterdir()
+        if path.is_dir() and path.name != "debug"
+    ]
+    for project_dir in sorted(project_dirs, key=lambda path: path.stat().st_mtime, reverse=True):
         manifest = infer_project_manifest(project_dir)
         if normalized_url and str(manifest.get("normalized_url") or "") == normalized_url:
             return _download_project_entry(project_dir)
-    matches = _matching_video_files(DOWNLOAD_DIR, title)
-    if matches:
-        video = matches[0]
+    matches = [
+        path
+        for path in _matching_video_files(DOWNLOAD_DIR, title)
+        if _is_direct_download_project_file(path)
+    ]
+    exact_matches = [
+        path
+        for path in matches
+        if _filename_match_key(path.stem) == _filename_match_key(title)
+    ]
+    candidates = exact_matches or matches
+    if len(candidates) == 1:
+        video = candidates[0]
         update_youtube_project_manifest(
             video,
             source_url=normalized_url,
@@ -6446,6 +6564,14 @@ def _find_or_bind_youtube_project(normalized_url: str, title: str) -> dict[str, 
         )
         return _download_project_entry(video.parent)
     return {}
+
+
+def _is_direct_download_project_file(path: Path) -> bool:
+    try:
+        relative = path.resolve().relative_to(DOWNLOAD_DIR.resolve())
+    except (OSError, ValueError):
+        return False
+    return len(relative.parts) == 2 and relative.parts[0] != "debug"
 
 
 def _backfill_project_manifest_from_tasks(project_dir: Path) -> None:
