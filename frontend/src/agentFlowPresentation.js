@@ -24,6 +24,7 @@ export const AGENT_FLOW_STAGES = Object.freeze([
 export const AGENT_PHASE_PRESENTATIONS = freezeEntries({
   created: { stageId: 'analyze', label: '等待启动' },
   probe: { stageId: 'analyze', label: '检测视频和字幕' },
+  download_video_for_project: { stageId: 'source', label: '下载工程视频' },
   download_video_for_audio_probe: { stageId: 'analyze', label: '下载视频用于音源检测' },
   probe_audio_language: { stageId: 'analyze', label: '检测音源语言' },
 
@@ -34,6 +35,9 @@ export const AGENT_PHASE_PRESENTATIONS = freezeEntries({
   confirm_ocr_reuse: { stageId: 'decide', label: '等待确认是否复用 OCR' },
 
   download_subtitle: { stageId: 'source', label: '下载原文字幕' },
+  download_video_for_subtitle: { stageId: 'source', label: '下载字幕路线视频' },
+  download_video_for_manual: { stageId: 'source', label: '下载手动处理视频' },
+  download_video_for_ocr: { stageId: 'source', label: '下载视频用于 OCR' },
   download_reference_subtitle: { stageId: 'source', label: '下载参考字幕' },
   dual_subtitle_reference: { stageId: 'source', label: '合并原声主字幕与英文参考' },
   download_anchor_subtitle: { stageId: 'source', label: '下载定轴字幕' },
@@ -47,6 +51,7 @@ export const AGENT_PHASE_PRESENTATIONS = freezeEntries({
 
   generate_glossary: { stageId: 'glossary', label: '生成 Glossary' },
   review_glossary: { stageId: 'glossary', label: '等待 Glossary 审核' },
+  download_video_for_translation: { stageId: 'translate', label: '下载视频用于字幕交付' },
   translate: { stageId: 'translate', label: '翻译字幕' },
   done: { stageId: 'deliver', label: '已完成' },
 
@@ -78,10 +83,14 @@ const OCR_WORKBENCH_QUESTION_KINDS = new Set([
 const RUNNING_OPERATION_PRESENTATIONS = freezeEntries({
   created: { title: 'Agent 正在启动', message: '正在准备任务环境。' },
   probe: { title: '正在检测素材', message: '正在读取视频信息和可用字幕。' },
+  download_video_for_project: { title: '正在下载工程视频', message: '路线已确定，视频保存后会继续当前处理。', download: true },
   download_video_for_audio_probe: { title: '正在下载视频', message: '下载完成后将继续检测音源语言。', download: true },
   probe_audio_language: { title: '正在检测音源语言', message: '正在分析音频样本。' },
   download_video_for_preview: { title: '正在下载 OCR 预览视频', message: '下载完成后会自动抽帧并打开字幕区域。', download: true },
   download_subtitle: { title: '正在下载原文字幕', message: '正在取得字幕文件。' },
+  download_video_for_subtitle: { title: '正在下载工程视频', message: '字幕路线已确定，视频保存后会继续取得原文字幕。', download: true },
+  download_video_for_manual: { title: '正在下载工程视频', message: '视频保存后会进入手动处理页面。', download: true },
+  download_video_for_ocr: { title: '正在下载 OCR 视频', message: 'OCR 路线已确定，视频保存后会开始提取字幕。', download: true },
   download_reference_subtitle: { title: '正在下载参考字幕', message: '正在取得参考字幕文件。' },
   download_anchor_subtitle: { title: '正在下载定轴字幕', message: '正在准备 OCR 所需的时间轴。' },
   download_video_for_hybrid: { title: '正在下载视频', message: '下载完成后将运行定轴 OCR。', download: true },
@@ -93,6 +102,7 @@ const RUNNING_OPERATION_PRESENTATIONS = freezeEntries({
   ocr_reference: { title: '正在提取 OCR 参考', message: '正在识别画面字幕以校准 ASR 原文。' },
   asr_ocr_refine: { title: '正在校准原文', message: '正在用 OCR 结果纠正 ASR 人名、术语和短语。' },
   generate_glossary: { title: '正在生成 Glossary', message: '正在整理人名、作品名和固定译法。' },
+  download_video_for_translation: { title: '正在补全工程视频', message: '视频保存后会继续翻译并把字幕放回素材目录。', download: true },
   translate: { title: '正在翻译字幕', message: '正在保留时间轴生成中文字幕。' },
 })
 

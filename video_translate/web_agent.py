@@ -498,7 +498,7 @@ def _start_agent_translation(
     task: dict[str, Any],
     *,
     waiting_session_id: str = "",
-    use_glossary: bool = True,
+    use_glossary: bool | None = None,
 ) -> AgentSession:
     task_id = str(task.get("id") or "").strip()
     if not task_id:
@@ -506,6 +506,9 @@ def _start_agent_translation(
     with _AGENT_TRANSLATION_START_LOCK:
         task = _read_task(task_id)
         run_generation = int(task.get("run_generation") or 0)
+        if use_glossary is None:
+            persisted_choice = _task_stage_value(task, "translate", "use_glossary")
+            use_glossary = persisted_choice if isinstance(persisted_choice, bool) else True
         active = _find_active_task_translation_session(task_id, run_generation)
         if active:
             return active
@@ -545,6 +548,7 @@ def _start_agent_translation(
             task_id,
             source_srt=source_srt,
             glossary_path=glossary_path if use_glossary else "",
+            use_glossary=use_glossary,
             attempt_id=attempt_id,
             glossary_digest=glossary_digest,
             expected_generation=run_generation,
@@ -561,6 +565,7 @@ def _start_agent_translation(
                 current.result["translation_attempt_id"] = attempt_id
                 current.result["translation_glossary_path"] = translation_glossary_path
                 current.result["glossary_digest"] = glossary_digest
+                current.result["translation_use_glossary"] = bool(use_glossary)
                 current.result["run_generation"] = run_generation
                 current.updated_at = time.time()
                 session = current
@@ -932,7 +937,11 @@ def _agent_start(session: AgentSession) -> None:
     existing_project = probe.get("existing_project") if isinstance(probe.get("existing_project"), dict) else {}
     project_dir = str(existing_project.get("path") or "")
     input_video = _project_video_path(project_dir, existing_project.get("primary_video"))
-    probe_result: dict[str, Any] = {"probe": probe, "normalized_url": probe.get("normalized_url")}
+    probe_result: dict[str, Any] = {
+        "probe": probe,
+        "normalized_url": probe.get("normalized_url"),
+        "source_type": "youtube",
+    }
     if project_dir:
         probe_result["project_dir"] = project_dir
     if input_video:
@@ -945,7 +954,7 @@ def _agent_start(session: AgentSession) -> None:
         payload=payload,
     )
     _bind_session_to_task_run(session.id, task)
-    _update_task_stage(
+    if not _update_task_stage(
         task["id"],
         "probe",
         "done",
@@ -958,7 +967,8 @@ def _agent_start(session: AgentSession) -> None:
         project_dir=project_dir,
         input_video=input_video,
         expected_generation=int(task.get("run_generation") or 0),
-    )
+    ):
+        raise RuntimeError("任务已被新一轮处理替代，停止继续旧 Agent 流程")
     if title and bool(payload.get("translate_title", False)):
         try:
             translated = translate_title_text(title)
@@ -975,16 +985,101 @@ def _agent_start(session: AgentSession) -> None:
     _agent_handle_plan(session, plan)
 
 
+def _explicit_youtube_url(value: Any) -> str:
+    """Return a normalized URL only for an explicit YouTube HTTP(S) origin."""
+
+    raw = str(value or "").strip()
+    parsed = urlparse(raw)
+    host = str(parsed.hostname or "").lower()
+    is_youtube_host = host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
+    if parsed.scheme not in {"http", "https"} or not is_youtube_host:
+        return ""
+    try:
+        return normalize_youtube_url(raw)
+    except ValueError:
+        return ""
+
+
+def _agent_ensure_project_video(
+    session: AgentSession,
+    probe: dict[str, Any] | None = None,
+    *,
+    phase: str,
+) -> dict[str, str]:
+    """Ensure the chosen Agent route has a local video, reusing one if possible."""
+
+    current = get_agent_session(session.id) or session
+    probe = probe if isinstance(probe, dict) else (current.result.get("probe") or {})
+    existing = _agent_input_video_path(current)
+    if existing:
+        context = {
+            "input_video": str(existing),
+            **(
+                {"project_dir": str(current.result.get("project_dir") or "").strip()}
+                if str(current.result.get("project_dir") or "").strip()
+                else {}
+            ),
+        }
+        _agent_update_result(session.id, context)
+        _agent_persist_project_video(current, context)
+        return context
+
+    url = _explicit_youtube_url(
+        probe.get("normalized_url")
+        or current.result.get("normalized_url")
+        or current.payload.get("url")
+        or ""
+    )
+    if not url:
+        raise RuntimeError("当前 Agent 任务没有可用于下载的 YouTube 地址")
+
+    _agent_set_phase(session.id, phase)
+    video_result = _wait_for_job(
+        download_video_job({"url": url, "title": str(probe.get("title") or "")}),
+        session_id=session.id,
+    )
+    context = _agent_project_context(video_result)
+    if not context.get("input_video"):
+        raise RuntimeError("视频下载完成，但 Agent 工程中没有找到可用视频")
+    _agent_update_result(
+        session.id,
+        {"download_video": video_result, **context},
+    )
+    _agent_persist_project_video(get_agent_session(session.id) or current, context)
+    return context
+
+
+def _agent_persist_project_video(session: AgentSession, context: dict[str, str]) -> None:
+    task_id = str(session.result.get("task_id") or "").strip()
+    if not task_id:
+        return
+    if not _update_task_stage(
+        task_id,
+        "probe",
+        "done",
+        project_dir=str(context.get("project_dir") or ""),
+        input_video=str(context.get("input_video") or ""),
+        expected_generation=_session_run_generation(session),
+    ):
+        raise RuntimeError("任务已被新一轮处理替代，停止保存视频关联")
+
+
+def _agent_enter_manual_mode(session: AgentSession) -> None:
+    _agent_ensure_project_video(session, phase="download_video_for_manual")
+    _agent_done(session.id, {"next_view": "new-task"})
+
+
 def _agent_continue(session: AgentSession, answer: dict[str, Any]) -> None:
     _agent_update_ocr_settings_from_answer(session, answer)
     action = str(answer.get("action") or "")
     if action == "manual_mode":
-        _agent_done(session.id, {"next_view": "new-task"})
+        _agent_enter_manual_mode(session)
         return
     if action == "use_cached_ocr":
         cached = session.result.get("reusable_ocr") if isinstance(session.result.get("reusable_ocr"), dict) else {}
         if not cached:
             raise RuntimeError("没有可复用 OCR 结果")
+        _agent_ensure_project_video(session, phase="download_video_for_ocr")
         _agent_use_cached_ocr(session, cached)
         return
     if action == "rerun_ocr":
@@ -1166,12 +1261,7 @@ def _agent_prepare_hybrid_ocr_settings(session: AgentSession) -> None:
         anchor_srt = str(subtitle_result.get("subtitle_path") or "")
         _agent_update_result(session.id, {"anchor_srt": anchor_srt, "download_subtitle": subtitle_result})
 
-    input_video = str(result.get("input_video") or "")
-    if not input_video or not Path(input_video).exists():
-        _agent_set_phase(session.id, "download_video_for_hybrid")
-        video_result = _wait_for_job(download_video_job({"url": url, "title": probe.get("title") or ""}), session_id=session.id)
-        input_video = str(video_result.get("input_video") or "")
-        _agent_update_result(session.id, {"input_video": input_video, "download_video": video_result})
+    _agent_ensure_project_video(session, probe, phase="download_video_for_hybrid")
 
     _agent_confirm_hybrid_ocr_settings(get_agent_session(session.id) or session)
 
@@ -1205,6 +1295,25 @@ def _agent_retry_current_phase(session: AgentSession) -> None:
     if phase in {"created", "probe"}:
         _agent_start(session)
         return
+    if phase == "download_video_for_project":
+        _agent_ensure_project_video(session, phase=phase)
+        _agent_handle_plan(session, session.result.get("agent_plan") or {})
+        return
+    if phase == "download_video_for_manual":
+        _agent_enter_manual_mode(session)
+        return
+    if phase == "download_video_for_subtitle":
+        _agent_use_recommended_subtitle(session)
+        return
+    if phase == "download_video_for_ocr":
+        _agent_run_ocr(session, force=bool(session.result.get("ocr_force_requested")))
+        return
+    if phase == "download_video_for_translation":
+        use_glossary = session.result.get("translation_use_glossary")
+        if not isinstance(use_glossary, bool):
+            use_glossary = bool(session.result.get("glossary_path"))
+        _agent_translate_after_glossary(session, use_glossary=use_glossary)
+        return
     if phase in {"confirm_subtitle", "download_subtitle"}:
         _agent_use_recommended_subtitle(session)
         return
@@ -1225,10 +1334,13 @@ def _agent_retry_current_phase(session: AgentSession) -> None:
         _agent_generate_glossary_review(session, source_srt)
         return
     if phase in {"translate_pending", "translate"}:
-        _agent_translate_after_glossary(session, use_glossary=bool(session.result.get("glossary_path")))
+        use_glossary = session.result.get("translation_use_glossary")
+        if not isinstance(use_glossary, bool):
+            use_glossary = bool(session.result.get("glossary_path"))
+        _agent_translate_after_glossary(session, use_glossary=use_glossary)
         return
     if phase == "ocr_full":
-        _agent_run_ocr(session)
+        _agent_run_ocr(session, force=bool(session.result.get("ocr_force_requested")))
         return
     if phase in {"download_video_for_asr", "audio_asr"}:
         _agent_run_asr(session)
@@ -1246,12 +1358,6 @@ def _agent_retry_current_phase(session: AgentSession) -> None:
 def _agent_handle_plan(session: AgentSession, plan: dict[str, Any]) -> None:
     selected = plan.get("selected_subtitle") if isinstance(plan, dict) else None
     if selected:
-        route = str(plan.get("route") or "")
-        confidence = float(plan.get("confidence") or 0)
-        if route in {"download_target_subtitle", "translate_source_subtitle", "dual_subtitle_reference"} and confidence >= 0.85:
-            _agent_log(session.id, "agent_auto_use_recommended_subtitle")
-            _agent_use_recommended_subtitle(session)
-            return
         _agent_wait(
             session.id,
             "confirm_subtitle",
@@ -1272,6 +1378,7 @@ def _agent_use_recommended_subtitle(session: AgentSession) -> None:
     result = session.result
     probe = result.get("probe") or {}
     plan = result.get("agent_plan") or {}
+    _agent_ensure_project_video(session, probe, phase="download_video_for_subtitle")
     if str(plan.get("route") or "") == "dual_subtitle_reference":
         _agent_run_dual_subtitle_reference(session)
         return
@@ -1286,6 +1393,23 @@ def _agent_use_recommended_subtitle(session: AgentSession) -> None:
     project_context = _agent_project_context(subtitle_result)
     _agent_update_result(session.id, {"source_srt": source_srt, "download_subtitle": subtitle_result, **project_context})
     if not plan.get("requires_translation", True):
+        current = get_agent_session(session.id) or session
+        task_id = str(current.result.get("task_id") or "")
+        input_video = _agent_input_video_path(current)
+        if task_id and not _update_task_stage(
+            task_id,
+            "translate",
+            "done",
+            current_stage="done",
+            translated_srt=source_srt,
+            subtitle_path=source_srt,
+            source_kind="target_subtitle",
+            input_video=str(input_video) if input_video else "",
+            project_dir=str(current.result.get("project_dir") or ""),
+            job_result=subtitle_result,
+            expected_generation=_session_run_generation(current),
+        ):
+            raise RuntimeError("任务已被新一轮处理替代，停止保存目标语言字幕")
         _agent_done(session.id, {"subtitle_path": source_srt, "message": "已下载目标语言字幕。"})
         return
     if plan.get("needs_source_correction"):
@@ -1374,6 +1498,7 @@ def _agent_source_language_for_glossary(session: AgentSession, prefer_source: bo
 def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool) -> None:
     if not _session_task_is_current(session):
         raise RuntimeError("任务已被新一轮处理替代，停止旧翻译")
+    _agent_update_result(session.id, {"translation_use_glossary": bool(use_glossary)})
     source_srt = str(session.result.get("source_srt") or "")
     glossary_path = str(session.result.get("glossary_path") or "") if use_glossary else ""
     translation_glossary_path = (
@@ -1387,6 +1512,12 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
     run_generation = _session_run_generation(session)
     attempt_id = str(session.result.get("translation_attempt_id") or "")
     input_video = _agent_input_video_path(session)
+    normalized_url = _explicit_youtube_url(
+        session.result.get("normalized_url") or session.payload.get("url") or ""
+    )
+    if not input_video and normalized_url:
+        context = _agent_ensure_project_video(session, phase="download_video_for_translation")
+        input_video = Path(context["input_video"]) if context.get("input_video") else None
     if input_video:
         project_dir = str(session.result.get("project_dir") or "").strip()
         if not project_dir or not _primary_video_for_project(project_dir):
@@ -1403,6 +1534,7 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
                 task_id,
                 source_srt=source_srt,
                 glossary_path=glossary_path,
+                use_glossary=use_glossary,
                 attempt_id=attempt_id,
                 glossary_digest=str(session.result.get("glossary_digest") or ""),
                 expected_generation=run_generation,
@@ -1559,27 +1691,15 @@ def _agent_ocr_asr_options(route: str, embedded_goal: str = "screen_subtitle") -
 
 def _agent_download_video_for_preview(session: AgentSession) -> None:
     result = session.result
-    probe = result.get("probe") or {}
     plan = result.get("agent_plan") or {}
-    url = str(probe.get("normalized_url") or result.get("normalized_url") or session.payload.get("url") or "")
-    input_video = str(result.get("input_video") or "")
-    if not input_video:
-        _agent_set_phase(session.id, "download_video_for_preview")
-        video_result = _wait_for_job(download_video_job({"url": url, "title": probe.get("title") or ""}), session_id=session.id)
-        input_video = str(video_result.get("input_video") or "")
-        _agent_update_result(session.id, {"input_video": input_video, "download_video_for_preview": video_result})
+    _agent_ensure_project_video(session, phase="download_video_for_preview")
     _agent_continue_route_without_subtitle(session.id, plan)
 
 def _agent_probe_audio_language(session: AgentSession) -> None:
     result = session.result
     probe = result.get("probe") or {}
-    url = str(probe.get("normalized_url") or result.get("normalized_url") or session.payload.get("url") or "")
-    input_video = str(result.get("input_video") or "")
-    if not input_video:
-        _agent_set_phase(session.id, "download_video_for_audio_probe")
-        video_result = _wait_for_job(download_video_job({"url": url, "title": probe.get("title") or ""}), session_id=session.id)
-        input_video = str(video_result.get("input_video") or "")
-        _agent_update_result(session.id, {"input_video": input_video, "download_video": video_result})
+    project_context = _agent_ensure_project_video(session, probe, phase="download_video_for_audio_probe")
+    input_video = str(project_context.get("input_video") or "")
 
     _agent_set_phase(session.id, "probe_audio_language")
     language_result = _wait_for_job(audio_language_probe_job({"input_video": input_video}), session_id=session.id)
@@ -1605,6 +1725,7 @@ def _agent_probe_audio_language(session: AgentSession) -> None:
 
 
 def _agent_run_ocr(session: AgentSession, *, force: bool = False) -> None:
+    _agent_update_result(session.id, {"ocr_force_requested": bool(force)})
     _agent_set_phase(session.id, "ocr_full")
     url = str(session.result.get("normalized_url") or session.payload.get("url") or "")
     title = str((session.result.get("probe") or {}).get("title") or "")
@@ -1681,30 +1802,34 @@ def _agent_run_ocr(session: AgentSession, *, force: bool = False) -> None:
                 },
             )
             return
-    job = ocr_extract_job(
-        {
-            "url": url,
-            "title": title,
-            "extra_hint": str(session.payload.get("extra_hint") or ""),
-            "translation_mode": translation_mode,
-            "ocr_pipeline_version": ocr_pipeline_version,
-            "ocr_scope": ocr_scope,
-            "ocr_extraction_mode": ocr_extraction_mode,
-            "ocr_shape_mode": ocr_shape_mode,
-            "ocr_refinement_mode": ocr_refinement_mode,
-            "ocr_crop_top_ratio": ocr_crop_top_ratio,
-            "ocr_crop_bottom_ratio": ocr_crop_bottom_ratio,
-            "ocr_crop_left_ratio": ocr_crop_left_ratio,
-            "ocr_crop_right_ratio": ocr_crop_right_ratio,
-            "ocr_exclude_enabled": ocr_exclude_enabled,
-            "ocr_exclude_top_ratio": ocr_exclude_top_ratio,
-            "ocr_exclude_bottom_ratio": ocr_exclude_bottom_ratio,
-            "ocr_exclude_left_ratio": ocr_exclude_left_ratio,
-            "ocr_exclude_right_ratio": ocr_exclude_right_ratio,
-            "source_language": source_language,
-            "ocr_language": ocr_language,
-        }
-    )
+    project_context = _agent_ensure_project_video(session, phase="download_video_for_ocr")
+    input_video = Path(project_context["input_video"]) if project_context.get("input_video") else None
+    _agent_set_phase(session.id, "ocr_full")
+    job_payload: dict[str, Any] = {
+        "url": url,
+        "title": title,
+        "extra_hint": str(session.payload.get("extra_hint") or ""),
+        "translation_mode": translation_mode,
+        "ocr_pipeline_version": ocr_pipeline_version,
+        "ocr_scope": ocr_scope,
+        "ocr_extraction_mode": ocr_extraction_mode,
+        "ocr_shape_mode": ocr_shape_mode,
+        "ocr_refinement_mode": ocr_refinement_mode,
+        "ocr_crop_top_ratio": ocr_crop_top_ratio,
+        "ocr_crop_bottom_ratio": ocr_crop_bottom_ratio,
+        "ocr_crop_left_ratio": ocr_crop_left_ratio,
+        "ocr_crop_right_ratio": ocr_crop_right_ratio,
+        "ocr_exclude_enabled": ocr_exclude_enabled,
+        "ocr_exclude_top_ratio": ocr_exclude_top_ratio,
+        "ocr_exclude_bottom_ratio": ocr_exclude_bottom_ratio,
+        "ocr_exclude_left_ratio": ocr_exclude_left_ratio,
+        "ocr_exclude_right_ratio": ocr_exclude_right_ratio,
+        "source_language": source_language,
+        "ocr_language": ocr_language,
+    }
+    if input_video:
+        job_payload["input_video"] = str(input_video)
+    job = ocr_extract_job(job_payload)
     result = _wait_for_job(job, session_id=session.id)
     source_srt = str(result.get("source_srt") or "")
     source_srt = _materialize_task_artifact(session, source_srt, "source.srt") or source_srt
@@ -1761,13 +1886,14 @@ def _agent_use_cached_ocr(session: AgentSession, cached: dict[str, Any]) -> None
         raise RuntimeError(f"可复用 OCR 原文不存在: {source_srt or '<empty>'}")
     source_srt = _materialize_task_artifact(session, source_srt, "source.srt") or source_srt
     _agent_log(session.id, f"agent_reuse_ocr: {source_srt}")
+    input_video = _agent_input_video_path(session)
     _agent_update_result(
         session.id,
         {
             "ocr": cached,
             "source_srt": source_srt,
             "source_kind": "ocr",
-            "input_video": cached.get("input_video"),
+            **({"input_video": str(input_video)} if input_video else {}),
             "reused_ocr": True,
         },
     )
@@ -1779,7 +1905,7 @@ def _agent_use_cached_ocr(session: AgentSession, cached: dict[str, Any]) -> None
             "done",
             current_stage="ocr_done",
             source_srt=source_srt,
-            input_video=cached.get("input_video"),
+            input_video=str(input_video) if input_video else "",
             output_dir=cached.get("output_dir"),
             ocr_pipeline_version=cached.get("ocr_pipeline_version"),
             ocr_translation_mode=cached.get("ocr_translation_mode"),
@@ -1943,12 +2069,9 @@ def _agent_run_dual_subtitle_reference(session: AgentSession) -> None:
 
 
 def _agent_run_asr(session: AgentSession) -> None:
-    _agent_set_phase(session.id, "download_video_for_asr")
-    url = str(session.result.get("normalized_url") or session.payload.get("url") or "")
     probe = session.result.get("probe") or {}
-    video_result = _wait_for_job(download_video_job({"url": url, "title": probe.get("title") or ""}), session_id=session.id)
-    input_video = str(video_result.get("input_video") or "")
-    _agent_update_result(session.id, {"input_video": input_video, "download_video": video_result})
+    project_context = _agent_ensure_project_video(session, probe, phase="download_video_for_asr")
+    input_video = str(project_context.get("input_video") or "")
     _agent_set_phase(session.id, "audio_asr")
     asr_result = _wait_for_job(
         audio_local_video_job({"input_video": input_video, "source_language": _session_source_language(session), "language": asr_language_for_source(_session_source_language(session)), "model_size": "large-v3"}),
@@ -1982,14 +2105,9 @@ def _agent_run_asr(session: AgentSession) -> None:
 
 
 def _agent_run_asr_with_ocr_reference(session: AgentSession) -> None:
-    _agent_set_phase(session.id, "download_video_for_asr")
-    url = str(session.result.get("normalized_url") or session.payload.get("url") or "")
     probe = session.result.get("probe") or {}
-    input_video = str(session.result.get("input_video") or "")
-    if not input_video or not Path(input_video).exists():
-        video_result = _wait_for_job(download_video_job({"url": url, "title": probe.get("title") or ""}), session_id=session.id)
-        input_video = str(video_result.get("input_video") or "")
-        _agent_update_result(session.id, {"input_video": input_video, "download_video": video_result})
+    project_context = _agent_ensure_project_video(session, probe, phase="download_video_for_asr")
+    input_video = str(project_context.get("input_video") or "")
 
     _agent_set_phase(session.id, "audio_asr")
     asr_result = _wait_for_job(
@@ -2249,6 +2367,7 @@ def _ensure_agent_task(*, normalized_url: str, title: str, payload: dict[str, An
                 "id": task_dir.name,
                 "video_key": video_key,
                 "url": normalized,
+                "source_type": "youtube",
                 "title": title or data.get("title") or "",
                 "task_dir": str(task_dir),
                 "payload": {**(data.get("payload") if isinstance(data.get("payload"), dict) else {}), **dict(payload)},
@@ -2352,6 +2471,7 @@ def _import_legacy_agent_jobs() -> None:
             continue
         source_run = source_srt.parent / "run.yaml"
         input_video = ""
+        normalized_url = ""
         title = source_srt.parent.name
         if source_run.exists():
             try:
@@ -2362,6 +2482,13 @@ def _import_legacy_agent_jobs() -> None:
                 input_video = str(run_config.get("input_video") or "")
                 if input_video:
                     title = Path(input_video).stem
+                agent_cache = run_config.get("agent_cache") if isinstance(run_config.get("agent_cache"), dict) else {}
+                normalized_url = _explicit_youtube_url(
+                    agent_cache.get("normalized_url")
+                    or run_config.get("normalized_url")
+                    or run_config.get("url")
+                    or ""
+                )
         task_dir = TASK_DIR / legacy_task_id
         if (task_dir / "task.yaml").exists():
             continue
@@ -2369,7 +2496,8 @@ def _import_legacy_agent_jobs() -> None:
         data = {
             "id": task_dir.name,
             "video_key": task_dir.name,
-            "url": "",
+            "url": normalized_url,
+            "source_type": "youtube" if normalized_url else "legacy",
             "title": title,
             "task_dir": str(task_dir),
             "payload": {},
@@ -2435,6 +2563,7 @@ def _agent_session_from_task(task: dict[str, Any]) -> AgentSession:
         "task_dir": task.get("task_dir"),
         "run_generation": int(task.get("run_generation") or 0),
         "normalized_url": task.get("url"),
+        "source_type": task.get("source_type") or ("youtube" if _explicit_youtube_url(task.get("url")) else "legacy"),
         "probe": {
             "title": task.get("title") or "",
             "normalized_url": task.get("url") or "",
@@ -2705,6 +2834,7 @@ def _mark_task_translation_pending(
     *,
     source_srt: str,
     glossary_path: str,
+    use_glossary: bool,
     attempt_id: str,
     glossary_digest: str,
     expected_generation: int | None = None,
@@ -2718,6 +2848,7 @@ def _mark_task_translation_pending(
         current_stage="translate_pending",
         source_srt=source_srt,
         glossary_path=glossary_path,
+        use_glossary=bool(use_glossary),
         attempt_id=attempt_id,
         glossary_digest=glossary_digest,
         queued_at=time.time(),
@@ -2977,6 +3108,11 @@ def _existing_video_path(value: Any) -> str:
     if not path.exists() or not path.is_file():
         return ""
     if path.suffix.lower() not in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}:
+        return ""
+    try:
+        if path.stat().st_size <= 0:
+            return ""
+    except OSError:
         return ""
     return str(path)
 
@@ -3451,13 +3587,18 @@ def _agent_fail(session_id: str, exc: Exception) -> None:
 
 
 def _task_stage_for_phase(phase: str) -> str:
-    if phase in {"ocr_full", "confirm_ocr_reuse"}:
+    if phase in {"ocr_full", "confirm_ocr_reuse", "download_video_for_ocr"}:
         return "ocr"
     if phase in {"generate_glossary", "review_glossary"}:
         return "glossary"
-    if phase in {"translate_pending", "translate"}:
+    if phase in {"translate_pending", "translate", "download_video_for_translation"}:
         return "translate"
-    if phase == "probe":
+    if phase in {
+        "probe",
+        "download_video_for_project",
+        "download_video_for_manual",
+        "download_video_for_subtitle",
+    }:
         return "probe"
     return ""
 
@@ -3932,6 +4073,13 @@ def ocr_full_job(payload: dict[str, Any]) -> Job:
 def ocr_extract_job(payload: dict[str, Any]) -> Job:
     url = _required_str(payload, "url")
     title = str(payload.get("title") or "").strip()
+    prebound_input_video: Path | None = None
+    raw_input_video = str(payload.get("input_video") or "").strip()
+    if raw_input_video:
+        prebound_input_video = _resolve_project_path(raw_input_video)
+        _ensure_under_root(prebound_input_video)
+        if not _existing_video_path(prebound_input_video):
+            raise FileNotFoundError(f"视频文件不存在或格式不受支持: {prebound_input_video}")
     extra_hint = str(payload.get("extra_hint") or "")
     pipeline = _resolve_ocr_pipeline(
         payload.get("ocr_pipeline_version"),
@@ -3963,14 +4111,18 @@ def ocr_extract_job(payload: dict[str, Any]) -> Job:
     def target(job_id: str) -> dict[str, Any]:
         out_dir = JOB_DIR / job_id
         out_dir.mkdir(parents=True, exist_ok=True)
-        before_videos = _snapshot_video_files(DOWNLOAD_DIR)
-        _append_log(job_id, "download_video_start")
-        _run_command(job_id, _module_command("video_translate.youtube.download_video", url, "--output-dir", DOWNLOAD_DIR, "--quality", "1080p"))
-        videos = _downloaded_video_candidates(DOWNLOAD_DIR, before_videos, title, newest_limit=1)
-        if not videos:
-            missing_title = title or "<unknown>"
-            raise RuntimeError(f"视频下载完成后没有找到匹配文件: title={missing_title}")
-        input_video = videos[0]
+        if prebound_input_video:
+            input_video = prebound_input_video
+            _append_log(job_id, f"reuse_input_video: {input_video}")
+        else:
+            before_videos = _snapshot_video_files(DOWNLOAD_DIR)
+            _append_log(job_id, "download_video_start")
+            _run_command(job_id, _module_command("video_translate.youtube.download_video", url, "--output-dir", DOWNLOAD_DIR, "--quality", "1080p"))
+            videos = _downloaded_video_candidates(DOWNLOAD_DIR, before_videos, title, newest_limit=1)
+            if not videos:
+                missing_title = title or "<unknown>"
+                raise RuntimeError(f"视频下载完成后没有找到匹配文件: title={missing_title}")
+            input_video = videos[0]
         thumbnail = _matching_thumbnail_file(input_video)
         manifest = update_youtube_project_manifest(input_video, source_url=url, title=title or input_video.parent.name, thumbnail_path=thumbnail)
         _append_log(job_id, f"input_video: {input_video}")

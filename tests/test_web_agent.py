@@ -15,6 +15,22 @@ def isolate_agent_task_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(web_agent, "TASK_DIR", tmp_path / "agent_tasks")
 
 
+def _stub_agent_project_video(monkeypatch, video: Path) -> None:
+    video.parent.mkdir(parents=True, exist_ok=True)
+    if not video.exists():
+        video.write_bytes(b"video")
+    monkeypatch.setattr(
+        web_agent,
+        "download_video_job",
+        lambda payload: web_agent.Job(
+            id="project-video",
+            name="project-video",
+            status="done",
+            result={"input_video": str(video)},
+        ),
+    )
+
+
 def test_caption_entries_collects_formats():
     raw = {"en": [{"ext": "vtt"}, {"ext": "json3"}], "ko": [{"ext": "srv3"}]}
 
@@ -73,9 +89,10 @@ def test_probe_video_normalizes_url_and_adds_agent_plan(monkeypatch):
 
 
 
-def test_start_agent_session_uses_configured_japanese_for_probe(monkeypatch):
+def test_start_agent_session_uses_configured_japanese_for_probe(monkeypatch, tmp_path):
     monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
     captured = {}
+    _stub_agent_project_video(monkeypatch, tmp_path / "demo.mp4")
 
     def fake_probe(url, **kwargs):
         captured.update(kwargs)
@@ -153,8 +170,9 @@ def test_ocr_config_records_japanese_source_language(tmp_path: Path):
 
     assert config["source_language"] == "japanese"
 
-def test_agent_session_waits_for_auto_subtitle_confirmation(monkeypatch):
+def test_agent_session_waits_for_auto_subtitle_confirmation(monkeypatch, tmp_path):
     monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    _stub_agent_project_video(monkeypatch, tmp_path / "demo.mp4")
     monkeypatch.setattr(
         web_agent,
         "probe_video",
@@ -235,6 +253,7 @@ def test_agent_session_hybrid_downloads_anchor_video_and_generates_glossary(monk
     session = web_agent.start_agent_session({"url": "abc123", "embedded_subtitle_hint": "yes"})
     snapshot = _wait_agent_phase(session.id, "confirm_subtitle")
     assert snapshot["question"]["options"][0]["action"] == "use_recommended"
+    assert calls == []
 
     web_agent.answer_agent_session(session.id, {"action": "use_recommended"})
     snapshot = _wait_agent_phase(session.id, "confirm_hybrid_ocr_settings")
@@ -328,6 +347,11 @@ def test_agent_session_dual_reference_downloads_source_and_reference_subtitles(m
     )
 
     session = web_agent.start_agent_session({"url": "abc123", "detected_source_language": "ko"})
+    snapshot = _wait_agent_phase(session.id, "confirm_subtitle")
+
+    assert calls == []
+
+    web_agent.answer_agent_session(session.id, {"action": "use_recommended"})
     snapshot = _wait_agent_phase(session.id, "review_glossary")
 
     assert snapshot["result"]["source_kind"] == "dual_subtitle_reference"
@@ -337,7 +361,7 @@ def test_agent_session_dual_reference_downloads_source_and_reference_subtitles(m
 
 
 
-def test_agent_can_download_video_for_ocr_preview_before_route_choice(monkeypatch, tmp_path):
+def test_agent_waits_for_route_choice_before_downloading_project_video(monkeypatch, tmp_path):
     monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
     video = tmp_path / "demo.mp4"
     video.write_bytes(b"video")
@@ -366,15 +390,19 @@ def test_agent_can_download_video_for_ocr_preview_before_route_choice(monkeypatc
 
     session = web_agent.start_agent_session({"url": "abc123", "embedded_subtitle_hint": "yes"})
     snapshot = _wait_agent_phase(session.id, "diagnose_ocr_asr")
-    assert snapshot["result"].get("input_video") is None
-    assert any(option["action"] == "download_video_for_preview" for option in snapshot["question"]["options"])
-
-    web_agent.answer_agent_session(session.id, {"action": "download_video_for_preview"})
-    snapshot = _wait_agent_phase(session.id, "diagnose_ocr_asr")
 
     assert snapshot["status"] == "waiting"
-    assert snapshot["result"]["input_video"] == str(video)
+    assert "input_video" not in snapshot["result"]
     assert snapshot["question"]["kind"] == "diagnose_ocr_asr"
+    assert calls == []
+
+    web_agent.answer_agent_session(session.id, {"action": "manual_mode"})
+    snapshot = _wait_agent_status(session.id, "done")
+    task = web_agent.get_agent_task(snapshot["result"]["task_id"])
+
+    assert snapshot["result"]["input_video"] == str(video)
+    assert snapshot["result"]["next_view"] == "new-task"
+    assert task["stages"]["probe"]["input_video"] == str(video)
     assert calls == ["video:https://www.youtube.com/watch?v=abc123"]
 
 
@@ -479,6 +507,8 @@ def test_agent_answer_switches_to_v2_and_persists_pipeline_in_task(monkeypatch, 
     def done_job(name, result):
         return web_agent.Job(id=name, name=name, status="done", result=result)
 
+    _stub_agent_project_video(monkeypatch, video)
+
     def fake_ocr(payload):
         captured.update(payload)
         return done_job(
@@ -526,6 +556,7 @@ def test_agent_answer_switches_to_v2_and_persists_pipeline_in_task(monkeypatch, 
         assert snapshot["payload"][key] == value
         assert task["payload"][key] == value
         assert captured[key if key != "ocr_translation_mode" else "translation_mode"] == value
+    assert captured["input_video"] == str(video)
     assert task["stages"]["ocr"]["ocr_pipeline_version"] == "v2"
     assert task["stages"]["ocr"]["ocr_extraction_mode"] == "region"
     assert task["stages"]["ocr"]["ocr_refinement_mode"] == "llm_boxes"
@@ -570,8 +601,14 @@ def test_agent_session_ocr_extracts_then_generates_glossary(monkeypatch, tmp_pat
 
     monkeypatch.setattr(
         web_agent,
+        "download_video_job",
+        lambda payload: calls.append("video") or done_job("video", {"input_video": str(video)}),
+    )
+
+    monkeypatch.setattr(
+        web_agent,
         "ocr_extract_job",
-        lambda payload: calls.append(f"ocr:{payload['url']}:{payload['ocr_extraction_mode']}:{payload['ocr_shape_mode']}") or done_job("ocr", {"source_srt": str(source), "input_video": str(video)}),
+        lambda payload: calls.append(f"ocr:{payload['input_video']}:{payload['ocr_extraction_mode']}:{payload['ocr_shape_mode']}") or done_job("ocr", {"source_srt": str(source), "input_video": str(video)}),
     )
     monkeypatch.setattr(
         web_agent,
@@ -592,6 +629,7 @@ def test_agent_session_ocr_extracts_then_generates_glossary(monkeypatch, tmp_pat
     assert snapshot["status"] == "waiting"
     assert snapshot["question"]["kind"] == "diagnose_ocr_asr"
     assert any(option["action"] == "run_ocr" for option in snapshot["question"]["options"])
+    assert calls == []
 
     web_agent.answer_agent_session(session.id, {"action": "run_ocr"})
     snapshot = _wait_agent_phase(session.id, "review_glossary")
@@ -601,7 +639,7 @@ def test_agent_session_ocr_extracts_then_generates_glossary(monkeypatch, tmp_pat
     assert "OCR 原文字幕" in snapshot["question"]["message"]
     assert snapshot["result"]["source_kind"] == "ocr"
     assert Path(snapshot["result"]["source_srt"]).parts[-3:] == ("agent_tasks", "abc123_demo", "source.srt")
-    assert calls == ["ocr:https://www.youtube.com/watch?v=abc123:region_v3:horizontal_strict", f"glossary:{snapshot['result']['source_srt']}:korean"]
+    assert calls == ["video", f"ocr:{video}:region_v3:horizontal_strict", f"glossary:{snapshot['result']['source_srt']}:korean"]
 
 
 def test_agent_session_asr_generates_glossary(monkeypatch, tmp_path):
@@ -636,6 +674,8 @@ def test_agent_session_asr_generates_glossary(monkeypatch, tmp_path):
     def done_job(name, result):
         return web_agent.Job(id=name, name=name, status="done", result=result)
 
+    _stub_agent_project_video(monkeypatch, video)
+
     monkeypatch.setattr(
         web_agent,
         "download_video_job",
@@ -656,6 +696,7 @@ def test_agent_session_asr_generates_glossary(monkeypatch, tmp_path):
     snapshot = _wait_agent_phase(session.id, "diagnose_ocr_asr")
     assert snapshot["question"]["kind"] == "diagnose_ocr_asr"
     assert snapshot["question"]["recommended_route"] == "asr"
+    assert calls == []
 
     web_agent.answer_agent_session(session.id, {"action": "run_asr"})
     snapshot = _wait_agent_phase(session.id, "review_glossary")
@@ -720,6 +761,7 @@ def test_agent_session_embedded_full_speech_runs_asr_with_ocr_reference(monkeypa
     )
     snapshot = _wait_agent_phase(session.id, "diagnose_ocr_asr")
     assert any(option["action"] == "run_asr_with_ocr" for option in snapshot["question"]["options"])
+    assert calls == []
 
     web_agent.answer_agent_session(session.id, {"action": "run_asr_with_ocr"})
     snapshot = _wait_agent_phase(session.id, "review_glossary")
@@ -751,6 +793,8 @@ def test_agent_session_chinese_ocr_finishes_without_glossary(monkeypatch, tmp_pa
 
     def done_job(name, result):
         return web_agent.Job(id=name, name=name, status="done", result=result)
+
+    _stub_agent_project_video(monkeypatch, video)
 
     monkeypatch.setattr(
         web_agent,
@@ -1191,14 +1235,17 @@ def test_agent_session_reuses_cached_ocr_before_generating_glossary(monkeypatch,
     source = tmp_path / "oldjob" / "source.srt"
     source.parent.mkdir(parents=True)
     source.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
-    video = tmp_path / "downloads" / "demo.mp4"
-    video.parent.mkdir(parents=True)
-    video.write_bytes(b"video")
+    cached_video = tmp_path / "old-downloads" / "demo.mp4"
+    cached_video.parent.mkdir(parents=True)
+    cached_video.write_bytes(b"old-video")
+    project_video = tmp_path / "downloads" / "demo.mp4"
+    project_video.parent.mkdir(parents=True)
+    project_video.write_bytes(b"current-video")
     (source.parent / "run.yaml").write_text(
         "\n".join(
             [
                 "mode: extract",
-                f"input_video: {video}",
+                f"input_video: {cached_video}",
                 f"source_srt: {source}",
                 "agent_cache:",
                 "  kind: youtube_ocr",
@@ -1236,6 +1283,8 @@ def test_agent_session_reuses_cached_ocr_before_generating_glossary(monkeypatch,
     def done_job(name, result):
         return web_agent.Job(id=name, name=name, status="done", result=result)
 
+    _stub_agent_project_video(monkeypatch, project_video)
+
     monkeypatch.setattr(
         web_agent,
         "generate_glossary_job",
@@ -1259,8 +1308,11 @@ def test_agent_session_reuses_cached_ocr_before_generating_glossary(monkeypatch,
     snapshot = _wait_agent_phase(session.id, "review_glossary")
 
     assert snapshot["result"]["reused_ocr"] is True
+    assert snapshot["result"]["input_video"] == str(project_video)
     assert Path(snapshot["result"]["source_srt"]).parts[-3:] == ("agent_tasks", "abc123_demo", "source.srt")
     assert calls == [f"glossary:{snapshot['result']['source_srt']}:korean"]
+    task = web_agent.get_agent_task(snapshot["result"]["task_id"])
+    assert task["stages"]["ocr"]["input_video"] == str(project_video)
 
     assert (
         web_agent._find_reusable_ocr_result(
@@ -1281,6 +1333,7 @@ def test_agent_task_persists_glossary_review_and_can_continue(monkeypatch, tmp_p
     source = tmp_path / "source.srt"
     glossary = tmp_path / "glossary.draft.yaml"
     translated = tmp_path / "zh.srt"
+    video = tmp_path / "demo.mp4"
     source.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
     glossary.write_text("characters: []\n", encoding="utf-8")
     translated.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8")
@@ -1302,7 +1355,8 @@ def test_agent_task_persists_glossary_review_and_can_continue(monkeypatch, tmp_p
     def done_job(name, result):
         return web_agent.Job(id=name, name=name, status="done", result=result)
 
-    monkeypatch.setattr(web_agent, "ocr_extract_job", lambda payload: done_job("ocr", {"source_srt": str(source), "input_video": str(tmp_path / "demo.mp4")}))
+    _stub_agent_project_video(monkeypatch, video)
+    monkeypatch.setattr(web_agent, "ocr_extract_job", lambda payload: done_job("ocr", {"source_srt": str(source), "input_video": str(video)}))
     monkeypatch.setattr(web_agent, "generate_glossary_job", lambda payload: done_job("glossary", {"glossary_path": str(glossary), "content": "characters: []\n"}))
     monkeypatch.setattr(
         web_agent,
@@ -1992,6 +2046,10 @@ def test_agent_session_probes_audio_language_before_choosing_manual_source(monke
     assert snapshot["question"]["recommended_route"] == "probe_audio_language"
 
     web_agent.answer_agent_session(session.id, {"action": "probe_audio_language"})
+    snapshot = _wait_agent_phase(session.id, "confirm_subtitle")
+    assert calls == ["video", f"lang:{video}"]
+
+    web_agent.answer_agent_session(session.id, {"action": "use_recommended"})
     snapshot = _wait_agent_phase(session.id, "review_glossary")
 
     assert snapshot["result"]["detected_source_language"] == "ko"
@@ -2094,6 +2152,8 @@ def test_subtitle_editor_rejects_non_srt_save(tmp_path: Path, monkeypatch):
 
 def test_agent_session_downloads_generates_glossary_then_waits(monkeypatch, tmp_path):
     monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"video")
     glossary = tmp_path / "draft.yaml"
     glossary.write_text("characters: []\n", encoding="utf-8")
     source = tmp_path / "demo.ko.srt"
@@ -2128,6 +2188,10 @@ def test_agent_session_downloads_generates_glossary_then_waits(monkeypatch, tmp_
         calls.append(f"download:{payload['lang']}:{payload['kind']}")
         return done_job("download", {"subtitle_path": str(source)})
 
+    def fake_video_download(payload):
+        calls.append(f"video:{payload['url']}")
+        return done_job("video", {"input_video": str(video)})
+
     def fake_glossary(payload):
         calls.append(f"glossary:{payload['source_srt']}:{payload.get('out', '')}")
         assert Path(payload["out"]).name == "glossary.draft.yaml"
@@ -2135,10 +2199,17 @@ def test_agent_session_downloads_generates_glossary_then_waits(monkeypatch, tmp_
         assert ".work" in Path(payload["out"]).parts
         return done_job("glossary", {"glossary_path": str(glossary), "content": "characters: []\n"})
 
+    monkeypatch.setattr(web_agent, "download_video_job", fake_video_download)
     monkeypatch.setattr(web_agent, "download_subtitle_job", fake_download)
     monkeypatch.setattr(web_agent, "generate_glossary_job", fake_glossary)
 
     session = web_agent.start_agent_session({"url": "abc123", "detected_source_language": "ko"})
+    snapshot = _wait_agent_phase(session.id, "confirm_subtitle")
+
+    assert snapshot["question"]["kind"] == "confirm_subtitle"
+    assert calls == []
+
+    web_agent.answer_agent_session(session.id, {"action": "use_recommended"})
     snapshot = _wait_agent_phase(session.id, "review_glossary")
 
     assert snapshot["status"] == "waiting"
@@ -2147,8 +2218,145 @@ def test_agent_session_downloads_generates_glossary_then_waits(monkeypatch, tmp_
     assert Path(snapshot["result"]["glossary_path"]).name == "glossary.draft.yaml"
     assert Path(snapshot["result"]["glossary_path"]).parent.parent == web_agent.TASK_DIR
     assert Path(snapshot["result"]["glossary_path"]).read_text(encoding="utf-8") == glossary.read_text(encoding="utf-8")
-    assert calls[0] == "download:ko:manual"
-    assert calls[1].startswith(f"glossary:{source}:")
+    assert snapshot["result"]["input_video"] == str(video)
+    assert calls[0] == "video:https://www.youtube.com/watch?v=abc123"
+    assert calls[1] == "download:ko:manual"
+    assert calls[2].startswith(f"glossary:{source}:")
+
+
+def test_target_subtitle_route_downloads_video_only_after_confirmation(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"video")
+    subtitle = tmp_path / "demo.zh.srt"
+    subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8")
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        web_agent,
+        "probe_video",
+        lambda url, **kwargs: {
+            "title": "demo",
+            "normalized_url": "https://www.youtube.com/watch?v=abc123",
+            "webpage_url": "https://www.youtube.com/watch?v=abc123",
+            "subtitles": [{"lang": "zh-CN", "kind": "manual", "label": "zh-CN · 人工字幕"}],
+            "agent_plan": {
+                "route": "download_target_subtitle",
+                "selected_subtitle": {"lang": "zh-CN", "kind": "manual", "label": "zh-CN · 人工字幕"},
+                "requires_translation": False,
+                "confidence": 0.95,
+            },
+        },
+    )
+
+    def done_job(name, result):
+        return web_agent.Job(id=name, name=name, status="done", result=result)
+
+    monkeypatch.setattr(
+        web_agent,
+        "download_video_job",
+        lambda payload: calls.append("video") or done_job("video", {"input_video": str(video)}),
+    )
+    monkeypatch.setattr(
+        web_agent,
+        "download_subtitle_job",
+        lambda payload: calls.append("subtitle") or done_job("subtitle", {"subtitle_path": str(subtitle)}),
+    )
+    monkeypatch.setattr(
+        web_agent,
+        "generate_glossary_job",
+        lambda payload: (_ for _ in ()).throw(AssertionError("目标语言字幕不应生成 Glossary")),
+    )
+
+    session = web_agent.start_agent_session({"url": "abc123", "detected_source_language": "ko"})
+    snapshot = _wait_agent_phase(session.id, "confirm_subtitle")
+
+    assert calls == []
+    assert "input_video" not in snapshot["result"]
+
+    web_agent.answer_agent_session(session.id, {"action": "use_recommended"})
+    snapshot = _wait_agent_status(session.id, "done")
+
+    assert calls == ["video", "subtitle"]
+    assert snapshot["result"]["input_video"] == str(video)
+    assert snapshot["result"]["subtitle_path"] == str(subtitle)
+    assert "glossary_path" not in snapshot["result"]
+    task = web_agent.get_agent_task(snapshot["result"]["task_id"])
+    assert task["current_stage"] == "done"
+    assert task["workflow_status"] == "completed"
+    assert task["stages"]["translate"]["translated_srt"] == str(subtitle)
+
+
+def test_failed_translation_restart_keeps_skip_glossary_choice(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    source = tmp_path / "source.srt"
+    glossary = tmp_path / "glossary.yaml"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
+    glossary.write_text("characters: []\n", encoding="utf-8")
+    task_dir = web_agent.TASK_DIR / "legacy_demo"
+    task_dir.mkdir(parents=True)
+    web_agent._write_task_file(
+        task_dir / "task.yaml",
+        {
+            "id": "legacy_demo",
+            "task_dir": str(task_dir),
+            "url": "",
+            "title": "demo",
+            "payload": {},
+            "run_generation": 1,
+            "current_stage": "translate_failed",
+            "workflow_status": "active",
+            "stages": {
+                "glossary": {
+                    "status": "reviewed",
+                    "source_srt": str(source),
+                    "glossary_path": str(glossary),
+                },
+                "translate": {
+                    "status": "failed",
+                    "source_srt": str(source),
+                    "use_glossary": False,
+                },
+            },
+        },
+    )
+    scheduled: list[str] = []
+    monkeypatch.setattr(web_agent, "_run_agent_async", lambda session_id, target: scheduled.append(session_id))
+
+    session = web_agent._start_agent_translation(web_agent._read_task("legacy_demo"))
+
+    assert session.result["translation_use_glossary"] is False
+    assert session.result["translation_glossary_path"] == ""
+    assert scheduled == [session.id]
+    task = web_agent.get_agent_task("legacy_demo")
+    assert task["stages"]["translate"]["use_glossary"] is False
+    assert "glossary_path" not in task["stages"]["translate"]
+
+
+def test_retry_ocr_download_preserves_explicit_rerun_choice(monkeypatch):
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        web_agent,
+        "_agent_run_ocr",
+        lambda session, force=False: calls.append(force),
+    )
+    session = web_agent.AgentSession(
+        id="retry-ocr",
+        status="failed",
+        phase="download_video_for_ocr",
+        result={"ocr_force_requested": True},
+    )
+
+    web_agent._agent_retry_current_phase(session)
+
+    assert calls == [True]
+
+
+def test_explicit_youtube_url_rejects_local_paths_and_bare_ids():
+    assert web_agent._explicit_youtube_url("/data/video.mp4") == ""
+    assert web_agent._explicit_youtube_url("abc123") == ""
+    assert web_agent._explicit_youtube_url("https://example.com/watch?v=abc123") == ""
+    assert web_agent._explicit_youtube_url("https://youtu.be/abc123?t=3") == "https://www.youtube.com/watch?v=abc123"
 
 
 def test_retry_failed_agent_regenerates_glossary_from_existing_source(monkeypatch, tmp_path: Path):
@@ -3591,6 +3799,45 @@ def test_ocr_extract_job_downloads_ocr_compatible_video(monkeypatch, tmp_path: P
     assert snapshot["status"] == "done"
     download_call = next(call for call in calls if call[:3] == ["/python", "-m", "video_translate.youtube.download_video"])
     assert download_call[download_call.index("--quality") + 1] == "1080p"
+
+
+def test_ocr_extract_job_reuses_prebound_project_video(monkeypatch, tmp_path: Path):
+    downloads = tmp_path / "YoutubeDownloads"
+    project = downloads / "Target Video"
+    project.mkdir(parents=True)
+    video = project / "Target Video.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "agent_jobs")
+    monkeypatch.setattr(web_agent, "PYTHON", "/python")
+    calls = []
+
+    def fake_run_command(job_id, args):
+        calls.append(args)
+        if args[:2] == ["/python", str(web_agent.ROOT / "run_from_config.py")]:
+            (web_agent.JOB_DIR / job_id / "source.srt").write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\n안녕\n",
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr(web_agent, "_run_command", fake_run_command)
+
+    job = web_agent.ocr_extract_job(
+        {
+            "url": "abc123",
+            "title": "Target Video",
+            "input_video": str(video),
+            "ocr_extraction_mode": "region_v3",
+            "ocr_shape_mode": "horizontal_strict",
+        }
+    )
+    snapshot = _wait_job_status(job.id, "done")
+
+    assert snapshot["result"]["input_video"] == str(video)
+    assert not any(call[:3] == ["/python", "-m", "video_translate.youtube.download_video"] for call in calls)
+    manifest = yaml.safe_load((project / "project.yaml").read_text(encoding="utf-8"))
+    assert manifest["source_type"] == "youtube"
+    assert manifest["normalized_url"] == "https://www.youtube.com/watch?v=abc123"
 
 
 def test_ocr_extract_job_uses_existing_file_matching_title(monkeypatch, tmp_path: Path):

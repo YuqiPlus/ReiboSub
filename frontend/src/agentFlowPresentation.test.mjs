@@ -31,6 +31,7 @@ test('maps every current backend phase to a stable stage', () => {
   const expected = {
     created: 'analyze',
     probe: 'analyze',
+    download_video_for_project: 'source',
     download_video_for_audio_probe: 'analyze',
     probe_audio_language: 'analyze',
     confirm_subtitle: 'decide',
@@ -39,6 +40,9 @@ test('maps every current backend phase to a stable stage', () => {
     confirm_hybrid_ocr_settings: 'decide',
     confirm_ocr_reuse: 'decide',
     download_subtitle: 'source',
+    download_video_for_subtitle: 'source',
+    download_video_for_manual: 'source',
+    download_video_for_ocr: 'source',
     download_reference_subtitle: 'source',
     dual_subtitle_reference: 'source',
     download_anchor_subtitle: 'source',
@@ -51,6 +55,7 @@ test('maps every current backend phase to a stable stage', () => {
     asr_ocr_refine: 'source',
     generate_glossary: 'glossary',
     review_glossary: 'glossary',
+    download_video_for_translation: 'translate',
     translate: 'translate',
     done: 'deliver',
   }
@@ -64,6 +69,8 @@ test('maps every current backend phase to a stable stage', () => {
 
 test('labels phases that were missing from the old progress rail', () => {
   assert.equal(sessionPhaseLabel('created'), '等待启动')
+  assert.equal(sessionPhaseLabel('download_video_for_project'), '下载工程视频')
+  assert.equal(sessionPhaseLabel('download_video_for_ocr'), '下载视频用于 OCR')
   assert.equal(sessionPhaseLabel('download_video_for_preview'), '下载视频用于 OCR 预览')
   assert.equal(sessionPhaseLabel('download_video_for_asr'), '下载视频用于 ASR')
   assert.equal(sessionPhaseLabel('diagnose_ocr_asr'), '等待选择 OCR / ASR 路线')
@@ -189,6 +196,18 @@ test('describes running probe and OCR operations in user-facing language', () =>
     message: 'OCR 正在逐帧识别，耗时取决于视频长度。',
   })
   assert.equal(agentOperationPresentation({ status: 'waiting', phase: 'probe' }), null)
+})
+
+test('shows safe progress while downloading the project video', () => {
+  const operation = agentOperationPresentation({
+    status: 'running',
+    phase: 'download_video_for_project',
+    result: { current_job_logs: ['[download]  18.25% of 120.00MiB'] },
+  })
+
+  assert.equal(operation.title, '正在下载工程视频')
+  assert.match(operation.message, /18\.3%/)
+  assert.match(operation.message, /继续当前处理/)
 })
 
 test('extracts only safe download progress and never exposes raw logs or paths', () => {
