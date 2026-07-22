@@ -62,7 +62,7 @@
             <label for="settingsDefaultProvider">默认服务商</label>
             <select
               id="settingsDefaultProvider"
-              v-model="draft.defaults.provider_profile"
+              :value="draft.defaults.provider_profile"
               @change="handleDefaultProviderChange"
             >
               <option
@@ -158,9 +158,11 @@
           <div class="settings-provider-create-head">
             <div>
               <b>新增 OpenAI-compatible 服务商</b>
-            <p>服务定义写入本地 Provider YAML；密钥和地址写入私密 YAML，密钥不会回显，也不会在创建时主动请求新地址。</p>
+              <p>先保存名称和连接；创建成功后会自动拉取模型，并留在这里选择默认模型。</p>
             </div>
-            <button type="button" class="secondary mini" :disabled="providerManaging" @click="cancelCreateProvider">取消</button>
+            <button type="button" class="secondary mini" :disabled="providerManaging" @click="cancelCreateProvider">
+              {{ createdProviderId ? '完成' : '取消' }}
+            </button>
           </div>
           <div class="settings-provider-create-grid">
             <div>
@@ -171,7 +173,7 @@
                 autocomplete="off"
                 spellcheck="false"
                 placeholder="例如 siliconflow"
-                :disabled="providerManaging"
+                :disabled="providerManaging || Boolean(createdProviderId)"
               />
               <p class="muted settings-field-help">仅限小写字母、数字、点、下划线和连字符。</p>
             </div>
@@ -182,7 +184,7 @@
                 v-model.trim="newProviderDraft.label"
                 autocomplete="off"
                 placeholder="例如 SiliconFlow"
-                :disabled="providerManaging"
+                :disabled="providerManaging || Boolean(createdProviderId)"
               />
             </div>
             <div>
@@ -195,7 +197,7 @@
                 autocomplete="off"
                 spellcheck="false"
                 placeholder="https://api.example.com/v1"
-                :disabled="providerManaging"
+                :disabled="providerManaging || Boolean(createdProviderId)"
               />
             </div>
             <div>
@@ -208,18 +210,7 @@
                 autocomplete="new-password"
                 spellcheck="false"
                 placeholder="只写，不回显"
-                :disabled="providerManaging"
-              />
-            </div>
-            <div>
-              <label for="settingsNewProviderModel">初始模型 ID <span class="muted">（可选）</span></label>
-              <input
-                id="settingsNewProviderModel"
-                v-model.trim="newProviderDraft.default_model"
-                autocomplete="off"
-                spellcheck="false"
-                placeholder="例如 model-name"
-                :disabled="providerManaging"
+                :disabled="providerManaging || Boolean(createdProviderId)"
               />
             </div>
             <div>
@@ -232,28 +223,73 @@
                 autocomplete="off"
                 spellcheck="false"
                 placeholder="默认使用 Base URL + /models"
-                :disabled="providerManaging"
+                :disabled="providerManaging || Boolean(createdProviderId)"
               />
-            </div>
-            <div class="settings-provider-models-field">
-              <label for="settingsNewProviderStaticModels">其他静态模型 <span class="muted">（可选）</span></label>
-              <textarea
-                id="settingsNewProviderStaticModels"
-                v-model="newProviderDraft.models_text"
-                rows="4"
-                spellcheck="false"
-                placeholder="每行一个模型 ID，也可以用逗号分隔"
-                :disabled="providerManaging"
-              />
+              <p class="muted settings-field-help">通常留空，默认请求 Base URL 下的模型列表接口。</p>
             </div>
           </div>
-          <div class="settings-provider-create-actions">
+          <div v-if="!createdProviderId" class="settings-provider-create-actions">
             <button type="button" :disabled="!canCreateProvider" @click="submitCreateProvider">
-              {{ providerManaging ? '正在创建…' : '创建服务商' }}
+              {{ providerManaging ? '正在创建…' : '创建并获取模型' }}
             </button>
             <span v-if="newProviderDraft.id && !providerIdIsValid(newProviderDraft.id)" class="settings-inline-error">
               Provider ID 格式不正确。
             </span>
+          </div>
+
+          <div v-else class="settings-provider-default-model">
+            <div class="settings-provider-create-head">
+              <div>
+                <b>服务商已创建，选择默认模型</b>
+                <p>后续模块留空模型 ID 时，会使用这里保存的默认模型。</p>
+              </div>
+              <span class="badge done">连接已保存</span>
+            </div>
+            <div class="settings-model-input-row">
+              <select
+                v-if="createdProviderModels.length"
+                id="settingsNewProviderModel"
+                v-model="newProviderDraft.default_model"
+                :disabled="providerManaging"
+              >
+                <option value="" disabled>请选择默认模型</option>
+                <option v-for="model in createdProviderModels" :key="model" :value="model">{{ model }}</option>
+              </select>
+              <input
+                v-else
+                id="settingsNewProviderModel"
+                v-model.trim="newProviderDraft.default_model"
+                autocomplete="off"
+                spellcheck="false"
+                :placeholder="createdProviderFetching ? '正在获取模型…' : '获取失败时可手动填写模型 ID'"
+                :disabled="providerManaging || createdProviderFetching"
+              />
+              <button
+                type="button"
+                class="secondary"
+                :disabled="providerManaging || createdProviderFetching"
+                @click="requestModels(createdProviderId)"
+              >
+                {{ createdProviderFetching ? '正在获取…' : (createdProviderModelError ? '重试获取' : '刷新模型') }}
+              </button>
+            </div>
+            <p v-if="createdProviderModelError" class="settings-inline-error">
+              模型列表获取失败：{{ createdProviderModelError }}。可以重试，也可以手动填写模型 ID。
+            </p>
+            <p v-else class="muted settings-field-help">
+              {{ createdProviderModels.length ? `已获取 ${createdProviderModels.length} 个模型，请从列表中选择。` : '模型列表为空，可以手动填写。' }}
+            </p>
+            <div class="settings-provider-create-actions">
+              <button
+                type="button"
+                :disabled="providerManaging || !createdProviderDefaultModelDirty"
+                @click="submitCreatedProviderDefaultModel"
+              >
+                {{ providerManaging && pendingCreatedDefaultModel ? '正在保存…' : '保存默认模型' }}
+              </button>
+              <span v-if="pendingCreatedDefaultModel" class="muted">等待服务端保存…</span>
+              <span v-else-if="createdProviderSavedModel" class="badge done">默认模型已保存</span>
+            </div>
           </div>
         </div>
 
@@ -289,13 +325,34 @@
             </div>
             <div>
               <label for="settingsEditProviderDefaultModel">默认模型 ID <span class="muted">（可留空）</span></label>
-              <input
-                id="settingsEditProviderDefaultModel"
-                v-model.trim="editProviderDraft.default_model"
-                autocomplete="off"
-                spellcheck="false"
-                :disabled="providerManaging"
-              />
+              <div class="settings-model-input-row">
+                <select
+                  v-if="selectedProviderModels.length"
+                  id="settingsEditProviderDefaultModel"
+                  v-model="editProviderDraft.default_model"
+                  :disabled="providerManaging"
+                >
+                  <option value="">不设置默认模型</option>
+                  <option v-for="model in selectedProviderModels" :key="model" :value="model">{{ model }}</option>
+                </select>
+                <input
+                  v-else
+                  id="settingsEditProviderDefaultModel"
+                  v-model.trim="editProviderDraft.default_model"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="暂无候选，请手动填写模型 ID"
+                  :disabled="providerManaging || selectedProviderFetching"
+                />
+                <button
+                  type="button"
+                  class="secondary mini"
+                  :disabled="providerManaging || selectedProviderFetching"
+                  @click="requestModels(selectedProviderId)"
+                >
+                  {{ selectedProviderFetching ? '获取中' : '刷新' }}
+                </button>
+              </div>
             </div>
             <div class="settings-provider-models-field">
               <label for="settingsEditProviderStaticModels">静态模型列表 <span class="muted">（可留空）</span></label>
@@ -319,7 +376,7 @@
         </div>
 
         <div v-if="selectedProviderModelError" class="status bad settings-model-error">
-          远程模型获取失败：{{ selectedProviderModelError }}。可以继续使用配置文件中的模型，或在下方直接填写模型 ID。
+          远程模型获取失败：{{ selectedProviderModelError }}。可以继续使用已保存的模型，或在下方直接填写模型 ID。
         </div>
 
         <div v-if="selectedProviderId" class="settings-connection-editor">
@@ -387,7 +444,7 @@
                 />
                 <p class="muted settings-field-help">
                   {{ activeConnection.endpoint_origin_change_allowed
-                    ? '保存后优先使用本地地址；清空可恢复进程环境变量 / 服务配置。'
+                    ? '地址会保存在 provider_secrets.yaml；通常不需要手工编辑文件。'
                     : '远程页面可修改同一服务的路径；切换服务来源或清空 Base URL 需要本机 / SSH。' }}
                 </p>
               </div>
@@ -417,15 +474,7 @@
                 :disabled="connectionLoading || connectionSaving || !connectionDirty || connectionEndpointChangeBlocked"
                 @click="saveLocalConnection"
               >
-                {{ connectionSaving ? '正在保存…' : (connectionEndpointChangeBlocked ? '跨来源地址需本机保存' : '保存本地连接') }}
-              </button>
-              <button
-                type="button"
-                class="secondary"
-                :disabled="connectionLoading || connectionSaving || !activeConnection.key_write_allowed"
-                @click="importCurrentConnection"
-              >
-                导入当前环境变量 / 配置
+                {{ connectionSaving ? '正在保存…' : (connectionEndpointChangeBlocked ? '跨来源地址需本机保存' : '保存连接') }}
               </button>
               <button
                 type="button"
@@ -433,7 +482,7 @@
                 :disabled="connectionLoading || connectionSaving || !activeConnection.key_write_allowed || !activeConnection.local_key_configured"
                 @click="clearLocalApiKey"
               >
-                清除本地密钥
+                清除密钥
               </button>
             </div>
 
@@ -452,7 +501,7 @@
             <span class="eyebrow">03 · 模块</span>
             <h3>模型绑定</h3>
           </div>
-          <span class="muted">模型框支持搜索建议和手动输入完整 ID</span>
+          <span class="muted">有远程候选时直接选择；列表为空时才需要手动填写</span>
         </div>
 
         <div class="settings-model-list">
@@ -467,7 +516,7 @@
               <label :for="`settingsProvider-${task.key}`">服务配置</label>
               <select
                 :id="`settingsProvider-${task.key}`"
-                v-model="draft.tasks[task.key].provider_profile"
+                :value="draft.tasks[task.key].provider_profile"
                 @change="handleTaskProviderChange(task.key, $event)"
               >
                 <option value="">跟随默认（{{ defaultProviderName }}）</option>
@@ -486,12 +535,28 @@
             <div class="settings-model-input">
               <label :for="`settingsModel-${task.key}`">模型 ID</label>
               <div class="settings-model-input-row">
+                <select
+                  v-if="modelsForTask(task.key).length"
+                  :id="`settingsModel-${task.key}`"
+                  v-model="draft.tasks[task.key].model"
+                  @focus="ensureTaskModelCatalog(task.key)"
+                >
+                  <option value="">使用服务商默认模型{{ defaultModelForTask(task.key) ? `（${defaultModelForTask(task.key)}）` : '' }}</option>
+                  <option
+                    v-if="taskModelAwaitingValidation(task.key)"
+                    :value="draft.tasks[task.key].model"
+                  >
+                    {{ draft.tasks[task.key].model }}（等待刷新验证）
+                  </option>
+                  <option v-for="model in modelsForTask(task.key)" :key="model" :value="model">{{ model }}</option>
+                </select>
                 <input
+                  v-else
                   :id="`settingsModel-${task.key}`"
                   v-model.trim="draft.tasks[task.key].model"
-                  :list="`settingsModels-${task.key}`"
                   autocomplete="off"
-                  placeholder="选择或手动输入模型 ID"
+                  placeholder="暂无候选，请手动填写模型 ID"
+                  :disabled="isProviderFetching(providerIdForTask(task.key))"
                 />
                 <button
                   type="button"
@@ -502,11 +567,8 @@
                   {{ isProviderFetching(providerIdForTask(task.key)) ? '获取中' : '刷新' }}
                 </button>
               </div>
-              <datalist :id="`settingsModels-${task.key}`">
-                <option v-for="model in modelsForTask(task.key)" :key="model" :value="model" />
-              </datalist>
               <p v-if="modelErrorFor(providerIdForTask(task.key))" class="settings-inline-error">
-                列表获取失败，手填仍然有效。
+                列表获取失败；没有本地候选时可手填，或点击“刷新”重试。
               </p>
               <p v-else class="muted settings-field-help">
                 {{ modelsForTask(task.key).length ? `${modelsForTask(task.key).length} 个可选模型` : '无可选列表，请手动填写' }}
@@ -536,6 +598,8 @@ import { computed, ref, watch } from 'vue'
 import {
   SETTINGS_TASKS,
   SOURCE_LANGUAGE_OPTIONS,
+  applyDefaultProviderChange,
+  applyTaskProviderChange,
   buildSettingsPayload,
   normalizeSettings,
   providerCredentialState,
@@ -554,6 +618,7 @@ import {
   providerIdIsValid,
   providerMetadataMatches,
   replacementProviderId,
+  reconcileTaskModelBindings,
   resolvedProviderId,
   shouldFetchProviderModelsOnSelection,
 } from '../settingsState.js'
@@ -586,12 +651,15 @@ const emit = defineEmits([
   'update-provider',
   'delete-provider',
 ])
-const draft = ref(normalizeSettings(props.settings, props.providers))
-const savedPayload = ref(JSON.stringify(buildSettingsPayload(draft.value)))
+const initialSettings = normalizeSettings(props.settings, props.providers)
+const draft = ref(reconcileTaskModelBindings(initialSettings, props.providers, props.modelsByProvider))
+const savedPayload = ref(JSON.stringify(buildSettingsPayload(initialSettings)))
 const connectionDraft = ref(createProviderConnectionDraft())
 const showCreateProvider = ref(false)
 const newProviderDraft = ref(createProviderDraft())
 const pendingCreatedProviderId = ref('')
+const createdProviderId = ref('')
+const pendingCreatedDefaultModel = ref('')
 const showEditProvider = ref(false)
 const editProviderDraft = ref(createProviderMetadataDraft())
 const editProviderSavedPayload = ref('')
@@ -600,8 +668,17 @@ const pendingUpdatedProvider = ref(null)
 watch(
   () => props.settings,
   (settings) => {
-    draft.value = normalizeSettings(settings, props.providers)
-    savedPayload.value = JSON.stringify(buildSettingsPayload(draft.value))
+    const normalized = normalizeSettings(settings, props.providers)
+    draft.value = reconcileTaskModelBindings(normalized, props.providers, props.modelsByProvider)
+    savedPayload.value = JSON.stringify(buildSettingsPayload(normalized))
+  },
+  { deep: true },
+)
+
+watch(
+  [() => props.providers, () => props.modelsByProvider],
+  ([providers, modelsByProvider]) => {
+    draft.value = reconcileTaskModelBindings(draft.value, providers, modelsByProvider)
   },
   { deep: true },
 )
@@ -623,6 +700,15 @@ const selectedProviderFetching = computed(() => isProviderFetching(selectedProvi
 const selectedProviderModelError = computed(() => modelErrorFor(selectedProviderId.value))
 const defaultProviderModels = computed(() => providerModels(defaultProviderId.value, props.providers, props.modelsByProvider))
 const defaultProviderFetching = computed(() => isProviderFetching(defaultProviderId.value))
+const createdProvider = computed(() => providerById.value.get(createdProviderId.value) || null)
+const createdProviderModels = computed(() => providerModels(createdProviderId.value, props.providers, props.modelsByProvider))
+const createdProviderFetching = computed(() => isProviderFetching(createdProviderId.value))
+const createdProviderModelError = computed(() => modelErrorFor(createdProviderId.value))
+const createdProviderSavedModel = computed(() => String(createdProvider.value?.default_model || '').trim())
+const createdProviderDefaultModelDirty = computed(() => (
+  Boolean(String(newProviderDraft.value.default_model || '').trim())
+  && String(newProviderDraft.value.default_model || '').trim() !== createdProviderSavedModel.value
+))
 const credential = computed(() => providerCredentialState(defaultProvider.value))
 const credentialBadgeClass = computed(() => ({
   done: credential.value.state === 'configured',
@@ -646,6 +732,7 @@ const canDeleteSelectedProvider = computed(() => (
 const canCreateProvider = computed(() => (
   props.providerManagementAllowed
   && !props.providerManaging
+  && !createdProviderId.value
   && providerIdIsValid(newProviderDraft.value.id)
   && Boolean(String(newProviderDraft.value.base_url || '').trim())
 ))
@@ -706,8 +793,17 @@ watch(
     const pendingId = pendingCreatedProviderId.value
     if (pendingId && (providers || []).some((provider) => String(provider?.id || '') === pendingId)) {
       pendingCreatedProviderId.value = ''
-      showCreateProvider.value = false
-      newProviderDraft.value = createProviderDraft()
+      createdProviderId.value = pendingId
+      const created = (providers || []).find((provider) => String(provider?.id || '') === pendingId)
+      newProviderDraft.value.default_model = String(created?.default_model || '').trim()
+    }
+
+    const pendingModel = pendingCreatedDefaultModel.value
+    if (pendingModel && createdProviderId.value) {
+      const created = (providers || []).find((provider) => String(provider?.id || '') === createdProviderId.value)
+      if (String(created?.default_model || '').trim() === pendingModel) {
+        pendingCreatedDefaultModel.value = ''
+      }
     }
 
     const pendingUpdate = pendingUpdatedProvider.value
@@ -738,6 +834,31 @@ function modelsForTask(taskKey) {
   return providerModels(providerIdForTask(taskKey), props.providers, props.modelsByProvider)
 }
 
+function defaultModelForTask(taskKey) {
+  const provider = providerById.value.get(providerIdForTask(taskKey))
+  return String(provider?.default_model || provider?.model_name || '').trim()
+}
+
+function providerCatalogLoaded(providerId) {
+  return Object.prototype.hasOwnProperty.call(props.modelsByProvider || {}, providerId)
+}
+
+function taskModelAwaitingValidation(taskKey) {
+  const model = String(draft.value.tasks[taskKey]?.model || '').trim()
+  const providerId = providerIdForTask(taskKey)
+  return Boolean(
+    model
+    && !providerCatalogLoaded(providerId)
+    && !modelsForTask(taskKey).includes(model)
+  )
+}
+
+function ensureTaskModelCatalog(taskKey) {
+  const providerId = providerIdForTask(taskKey)
+  if (!shouldFetchProviderModelsOnSelection(providerId, props.providers, props.modelsByProvider)) return
+  requestModels(providerId)
+}
+
 function isProviderFetching(providerId) {
   return Boolean(providerId) && props.fetchingProviderId === providerId
 }
@@ -757,6 +878,7 @@ function requestModels(providerId) {
 
 function handleDefaultProviderChange(event) {
   const providerId = String(event?.target?.value || '').trim()
+  draft.value = applyDefaultProviderChange(draft.value, providerId)
   emit('select-provider', providerId)
   if (!shouldFetchProviderModelsOnSelection(providerId, props.providers, props.modelsByProvider)) return
   requestModels(providerId)
@@ -772,6 +894,7 @@ function handleManagedProviderChange(event) {
 
 function handleTaskProviderChange(taskKey, event) {
   const selectedId = String(event?.target?.value || '').trim()
+  draft.value = applyTaskProviderChange(draft.value, taskKey, selectedId)
   const providerId = selectedId || defaultProviderId.value
   if (!taskKey || !shouldFetchProviderModelsOnSelection(providerId, props.providers, props.modelsByProvider)) return
   requestModels(providerId)
@@ -789,18 +912,9 @@ function saveLocalConnection() {
   emit('save-connection', { providerId: selectedProviderId.value, payload })
 }
 
-function importCurrentConnection() {
-  if (!selectedProviderId.value || props.connectionSaving || !activeConnection.value.key_write_allowed) return
-  connectionDraft.value.api_key = ''
-  emit('save-connection', {
-    providerId: selectedProviderId.value,
-    payload: { import_current: true },
-  })
-}
-
 function clearLocalApiKey() {
   if (!selectedProviderId.value || props.connectionSaving || !activeConnection.value.key_write_allowed || !activeConnection.value.local_key_configured) return
-  if (typeof window !== 'undefined' && !window.confirm('确定清除这个服务的本地密钥吗？进程环境变量或服务配置中的值不会被删除。')) return
+  if (typeof window !== 'undefined' && !window.confirm('确定清除这个服务的密钥吗？清除后需要重新填写，才能获取模型或发起请求。')) return
   connectionDraft.value.api_key = ''
   emit('save-connection', {
     providerId: selectedProviderId.value,
@@ -812,6 +926,10 @@ function openCreateProvider() {
   if (!props.providerManagementAllowed || props.providerManaging) return
   showEditProvider.value = false
   pendingUpdatedProvider.value = null
+  pendingCreatedProviderId.value = ''
+  createdProviderId.value = ''
+  pendingCreatedDefaultModel.value = ''
+  newProviderDraft.value = createProviderDraft()
   showCreateProvider.value = true
 }
 
@@ -819,6 +937,8 @@ function cancelCreateProvider() {
   if (props.providerManaging) return
   showCreateProvider.value = false
   pendingCreatedProviderId.value = ''
+  createdProviderId.value = ''
+  pendingCreatedDefaultModel.value = ''
   newProviderDraft.value = createProviderDraft()
 }
 
@@ -828,6 +948,17 @@ function submitCreateProvider() {
   pendingCreatedProviderId.value = payload.id
   newProviderDraft.value.api_key = ''
   emit('create-provider', payload)
+}
+
+function submitCreatedProviderDefaultModel() {
+  const providerId = createdProviderId.value
+  const defaultModel = String(newProviderDraft.value.default_model || '').trim()
+  if (!providerId || !defaultModel || props.providerManaging || !createdProviderDefaultModelDirty.value) return
+  pendingCreatedDefaultModel.value = defaultModel
+  emit('update-provider', {
+    providerId,
+    payload: { default_model: defaultModel },
+  })
 }
 
 function openEditProvider() {

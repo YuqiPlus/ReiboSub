@@ -322,6 +322,55 @@ tasks:
     )
 
 
+def test_selected_profile_uses_its_default_instead_of_stale_legacy_model(tmp_path: Path, monkeypatch):
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    (config_dir / "llm.yaml").write_text(
+        """
+defaults:
+  model: stale-legacy-model
+tasks:
+  subtitle_translation:
+    fallback_models:
+      - stale-legacy-fallback
+""",
+        encoding="utf-8",
+    )
+    (config_dir / "app_settings.yaml").write_text(
+        """
+version: 1
+defaults:
+  provider_profile: selected-profile
+tasks:
+  subtitle_translation:
+    provider_profile: ''
+    model: ''
+""",
+        encoding="utf-8",
+    )
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setattr(
+        llm_config,
+        "_get_provider_profile",
+        lambda profile_id, root: SimpleNamespace(
+            base_url="https://selected.example/v1",
+            api_key="selected-key",
+            api_key_env=None,
+            default_model="selected-default-model",
+        ) if profile_id == "selected-profile" else None,
+    )
+
+    task = load_llm_task_config("subtitle_translation", root=tmp_path)
+
+    assert task == LLMTaskConfig(
+        model="selected-default-model",
+        base_url="https://selected.example/v1",
+        api_key="selected-key",
+        provider="openai-compatible",
+        provider_profile="selected-profile",
+    )
+
+
 def test_app_settings_explicit_values_override_overlay_and_overlay_fallbacks_are_kept(tmp_path: Path, monkeypatch):
     config_dir = tmp_path / "configs"
     config_dir.mkdir()

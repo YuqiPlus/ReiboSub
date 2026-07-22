@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 
 import {
   SETTINGS_TASKS,
+  applyDefaultProviderChange,
+  applyTaskProviderChange,
   buildProviderConnectionPayload,
   buildCreateProviderPayload,
   buildUpdateProviderPayload,
@@ -20,6 +22,7 @@ import {
   providerIdIsValid,
   providerMetadataMatches,
   providerModels,
+  reconcileTaskModelBindings,
   replacementProviderId,
   resolvedProviderId,
   shouldFetchProviderModelsOnSelection,
@@ -77,7 +80,132 @@ test('keeps explicit provider and model bindings while dropping unknown tasks fr
   assert.equal(payload.tasks.unsupported_task, undefined)
 })
 
-test('merges profile and remote model lists without preventing manual values', () => {
+test('changing the default provider clears only models inherited from the old default', () => {
+  const settings = normalizeSettings({
+    defaults: { provider_profile: 'volcano' },
+    tasks: {
+      glossary: { provider_profile: '', model: 'doubao-glossary' },
+      subtitle_translation: { provider_profile: 'qianwen', model: 'qwen-plus' },
+      title_translation: { provider_profile: '', model: 'doubao-title' },
+    },
+  })
+
+  const changed = applyDefaultProviderChange(settings, 'openai')
+
+  assert.equal(changed.defaults.provider_profile, 'openai')
+  assert.deepEqual(changed.tasks.glossary, { provider_profile: '', model: '' })
+  assert.deepEqual(changed.tasks.title_translation, { provider_profile: '', model: '' })
+  assert.deepEqual(changed.tasks.subtitle_translation, {
+    provider_profile: 'qianwen',
+    model: 'qwen-plus',
+  })
+  assert.equal(settings.tasks.glossary.model, 'doubao-glossary')
+})
+
+test('changing a task provider clears its stale model, including when switching back to inherit', () => {
+  const settings = normalizeSettings({
+    defaults: { provider_profile: 'volcano' },
+    tasks: {
+      subtitle_translation: { provider_profile: 'qianwen', model: 'qwen-plus' },
+    },
+  })
+
+  const explicit = applyTaskProviderChange(settings, 'subtitle_translation', 'openai')
+  assert.deepEqual(explicit.tasks.subtitle_translation, {
+    provider_profile: 'openai',
+    model: '',
+  })
+
+  const inherited = applyTaskProviderChange(settings, 'subtitle_translation', '')
+  assert.deepEqual(inherited.tasks.subtitle_translation, {
+    provider_profile: '',
+    model: '',
+  })
+  assert.equal(settings.tasks.subtitle_translation.model, 'qwen-plus')
+})
+
+test('keeps the model when toggling inherit versus the same effective provider', () => {
+  const inherited = normalizeSettings({
+    defaults: { provider_profile: 'volcano' },
+    tasks: { glossary: { provider_profile: '', model: 'doubao-lite' } },
+  })
+  const explicit = applyTaskProviderChange(inherited, 'glossary', 'volcano')
+  const backToInherited = applyTaskProviderChange(explicit, 'glossary', '')
+
+  assert.deepEqual(explicit.tasks.glossary, {
+    provider_profile: 'volcano',
+    model: 'doubao-lite',
+  })
+  assert.deepEqual(backToInherited.tasks.glossary, {
+    provider_profile: '',
+    model: 'doubao-lite',
+  })
+})
+
+test('reconciles stale task models by exact provider catalog membership', () => {
+  const providers = [
+    { id: 'volcano', default_model: 'doubao-pro', models: ['doubao-pro', 'doubao-lite'] },
+    { id: 'openai', default_model: 'gpt-5.6-sol', models: ['gpt-5.6-sol'] },
+    { id: 'manual', models: [] },
+  ]
+  const settings = {
+    defaults: { provider_profile: 'volcano' },
+    tasks: {
+      glossary: { provider_profile: 'openai', model: 'doubao-lite' },
+      subtitle_translation: { provider_profile: 'openai', model: 'gpt-5.6-sol' },
+      asr_correction: { provider_profile: 'manual', model: 'private-model' },
+    },
+  }
+
+  const reconciled = reconcileTaskModelBindings(settings, providers, {
+    openai: ['gpt-5.4', 'gpt-5.6-sol'],
+  })
+
+  assert.equal(reconciled.tasks.glossary.model, '')
+  assert.equal(reconciled.tasks.subtitle_translation.model, 'gpt-5.6-sol')
+  assert.equal(reconciled.tasks.asr_correction.model, 'private-model')
+  assert.equal(settings.tasks.glossary.model, 'doubao-lite')
+})
+
+test('preserves a remote model until its provider catalog has actually loaded', () => {
+  const providers = [{
+    id: 'openai',
+    default_model: 'gpt-5.6-sol',
+    models: ['gpt-5.6-sol'],
+  }]
+  const settings = {
+    defaults: { provider_profile: 'openai' },
+    tasks: { glossary: { provider_profile: 'openai', model: 'gpt-5.4' } },
+  }
+
+  assert.equal(reconcileTaskModelBindings(settings, providers, {}).tasks.glossary.model, 'gpt-5.4')
+  assert.equal(
+    reconcileTaskModelBindings(settings, providers, { openai: ['gpt-5.4', 'gpt-5.6-sol'] }).tasks.glossary.model,
+    'gpt-5.4',
+  )
+  assert.equal(
+    reconcileTaskModelBindings(settings, providers, { openai: ['gpt-5.6-sol'] }).tasks.glossary.model,
+    '',
+  )
+})
+
+test('reselecting the same provider keeps the selected model', () => {
+  const settings = normalizeSettings({
+    defaults: { provider_profile: 'volcano' },
+    tasks: {
+      glossary: { provider_profile: '', model: 'doubao-glossary' },
+      subtitle_translation: { provider_profile: 'qianwen', model: 'qwen-plus' },
+    },
+  })
+
+  assert.equal(applyDefaultProviderChange(settings, 'volcano').tasks.glossary.model, 'doubao-glossary')
+  assert.equal(
+    applyTaskProviderChange(settings, 'subtitle_translation', 'qianwen').tasks.subtitle_translation.model,
+    'qwen-plus',
+  )
+})
+
+test('uses a fetched remote catalog instead of mixing in stale profile fallbacks', () => {
   const providers = [{
     id: 'volcano',
     model_name: 'doubao-seed-2-0-lite',
@@ -93,14 +221,12 @@ test('merges profile and remote model lists without preventing manual values', (
   }
 
   assert.deepEqual(providerModels('volcano', providers, remoteModels), [
-    'doubao-seed-2-0-pro',
-    'deepseek-v4-pro',
     'doubao-seed-2-0-lite',
     'kimi-k2.6',
   ])
 })
 
-test('reconciles saved provider profiles with already fetched model lists', () => {
+test('drops removed providers and keeps fetched catalogs authoritative', () => {
   const providers = [
     { id: 'volcano', models: ['doubao-seed-2-0-lite'] },
     { id: 'qianwen', models: [] },
@@ -112,7 +238,7 @@ test('reconciles saved provider profiles with already fetched model lists', () =
   })
 
   assert.deepEqual(result, {
-    volcano: ['doubao-seed-2-0-lite', 'doubao-seed-2-0-pro'],
+    volcano: ['doubao-seed-2-0-pro'],
     qianwen: ['qwen-plus'],
   })
 })
@@ -203,8 +329,8 @@ test('clearing an inherited base URL uses the explicit clear flag', () => {
 })
 
 test('formats connection source values for the settings UI', () => {
-  assert.equal(providerConnectionSourceLabel('local'), '本地私密配置')
-  assert.equal(providerConnectionSourceLabel('env'), '进程环境变量（兼容旧配置）')
+  assert.equal(providerConnectionSourceLabel('local'), '网页保存')
+  assert.equal(providerConnectionSourceLabel('env'), '旧环境变量（建议重新保存）')
   assert.equal(providerConnectionSourceLabel('unconfigured'), '未配置')
   assert.equal(providerConnectionSourceLabel('', { configured: false }), '未配置')
 })

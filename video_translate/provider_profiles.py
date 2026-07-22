@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import requests
 import yaml
@@ -17,11 +17,25 @@ from .provider_secrets import _get_provider_secret_override
 
 ROOT = Path(__file__).resolve().parent.parent
 PROVIDER_CONFIG_DIR = Path("configs") / "providers"
+PROVIDER_PROFILES_PATH = Path("configs") / "provider_profiles.yaml"
 MODEL_CACHE_TTL_SECONDS = 300.0
 
 _PROFILE_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
 _ENV_NAME_RE = re.compile(r"[A-Z_][A-Z0-9_]*")
 _MODEL_CACHE_LOCK = threading.Lock()
+_PROFILE_METADATA_FIELDS = frozenset(
+    {"label", "provider", "backend", "default_model", "models"}
+)
+_PROFILE_CONNECTION_FIELDS = frozenset(
+    {
+        "api_key",
+        "api_key_env",
+        "base_url",
+        "base_url_env",
+        "models_url",
+        "models_url_env",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -73,9 +87,73 @@ def list_provider_profiles(
     *,
     include_local: bool = True,
 ) -> list[ProviderProfile]:
-    """Load all trusted provider profiles under ``root/configs/providers``."""
+    """Load trusted provider profiles from the unified registry or legacy files."""
+
+    project_root = _project_root(root)
+    registry_path = project_root / PROVIDER_PROFILES_PATH
+    if _path_present(registry_path):
+        document = read_provider_metadata_document(project_root)
+        return [
+            _load_provider_profile_data(
+                dict(document["providers"][profile_id]),
+                profile_id,
+                root,
+                include_local=include_local,
+            )
+            for profile_id in sorted(document["providers"], key=str.casefold)
+        ]
+
+    return _list_legacy_provider_profiles(root, include_local=include_local)
+
+
+def read_provider_metadata_document(root: Path | None = None) -> dict[str, Any]:
+    """Return the canonical non-secret registry document.
+
+    When the unified registry does not exist, legacy profile files are read and
+    converted in memory. This function never includes connection fields or
+    resolved credentials in its result.
+    """
+
+    project_root = _project_root(root)
+    registry_path = project_root / PROVIDER_PROFILES_PATH
+    if _path_present(registry_path):
+        return _read_unified_provider_document(registry_path)
+
+    profiles = _list_legacy_provider_profiles(root, include_local=False)
+    return {
+        "version": 1,
+        "providers": {
+            profile.id: provider_profile_to_metadata(profile)
+            for profile in profiles
+        },
+    }
+
+
+def provider_profile_to_metadata(profile: ProviderProfile) -> dict[str, Any]:
+    """Serialize one profile without any connection or credential fields."""
+
+    metadata: dict[str, Any] = {
+        "label": profile.label,
+        "provider": profile.provider,
+        "backend": profile.backend,
+    }
+    if profile.default_model:
+        metadata["default_model"] = profile.default_model
+    if profile.static_models:
+        metadata["models"] = list(profile.static_models)
+    return metadata
+
+
+def _list_legacy_provider_profiles(
+    root: Path | None,
+    *,
+    include_local: bool,
+) -> list[ProviderProfile]:
+    """Load the old one-file-per-provider layout."""
 
     provider_dir = _provider_dir(root)
+    if provider_dir.is_symlink():
+        raise ValueError("configs/providers 不能是符号链接")
     if not provider_dir.is_dir():
         return []
 
@@ -154,7 +232,7 @@ def fetch_provider_models(
     models_url = _model_discovery_url(profile)
 
     if not models_url:
-        warning = "服务商没有配置模型列表地址，已显示配置文件中的静态模型。"
+        warning = _model_discovery_warning(profile)
     elif not profile.api_key:
         warning = "服务商 API Key 未配置，已显示配置文件中的静态模型。"
     else:
@@ -187,6 +265,11 @@ def fetch_provider_models(
         "provider": profile.provider,
         "profile": profile.to_public_dict(),
         "models": models,
+        # Keep the compatibility `models` union for API callers, while also
+        # exposing the actual endpoint catalog so the Settings UI does not
+        # mix static fallbacks into a successfully fetched model picker.
+        "remote_models": _sorted_unique(remote_models),
+        "static_models": _sorted_unique(static_models),
         "default_model": profile.default_model,
         "source": "remote" if remote_models else "static",
         "warning": warning,
@@ -220,6 +303,47 @@ def _provider_dir(root: Path | None) -> Path:
     return _project_root(root) / PROVIDER_CONFIG_DIR
 
 
+def _path_present(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _read_unified_provider_document(path: Path) -> dict[str, Any]:
+    if path.is_symlink():
+        raise ValueError("provider_profiles.yaml 不能是符号链接")
+    if not path.is_file():
+        raise ValueError("provider_profiles.yaml 必须是普通文件")
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (yaml.YAMLError, UnicodeError):
+        raise ValueError("provider_profiles.yaml 不是有效的 YAML") from None
+    if not isinstance(data, dict):
+        raise ValueError("provider_profiles.yaml 必须是 YAML 对象")
+    if data.get("version") != 1:
+        raise ValueError("provider_profiles.yaml 仅支持 version: 1")
+    raw_providers = data.get("providers")
+    if not isinstance(raw_providers, dict):
+        raise ValueError("provider_profiles.yaml 的 providers 必须是对象")
+
+    providers: dict[str, dict[str, Any]] = {}
+    for raw_id, raw_record in raw_providers.items():
+        profile_id = normalize_provider_id(raw_id)
+        if not isinstance(raw_record, dict):
+            raise ValueError(f"provider {profile_id} 的元数据必须是对象")
+        forbidden = sorted(set(raw_record) & _PROFILE_CONNECTION_FIELDS)
+        if forbidden:
+            raise ValueError(
+                f"provider {profile_id} 的连接配置不能写入 provider_profiles.yaml: "
+                f"{', '.join(forbidden)}"
+            )
+        unknown = sorted(set(raw_record) - _PROFILE_METADATA_FIELDS)
+        if unknown:
+            raise ValueError(
+                f"provider {profile_id} 含有不支持的元数据字段: {', '.join(unknown)}"
+            )
+        providers[profile_id] = dict(raw_record)
+    return {"version": 1, "providers": providers}
+
+
 def _load_provider_profile(
     path: Path,
     profile_id: str,
@@ -234,6 +358,22 @@ def _load_provider_profile(
     if not isinstance(data, dict):
         raise ValueError(f"provider 配置必须是 YAML 对象: {path.name}")
 
+    return _load_provider_profile_data(
+        data,
+        profile_id,
+        root,
+        include_local=include_local,
+    )
+
+
+def _load_provider_profile_data(
+    data: dict[str, Any],
+    profile_id: str,
+    root: Path | None,
+    *,
+    include_local: bool,
+) -> ProviderProfile:
+
     api_key, api_key_env, api_key_source = _resolve_secret(data, "api_key")
     base_url, base_url_source = _resolve_config_value(data, "base_url")
     models_url, models_url_source = _resolve_config_value(data, "models_url")
@@ -247,7 +387,12 @@ def _load_provider_profile(
     if "models_url" in local:
         models_url = local["models_url"]
         models_url_source = "local"
-    default_model = _clean(data.get("api_model_name") or data.get("model_name") or data.get("model"))
+    default_model = _clean(
+        data.get("default_model")
+        or data.get("api_model_name")
+        or data.get("model_name")
+        or data.get("model")
+    )
     static_models = _configured_static_models(data)
     models = _sorted_unique([default_model, *static_models])
     backend = _normalize_backend(data.get("backend") or data.get("interface") or "openai-compatible")
@@ -346,14 +491,31 @@ def _model_discovery_url(profile: ProviderProfile) -> str | None:
         # The same Bearer token is used for discovery. Never send it to a
         # catalog hosted on a different origin than the configured API.
         return None
-    base = raw.rstrip("/")
-    if not profile.models_url and base.endswith("/chat/completions"):
-        base = base[: -len("/chat/completions")]
-    url = base if profile.models_url else f"{base}/models"
-    parsed = urlparse(url)
+    parsed = urlparse(raw)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
-    return url
+    if profile.models_url:
+        return raw.rstrip("/")
+
+    path = parsed.path.rstrip("/")
+    for suffix in ("/chat/completions", "/responses", "/completions"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    if not path.endswith("/models"):
+        path = f"{path}/models"
+    return urlunparse(parsed._replace(path=path or "/models"))
+
+
+def _model_discovery_warning(profile: ProviderProfile) -> str:
+    if profile.models_url and _url_origin(profile.models_url) != _url_origin(profile.base_url):
+        return (
+            "模型列表地址与 API Base URL 不同源，出于密钥安全未发起请求；"
+            "已显示配置文件中的静态模型。"
+        )
+    if profile.models_url or profile.base_url:
+        return "模型列表地址不是有效的 HTTP/HTTPS URL，已显示配置文件中的静态模型。"
+    return "服务商没有配置模型列表地址，已显示配置文件中的静态模型。"
 
 
 def _url_origin(value: str | None) -> tuple[str, str, int | None] | None:
@@ -414,6 +576,8 @@ def _clean(value: Any) -> str | None:
 def _copy_model_result(result: dict[str, Any]) -> dict[str, Any]:
     copied = dict(result)
     copied["models"] = list(result.get("models") or [])
+    copied["remote_models"] = list(result.get("remote_models") or [])
+    copied["static_models"] = list(result.get("static_models") or [])
     copied["profile"] = dict(result.get("profile") or {})
     copied["profile"]["models"] = list(copied["profile"].get("models") or [])
     copied["profile"]["static_models"] = list(

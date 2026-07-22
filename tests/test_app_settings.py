@@ -110,6 +110,34 @@ tasks:
     assert payload["tasks"]["asr_correction"]["provider_profile"] == ""
 
 
+def test_load_preserves_explicit_empty_model_instead_of_restoring_legacy_model(tmp_path: Path) -> None:
+    _write_provider(tmp_path, "volcano", "model_name: provider-default\n")
+    config_dir = tmp_path / "configs"
+    (config_dir / "llm.yaml").write_text(
+        "defaults:\n  model: stale-legacy-model\n",
+        encoding="utf-8",
+    )
+    (config_dir / "app_settings.yaml").write_text(
+        """
+version: 1
+defaults:
+  provider_profile: volcano
+tasks:
+  subtitle_translation:
+    provider_profile: ''
+    model: ''
+""",
+        encoding="utf-8",
+    )
+
+    settings = get_app_settings_payload(tmp_path)["settings"]
+
+    assert settings["tasks"]["subtitle_translation"] == {
+        "provider_profile": "",
+        "model": "",
+    }
+
+
 def test_save_round_trip_is_normalized_atomic_and_drops_unknown_secret_fields(
     tmp_path: Path,
 ) -> None:

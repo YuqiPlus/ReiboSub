@@ -106,30 +106,80 @@ export function resolvedProviderId(binding, defaultProviderId = '') {
   return cleanText(binding?.provider_profile) || cleanText(defaultProviderId)
 }
 
+export function applyDefaultProviderChange(settings = {}, providerId = '') {
+  const normalized = normalizeSettings(settings)
+  const nextProviderId = cleanText(providerId)
+  const previousProviderId = cleanText(normalized.defaults.provider_profile)
+  normalized.defaults.provider_profile = nextProviderId
+
+  if (nextProviderId === previousProviderId) return normalized
+  for (const task of SETTINGS_TASKS) {
+    const binding = normalized.tasks[task.key]
+    if (!cleanText(binding.provider_profile)) binding.model = ''
+  }
+  return normalized
+}
+
+export function applyTaskProviderChange(settings = {}, taskKey = '', providerId = '') {
+  const normalized = normalizeSettings(settings)
+  const key = cleanText(taskKey)
+  if (!SETTINGS_TASKS.some((task) => task.key === key)) return normalized
+
+  const binding = normalized.tasks[key]
+  const nextProviderId = cleanText(providerId)
+  if (cleanText(binding.provider_profile) === nextProviderId) return normalized
+  const previousEffectiveProviderId = resolvedProviderId(binding, normalized.defaults.provider_profile)
+  const nextEffectiveProviderId = nextProviderId || cleanText(normalized.defaults.provider_profile)
+  binding.provider_profile = nextProviderId
+  if (previousEffectiveProviderId !== nextEffectiveProviderId) binding.model = ''
+  return normalized
+}
+
 export function providerModels(providerId, providers = [], modelsByProvider = {}) {
   const id = cleanText(providerId)
   if (!id) return []
   const provider = (providers || []).find((item) => cleanText(item?.id) === id) || {}
-  const remote = asObject(modelsByProvider)[id]
+  const remoteCatalogs = asObject(modelsByProvider)
+  const remote = remoteCatalogs[id]
+  const remoteModels = uniqueModels(extractModels(remote))
+  // Once a non-empty remote catalog is available, it is the authority for
+  // this provider. Mixing profile fallbacks back in can show models that the
+  // selected endpoint does not actually expose.
+  if (Object.prototype.hasOwnProperty.call(remoteCatalogs, id) && remoteModels.length) {
+    return remoteModels
+  }
   const candidates = [
     provider.models,
     provider.model_names,
     provider.model_name,
     provider.default_model,
-    remote,
   ]
-  const result = []
-  const seen = new Set()
+  return uniqueModels(candidates.flatMap((candidate) => extractModels(candidate)))
+}
 
-  for (const candidate of candidates) {
-    for (const model of extractModels(candidate)) {
-      if (!seen.has(model)) {
-        seen.add(model)
-        result.push(model)
-      }
-    }
+/**
+ * Keep task models inside the namespace of their effective provider.
+ *
+ * A model that is absent from a fetched, non-empty provider catalog is stale
+ * (usually left behind after switching providers).  Before the remote catalog
+ * is fetched we preserve the value because a valid remote model may not be in
+ * the profile's small static fallback list.  Empty catalogs still allow manual
+ * model IDs for services without a /models endpoint.
+ */
+export function reconcileTaskModelBindings(settings = {}, providers = [], modelsByProvider = {}) {
+  const normalized = normalizeSettings(settings, providers)
+  const defaultProviderId = cleanText(normalized.defaults.provider_profile)
+
+  for (const task of SETTINGS_TASKS) {
+    const binding = normalized.tasks[task.key]
+    const model = cleanText(binding.model)
+    if (!model) continue
+    const providerId = resolvedProviderId(binding, defaultProviderId)
+    if (!Object.prototype.hasOwnProperty.call(asObject(modelsByProvider), providerId)) continue
+    const candidates = uniqueModels(extractModels(asObject(modelsByProvider)[providerId]))
+    if (candidates.length && !candidates.includes(model)) binding.model = ''
   }
-  return result
+  return normalized
 }
 
 export function mergeProviderModelMaps(providers = [], current = {}) {
@@ -319,11 +369,11 @@ export function providerConnectionEndpointChangeRequiresLocal(draft = {}, connec
 export function providerConnectionSourceLabel(source, { configured = false } = {}) {
   const value = cleanText(source).toLowerCase()
   const labels = {
-    local: '本地私密配置',
-    local_config: '本地私密配置',
-    env: '进程环境变量（兼容旧配置）',
-    environment: '进程环境变量（兼容旧配置）',
-    profile: '服务配置文件',
+    local: '网页保存',
+    local_config: '网页保存',
+    env: '旧环境变量（建议重新保存）',
+    environment: '旧环境变量（建议重新保存）',
+    profile: '旧服务配置文件（建议重新保存）',
     configured: '已配置',
     missing: '未配置',
     unconfigured: '未配置',
@@ -343,6 +393,16 @@ function extractModels(value) {
   if (Array.isArray(value.items)) return extractModels(value.items)
   const model = cleanText(value.id) || cleanText(value.model) || cleanText(value.model_name) || cleanText(value.name)
   return model ? [model] : []
+}
+
+function uniqueModels(models) {
+  const seen = new Set()
+  return (models || []).filter((model) => {
+    const normalized = cleanText(model)
+    if (!normalized || seen.has(normalized)) return false
+    seen.add(normalized)
+    return true
+  })
 }
 
 function splitModelText(value) {

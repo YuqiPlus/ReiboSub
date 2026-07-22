@@ -97,6 +97,7 @@ def _normalize_loaded_settings(
 
     normalized_tasks: dict[str, dict[str, str]] = {}
     for task_key in LLM_TASK_KEYS:
+        binding_is_configured = task_key in tasks
         raw_binding = tasks.get(task_key)
         if isinstance(raw_binding, str):
             binding: dict[str, Any] = {"model": raw_binding}
@@ -109,7 +110,11 @@ def _normalize_loaded_settings(
         if provider_override not in provider_ids:
             provider_override = ""
         model = _clean_text(binding.get("model"))
-        if not model:
+        # Once the Settings UI has written a task binding, an empty model is
+        # intentional: it means "use the selected provider's default".  Do
+        # not resurrect a model from legacy llm.yaml/.env after the user
+        # switches providers and clears the old model selection.
+        if not model and not binding_is_configured:
             model = _clean_text(load_llm_task_config(task_key, root=root).model)
 
         normalized_tasks[task_key] = {

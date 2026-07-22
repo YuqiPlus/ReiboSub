@@ -2065,6 +2065,12 @@ details.more-subtitles summary { display: flex; justify-content: space-between; 
 .settings-provider-create-actions .settings-inline-error {
   margin: 0;
 }
+.settings-provider-default-model {
+  display: grid;
+  gap: 10px;
+  padding-top: 13px;
+  border-top: 1px solid var(--line);
+}
 .settings-model-error {
   min-height: 0;
   margin: 0;
@@ -2255,8 +2261,10 @@ details.more-subtitles summary { display: flex; justify-content: space-between; 
   gap: 7px;
   align-items: center;
 }
-.settings-model-input-row input {
+.settings-model-input-row input,
+.settings-model-input-row select {
   min-width: 0;
+  width: 100%;
 }
 .settings-inline-error {
   margin-top: 7px;

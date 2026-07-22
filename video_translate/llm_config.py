@@ -82,8 +82,17 @@ def load_llm_task_config(task: str, *, root: Path | None = None, explicit_model:
     app_defaults, app_task = _load_app_task_settings(root, task)
     overlay_model = _clean(app_task.get("model"))
     profile_id, profile = _resolve_app_provider_profile(root, app_defaults, app_task)
+    profile_default_model = _profile_value(profile, "default_model")
 
-    model = _clean(explicit_model) or overlay_model or legacy_model
+    if profile_id:
+        # A selected provider owns its model namespace.  Falling through to a
+        # model from legacy llm.yaml/.env after switching providers can send an
+        # invalid model name to the new endpoint.  An empty task binding uses
+        # the provider default; if that is also empty, surface the missing
+        # model instead of reviving the legacy value.
+        model = _clean(explicit_model) or overlay_model or profile_default_model
+    else:
+        model = _clean(explicit_model) or overlay_model or legacy_model
     base_url = _clean(explicit_base_url) or _profile_value(profile, "base_url") or legacy_base_url
     api_key = _profile_api_key(profile) or legacy_api_key
     # ``provider`` is the legacy transport/protocol field used by run config
@@ -94,10 +103,10 @@ def load_llm_task_config(task: str, *, root: Path | None = None, explicit_model:
     has_overlay_fallbacks = "fallback_models" in app_task
     if has_overlay_fallbacks:
         fallback_models = _clean_list(app_task.get("fallback_models"))
-    elif overlay_model:
+    elif overlay_model or profile_id:
         # A legacy fallback generally belongs to the legacy provider.  Carrying
-        # it across a Settings-selected model can send an invalid model ID to
-        # the newly selected provider, so an overlay model opts out by default.
+        # it across a Settings-selected provider can send an invalid model ID
+        # to the new endpoint, so any resolved profile opts out by default.
         fallback_models = []
     else:
         fallback_models = legacy_fallback_models

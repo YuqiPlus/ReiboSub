@@ -13,7 +13,7 @@ from video_translate.provider_management import (
     delete_provider_profile,
     update_provider_profile,
 )
-from video_translate.provider_profiles import get_provider_profile
+from video_translate.provider_profiles import PROVIDER_PROFILES_PATH, get_provider_profile
 from video_translate.provider_secrets import PROVIDER_SECRETS_PATH, update_provider_connection_settings
 
 
@@ -41,9 +41,9 @@ def test_create_provider_keeps_secret_connection_out_of_profile_yaml(tmp_path: P
         tmp_path,
     )
 
-    profile_path = tmp_path / "configs" / "providers" / "custom-gateway.yml"
+    profile_path = tmp_path / PROVIDER_PROFILES_PATH
     profile_text = profile_path.read_text(encoding="utf-8")
-    profile_data = yaml.safe_load(profile_text)
+    profile_data = yaml.safe_load(profile_text)["providers"]["custom-gateway"]
     secrets_path = tmp_path / PROVIDER_SECRETS_PATH
     secrets_data = yaml.safe_load(secrets_path.read_text(encoding="utf-8"))
     resolved = get_provider_profile("custom-gateway", tmp_path)
@@ -52,8 +52,8 @@ def test_create_provider_keeps_secret_connection_out_of_profile_yaml(tmp_path: P
         "label": "Custom Gateway",
         "provider": "custom-gateway",
         "backend": "openai-compatible",
-        "model_name": "custom-model",
-        "model_names": ["custom-model-2"],
+        "default_model": "custom-model",
+        "models": ["custom-model-2"],
     }
     assert "top-secret-key" not in profile_text
     assert "gateway.example" not in profile_text
@@ -90,7 +90,7 @@ def test_create_provider_rejects_unsafe_payloads(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         create_provider_profile(payload, tmp_path)
-    assert not list((tmp_path / "configs" / "providers").glob("*.yml")) if (tmp_path / "configs" / "providers").exists() else True
+    assert not (tmp_path / PROVIDER_PROFILES_PATH).exists()
 
 
 def test_create_rejects_duplicate_and_provider_directory_symlink(tmp_path: Path) -> None:
@@ -134,6 +134,75 @@ def test_create_clears_orphan_secret_before_reusing_id(tmp_path: Path) -> None:
     assert "stale-secret" not in secret_path.read_text(encoding="utf-8")
 
 
+def test_first_management_write_migrates_legacy_connections_without_leaking_them(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    literal_path = tmp_path / "configs" / "providers" / "literal.yml"
+    literal_path.parent.mkdir(parents=True, exist_ok=True)
+    literal_path.write_text(
+        """
+label: Literal
+api_key: literal-secret
+base_url: https://literal.example/v1
+models_url: https://literal.example/v1/models
+model_name: literal-model
+""".lstrip(),
+        encoding="utf-8",
+    )
+    env_path = literal_path.with_name("environment.yml")
+    env_path.write_text(
+        """
+label: Environment
+api_key: LEGACY_API_KEY
+base_url: LEGACY_BASE_URL
+models_url: LEGACY_MODELS_URL
+model_name: env-model
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LEGACY_API_KEY", "environment-secret")
+    monkeypatch.setenv("LEGACY_BASE_URL", "https://environment.example/v1")
+    monkeypatch.setenv("LEGACY_MODELS_URL", "https://environment.example/v1/models")
+
+    update_provider_profile("literal", {"label": "Literal Updated"}, tmp_path)
+
+    registry_path = tmp_path / PROVIDER_PROFILES_PATH
+    registry_text = registry_path.read_text(encoding="utf-8")
+    registry = yaml.safe_load(registry_text)
+    secrets = yaml.safe_load(
+        (tmp_path / PROVIDER_SECRETS_PATH).read_text(encoding="utf-8")
+    )
+    monkeypatch.delenv("LEGACY_API_KEY")
+    monkeypatch.delenv("LEGACY_BASE_URL")
+    monkeypatch.delenv("LEGACY_MODELS_URL")
+
+    assert registry["providers"]["literal"]["label"] == "Literal Updated"
+    assert registry["providers"]["environment"]["default_model"] == "env-model"
+    for sensitive_value in (
+        "literal-secret",
+        "environment-secret",
+        "literal.example",
+        "environment.example",
+        "LEGACY_API_KEY",
+        "LEGACY_BASE_URL",
+        "LEGACY_MODELS_URL",
+    ):
+        assert sensitive_value not in registry_text
+    assert secrets["providers"]["literal"] == {
+        "api_key": "literal-secret",
+        "base_url": "https://literal.example/v1",
+        "models_url": "https://literal.example/v1/models",
+    }
+    assert secrets["providers"]["environment"] == {
+        "api_key": "environment-secret",
+        "base_url": "https://environment.example/v1",
+        "models_url": "https://environment.example/v1/models",
+    }
+    assert get_provider_profile("literal", tmp_path).api_key == "literal-secret"
+    assert get_provider_profile("environment", tmp_path).base_url == "https://environment.example/v1"
+
+
 def test_delete_provider_migrates_default_tasks_and_removes_secret(tmp_path: Path) -> None:
     first_path = _write_profile(tmp_path, "first", model="first-model")
     _write_profile(tmp_path, "second", model="second-model")
@@ -168,7 +237,10 @@ def test_delete_provider_migrates_default_tasks_and_removes_secret(tmp_path: Pat
     saved = yaml.safe_load((tmp_path / APP_SETTINGS_PATH).read_text(encoding="utf-8"))
     secrets = yaml.safe_load((tmp_path / PROVIDER_SECRETS_PATH).read_text(encoding="utf-8"))
 
-    assert not first_path.exists()
+    assert first_path.exists()  # Legacy files are left untouched after one-time migration.
+    registry = yaml.safe_load((tmp_path / PROVIDER_PROFILES_PATH).read_text(encoding="utf-8"))
+    assert "first" not in registry["providers"]
+    assert "second" in registry["providers"]
     assert get_provider_profile("first", tmp_path) is None
     assert "first" not in secrets["providers"]
     assert secrets["providers"]["second"]["api_key"] == "second-secret"
@@ -231,7 +303,7 @@ def test_delete_rejects_unknown_self_replacement_and_last_provider(tmp_path: Pat
         delete_provider_profile("only", "missing", tmp_path)
 
 
-def test_update_provider_metadata_preserves_connection_and_unknown_fields(tmp_path: Path) -> None:
+def test_update_provider_metadata_migrates_connection_and_drops_legacy_extras(tmp_path: Path) -> None:
     profile_path = tmp_path / "configs" / "providers" / "editable.yml"
     profile_path.parent.mkdir(parents=True, exist_ok=True)
     profile_path.write_text(
@@ -249,7 +321,6 @@ timeout: 120
 """.lstrip(),
         encoding="utf-8",
     )
-    original_mode = stat.S_IMODE(profile_path.stat().st_mode)
     update_provider_connection_settings(
         "editable",
         {"api_key": "local-secret", "base_url": "https://local.example/v1"},
@@ -265,19 +336,24 @@ timeout: 120
         },
         tmp_path,
     )
-    document = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    legacy_document = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    registry_path = tmp_path / PROVIDER_PROFILES_PATH
+    document = yaml.safe_load(registry_path.read_text(encoding="utf-8"))["providers"]["editable"]
     secrets = yaml.safe_load((tmp_path / PROVIDER_SECRETS_PATH).read_text(encoding="utf-8"))
     resolved = get_provider_profile("editable", tmp_path)
 
-    assert document["api_key"] == "EDITABLE_KEY"
-    assert document["base_url"] == "https://profile.example/v1"
-    assert document["temperature"] == 0.25
-    assert document["timeout"] == 120
+    assert legacy_document["api_key"] == "EDITABLE_KEY"
+    assert legacy_document["base_url"] == "https://profile.example/v1"
+    assert legacy_document["temperature"] == 0.25
+    assert legacy_document["timeout"] == 120
     assert document["label"] == "New Label"
-    assert document["api_model_name"] == "new-default"
-    assert document["model_name"] == "new-default"
-    assert document["model_names"] == ["new-extra"]
-    assert stat.S_IMODE(profile_path.stat().st_mode) == original_mode
+    assert document["default_model"] == "new-default"
+    assert document["models"] == ["new-extra"]
+    assert "api_key" not in document
+    assert "base_url" not in document
+    assert "temperature" not in document
+    assert "timeout" not in document
+    assert stat.S_IMODE(registry_path.stat().st_mode) == 0o600
     assert secrets["providers"]["editable"]["api_key"] == "local-secret"
     assert resolved is not None
     assert resolved.label == "New Label"
@@ -302,14 +378,13 @@ def test_update_provider_can_clear_optional_metadata_without_touching_secret(tmp
         tmp_path,
     )
     document = yaml.safe_load(
-        (tmp_path / "configs" / "providers" / "editable.yml").read_text(encoding="utf-8")
-    )
+        (tmp_path / PROVIDER_PROFILES_PATH).read_text(encoding="utf-8")
+    )["providers"]["editable"]
     resolved = get_provider_profile("editable", tmp_path)
 
     assert "label" not in document
-    assert "name" not in document
-    assert "model_name" not in document
-    assert "model_names" not in document
+    assert "default_model" not in document
+    assert "models" not in document
     assert resolved is not None
     assert resolved.label == "editable"
     assert resolved.default_model is None

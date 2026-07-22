@@ -434,6 +434,8 @@ const settingsConnectionSaving = ref(false)
 const settingsConnectionError = ref('')
 const settingsCapabilities = ref({})
 const settingsProviderManaging = ref(false)
+let settingsModelFetchSequence = 0
+const settingsModelFetchTokens = new Map()
 
 const assets = reactive({ videos: [], subtitles: [], projects: [], ocr_jobs: [], ocr_debug_folders: [] })
 const jobs = reactive({})
@@ -578,6 +580,8 @@ async function loadAppSettings({ applyDefaults = false } = {}) {
     // profile models remain available through SettingsPanel's provider data.
     settingsModelsByProvider.value = {}
     settingsModelErrors.value = {}
+    settingsModelFetchTokens.clear()
+    settingsFetchingProviderId.value = ''
     if (applyDefaults) applyAppSettingDefaults(settingsEditor.value)
     const defaultProviderId = String(settingsEditor.value?.defaults?.provider_profile || '').trim()
     if (defaultProviderId) await loadProviderConnection(defaultProviderId, { quiet: true })
@@ -670,7 +674,8 @@ async function createSettingsProvider(payload = {}) {
     delete settingsModelsByProvider.value[createdId]
     settingsModelErrors.value = { ...settingsModelErrors.value, [createdId]: '' }
     await loadProviderConnection(createdId, { quiet: true })
-    setStatus(settingsStatus, `${createdId} 已创建；可以继续获取模型或绑定到具体模块。`, 'ok')
+    setStatus(settingsStatus, `${createdId} 已创建，正在获取可用模型…`, 'ok')
+    await fetchProviderModels(createdId)
   } catch (error) {
     setStatus(settingsStatus, error.message, 'bad')
   } finally {
@@ -696,6 +701,8 @@ async function deleteSettingsProvider({ providerId, replacementProviderId } = {}
     settingsModelErrors.value = { ...settingsModelErrors.value }
     delete settingsModelsByProvider.value[id]
     delete settingsModelErrors.value[id]
+    settingsModelFetchTokens.delete(id)
+    if (settingsFetchingProviderId.value === id) settingsFetchingProviderId.value = ''
     await loadProviderConnection(replacementId, { quiet: true })
     const affectedCount = Array.isArray(result.affected_tasks) ? result.affected_tasks.length : 0
     setStatus(
@@ -722,9 +729,7 @@ async function updateSettingsProvider({ providerId, payload } = {}) {
     )
     settingsProviders.value = result.providers || settingsProviders.value
     if (result.capabilities) settingsCapabilities.value = result.capabilities
-    settingsModelsByProvider.value = { ...settingsModelsByProvider.value }
     settingsModelErrors.value = { ...settingsModelErrors.value, [id]: '' }
-    delete settingsModelsByProvider.value[id]
     if (settingsConnectionProviderId.value === id) {
       await loadProviderConnection(id, { quiet: true })
     }
@@ -751,7 +756,8 @@ async function saveProviderConnection({ providerId, payload } = {}) {
     settingsModelsByProvider.value = { ...settingsModelsByProvider.value }
     delete settingsModelsByProvider.value[id]
     settingsModelErrors.value = { ...settingsModelErrors.value, [id]: '' }
-    setStatus(settingsStatus, `${id} 的本地连接已保存。`, 'ok')
+    setStatus(settingsStatus, `${id} 的本地连接已保存，正在刷新模型…`, 'ok')
+    await fetchProviderModels(id)
   } catch (error) {
     settingsConnectionError.value = error.message
     setStatus(settingsStatus, error.message, 'bad')
@@ -763,15 +769,21 @@ async function saveProviderConnection({ providerId, payload } = {}) {
 async function fetchProviderModels(providerId) {
   const id = String(providerId || '').trim()
   if (!id) return
+  const requestToken = ++settingsModelFetchSequence
+  settingsModelFetchTokens.set(id, requestToken)
   settingsFetchingProviderId.value = id
   settingsModelErrors.value = { ...settingsModelErrors.value, [id]: '' }
   setStatus(settingsStatus, `正在向 ${id} 获取可用模型...`, '')
   try {
     const result = await getJson(`/api/settings/providers/${encodeURIComponent(id)}/models?refresh=1`)
+    if (settingsModelFetchTokens.get(id) !== requestToken) return
     if (!settingsProviders.value.some((provider) => String(provider?.id || '') === id)) return
+    const discoveredModels = result.source === 'remote' && Array.isArray(result.remote_models)
+      ? result.remote_models
+      : (result.models || [])
     settingsModelsByProvider.value = {
       ...settingsModelsByProvider.value,
-      [id]: result.models || [],
+      [id]: discoveredModels,
     }
     settingsModelErrors.value = {
       ...settingsModelErrors.value,
@@ -781,14 +793,18 @@ async function fetchProviderModels(providerId) {
       settingsStatus,
       result.warning
         ? `远端模型获取失败，已保留本地模型：${result.warning}`
-        : `已从 ${id} 获取 ${result.models?.length || 0} 个模型。`,
+        : `已从 ${id} 获取 ${discoveredModels.length} 个模型。`,
       result.warning ? 'bad' : 'ok',
     )
   } catch (error) {
+    if (settingsModelFetchTokens.get(id) !== requestToken) return
     settingsModelErrors.value = { ...settingsModelErrors.value, [id]: error.message }
     setStatus(settingsStatus, error.message, 'bad')
   } finally {
-    settingsFetchingProviderId.value = ''
+    if (settingsModelFetchTokens.get(id) === requestToken) {
+      settingsModelFetchTokens.delete(id)
+      if (settingsFetchingProviderId.value === id) settingsFetchingProviderId.value = ''
+    }
   }
 }
 

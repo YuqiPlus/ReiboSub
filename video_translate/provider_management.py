@@ -14,11 +14,13 @@ import yaml
 from .app_settings import APP_SETTINGS_PATH, get_app_settings_payload, save_app_settings
 from .local_config_lock import LOCAL_CONFIG_WRITE_LOCK
 from .provider_profiles import (
-    PROVIDER_CONFIG_DIR,
+    PROVIDER_PROFILES_PATH,
     clear_provider_model_cache,
     get_provider_profile,
     list_provider_profiles,
     normalize_provider_id,
+    provider_profile_to_metadata,
+    read_provider_metadata_document,
 )
 from .provider_secrets import (
     PROVIDER_SECRETS_PATH,
@@ -78,27 +80,24 @@ def create_provider_profile(
 
     project_root = _project_root(root)
     with LOCAL_CONFIG_WRITE_LOCK:
-        provider_dir = _writable_provider_dir(project_root)
-        profile_path = provider_dir / f"{profile_id}.yml"
-        alternate_path = provider_dir / f"{profile_id}.yaml"
-        if _path_present(profile_path) or _path_present(alternate_path):
+        profiles = list_provider_profiles(project_root)
+        if profile_id in {profile.id for profile in profiles}:
             raise ValueError(f"provider 已存在: {profile_id}")
-        if get_provider_profile(profile_id, project_root) is not None:
-            raise ValueError(f"provider 已存在: {profile_id}")
-
-        # A stale secret must never silently attach itself to a recreated ID.
-        delete_provider_secret_override(profile_id, project_root)
-
-        document: dict[str, Any] = {
+        registry_path = project_root / PROVIDER_PROFILES_PATH
+        secrets_path = project_root / PROVIDER_SECRETS_PATH
+        snapshots = {
+            registry_path: _snapshot_file(registry_path),
+            secrets_path: _snapshot_file(secrets_path),
+        }
+        provider_document: dict[str, Any] = {
             "label": label,
             "provider": profile_id,
             "backend": "openai-compatible",
         }
         if default_model:
-            document["model_name"] = default_model
+            provider_document["default_model"] = default_model
         if models:
-            document["model_names"] = models
-        _atomic_write_yaml(profile_path, document, mode=0o600)
+            provider_document["models"] = models
 
         connection_payload: dict[str, Any] = {"base_url": base_url}
         if api_key is not None and str(api_key).strip():
@@ -107,14 +106,21 @@ def create_provider_profile(
             connection_payload["models_url"] = models_url
 
         try:
+            document = _prepare_registry_for_management(project_root, profiles)
+
+            # A stale secret must never silently attach itself to a recreated ID.
+            delete_provider_secret_override(profile_id, project_root)
+            document["providers"][profile_id] = provider_document
+            _atomic_write_yaml(registry_path, document, mode=snapshots[registry_path].mode)
+
             connection = update_provider_connection_settings(
                 profile_id,
                 connection_payload,
                 project_root,
             )
         except Exception:
-            delete_provider_secret_override(profile_id, project_root)
-            profile_path.unlink(missing_ok=True)
+            for path, snapshot in snapshots.items():
+                _restore_file(path, snapshot)
             clear_provider_model_cache()
             raise
 
@@ -154,13 +160,13 @@ def delete_provider_profile(
         if replacement_id not in by_id:
             raise ValueError(f"未知替代 provider: {replacement_id}")
 
-        profile_path = _find_profile_path(project_root, normalized_id)
+        registry_path = project_root / PROVIDER_PROFILES_PATH
         settings_path = project_root / APP_SETTINGS_PATH
         secrets_path = project_root / PROVIDER_SECRETS_PATH
         snapshots = {
             settings_path: _snapshot_file(settings_path),
             secrets_path: _snapshot_file(secrets_path),
-            profile_path: _snapshot_file(profile_path),
+            registry_path: _snapshot_file(registry_path),
         }
 
         current = get_app_settings_payload(project_root)["settings"]
@@ -173,9 +179,11 @@ def delete_provider_profile(
         )
 
         try:
+            document = _prepare_registry_for_management(project_root, profiles)
+            document["providers"].pop(normalized_id, None)
             save_app_settings(updated_settings, project_root)
             delete_provider_secret_override(normalized_id, project_root)
-            profile_path.unlink()
+            _atomic_write_yaml(registry_path, document, mode=snapshots[registry_path].mode)
             clear_provider_model_cache()
         except Exception:
             for path, snapshot in snapshots.items():
@@ -213,51 +221,57 @@ def update_provider_profile(
 
     project_root = _project_root(root)
     with LOCAL_CONFIG_WRITE_LOCK:
-        current = get_provider_profile(normalized_id, project_root)
+        profiles = list_provider_profiles(project_root)
+        current = next((profile for profile in profiles if profile.id == normalized_id), None)
         if current is None:
             raise ValueError(f"未知 provider: {normalized_id}")
-        profile_path = _find_profile_path(project_root, normalized_id)
-        snapshot = _snapshot_file(profile_path)
-        document = _read_profile_document(profile_path)
-
-        if "label" in payload:
-            label = _optional_text(payload.get("label"), "label", _MAX_LABEL_LENGTH)
-            document.pop("label", None)
-            document.pop("name", None)
-            if label:
-                document["label"] = label
-
-        default_model_updated = "default_model" in payload
-        default_model = current.default_model or ""
-        if default_model_updated:
-            default_model = _optional_text(
-                payload.get("default_model"),
-                "default_model",
-                _MAX_MODEL_LENGTH,
-            )
-            had_api_model_name = "api_model_name" in document
-            document.pop("api_model_name", None)
-            document.pop("model_name", None)
-            document.pop("model", None)
-            if default_model:
-                document["model_name"] = default_model
-                if had_api_model_name:
-                    document["api_model_name"] = default_model
-
-        if default_model_updated or "models" in payload:
-            raw_models: Any
-            if "models" in payload:
-                raw_models = payload.get("models")
-            else:
-                raw_models = list(current.static_models)
-            models = _validated_models(raw_models)
-            document.pop("model_names", None)
-            document.pop("models", None)
-            if models:
-                document["model_names"] = models
-
+        registry_path = project_root / PROVIDER_PROFILES_PATH
+        secrets_path = project_root / PROVIDER_SECRETS_PATH
+        snapshots = {
+            registry_path: _snapshot_file(registry_path),
+            secrets_path: _snapshot_file(secrets_path),
+        }
         try:
-            _atomic_write_yaml(profile_path, document, mode=snapshot.mode)
+            document = _prepare_registry_for_management(project_root, profiles)
+            provider_document = dict(document["providers"][normalized_id])
+
+            if "label" in payload:
+                label = _optional_text(payload.get("label"), "label", _MAX_LABEL_LENGTH)
+                if label:
+                    provider_document["label"] = label
+                else:
+                    provider_document.pop("label", None)
+
+            default_model_updated = "default_model" in payload
+            if default_model_updated:
+                default_model = _optional_text(
+                    payload.get("default_model"),
+                    "default_model",
+                    _MAX_MODEL_LENGTH,
+                )
+                if default_model:
+                    provider_document["default_model"] = default_model
+                else:
+                    provider_document.pop("default_model", None)
+
+            if default_model_updated or "models" in payload:
+                raw_models: Any
+                if "models" in payload:
+                    raw_models = payload.get("models")
+                else:
+                    raw_models = list(current.static_models)
+                models = _validated_models(raw_models)
+                if models:
+                    provider_document["models"] = models
+                else:
+                    provider_document.pop("models", None)
+
+            document["providers"][normalized_id] = provider_document
+            _atomic_write_yaml(
+                registry_path,
+                document,
+                mode=snapshots[registry_path].mode,
+            )
             updated = get_provider_profile(normalized_id, project_root)
             if updated is None:
                 raise RuntimeError("服务商配置更新后无法读取")
@@ -265,7 +279,8 @@ def update_provider_profile(
             result = get_app_settings_payload(project_root)
             result["provider"] = updated.to_public_dict()
         except Exception:
-            _restore_file(profile_path, snapshot)
+            for path, snapshot in snapshots.items():
+                _restore_file(path, snapshot)
             clear_provider_model_cache()
             raise
         return result
@@ -304,28 +319,42 @@ def _project_root(root: Path | None) -> Path:
     return Path(root).expanduser() if root is not None else Path(__file__).resolve().parent.parent
 
 
-def _writable_provider_dir(project_root: Path) -> Path:
-    provider_dir = project_root / PROVIDER_CONFIG_DIR
-    if provider_dir.is_symlink():
-        raise ValueError("configs/providers 不能是符号链接")
-    provider_dir.mkdir(parents=True, exist_ok=True)
-    return provider_dir
-
-
-def _find_profile_path(project_root: Path, profile_id: str) -> Path:
-    provider_dir = _writable_provider_dir(project_root)
-    candidates = [provider_dir / f"{profile_id}.yml", provider_dir / f"{profile_id}.yaml"]
-    matches = [path for path in candidates if _path_present(path)]
-    if len(matches) != 1:
-        raise ValueError(f"provider 文件状态异常: {profile_id}")
-    path = matches[0]
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("provider 文件必须是普通文件")
-    return path
-
-
 def _path_present(path: Path) -> bool:
     return path.exists() or path.is_symlink()
+
+
+def _prepare_registry_for_management(
+    project_root: Path,
+    legacy_profiles: list[Any],
+) -> dict[str, Any]:
+    """Return registry metadata, migrating live legacy connections once.
+
+    The connection values are copied only through the credential store API.
+    They are never placed in the returned metadata document.
+    """
+
+    registry_path = project_root / PROVIDER_PROFILES_PATH
+    if _path_present(registry_path):
+        return read_provider_metadata_document(project_root)
+
+    document = {
+        "version": 1,
+        "providers": {
+            profile.id: provider_profile_to_metadata(profile)
+            for profile in legacy_profiles
+        },
+    }
+    for profile in legacy_profiles:
+        connection: dict[str, str] = {}
+        if profile.api_key:
+            connection["api_key"] = profile.api_key
+        if profile.base_url:
+            connection["base_url"] = profile.base_url
+        if profile.models_url:
+            connection["models_url"] = profile.models_url
+        if connection:
+            update_provider_connection_settings(profile.id, connection, project_root)
+    return document
 
 
 def _validated_text(value: Any, field: str, max_length: int) -> str:
@@ -376,16 +405,6 @@ def _snapshot_file(path: Path) -> _FileSnapshot:
         content=path.read_bytes(),
         mode=stat.S_IMODE(path.stat().st_mode),
     )
-
-
-def _read_profile_document(path: Path) -> dict[str, Any]:
-    try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (yaml.YAMLError, UnicodeError):
-        raise ValueError(f"provider 配置不是有效的 YAML: {path.name}") from None
-    if not isinstance(data, dict):
-        raise ValueError(f"provider 配置必须是 YAML 对象: {path.name}")
-    return dict(data)
 
 
 def _restore_file(path: Path, snapshot: _FileSnapshot) -> None:

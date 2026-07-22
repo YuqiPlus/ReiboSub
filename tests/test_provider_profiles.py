@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 import requests
+import yaml
 
 from video_translate.provider_profiles import (
+    PROVIDER_PROFILES_PATH,
     clear_provider_model_cache,
     fetch_provider_models,
     get_provider_profile,
@@ -18,6 +20,20 @@ def _write_profile(root: Path, name: str, content: str) -> Path:
     path = root / "configs" / "providers" / f"{name}.yml"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+    return path
+
+
+def _write_registry(root: Path, providers: dict) -> Path:
+    path = root / PROVIDER_PROFILES_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(
+            {"version": 1, "providers": providers},
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -99,6 +115,69 @@ model_name: inline-model
     assert inline.base_url == "https://inline.example/v1"
 
 
+def test_unified_registry_takes_precedence_over_legacy_profiles(tmp_path: Path) -> None:
+    _write_profile(
+        tmp_path,
+        "legacy-only",
+        "api_key: must-not-load\nbase_url: https://legacy.example/v1\nmodel_name: old\n",
+    )
+    _write_registry(
+        tmp_path,
+        {
+            "unified": {
+                "label": "Unified Provider",
+                "provider": "gateway",
+                "backend": "openai-compatible",
+                "default_model": "model-a",
+                "models": ["model-b"],
+            }
+        },
+    )
+    secrets_path = tmp_path / "configs" / "provider_secrets.yaml"
+    secrets_path.write_text(
+        """
+version: 1
+providers:
+  unified:
+    api_key: unified-secret
+    base_url: https://unified.example/v1
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    profiles = list_provider_profiles(tmp_path)
+
+    assert [profile.id for profile in profiles] == ["unified"]
+    profile = profiles[0]
+    assert profile.label == "Unified Provider"
+    assert profile.provider == "gateway"
+    assert profile.default_model == "model-a"
+    assert profile.models == ("model-a", "model-b")
+    assert profile.api_key == "unified-secret"
+    assert profile.base_url == "https://unified.example/v1"
+    assert get_provider_profile("legacy-only", tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"version": 2, "providers": {}},
+        {"version": 1, "providers": {"unsafe": {"api_key": "secret"}}},
+        {"version": 1, "providers": {"unsafe": {"base_url": "https://example.com"}}},
+    ],
+)
+def test_unified_registry_rejects_invalid_or_connection_fields(
+    tmp_path: Path,
+    document: dict,
+) -> None:
+    path = tmp_path / PROVIDER_PROFILES_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="version|连接配置"):
+        list_provider_profiles(tmp_path)
+
+
 def test_unknown_and_illegal_profile_ids_cannot_escape_provider_directory(tmp_path: Path) -> None:
     _write_profile(tmp_path, "known", "model_name: known-model\n")
 
@@ -150,6 +229,8 @@ model_names:
     refreshed = fetch_provider_models("ark", tmp_path, refresh=True)
 
     assert first["models"] == ["configured-alias", "remote-a", "remote-z", "static-only"]
+    assert first["remote_models"] == ["configured-alias", "remote-a", "remote-z"]
+    assert first["static_models"] == ["configured-alias", "static-only"]
     assert first["source"] == "remote"
     assert first["warning"] == ""
     assert first["cached"] is False
@@ -186,6 +267,52 @@ model_name: fallback-model
     result = fetch_provider_models("gateway", tmp_path)
 
     assert result["models"] == ["fallback-model", "model-a", "model-b"]
+    assert result["remote_models"] == ["model-a", "model-b"]
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected_models_url"),
+    [
+        ("https://gateway.example/v1", "https://gateway.example/v1/models"),
+        ("https://gateway.example/api/coding/v3", "https://gateway.example/api/coding/v3/models"),
+        ("https://gateway.example/v1/models", "https://gateway.example/v1/models"),
+        ("https://gateway.example/v1/models/", "https://gateway.example/v1/models"),
+        ("https://gateway.example/v1/chat/completions", "https://gateway.example/v1/models"),
+        ("https://gateway.example/v1/responses", "https://gateway.example/v1/models"),
+        ("https://gateway.example/v1/completions", "https://gateway.example/v1/models"),
+    ],
+)
+def test_fetch_normalizes_common_openai_compatible_base_urls(
+    tmp_path: Path,
+    monkeypatch,
+    base_url: str,
+    expected_models_url: str,
+) -> None:
+    _write_profile(
+        tmp_path,
+        "normalized",
+        f"api_key: secret\nbase_url: {base_url}\nmodel_name: fallback-model\n",
+    )
+    clear_provider_model_cache()
+    calls: list[str] = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"data": [{"id": "remote-model"}]}
+
+    def fake_get(url, **_kwargs):
+        calls.append(url)
+        return Response()
+
+    monkeypatch.setattr("video_translate.provider_profiles.requests.get", fake_get)
+
+    result = fetch_provider_models("normalized", tmp_path)
+
+    assert calls == [expected_models_url]
+    assert result["models"] == ["fallback-model", "remote-model"]
 
 
 def test_upstream_failure_returns_only_static_models_and_sanitized_warning(tmp_path: Path, monkeypatch) -> None:
@@ -261,4 +388,5 @@ model_name: static-model
 
     assert result["models"] == ["static-model"]
     assert result["source"] == "static"
-    assert result["warning"]
+    assert "不同源" in result["warning"]
+    assert "密钥安全" in result["warning"]
