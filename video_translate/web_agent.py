@@ -84,8 +84,14 @@ from video_translate.translate.volcengine import (
 )
 from video_translate.utils.timecode import format_srt_time, parse_srt_time
 from video_translate.utils.text import normalize_ocr_text
-from video_translate.youtube.download_video import convert_thumbnail_bytes, thumbnail_extension, thumbnail_url_from_info
-from video_translate.youtube.filenames import filesystem_safe_title
+from video_translate.youtube.download_video import (
+    convert_thumbnail_bytes,
+    normalize_download_container,
+    normalize_exact_format_id,
+    thumbnail_extension,
+    thumbnail_url_from_info,
+)
+from video_translate.youtube.filenames import filesystem_safe_title, normalize_download_format_tag
 from video_translate.youtube_url import normalize_youtube_url
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -147,6 +153,7 @@ _AGENT_SESSIONS: dict[str, AgentSession] = {}
 _LOCK = threading.Lock()
 _TASK_FILE_LOCK = threading.RLock()
 _AGENT_TRANSLATION_START_LOCK = threading.RLock()
+_YOUTUBE_PROJECT_BIND_LOCK = threading.RLock()
 _OCR_PREVIEW_LOCK = threading.Lock()
 _OCR_PREVIEW_MODEL_KEY: tuple[str, str] | None = None
 _OCR_PREVIEW_MODEL: Any = None
@@ -233,6 +240,8 @@ def probe_video(
     }
     if proxy:
         opts["proxy"] = proxy
+    if shutil.which("node"):
+        opts["js_runtimes"] = {"node": {}}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(normalized_url, download=False)
 
@@ -268,6 +277,382 @@ def probe_video(
         "existing_project": existing_project,
         "thumbnail_path": str(thumbnail_path) if thumbnail_path else "",
     }
+
+
+def download_formats(url: str, *, proxy: str | None = DEFAULT_PROXY) -> dict[str, Any]:
+    """Return safe, exact video/audio selections without exposing signed media URLs."""
+
+    normalized_url = normalize_youtube_url(url)
+    opts: dict[str, Any] = {
+        "skip_download": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+    }
+    if proxy:
+        opts["proxy"] = proxy
+    if shutil.which("node"):
+        opts["js_runtimes"] = {"node": {}}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(normalized_url, download=False)
+    if not isinstance(info, dict):
+        raise RuntimeError("没有获取到视频格式信息")
+    formats = _download_format_choices(info.get("formats") or [])
+    if not formats:
+        raise RuntimeError("没有发现可下载的视频格式")
+    return {
+        "id": str(info.get("id") or ""),
+        "title": str(info.get("title") or ""),
+        "duration": info.get("duration"),
+        "formats": formats,
+        "recommended_format_id": formats[0]["id"],
+    }
+
+
+def _download_format_choices(raw_formats: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_formats, list):
+        return []
+    videos: list[dict[str, Any]] = []
+    audios: list[dict[str, Any]] = []
+    for raw in raw_formats:
+        if not isinstance(raw, dict) or raw.get("has_drm"):
+            continue
+        format_id = _safe_download_format_id(raw.get("format_id"))
+        if not format_id:
+            continue
+        vcodec = str(raw.get("vcodec") or "none").strip().lower()
+        acodec = str(raw.get("acodec") or "none").strip().lower()
+        if vcodec not in {"", "none"} and _positive_int(raw.get("height")):
+            videos.append(raw)
+        elif vcodec in {"", "none"} and acodec not in {"", "none"}:
+            audios.append(raw)
+
+    grouped: dict[tuple[Any, ...], tuple[tuple[Any, ...], dict[str, Any]]] = {}
+    for video in videos:
+        choice = _download_format_choice(video, audios)
+        if not choice:
+            continue
+        key = (
+            choice["height"],
+            choice["video_codec"],
+            choice["container"],
+            choice["fps"],
+            choice["hdr"],
+        )
+        score = _raw_video_score(video)
+        previous = grouped.get(key)
+        if previous is None or score > previous[0]:
+            grouped[key] = (score, choice)
+
+    choices = [item[1] for item in grouped.values()]
+    choices.sort(key=_download_format_sort_key, reverse=True)
+    return choices
+
+
+def _download_format_choice(video: dict[str, Any], audios: list[dict[str, Any]]) -> dict[str, Any] | None:
+    video_id = _safe_download_format_id(video.get("format_id"))
+    if not video_id:
+        return None
+    height = _positive_int(video.get("height"))
+    if not height:
+        return None
+    width = _positive_int(video.get("width"))
+    fps = _normalized_fps(video.get("fps"))
+    video_codec = _video_codec_family(video.get("vcodec"))
+    embedded_audio = str(video.get("acodec") or "none").strip().lower() not in {"", "none"}
+    audio = None if embedded_audio else _preferred_audio_format(video_codec, video, audios)
+    source_container = str(video.get("ext") or "").strip().lower()
+    if not embedded_audio and audio is None and source_container not in {"mp4", "webm", "mkv"}:
+        return None
+    audio_id = _safe_download_format_id(audio.get("format_id")) if audio else ""
+    audio_codec = _audio_codec_family(video.get("acodec") if embedded_audio else (audio or {}).get("acodec"))
+    container = _download_choice_container(video_codec, video, audio, embedded_audio=embedded_audio)
+    hdr = _is_hdr_format(video)
+    format_tag = _download_format_tag(height, fps, video_codec, hdr=hdr)
+    selection_id = video_id if embedded_audio or not audio_id else f"{video_id}+{audio_id}"
+    try:
+        selection_id = normalize_exact_format_id(selection_id)
+        format_tag = normalize_download_format_tag(format_tag)
+        container = normalize_download_container(container)
+    except ValueError:
+        return None
+    compatibility = _download_format_compatibility(video_codec, audio_codec, container, has_audio=embedded_audio or bool(audio_id))
+    size = _combined_format_size(video, audio)
+    return {
+        "id": selection_id,
+        "video_format_id": video_id,
+        "audio_format_id": audio_id,
+        "height": height,
+        "width": width,
+        "fps": fps,
+        "hdr": hdr,
+        "video_codec": video_codec,
+        "audio_codec": audio_codec,
+        "container": container,
+        "filesize_approx": size,
+        "label": _download_format_label(
+            height,
+            fps,
+            hdr,
+            video_codec,
+            container,
+            compatibility,
+            size,
+        ),
+        "format_tag": format_tag,
+        "compatibility": compatibility,
+    }
+
+
+def _safe_download_format_id(value: Any) -> str:
+    try:
+        return normalize_exact_format_id(str(value or ""))
+    except ValueError:
+        return ""
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _normalized_fps(value: Any) -> int | float | None:
+    try:
+        fps = float(value)
+    except (TypeError, ValueError):
+        return None
+    if fps <= 0:
+        return None
+    rounded = round(fps)
+    return int(rounded) if abs(fps - rounded) < 0.01 else round(fps, 2)
+
+
+def _video_codec_family(value: Any) -> str:
+    codec = str(value or "").strip().lower()
+    if codec.startswith(("avc1", "avc3", "h264")):
+        return "h264"
+    if codec.startswith(("av01", "av1")):
+        return "av1"
+    if codec.startswith(("vp09", "vp9")):
+        return "vp9"
+    if codec.startswith(("hev1", "hvc1", "hevc", "h265")):
+        return "hevc"
+    safe = re.sub(r"[^a-z0-9_-]", "", codec.split(".", 1)[0])
+    return safe[:20] or "video"
+
+
+def _audio_codec_family(value: Any) -> str:
+    codec = str(value or "").strip().lower()
+    if codec in {"", "none"}:
+        return ""
+    if codec.startswith(("mp4a", "aac")):
+        return "aac"
+    if codec.startswith("opus"):
+        return "opus"
+    if codec.startswith("vorbis"):
+        return "vorbis"
+    safe = re.sub(r"[^a-z0-9_-]", "", codec.split(".", 1)[0])
+    return safe[:20] or "audio"
+
+
+def _preferred_audio_format(
+    video_codec: str,
+    video: dict[str, Any],
+    audios: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not audios:
+        return None
+    video_ext = str(video.get("ext") or "").strip().lower()
+    if video_codec in {"h264", "hevc", "av1"} or video_ext in {"mp4", "m4v", "mov"}:
+        preferred_codecs = {"aac"}
+    elif video_codec == "vp9" or video_ext == "webm":
+        preferred_codecs = {"opus", "vorbis"}
+    else:
+        preferred_codecs = set()
+
+    def score(item: dict[str, Any]) -> tuple[Any, ...]:
+        codec = _audio_codec_family(item.get("acodec"))
+        preferred = int(not preferred_codecs or codec in preferred_codecs)
+        language = str(item.get("language") or "").strip().lower()
+        note = str(item.get("format_note") or "").strip().lower()
+        language_preference = _number(item.get("language_preference"))
+        if language_preference is None:
+            language_preference = -1.0
+        original_track = int("original" in note)
+        default_track = int("default" in note)
+        regular_track = int("descriptive" not in note and not language.endswith("-desc"))
+        original_language = int(language in {"", "und", "original"})
+        quality = _number(item.get("abr")) or _number(item.get("tbr")) or 0.0
+        size = _format_size(item) or 0
+        # yt-dlp assigns YouTube's original/default tracks a language_preference
+        # of 10/5 and dubbed alternatives -1. Honour that before bitrate so a
+        # louder/higher-bitrate dub cannot silently replace the source audio.
+        return (
+            preferred,
+            language_preference,
+            original_track,
+            default_track,
+            regular_track,
+            original_language,
+            quality,
+            size,
+        )
+
+    compatible = [item for item in audios if not preferred_codecs or _audio_codec_family(item.get("acodec")) in preferred_codecs]
+    return max(compatible or audios, key=score)
+
+
+def _download_choice_container(
+    video_codec: str,
+    video: dict[str, Any],
+    audio: dict[str, Any] | None,
+    *,
+    embedded_audio: bool,
+) -> str:
+    video_ext = str(video.get("ext") or "").strip().lower()
+    if not embedded_audio and audio is None:
+        return video_ext if video_ext in {"mp4", "webm", "mkv"} else "mkv"
+    audio_codec = _audio_codec_family(video.get("acodec") if embedded_audio else (audio or {}).get("acodec"))
+    if video_codec in {"h264", "hevc", "av1"} and audio_codec in {"", "aac"}:
+        return "mp4"
+    if video_codec in {"vp9", "av1"} and audio_codec in {"", "opus", "vorbis"}:
+        return "webm"
+    if embedded_audio and video_ext in {"mp4", "webm", "mkv"}:
+        return video_ext
+    return "mkv"
+
+
+def _is_hdr_format(item: dict[str, Any]) -> bool:
+    dynamic_range = str(item.get("dynamic_range") or "").strip().lower()
+    note = str(item.get("format_note") or "").strip().lower()
+    return bool((dynamic_range and dynamic_range not in {"sdr", "none"}) or "hdr" in note)
+
+
+def _number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _format_size(item: dict[str, Any] | None) -> int | None:
+    if not item:
+        return None
+    for key in ("filesize", "filesize_approx"):
+        number = _number(item.get(key))
+        if number:
+            return int(number)
+    return None
+
+
+def _combined_format_size(video: dict[str, Any], audio: dict[str, Any] | None) -> int | None:
+    video_size = _format_size(video)
+    if video_size is None:
+        return None
+    return video_size + (_format_size(audio) or 0)
+
+
+def _raw_video_score(item: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        _number(item.get("quality")) or 0.0,
+        _number(item.get("source_preference")) or 0.0,
+        _number(item.get("tbr")) or 0.0,
+        _format_size(item) or 0,
+    )
+
+
+def _download_format_tag(height: int, fps: int | float | None, video_codec: str, *, hdr: bool) -> str:
+    resolution = f"{height}p"
+    if fps and fps > 30:
+        resolution += str(int(round(float(fps))))
+    parts = [resolution]
+    if hdr:
+        parts.append("hdr")
+    parts.append(video_codec)
+    return ".".join(parts)
+
+
+def _download_format_compatibility(
+    video_codec: str,
+    audio_codec: str,
+    container: str,
+    *,
+    has_audio: bool,
+) -> str:
+    if not has_audio:
+        return "video-only"
+    if container == "mp4" and video_codec == "h264" and audio_codec in {"", "aac"}:
+        return "widely-compatible"
+    if container == "mp4":
+        return "modern"
+    if container == "webm":
+        return "webm"
+    return "limited"
+
+
+def _download_format_label(
+    height: int,
+    fps: int | float | None,
+    hdr: bool,
+    video_codec: str,
+    container: str,
+    compatibility: str,
+    size: int | None,
+) -> str:
+    resolution = f"{height}p"
+    if fps and fps > 30:
+        resolution += f" {int(round(float(fps)))}fps"
+    if hdr:
+        resolution += " HDR"
+    compatibility_labels = {
+        "widely-compatible": "兼容性高",
+        "modern": "现代设备",
+        "webm": "兼容性一般",
+        "limited": "兼容性有限",
+        "video-only": "无音频",
+    }
+    codec_label = {
+        "h264": "H.264",
+        "hevc": "H.265/HEVC",
+        "av1": "AV1",
+        "vp9": "VP9",
+    }.get(video_codec, video_codec.upper())
+    parts = [resolution, codec_label, container.upper(), compatibility_labels[compatibility]]
+    if size:
+        parts.append(f"约 {_human_file_size(size)}")
+    return " · ".join(parts)
+
+
+def _human_file_size(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{size} B"
+
+
+def _download_format_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    compatibility_score = {
+        "widely-compatible": 4,
+        "modern": 3,
+        "webm": 2,
+        "limited": 1,
+        "video-only": 0,
+    }.get(str(item.get("compatibility") or ""), 0)
+    codec_score = {"h264": 4, "av1": 3, "vp9": 2, "hevc": 1}.get(str(item.get("video_codec") or ""), 0)
+    return (
+        int(item.get("height") or 0),
+        float(item.get("fps") or 0),
+        int(bool(item.get("hdr"))),
+        compatibility_score,
+        codec_score,
+        int(item.get("filesize_approx") or 0),
+    )
 
 
 def translate_title_text(title: str, *, model: str | None = None, base_url: str | None = None) -> dict[str, Any]:
@@ -3844,28 +4229,72 @@ def download_video_job(payload: dict[str, Any]) -> Job:
     title = str(payload.get("title") or "").strip()
     thumbnail_format = str(payload.get("thumbnail_format") or "jpg").strip().lower()
     quality = str(payload.get("quality") or "1080p").strip() or "1080p"
-    archive_quality = quality.strip().lower() in {"best", "highest", "max", "最高", "archive", "best_archive", "best-archive"}
+    format_id = normalize_exact_format_id(payload.get("format_id"))
+    format_tag = normalize_download_format_tag(payload.get("format_tag"))
+    raw_container = str(payload.get("container") or "").strip()
+    if format_id and (not format_tag or not raw_container):
+        raise ValueError("精确下载必须同时提供 format_id、format_tag 和 container")
+    if not format_id and (format_tag or raw_container):
+        raise ValueError("format_tag/container 只能与 format_id 一起使用")
+    container = normalize_download_container(raw_container) if format_id else ""
+    archive_quality = not format_id and quality.strip().lower() in {
+        "best",
+        "highest",
+        "max",
+        "最高",
+        "archive",
+        "best_archive",
+        "best-archive",
+    }
     before = _snapshot_video_files(DOWNLOAD_DIR)
+    intended_project_dir: Path | None = None
+    if title:
+        with _YOUTUBE_PROJECT_BIND_LOCK:
+            intended_project_dir = _youtube_project_dir_for_title(title, normalized_url=url)
+            intended_project_dir.mkdir(parents=True, exist_ok=True)
+            update_youtube_project_metadata(intended_project_dir, source_url=url, title=title)
 
     def target(job_id: str) -> dict[str, Any]:
+        command = _module_command(
+            "video_translate.youtube.download_video",
+            url,
+            "--output-dir",
+            DOWNLOAD_DIR,
+            "--quality",
+            quality,
+            "--thumbnail-format",
+            thumbnail_format,
+        )
+        if intended_project_dir is not None:
+            command.extend(["--project-title", intended_project_dir.name])
+        if format_id:
+            command.extend(
+                [
+                    "--format-id",
+                    format_id,
+                    "--format-tag",
+                    format_tag,
+                    "--container",
+                    container,
+                ]
+            )
         _run_command(
             job_id,
-            _module_command(
-                "video_translate.youtube.download_video",
-                url,
-                "--output-dir",
-                DOWNLOAD_DIR,
-                "--quality",
-                quality,
-                "--thumbnail-format",
-                thumbnail_format,
-            ),
+            command,
         )
-        videos = _changed_video_files(DOWNLOAD_DIR, before)
-        if not videos:
-            videos = _matching_video_files(DOWNLOAD_DIR, title)
-        if not videos and not title:
-            videos = _newest_video_files(DOWNLOAD_DIR, limit=3)
+        videos = (
+            _project_video_files(
+                intended_project_dir,
+                archive_quality=archive_quality,
+                format_tag=format_tag,
+            )
+            if intended_project_dir is not None
+            else []
+        )
+        if not videos and intended_project_dir is None:
+            videos = _changed_video_files(DOWNLOAD_DIR, before)
+            if not videos:
+                videos = _newest_video_files(DOWNLOAD_DIR, limit=3)
         if not videos:
             raise RuntimeError(f"视频下载完成后没有找到匹配文件: title={title or '<unknown>'}")
         thumbnail = _matching_thumbnail_file(videos[0]) if videos else None
@@ -3882,21 +4311,25 @@ def download_video_job(payload: dict[str, Any]) -> Job:
                     thumbnail_format,
                 ),
             )
-            images = _changed_image_files(DOWNLOAD_DIR, before_images)
-            if not images:
+            images = _matching_image_files(intended_project_dir, intended_project_dir.name) if intended_project_dir is not None else []
+            if not images and intended_project_dir is None:
+                images = _changed_image_files(DOWNLOAD_DIR, before_images)
+            if not images and intended_project_dir is None:
                 images = _matching_image_files(DOWNLOAD_DIR, title or videos[0].parent.name)
             thumbnail = images[0] if images else _matching_thumbnail_file(videos[0])
-        if archive_quality:
+        if archive_quality or format_id:
             project_dir = videos[0].parent
             primary_candidates = [
                 path for path in _matching_video_files(DOWNLOAD_DIR, title or project_dir.name)
-                if path.parent == project_dir and ".best" not in path.stem
+                if path.parent == project_dir
+                and ".best" not in path.stem
+                and (not format_tag or not path.stem.endswith(f".{format_tag}"))
             ]
             manifest = update_youtube_project_metadata(
                 project_dir,
                 source_url=url,
                 title=title or project_dir.name,
-                primary_video=primary_candidates[0] if primary_candidates else None,
+                primary_video=primary_candidates[0] if primary_candidates else videos[0],
                 thumbnail_path=thumbnail,
             )
         else:
@@ -3910,9 +4343,16 @@ def download_video_job(payload: dict[str, Any]) -> Job:
         }
         if thumbnail:
             result["thumbnail_path"] = str(thumbnail)
+        if format_id:
+            result["selected_format"] = {
+                "id": format_id,
+                "format_tag": format_tag,
+                "container": container,
+            }
         return result
 
-    return start_job("下载视频", target)
+    job_name = f"下载视频 · {format_tag} · {container.upper()}" if format_id else "下载视频"
+    return start_job(job_name, target)
 
 
 def download_thumbnail_job(payload: dict[str, Any]) -> Job:
@@ -6637,8 +7077,10 @@ def _download_project_entry(project_dir: Path) -> dict[str, Any]:
 
 def _ensure_probe_thumbnail(normalized_url: str, title: str, info: dict[str, Any], *, proxy: str | None = DEFAULT_PROXY) -> Path | None:
     title = title or str(info.get("title") or "") or "youtube_video"
-    project_dir = _youtube_project_dir_for_title(title)
-    project_dir.mkdir(parents=True, exist_ok=True)
+    with _YOUTUBE_PROJECT_BIND_LOCK:
+        project_dir = _youtube_project_dir_for_title(title, normalized_url=normalized_url)
+        project_dir.mkdir(parents=True, exist_ok=True)
+        update_youtube_project_metadata(project_dir, source_url=normalized_url, title=title)
     existing = _matching_project_thumbnail(project_dir, title)
     if existing:
         update_youtube_project_metadata(project_dir, source_url=normalized_url, title=title, thumbnail_path=existing)
@@ -6661,11 +7103,43 @@ def _ensure_probe_thumbnail(normalized_url: str, title: str, info: dict[str, Any
     return thumbnail_path
 
 
-def _youtube_project_dir_for_title(title: str) -> Path:
+def _youtube_project_dir_for_title(title: str, *, normalized_url: str = "") -> Path:
+    normalized_url = normalize_youtube_url(normalized_url) if normalized_url else ""
+    if normalized_url and DOWNLOAD_DIR.exists():
+        for project_dir in sorted(
+            (path for path in DOWNLOAD_DIR.iterdir() if path.is_dir() and path.name != "debug"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        ):
+            if _youtube_project_bound_url(project_dir) == normalized_url:
+                return project_dir
     matches = _matching_media_files(DOWNLOAD_DIR, ["*.mp4", "*.mkv", "*.webm", "*.mov", "*.m4v", "*.jpg", "*.jpeg", "*.png", "*.webp", "*.srt"], title)
-    if matches:
-        return matches[0].parent
-    return DOWNLOAD_DIR / _filesystem_safe_title(title)
+    for match in matches:
+        bound_url = _youtube_project_bound_url(match.parent)
+        if not normalized_url or not bound_url or bound_url == normalized_url:
+            return match.parent
+    preferred = DOWNLOAD_DIR / _filesystem_safe_title(title)
+    bound_url = _youtube_project_bound_url(preferred) if preferred.exists() else ""
+    if not normalized_url or not bound_url or bound_url == normalized_url:
+        return preferred
+    video_key = _youtube_task_key(normalized_url)
+    suffix = f" [{video_key}]"
+    safe_title = _filesystem_safe_title(title)
+    return DOWNLOAD_DIR / f"{safe_title[:max(1, 180 - len(suffix))]}{suffix}"
+
+
+def _youtube_project_bound_url(project_dir: Path) -> str:
+    try:
+        manifest = infer_project_manifest(project_dir)
+    except (OSError, yaml.YAMLError):
+        return ""
+    raw = str(manifest.get("normalized_url") or manifest.get("source_url") or "").strip()
+    if not raw:
+        return ""
+    try:
+        return normalize_youtube_url(raw)
+    except ValueError:
+        return raw
 
 
 def _matching_project_thumbnail(project_dir: Path, title: str) -> Path | None:
@@ -6699,6 +7173,11 @@ def _find_or_bind_youtube_project(normalized_url: str, title: str) -> dict[str, 
         path
         for path in _matching_video_files(DOWNLOAD_DIR, title)
         if _is_direct_download_project_file(path)
+        and (
+            not normalized_url
+            or not _youtube_project_bound_url(path.parent)
+            or _youtube_project_bound_url(path.parent) == normalized_url
+        )
     ]
     exact_matches = [
         path
@@ -7031,6 +7510,29 @@ def _downloaded_video_candidates(directory: Path, before: dict[Path, float], tit
     if videos:
         return videos
     return _newest_video_files(directory, limit=newest_limit)
+
+
+def _project_video_files(
+    project_dir: Path,
+    *,
+    archive_quality: bool,
+    format_tag: str = "",
+) -> list[Path]:
+    videos = [
+        path
+        for path in project_dir.iterdir()
+        if _is_real_file(path) and path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+    ] if project_dir.exists() else []
+    if format_tag:
+        safe_format_tag = normalize_download_format_tag(format_tag)
+        marker = f".{safe_format_tag}"
+        return sorted(
+            [path for path in videos if path.stem.endswith(marker)],
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    preferred = [path for path in videos if (".best" in path.stem) == archive_quality]
+    return sorted(preferred or videos, key=lambda path: path.stat().st_mtime, reverse=True)
 
 
 def _changed_video_files(directory: Path, before: dict[Path, float]) -> list[Path]:
@@ -7715,6 +8217,13 @@ class AgentHandler(BaseHTTPRequestHandler):
                     embedded_subtitle_hint=str(payload.get("embedded_subtitle_hint") or "unknown"),
                 )
                 self._send_json(data)
+            elif self.path == "/api/download-formats":
+                self._send_json(
+                    download_formats(
+                        _required_str(payload, "url"),
+                        proxy=str(payload.get("proxy") or DEFAULT_PROXY) or None,
+                    )
+                )
             elif self.path == "/api/translate-title":
                 self._send_json(translate_title_text(_required_str(payload, "title")))
             elif self.path == "/api/jobs/download-subtitle":

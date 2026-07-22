@@ -104,6 +104,43 @@ def test_video_download_best_attempts_use_highest_available_selector():
     assert "bestvideo" in attempts[0][1]
 
 
+def test_exact_format_validation_and_output_template(tmp_path):
+    module = _load_video_module()
+
+    assert module.normalize_exact_format_id("401+140") == "401+140"
+    assert module.normalize_download_container(".MP4") == "mp4"
+    opts = module.build_video_options(
+        tmp_path,
+        2160,
+        proxy="",
+        format_selector="401+140",
+        format_tag="2160p60.hdr.av1",
+        container="mp4",
+        project_title="Demo",
+    )
+
+    assert opts["format"] == "401+140"
+    assert opts["merge_output_format"] == "mp4"
+    assert opts["outtmpl"] == str(tmp_path / "Demo" / "Demo.2160p60.hdr.av1.%(ext)s")
+
+    for invalid in (
+        "best[height=1]",
+        "401/140",
+        "401+140+251",
+        "../401",
+        "best",
+        "all",
+        "bv",
+        "401+ba",
+    ):
+        try:
+            module.normalize_exact_format_id(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid format ID accepted: {invalid}")
+
+
 def test_video_download_main_uses_cli_url(monkeypatch):
     module = _load_video_module()
     calls = []
@@ -261,6 +298,150 @@ def test_video_download_updates_yt_dlp_default_outtmpl_after_probe(monkeypatch, 
     module.download_video("abc123", output_dir=tmp_path)
 
     assert captured["outtmpl"] == str(tmp_path / "A ｜ B" / "A ｜ B.%(ext)s")
+
+
+def test_video_download_keeps_explicit_project_title_after_probe(monkeypatch, tmp_path):
+    module = _load_video_module()
+    captured = {}
+
+    class FakeYoutubeDL:
+        def __init__(self, opts):
+            self.params = {"outtmpl": {"default": opts["outtmpl"]}}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {"title": "Same Title", "thumbnail": ""}
+
+        def download(self, urls):
+            captured["outtmpl"] = self.params["outtmpl"]["default"]
+
+    monkeypatch.setattr(module.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(module.shutil, "which", lambda name: None)
+
+    module.download_video("new456", output_dir=tmp_path, project_title="Same Title [new456]")
+
+    assert captured["outtmpl"] == str(
+        tmp_path / "Same Title [new456]" / "Same Title [new456].%(ext)s"
+    )
+
+
+def test_exact_format_download_uses_exact_selector_container_and_filename(monkeypatch, tmp_path):
+    module = _load_video_module()
+    captured = []
+    video_dir = tmp_path / "Demo Video"
+    video = video_dir / "Demo Video.2160p60.av1.mp4"
+
+    class FakeYoutubeDL:
+        def __init__(self, opts):
+            self.opts = opts
+            self.params = {"outtmpl": {"default": opts["outtmpl"]}}
+            captured.append(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {"title": "Demo Video", "thumbnail": ""}
+
+        def download(self, urls):
+            video_dir.mkdir()
+            video.write_bytes(b"video")
+
+    monkeypatch.setattr(module.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(module.shutil, "which", lambda name: None)
+
+    downloaded = module.download_video(
+        "abc123",
+        output_dir=tmp_path,
+        format_id="401+140",
+        format_tag="2160p60.av1",
+        container="mp4",
+    )
+
+    assert downloaded == [video]
+    assert captured[0]["format"] == "401+140"
+    assert captured[0]["merge_output_format"] == "mp4"
+    assert captured[0]["outtmpl"] == str(tmp_path / "Demo Video" / "Demo Video.2160p60.av1.%(ext)s")
+
+
+def test_exact_format_download_retries_only_same_selector(monkeypatch, tmp_path):
+    module = _load_video_module()
+    calls = []
+
+    class FakeYoutubeDL:
+        def __init__(self, opts):
+            self.opts = opts
+            calls.append(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {"title": "Demo Video", "thumbnail": ""}
+
+        def download(self, urls):
+            if len(calls) == 1:
+                raise module.DownloadError("ERROR: unable to download video data: HTTP Error 403: Forbidden")
+
+    monkeypatch.setattr(module.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(module.shutil, "which", lambda name: None)
+
+    module.download_video(
+        "abc123",
+        output_dir=tmp_path,
+        format_id="401+140",
+        format_tag="2160p.av1",
+        container="mp4",
+    )
+
+    assert len(calls) == 2
+    assert {call["format"] for call in calls} == {"401+140"}
+    assert calls[0]["http_chunk_size"] > calls[1]["http_chunk_size"]
+
+
+def test_video_download_with_project_title_ignores_foreign_changed_video(monkeypatch, tmp_path):
+    module = _load_video_module()
+    project_title = "Same Title [new456]"
+    project = tmp_path / project_title
+    target = project / f"{project_title}.mp4"
+    foreign = tmp_path / "Foreign" / "Foreign.mp4"
+
+    class FakeYoutubeDL:
+        def __init__(self, opts):
+            self.params = {"outtmpl": {"default": opts["outtmpl"]}}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {"title": "Same Title", "thumbnail": ""}
+
+        def download(self, urls):
+            project.mkdir(parents=True)
+            target.write_bytes(b"target")
+            foreign.parent.mkdir()
+            foreign.write_bytes(b"foreign")
+
+    monkeypatch.setattr(module.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(module.shutil, "which", lambda name: None)
+
+    downloaded = module.download_video("new456", output_dir=tmp_path, project_title=project_title)
+
+    assert downloaded == [target]
 
 
 def test_best_video_download_uses_archive_template_and_preserves_primary(monkeypatch, tmp_path):
@@ -459,6 +640,25 @@ def test_capped_h264_download_replaces_existing_non_h264_video(monkeypatch, tmp_
     assert calls == [["https://www.youtube.com/watch?v=abc123"]]
     assert downloaded == [video]
     assert video.read_text(encoding="utf-8") == "new-h264"
+
+
+def test_capped_h264_cleanup_preserves_archive_and_exact_format_variants(monkeypatch, tmp_path):
+    module = _load_video_module()
+    video_dir = tmp_path / "Demo Video"
+    video_dir.mkdir()
+    compatibility_target = video_dir / "Demo Video.mp4"
+    archive = video_dir / "Demo Video.best.av1.mp4"
+    exact = video_dir / "Demo Video.2160p.av1.mp4"
+    for path in (compatibility_target, archive, exact):
+        path.write_bytes(b"av1")
+
+    monkeypatch.setattr(module, "video_codec", lambda path: "av1")
+
+    module.remove_incompatible_existing_h264_targets(tmp_path, "Demo Video")
+
+    assert not compatibility_target.exists()
+    assert archive.exists()
+    assert exact.exists()
 
 
 def test_video_download_matches_existing_video_inside_project_folder(monkeypatch, tmp_path):

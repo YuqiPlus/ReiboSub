@@ -74,16 +74,23 @@
               v-model:embedded-subtitle-hint="embeddedSubtitleHint"
               v-model:thumbnail-format="thumbnailFormat"
               v-model:video-quality="videoQuality"
+              :available-video-formats="availableVideoFormats"
+              :video-formats-loading="videoFormatsLoading"
+              :video-formats-status="videoFormatsStatus.text"
+              :video-formats-status-class="videoFormatsStatus.class"
               :probing="probing"
+              :action-busy="linkActionBusy"
               :status="probeStatus.text"
               :status-class="probeStatus.class"
               @probe="probeVideo"
+              @load-video-formats="loadVideoFormats"
               @download-video="downloadVideo"
               @download-thumbnail="downloadThumbnail"
               @ocr-full="runOcrFull"
             />
 
             <VideoInfoPanel
+              v-if="probe"
               v-model:title-box="titleBox"
               :probe="probe"
               :title-status="titleStatus.text"
@@ -335,6 +342,13 @@ import { createAgentSessionPoller } from './agentSessionPolling.js'
 import { buildAgentOcrPipelinePayload, inferAgentOcrPipelineVersion } from './agentOcrPipeline.js'
 import { createGlossaryReviewAutosave } from './glossaryReviewAutosave.js'
 import {
+  isProbeResponseCurrent,
+  looksLikeYoutubeInput,
+  resolveLinkActionUrl,
+  selectedVideoFormat,
+  shouldClearLinkProbe,
+} from './linkToolState.js'
+import {
   canReuseOpenedGlossaryReview,
   findGlossaryReviewSession,
   glossaryReviewKey,
@@ -352,6 +366,9 @@ import {
 const url = ref('')
 const probe = ref(null)
 const probing = ref(false)
+const probedInputUrl = ref('')
+const linkActionBusy = ref('')
+let linkProbeSequence = 0
 const titleBox = ref('')
 const sourceSrt = ref('')
 const subtitleEditorPath = ref('')
@@ -404,6 +421,11 @@ const ocrDevRunning = ref(false)
 const ocrRefinementMode = ref('none')
 const thumbnailFormat = ref('jpg')
 const videoQuality = ref('1080p')
+const availableVideoFormats = ref([])
+const videoFormatsTitle = ref('')
+const videoFormatsLoading = ref(false)
+let videoFormatsRequestSequence = 0
+let videoFormatsTimer = null
 const embeddedSubtitleHint = ref('unknown')
 const embeddedSubtitleGoal = ref('screen_subtitle')
 const sourceLanguage = ref('korean')
@@ -442,6 +464,7 @@ const jobs = reactive({})
 const pollTimers = new Map()
 
 const probeStatus = reactive({ text: '', class: '' })
+const videoFormatsStatus = reactive({ text: '', class: '' })
 const titleStatus = reactive({ text: '', class: '' })
 const flowStatus = reactive({ text: '', class: '' })
 const subtitleEditorStatus = reactive({ text: '', class: '' })
@@ -467,8 +490,8 @@ const pages = {
     description: '自动判断字幕来源，提取原文，审核术语并完成翻译。',
   },
   'new-task': {
-    title: '链接工具',
-    description: '手动检测字幕、下载视频或进入 OCR 全流程。',
+    title: '链接处理',
+    description: '粘贴链接即可直接下载；需要字幕信息时再检测，也可进入 OCR 全流程。',
   },
   assets: {
     title: '素材库',
@@ -530,6 +553,42 @@ const agentPreviewVideo = computed(() => (
 ))
 
 let skipNextOcrScopeCropReset = false
+watch(url, (nextUrl, previousUrl) => {
+  if (isProbeResponseCurrent(previousUrl, nextUrl)) return
+  linkProbeSequence += 1
+  videoFormatsRequestSequence += 1
+  if (videoFormatsTimer) {
+    window.clearTimeout(videoFormatsTimer)
+    videoFormatsTimer = null
+  }
+  availableVideoFormats.value = []
+  videoFormatsTitle.value = ''
+  videoFormatsLoading.value = false
+  setStatus(videoFormatsStatus, '', '')
+  if (String(videoQuality.value || '').startsWith('format:')) videoQuality.value = '1080p'
+  if (activeView.value === 'new-task') scheduleVideoFormats(nextUrl)
+  const clearedProbe = shouldClearLinkProbe(probe.value, probedInputUrl.value, nextUrl)
+  if (clearedProbe) {
+    probe.value = null
+    probedInputUrl.value = ''
+    titleBox.value = ''
+    setStatus(titleStatus, '', '')
+  }
+  if (clearedProbe || probing.value) {
+    setStatus(
+      probeStatus,
+      String(nextUrl || '').trim()
+        ? '链接已更改。可直接下载；如需字幕信息，请重新检测。'
+        : '',
+      '',
+    )
+  }
+})
+
+watch(activeView, (view) => {
+  if (view === 'new-task' && !availableVideoFormats.value.length) scheduleVideoFormats(url.value, 150)
+})
+
 watch(ocrScope, (scope) => {
   if (skipNextOcrScopeCropReset) {
     skipNextOcrScopeCropReset = false
@@ -546,7 +605,7 @@ const navItems = computed(() => [
   { id: 'glossary', group: '字幕制作', label: '术语审核', hint: '人名与固定译法', icon: 'G', badge: glossaryItems.value.length || '' },
   { id: 'subtitles', group: '字幕制作', label: '翻译与转换', hint: '字幕后续处理', icon: 'S', badge: sourceSrt.value ? '已选' : '' },
   { id: 'ocr-dev', group: '实验室', label: 'OCR Lab', hint: 'V2 / V3 独立测试', icon: 'O', badge: '' },
-  { id: 'new-task', group: '其他工具', label: '链接检测', hint: '手动下载与 OCR', icon: 'L', badge: probe.value?.subtitles?.length || '' },
+  { id: 'new-task', group: '日常流程', label: '链接处理', hint: '直接下载、字幕检测', icon: 'L', badge: probe.value?.subtitles?.length || '' },
   { id: 'video-overlay', group: '其他工具', label: '视频贴图', hint: '水印与遮 Logo', icon: 'V', badge: localVideo.value ? '已选' : '' },
   { id: 'settings', group: '系统', label: '设置', hint: '语言、服务与模型', icon: '⚙', badge: '' },
   { id: 'jobs', group: '系统', label: '任务日志', hint: '进度、错误与输出', icon: 'J', badge: runningJobCount.value || failedJobCount.value || '' },
@@ -567,6 +626,7 @@ onUnmounted(() => {
   window.removeEventListener('beforeunload', onGlossaryBeforeUnload)
   glossaryAutosave.destroy()
   agentPoller.cancelAll()
+  if (videoFormatsTimer) window.clearTimeout(videoFormatsTimer)
 })
 
 async function loadAppSettings({ applyDefaults = false } = {}) {
@@ -1184,43 +1244,118 @@ async function openGlossaryReviewForSession(session) {
   }
 }
 
+function scheduleVideoFormats(value, delay = 650) {
+  if (videoFormatsTimer) window.clearTimeout(videoFormatsTimer)
+  videoFormatsTimer = null
+  if (!looksLikeYoutubeInput(value)) return
+  const requestedUrl = String(value || '').trim()
+  videoFormatsTimer = window.setTimeout(() => {
+    videoFormatsTimer = null
+    loadVideoFormats({ requestedUrl, automatic: true })
+  }, delay)
+}
+
+async function loadVideoFormats(options = {}) {
+  const requestedUrl = String(options?.requestedUrl || url.value || '').trim()
+  if (!requestedUrl) {
+    setStatus(videoFormatsStatus, '先输入视频链接或 ID。', 'bad')
+    return
+  }
+  if (videoFormatsTimer) {
+    window.clearTimeout(videoFormatsTimer)
+    videoFormatsTimer = null
+  }
+  const requestSequence = ++videoFormatsRequestSequence
+  videoFormatsLoading.value = true
+  setStatus(videoFormatsStatus, '正在读取这个视频实际可下载的画质…', '')
+  try {
+    const result = await api('/api/download-formats', { url: requestedUrl })
+    if (
+      requestSequence !== videoFormatsRequestSequence
+      || !isProbeResponseCurrent(requestedUrl, url.value)
+    ) return
+    availableVideoFormats.value = Array.isArray(result.formats) ? result.formats : []
+    videoFormatsTitle.value = String(result.title || '')
+    if (selectedVideoFormat(availableVideoFormats.value, videoQuality.value) === null
+      && String(videoQuality.value || '').startsWith('format:')) {
+      videoQuality.value = '1080p'
+    }
+    const highest = availableVideoFormats.value[0]?.label || ''
+    setStatus(
+      videoFormatsStatus,
+      availableVideoFormats.value.length
+        ? `已读取 ${availableVideoFormats.value.length} 种真实格式${highest ? `；最高为 ${highest}` : ''}。`
+        : '没有读取到可下载的视频格式，仍可使用快速兼容模式。',
+      availableVideoFormats.value.length ? 'ok' : 'bad',
+    )
+  } catch (error) {
+    if (
+      requestSequence !== videoFormatsRequestSequence
+      || !isProbeResponseCurrent(requestedUrl, url.value)
+    ) return
+    availableVideoFormats.value = []
+    videoFormatsTitle.value = ''
+    if (String(videoQuality.value || '').startsWith('format:')) videoQuality.value = '1080p'
+    setStatus(videoFormatsStatus, `真实画质读取失败：${error.message}。仍可使用快速兼容模式。`, 'bad')
+  } finally {
+    if (requestSequence === videoFormatsRequestSequence) videoFormatsLoading.value = false
+  }
+}
+
 async function probeVideo() {
-  if (!url.value.trim()) {
+  const requestedUrl = url.value.trim()
+  if (!requestedUrl) {
     setStatus(probeStatus, '先输入视频链接或 ID。', 'bad')
     return
   }
+  const requestSequence = ++linkProbeSequence
   probing.value = true
-  setStatus(probeStatus, '正在检测字幕...', '')
+  setStatus(probeStatus, '正在检测字幕与视频信息...', '')
   try {
-    probe.value = await api('/api/probe', {
-      url: url.value.trim(),
+    const result = await api('/api/probe', {
+      url: requestedUrl,
       embedded_subtitle_hint: embeddedSubtitleHint.value,
       source_language: sourceLanguage.value,
       target_language: 'zh',
     })
-    if (probe.value.existing_project) {
-      useProject(probe.value.existing_project)
-      setStatus(probeStatus, `检测完成：${probe.value.subtitles?.length || 0} 条字幕轨道；已绑定本地项目：${probe.value.existing_project.name}`, 'ok')
-    } else {
-      setStatus(probeStatus, `检测完成：${probe.value.subtitles?.length || 0} 条字幕轨道。`, 'ok')
+    if (requestSequence !== linkProbeSequence || !isProbeResponseCurrent(requestedUrl, url.value)) {
+      setStatus(probeStatus, '链接已更改，已忽略上一条链接的检测结果。', '')
+      return
     }
-    if (probe.value.title) {
-      translateTitle(probe.value.title)
+    probe.value = result
+    probedInputUrl.value = requestedUrl
+    if (result.existing_project) {
+      setStatus(probeStatus, `检测完成：${result.subtitles?.length || 0} 条字幕轨道；找到本地项目 ${result.existing_project.name}，需要时可在下方手动载入。`, 'ok')
+    } else {
+      setStatus(probeStatus, `检测完成：${result.subtitles?.length || 0} 条字幕轨道。`, 'ok')
+    }
+    if (result.title) {
+      translateTitle(result.title, { requestedUrl, requestSequence })
     }
   } catch (error) {
-    setStatus(probeStatus, error.message, 'bad')
+    if (requestSequence === linkProbeSequence && isProbeResponseCurrent(requestedUrl, url.value)) {
+      setStatus(probeStatus, error.message, 'bad')
+    }
   } finally {
     probing.value = false
   }
 }
 
-async function translateTitle(title) {
+async function translateTitle(title, { requestedUrl = '', requestSequence = 0 } = {}) {
   setStatus(titleStatus, '正在盲翻标题...', '')
   try {
     const result = await api('/api/translate-title', { title })
+    if (requestSequence && (
+      requestSequence !== linkProbeSequence
+      || !isProbeResponseCurrent(requestedUrl, url.value)
+    )) return
     titleBox.value = result.zh_title || ''
     setStatus(titleStatus, titleBox.value ? '标题已翻译，可复制或填入任务提示。' : '标题翻译为空。', titleBox.value ? 'ok' : 'bad')
   } catch (error) {
+    if (requestSequence && (
+      requestSequence !== linkProbeSequence
+      || !isProbeResponseCurrent(requestedUrl, url.value)
+    )) return
     setStatus(titleStatus, error.message, 'bad')
   }
 }
@@ -1243,47 +1378,78 @@ async function downloadSubtitle(item) {
 }
 
 async function downloadVideo() {
-  const value = (probe.value?.webpage_url || url.value).trim()
+  if (linkActionBusy.value) return
+  const value = resolveLinkActionUrl(url.value, probe.value?.webpage_url)
   if (!value) {
     setStatus(probeStatus, '先输入视频链接或 ID。', 'bad')
     return
   }
+  const exactFormat = selectedVideoFormat(availableVideoFormats.value, videoQuality.value)
+  const quickQuality = String(videoQuality.value || '').startsWith('format:') ? '1080p' : videoQuality.value
+  const currentProbe = probe.value && isProbeResponseCurrent(probedInputUrl.value, url.value) ? probe.value : null
+  linkActionBusy.value = 'download-video'
+  setStatus(probeStatus, '正在创建视频下载任务...', '')
   try {
-    const job = await api('/api/jobs/download-video', { url: value, thumbnail_format: thumbnailFormat.value, quality: videoQuality.value })
+    const payload = {
+      url: value,
+      title: currentProbe?.title || videoFormatsTitle.value || '',
+      thumbnail_format: thumbnailFormat.value,
+      quality: quickQuality,
+    }
+    if (exactFormat) {
+      payload.format_id = exactFormat.id
+      payload.format_tag = exactFormat.format_tag
+      payload.container = exactFormat.container
+    }
+    const job = await api('/api/jobs/download-video', payload)
     watchJob(job)
+    setStatus(probeStatus, `视频下载任务已启动（${exactFormat?.label || '兼容 1080p，优先 H.264 / MP4'}）。页面会留在这里，进度可在“任务日志”查看。`, 'ok')
   } catch (error) {
     setStatus(probeStatus, error.message, 'bad')
+  } finally {
+    linkActionBusy.value = ''
   }
 }
 
 async function downloadThumbnail() {
-  const value = (probe.value?.webpage_url || url.value).trim()
+  if (linkActionBusy.value) return
+  const value = resolveLinkActionUrl(url.value, probe.value?.webpage_url)
   if (!value) {
     setStatus(probeStatus, '先输入视频链接或 ID。', 'bad')
     return
   }
+  const currentProbe = probe.value && isProbeResponseCurrent(probedInputUrl.value, url.value) ? probe.value : null
+  linkActionBusy.value = 'download-thumbnail'
+  setStatus(probeStatus, '正在创建封面下载任务...', '')
   try {
     const job = await api('/api/jobs/download-thumbnail', {
       url: value,
-      title: probe.value?.title || titleBox.value || '',
+      title: currentProbe?.title || titleBox.value || '',
       format: thumbnailFormat.value,
     })
     watchJob(job)
+    setStatus(probeStatus, '封面下载任务已启动。页面会留在这里，进度可在“任务日志”查看。', 'ok')
   } catch (error) {
     setStatus(probeStatus, error.message, 'bad')
+  } finally {
+    linkActionBusy.value = ''
   }
 }
 
 async function runOcrFull() {
-  const value = (probe.value?.webpage_url || url.value).trim()
+  if (linkActionBusy.value) return
+  const value = resolveLinkActionUrl(url.value, probe.value?.webpage_url)
   if (!value) {
     setStatus(probeStatus, '先输入视频链接或 ID。', 'bad')
     return
   }
+  const currentProbe = probe.value && isProbeResponseCurrent(probedInputUrl.value, url.value) ? probe.value : null
+  linkActionBusy.value = 'ocr-full'
+  setStatus(probeStatus, '正在创建视频下载与 OCR 任务...', '')
   try {
     const job = await api('/api/jobs/ocr-full', {
       url: value,
-      title: probe.value?.title || titleBox.value || '',
+      title: currentProbe?.title || titleBox.value || '',
       extra_hint: extraHint.value,
       ocr_pipeline_version: ocrExtractionMode.value === 'region_v3' ? 'v3' : 'custom',
       translation_mode: ocrTranslationMode.value,
@@ -1304,8 +1470,11 @@ async function runOcrFull() {
       ocr_language: ocrLanguage.value,
     })
     watchJob(job)
+    setStatus(probeStatus, '视频下载与 OCR 任务已启动。页面会留在这里，进度可在“任务日志”查看。', 'ok')
   } catch (error) {
     setStatus(probeStatus, error.message, 'bad')
+  } finally {
+    linkActionBusy.value = ''
   }
 }
 

@@ -1,6 +1,7 @@
 import argparse
 import io
 import os
+import re
 import shutil
 import subprocess
 import unicodedata
@@ -12,7 +13,7 @@ from PIL import Image
 from yt_dlp.utils import DownloadError, MaxDownloadsReached
 
 from video_translate.env import load_dotenv
-from video_translate.youtube.filenames import youtube_output_template
+from video_translate.youtube.filenames import normalize_download_format_tag, youtube_output_template
 from video_translate.youtube_url import normalize_youtube_url
 
 
@@ -37,6 +38,24 @@ DEFAULT_THUMBNAIL_FORMAT = os.environ.get("YTDLP_THUMBNAIL_FORMAT", "jpg").strip
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 THUMBNAIL_FORMATS = {"jpg", "jpeg", "png", "webp", "source"}
+DOWNLOAD_CONTAINERS = {"mp4", "mkv", "webm"}
+FORMAT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:\+[A-Za-z0-9][A-Za-z0-9._-]{0,127})?$")
+FORMAT_SELECTOR_KEYWORDS = {
+    "all",
+    "b",
+    "ba",
+    "bv",
+    "best",
+    "bestaudio",
+    "bestvideo",
+    "mergeall",
+    "w",
+    "wa",
+    "worst",
+    "worstaudio",
+    "worstvideo",
+    "wv",
+}
 
 
 def normalize_url(url):
@@ -53,15 +72,39 @@ def parse_quality(quality):
     return int(quality)
 
 
-def build_video_options(output_dir, height, *, proxy=DEFAULT_PROXY, format_selector=None, http_chunk_size=DEFAULT_HTTP_CHUNK_SIZE, archive=False, project_title=None):
+def build_video_options(
+    output_dir,
+    height,
+    *,
+    proxy=DEFAULT_PROXY,
+    format_selector=None,
+    http_chunk_size=DEFAULT_HTTP_CHUNK_SIZE,
+    archive=False,
+    project_title=None,
+    format_tag=None,
+    container="mp4",
+):
     output_path = Path(output_dir).expanduser()
-    filename_template = "%(title)s.best.%(ext)s" if archive else "%(title)s.%(ext)s"
-    outtmpl = youtube_output_template(output_path, project_title, archive=archive) if project_title else str(output_path / "%(title)s" / filename_template)
+    safe_format_tag = normalize_download_format_tag(format_tag)
+    container = normalize_download_container(container)
+    if archive and safe_format_tag:
+        raise ValueError("archive 与 format_tag 不能同时使用")
+    if safe_format_tag:
+        filename_template = f"%(title)s.{safe_format_tag}.%(ext)s"
+    elif archive:
+        filename_template = "%(title)s.best.%(ext)s"
+    else:
+        filename_template = "%(title)s.%(ext)s"
+    outtmpl = (
+        youtube_output_template(output_path, project_title, archive=archive, format_tag=safe_format_tag)
+        if project_title
+        else str(output_path / "%(title)s" / filename_template)
+    )
     ydl_opts = {
         "format": format_selector or (best_format_selector() if height is None else h264_format_selector(height)),
         "outtmpl": outtmpl,
         "noplaylist": True,
-        "merge_output_format": "mp4",
+        "merge_output_format": container,
         "concurrent_fragment_downloads": 5,
         "max_downloads": 1,
         "retries": 10,
@@ -78,6 +121,24 @@ def build_video_options(output_dir, height, *, proxy=DEFAULT_PROXY, format_selec
     if shutil.which("node"):
         ydl_opts["js_runtimes"] = {"node": {}}
     return ydl_opts
+
+
+def normalize_exact_format_id(value: str | None) -> str:
+    format_id = str(value or "").strip()
+    if not format_id:
+        return ""
+    if not FORMAT_ID_RE.fullmatch(format_id):
+        raise ValueError("下载格式 ID 无效")
+    if any(part.casefold() in FORMAT_SELECTOR_KEYWORDS for part in format_id.split("+")):
+        raise ValueError("下载格式 ID 必须是探测返回的具体格式，不能使用 best/all 等选择器")
+    return format_id
+
+
+def normalize_download_container(value: str | None) -> str:
+    container = str(value or "mp4").strip().lower().lstrip(".")
+    if container not in DOWNLOAD_CONTAINERS:
+        raise ValueError("下载封装格式无效，可选: mp4、mkv、webm")
+    return container
 
 
 def update_yt_dlp_outtmpl(ydl, ydl_opts: dict, outtmpl: str) -> None:
@@ -132,9 +193,8 @@ def fallback_format_selector(height):
         return "bestvideo*+bestaudio/best"
     return (
         "bestvideo[height<=%d][ext=mp4]+bestaudio[ext=m4a]/"
-        "best[height<=%d][ext=mp4]/"
-        "best[height<=%d]"
-    ) % (height, height, height)
+        "best[height<=%d][ext=mp4]"
+    ) % (height, height)
 
 
 def download_attempts(height):
@@ -152,6 +212,16 @@ def download_attempts(height):
         attempts.append(("h264-720p-fallback", h264_format_selector(720), DEFAULT_HTTP_CHUNK_SIZE))
     attempts.append(("mp4-%dp-fallback" % height, fallback_format_selector(height), DEFAULT_HTTP_CHUNK_SIZE))
     return attempts
+
+
+def exact_format_download_attempts(format_id: str):
+    format_id = normalize_exact_format_id(format_id)
+    if not format_id:
+        raise ValueError("下载格式 ID 不能为空")
+    return [
+        (f"exact-{format_id}", format_id, DEFAULT_HTTP_CHUNK_SIZE),
+        (f"exact-{format_id}-small-chunks", format_id, 4 * 1024 * 1024),
+    ]
 
 
 def video_codec(path: Path) -> str:
@@ -180,7 +250,13 @@ def video_codec(path: Path) -> str:
 
 
 def remove_incompatible_existing_h264_targets(output_dir: Path, title: str) -> None:
+    comparable = comparable_title(title)
+    # The compatibility download owns only the unsuffixed ``Title.ext`` target.
+    # Exact/archive variants (``Title.2160p.av1.mp4`` / ``Title.best.av1.mp4``)
+    # are separate assets and must survive a later quick 1080p download.
     for video_path in matching_video_files(output_dir, title):
+        if comparable_title(video_path.stem) != comparable:
+            continue
         codec = video_codec(video_path)
         if codec and codec not in {"h264", "avc1"}:
             print(f"replace_incompatible_video: {video_path} codec={codec}")
@@ -193,6 +269,12 @@ def is_archive_quality(quality) -> bool:
 
 def matching_archive_video_files(output_dir: Path, title: str) -> list[Path]:
     return [path for path in matching_video_files(output_dir, title) if ".best" in path.stem]
+
+
+def matching_exact_video_files(output_dir: Path, title: str, format_tag: str) -> list[Path]:
+    safe_format_tag = normalize_download_format_tag(format_tag)
+    marker = f".{safe_format_tag}"
+    return [path for path in matching_video_files(output_dir, title) if path.stem.endswith(marker)]
 
 
 def archive_video_path(path: Path) -> Path:
@@ -227,9 +309,26 @@ def is_retriable_download_error(error):
     )
 
 
-def download_video(url, quality=DEFAULT_QUALITY, output_dir=DEFAULT_OUTPUT_DIR, *, thumbnail_format=DEFAULT_THUMBNAIL_FORMAT):
+def download_video(
+    url,
+    quality=DEFAULT_QUALITY,
+    output_dir=DEFAULT_OUTPUT_DIR,
+    *,
+    thumbnail_format=DEFAULT_THUMBNAIL_FORMAT,
+    project_title=None,
+    format_id=None,
+    format_tag=None,
+    container=None,
+):
     height = parse_quality(quality)
-    archive = is_archive_quality(quality)
+    exact_format_id = normalize_exact_format_id(format_id)
+    exact_format_tag = normalize_download_format_tag(format_tag)
+    exact_container = normalize_download_container(container) if container else "mp4"
+    if exact_format_id and not exact_format_tag:
+        raise ValueError("精确下载必须提供格式标签")
+    if not exact_format_id and (exact_format_tag or container):
+        raise ValueError("format_tag/container 只能与 format_id 一起使用")
+    archive = is_archive_quality(quality) and not exact_format_id
     video_url = normalize_url(url)
     output_path = Path(output_dir).expanduser()
     output_path.mkdir(parents=True, exist_ok=True)
@@ -237,33 +336,58 @@ def download_video(url, quality=DEFAULT_QUALITY, output_dir=DEFAULT_OUTPUT_DIR, 
 
     last_error = None
     try:
-        for attempt_name, format_selector, chunk_size in download_attempts(height):
+        attempts = exact_format_download_attempts(exact_format_id) if exact_format_id else download_attempts(height)
+        for attempt_name, format_selector, chunk_size in attempts:
             ydl_opts = build_video_options(
                 output_path,
                 height,
                 format_selector=format_selector,
                 http_chunk_size=chunk_size,
                 archive=archive,
+                project_title=project_title,
+                format_tag=exact_format_tag,
+                container=exact_container,
             )
             print(f"download_attempt: {attempt_name}")
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(video_url, download=False) if hasattr(ydl, "extract_info") else {}
                     title = str(info.get("title") or "")
-                    if title:
-                        update_yt_dlp_outtmpl(ydl, ydl_opts, youtube_output_template(output_path, title, archive=archive))
-                    if height is not None:
-                        remove_incompatible_existing_h264_targets(output_path, title)
+                    output_title = str(project_title or title)
+                    if output_title:
+                        update_yt_dlp_outtmpl(
+                            ydl,
+                            ydl_opts,
+                            youtube_output_template(
+                                output_path,
+                                output_title,
+                                archive=archive,
+                                format_tag=exact_format_tag,
+                            ),
+                        )
+                    if height is not None and not exact_format_id:
+                        remove_incompatible_existing_h264_targets(output_path, output_title)
                     try:
                         ydl.download([video_url])
                     except MaxDownloadsReached:
                         print("Reached the maximum number of downloads. Download completed successfully.")
-                videos = changed_video_files(output_path, before_videos)
-                if archive:
-                    videos = [path for path in videos if ".best" in path.stem]
-                if not videos:
+                if exact_format_id:
+                    matcher = lambda root, candidate_title: matching_exact_video_files(
+                        root, candidate_title, exact_format_tag
+                    )
+                else:
                     matcher = matching_archive_video_files if archive else matching_video_files
-                    videos = matcher(output_path, str(info.get("title") or ""))
+                if project_title:
+                    videos = matcher(output_path, output_title)
+                else:
+                    videos = changed_video_files(output_path, before_videos)
+                    if archive:
+                        videos = [path for path in videos if ".best" in path.stem]
+                    elif exact_format_id:
+                        marker = f".{exact_format_tag}"
+                        videos = [path for path in videos if path.stem.endswith(marker)]
+                    if not videos:
+                        videos = matcher(output_path, output_title)
                 if archive:
                     videos = [archive_video_path(path) for path in videos]
                 thumbnail = thumbnail_url_from_info(info)
@@ -278,7 +402,7 @@ def download_video(url, quality=DEFAULT_QUALITY, output_dir=DEFAULT_OUTPUT_DIR, 
                 print("download_retry_next_strategy")
     except MaxDownloadsReached:
         print("Reached the maximum number of downloads. Download completed successfully.")
-        videos = changed_video_files(output_path, before_videos)
+        videos = matching_video_files(output_path, str(project_title)) if project_title else changed_video_files(output_path, before_videos)
         return videos
     if last_error:
         raise last_error
@@ -371,10 +495,25 @@ def main(argv=None):
     parser.add_argument("--quality", default=DEFAULT_QUALITY, help="Video quality: best, 2160p, 1440p, 1080p, 720p, etc.")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--thumbnail-format", default=DEFAULT_THUMBNAIL_FORMAT, choices=sorted(THUMBNAIL_FORMATS), help="Thumbnail format: jpg, png, webp, or source")
+    parser.add_argument("--project-title", default="", help="Optional fixed project folder and filename stem")
+    parser.add_argument("--format-id", default="", help="Exact yt-dlp format ID, for example 401+140")
+    parser.add_argument("--format-tag", default="", help="Safe filename tag returned by the format probe")
+    parser.add_argument("--container", default="", choices=sorted(DOWNLOAD_CONTAINERS), help="Exact download output container")
     args = parser.parse_args(argv)
 
     print(f"Downloading video: {args.url}")
-    download_video(args.url, quality=args.quality, output_dir=args.output_dir, thumbnail_format=args.thumbnail_format)
+    kwargs = {
+        "quality": args.quality,
+        "output_dir": args.output_dir,
+        "thumbnail_format": args.thumbnail_format,
+    }
+    if args.project_title:
+        kwargs["project_title"] = args.project_title
+    if args.format_id:
+        kwargs["format_id"] = args.format_id
+        kwargs["format_tag"] = args.format_tag
+        kwargs["container"] = args.container or "mp4"
+    download_video(args.url, **kwargs)
     print("Download process finished.")
 
 

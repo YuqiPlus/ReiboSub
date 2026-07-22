@@ -88,6 +88,182 @@ def test_probe_video_normalizes_url_and_adds_agent_plan(monkeypatch):
     assert result["agent_plan"]["selected_subtitle"]["lang"] == "ko"
 
 
+def test_download_formats_returns_exact_aggregated_safe_choices(monkeypatch):
+    captured = {}
+
+    class FakeYoutubeDL:
+        def __init__(self, opts):
+            captured["opts"] = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, url, download=False):
+            captured["url"] = url
+            return {
+                "id": "abc123",
+                "title": "Demo",
+                "duration": 61,
+                "formats": [
+                    {
+                        "format_id": "140",
+                        "vcodec": "none",
+                        "acodec": "mp4a.40.2",
+                        "ext": "m4a",
+                        "abr": 129,
+                        "filesize": 10_000_000,
+                        "url": "https://signed.example/audio?secret=1",
+                    },
+                    {
+                        "format_id": "251",
+                        "vcodec": "none",
+                        "acodec": "opus",
+                        "ext": "webm",
+                        "abr": 140,
+                    },
+                    {
+                        "format_id": "401",
+                        "vcodec": "av01.0.12M.08",
+                        "acodec": "none",
+                        "ext": "webm",
+                        "height": 2160,
+                        "width": 3840,
+                        "fps": 59.94,
+                        "dynamic_range": "HDR10",
+                        "tbr": 14000,
+                        "filesize_approx": 1_000_000_000,
+                        "url": "https://signed.example/video?secret=2",
+                    },
+                    {
+                        "format_id": "402",
+                        "vcodec": "av01.0.12M.08",
+                        "acodec": "none",
+                        "ext": "webm",
+                        "height": 2160,
+                        "width": 3840,
+                        "fps": 59.94,
+                        "dynamic_range": "HDR10",
+                        "tbr": 9000,
+                    },
+                    {
+                        "format_id": "137",
+                        "vcodec": "avc1.640028",
+                        "acodec": "none",
+                        "ext": "mp4",
+                        "height": 1080,
+                        "width": 1920,
+                        "fps": 30,
+                        "tbr": 4500,
+                    },
+                    {
+                        "format_id": "18",
+                        "vcodec": "avc1.42001E",
+                        "acodec": "mp4a.40.2",
+                        "ext": "mp4",
+                        "height": 360,
+                        "width": 640,
+                        "fps": 30,
+                    },
+                    {"format_id": "bad/selector", "vcodec": "avc1", "acodec": "none", "height": 720},
+                    {"format_id": "drm", "vcodec": "avc1", "acodec": "none", "height": 720, "has_drm": True},
+                ],
+            }
+
+    monkeypatch.setattr(web_agent.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+
+    result = web_agent.download_formats("abc123", proxy=None)
+
+    assert captured["url"] == "https://www.youtube.com/watch?v=abc123"
+    assert result["id"] == "abc123"
+    assert result["recommended_format_id"] == "401+140"
+    assert [item["id"] for item in result["formats"]] == ["401+140", "137+140", "18"]
+    best = result["formats"][0]
+    assert best == {
+        "id": "401+140",
+        "video_format_id": "401",
+        "audio_format_id": "140",
+        "height": 2160,
+        "width": 3840,
+        "fps": 59.94,
+        "hdr": True,
+        "video_codec": "av1",
+        "audio_codec": "aac",
+        "container": "mp4",
+        "filesize_approx": 1_010_000_000,
+        "label": "2160p 60fps HDR · AV1 · MP4 · 现代设备 · 约 963.2 MB",
+        "format_tag": "2160p60.hdr.av1",
+        "compatibility": "modern",
+    }
+    serialized = __import__("json").dumps(result)
+    assert "signed.example" not in serialized
+    assert "secret=" not in serialized
+
+
+def test_download_formats_rejects_audio_only_results(monkeypatch):
+    class FakeYoutubeDL:
+        def __init__(self, opts):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {
+                "id": "abc123",
+                "formats": [{"format_id": "140", "vcodec": "none", "acodec": "mp4a.40.2"}],
+            }
+
+    monkeypatch.setattr(web_agent.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+
+    with pytest.raises(RuntimeError, match="没有发现可下载的视频格式"):
+        web_agent.download_formats("abc123", proxy=None)
+
+
+def test_download_format_choices_prefer_original_audio_over_higher_bitrate_dub():
+    choices = web_agent._download_format_choices(
+        [
+            {
+                "format_id": "401",
+                "vcodec": "av01.0.12M.08",
+                "acodec": "none",
+                "ext": "mp4",
+                "height": 2160,
+                "width": 3840,
+                "fps": 30,
+            },
+            {
+                "format_id": "140",
+                "vcodec": "none",
+                "acodec": "mp4a.40.2",
+                "ext": "m4a",
+                "language": "ko",
+                "language_preference": 10,
+                "format_note": "Korean (original)",
+                "abr": 128,
+            },
+            {
+                "format_id": "140-en",
+                "vcodec": "none",
+                "acodec": "mp4a.40.2",
+                "ext": "m4a",
+                "language": "en",
+                "language_preference": -1,
+                "format_note": "English dubbed",
+                "abr": 160,
+            },
+        ]
+    )
+
+    assert choices[0]["id"] == "401+140"
+    assert choices[0]["audio_format_id"] == "140"
+
+
 
 def test_start_agent_session_uses_configured_japanese_for_probe(monkeypatch, tmp_path):
     monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
@@ -1878,6 +2054,57 @@ def test_find_or_bind_youtube_project_rejects_ambiguous_title_matches(monkeypatc
     assert not (second / "project.yaml").exists()
 
 
+def test_find_or_bind_youtube_project_does_not_rebind_same_title_from_another_url(monkeypatch, tmp_path):
+    downloads = tmp_path / "YoutubeDownloads"
+    project = downloads / "Target Video"
+    project.mkdir(parents=True)
+    video = project / "Target Video.mp4"
+    video.write_bytes(b"old video")
+    web_agent.update_youtube_project_manifest(
+        video,
+        source_url="https://www.youtube.com/watch?v=old123",
+        title="Target Video",
+    )
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
+
+    found = web_agent._find_or_bind_youtube_project(
+        "https://www.youtube.com/watch?v=new456",
+        "Target Video",
+    )
+
+    manifest = yaml.safe_load((project / "project.yaml").read_text(encoding="utf-8"))
+    assert found == {}
+    assert manifest["normalized_url"] == "https://www.youtube.com/watch?v=old123"
+
+
+def test_probe_thumbnail_reserves_separate_project_for_same_title_url(monkeypatch, tmp_path):
+    downloads = tmp_path / "YoutubeDownloads"
+    old_project = downloads / "Target Video"
+    old_project.mkdir(parents=True)
+    old_video = old_project / "Target Video.mp4"
+    old_video.write_bytes(b"old video")
+    web_agent.update_youtube_project_manifest(
+        old_video,
+        source_url="https://www.youtube.com/watch?v=old123",
+        title="Target Video",
+    )
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
+
+    thumbnail = web_agent._ensure_probe_thumbnail(
+        "https://www.youtube.com/watch?v=new456",
+        "Target Video",
+        {"title": "Target Video", "thumbnails": []},
+        proxy=None,
+    )
+
+    new_project = downloads / "Target Video [new456]"
+    old_manifest = yaml.safe_load((old_project / "project.yaml").read_text(encoding="utf-8"))
+    new_manifest = yaml.safe_load((new_project / "project.yaml").read_text(encoding="utf-8"))
+    assert thumbnail is None
+    assert old_manifest["normalized_url"] == "https://www.youtube.com/watch?v=old123"
+    assert new_manifest["normalized_url"] == "https://www.youtube.com/watch?v=new456"
+
+
 def test_api_path_segment_decodes_percent_encoded_task_id():
     task_id = "yqmrauhwt3w_금빛_대장정"
     encoded = "yqmrauhwt3w_%EA%B8%88%EB%B9%9B_%EB%8C%80%EC%9E%A5%EC%A0%95"
@@ -3512,6 +3739,63 @@ def test_download_video_job_passes_requested_quality(monkeypatch, tmp_path: Path
     assert calls[0][calls[0].index("--quality") + 1] == "1440p"
 
 
+def test_download_video_job_passes_exact_format_and_preserves_existing_primary(monkeypatch, tmp_path: Path):
+    downloads = tmp_path / "YoutubeDownloads"
+    project = downloads / "Target Video"
+    project.mkdir(parents=True)
+    primary = project / "Target Video.mp4"
+    exact = project / "Target Video.2160p60.hdr.av1.mp4"
+    primary.write_bytes(b"primary")
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
+    monkeypatch.setattr(web_agent, "PYTHON", "/python")
+    calls = []
+
+    def fake_run_command(job_id, args):
+        calls.append(args)
+        if args[:3] == ["/python", "-m", "video_translate.youtube.download_video"]:
+            exact.write_bytes(b"exact")
+
+    monkeypatch.setattr(web_agent, "_run_command", fake_run_command)
+
+    job = web_agent.download_video_job(
+        {
+            "url": "abc123",
+            "title": "Target Video",
+            "format_id": "401+140",
+            "format_tag": "2160p60.hdr.av1",
+            "container": "mp4",
+        }
+    )
+    snapshot = _wait_job_status(job.id, "done")
+
+    command = calls[0]
+    assert command[command.index("--format-id") + 1] == "401+140"
+    assert command[command.index("--format-tag") + 1] == "2160p60.hdr.av1"
+    assert command[command.index("--container") + 1] == "mp4"
+    assert snapshot["result"]["input_video"] == str(exact)
+    assert snapshot["result"]["selected_format"] == {
+        "id": "401+140",
+        "format_tag": "2160p60.hdr.av1",
+        "container": "mp4",
+    }
+    manifest = yaml.safe_load((project / "project.yaml").read_text(encoding="utf-8"))
+    assert manifest["primary_video"] == str(primary.resolve())
+
+
+@pytest.mark.parametrize(
+    "payload, message",
+    [
+        ({"format_id": "401/best", "format_tag": "2160p.av1", "container": "mp4"}, "格式 ID"),
+        ({"format_id": "401+140", "format_tag": "../escape", "container": "mp4"}, "格式标签"),
+        ({"format_id": "401+140", "format_tag": "2160p.av1", "container": "avi"}, "封装格式"),
+        ({"format_id": "401+140"}, "必须同时提供"),
+    ],
+)
+def test_download_video_job_rejects_invalid_exact_format_payload(payload, message):
+    with pytest.raises(ValueError, match=message):
+        web_agent.download_video_job({"url": "abc123", **payload})
+
+
 def test_download_video_job_keeps_primary_manifest_for_archive_quality(monkeypatch, tmp_path: Path):
     downloads = tmp_path / "YoutubeDownloads"
     project = downloads / "Target Video"
@@ -3764,6 +4048,80 @@ def test_download_video_job_uses_existing_file_matching_title(monkeypatch, tmp_p
 
     assert snapshot["result"]["input_video"] == str(target)
     assert snapshot["result"]["thumbnail_path"] == str(thumbnail)
+
+
+def test_download_video_job_isolates_same_title_urls_and_ignores_foreign_changed_file(monkeypatch, tmp_path: Path):
+    downloads = tmp_path / "YoutubeDownloads"
+    old_project = downloads / "Target Video"
+    old_project.mkdir(parents=True)
+    old_video = old_project / "Target Video.mp4"
+    old_video.write_bytes(b"old video")
+    web_agent.update_youtube_project_manifest(
+        old_video,
+        source_url="https://www.youtube.com/watch?v=old123",
+        title="Target Video",
+    )
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
+    monkeypatch.setattr(web_agent, "PYTHON", "/python")
+    requested_projects = []
+
+    def fake_run_command(job_id, args):
+        if args[:3] != ["/python", "-m", "video_translate.youtube.download_video"]:
+            return
+        project_title = args[args.index("--project-title") + 1]
+        requested_projects.append(project_title)
+        project = downloads / project_title
+        project.mkdir(parents=True, exist_ok=True)
+        (project / f"{project_title}.mp4").write_bytes(b"new video")
+        foreign = downloads / "Foreign Concurrent Download"
+        foreign.mkdir()
+        (foreign / "Foreign Concurrent Download.mp4").write_bytes(b"foreign")
+
+    monkeypatch.setattr(web_agent, "_run_command", fake_run_command)
+
+    job = web_agent.download_video_job(
+        {
+            "url": "https://www.youtube.com/watch?v=new456",
+            "title": "Target Video",
+        }
+    )
+    snapshot = _wait_job_status(job.id, "done")
+
+    new_project = downloads / requested_projects[0]
+    old_manifest = yaml.safe_load((old_project / "project.yaml").read_text(encoding="utf-8"))
+    new_manifest = yaml.safe_load((new_project / "project.yaml").read_text(encoding="utf-8"))
+    assert requested_projects == ["Target Video [new456]"]
+    assert snapshot["result"]["project_dir"] == str(new_project.resolve())
+    assert Path(snapshot["result"]["input_video"]).parent == new_project
+    assert old_manifest["normalized_url"] == "https://www.youtube.com/watch?v=old123"
+    assert new_manifest["normalized_url"] == "https://www.youtube.com/watch?v=new456"
+
+
+def test_download_video_job_does_not_claim_foreign_changed_video(monkeypatch, tmp_path: Path):
+    downloads = tmp_path / "YoutubeDownloads"
+    downloads.mkdir()
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
+    monkeypatch.setattr(web_agent, "PYTHON", "/python")
+
+    def fake_run_command(job_id, args):
+        if args[:3] != ["/python", "-m", "video_translate.youtube.download_video"]:
+            return
+        foreign = downloads / "Foreign Concurrent Download"
+        foreign.mkdir()
+        (foreign / "Foreign Concurrent Download.mp4").write_bytes(b"foreign")
+
+    monkeypatch.setattr(web_agent, "_run_command", fake_run_command)
+
+    job = web_agent.download_video_job(
+        {
+            "url": "https://www.youtube.com/watch?v=target123",
+            "title": "Target Video",
+        }
+    )
+    snapshot = _wait_job_status(job.id, "failed")
+
+    assert "Target Video" in snapshot["error"]
+    assert "Foreign Concurrent Download" not in snapshot["error"]
 
 
 def test_ocr_extract_job_downloads_ocr_compatible_video(monkeypatch, tmp_path: Path):
