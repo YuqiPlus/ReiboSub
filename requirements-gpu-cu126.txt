@@ -1,13 +1,6 @@
-# CUDA 12.6 GPU-oriented install helper.
-# Important: this file intentionally does not include requirements.txt because
-# requirements.txt installs CPU paddlepaddle. Use the README GPU section.
+# CUDA 12.6 installation: project runtime plus faster-whisper ASR.
+# Install paddlepaddle-gpu separately from Paddle's CUDA-specific package index.
 
-opencv-python>=4.8,<5
-paddleocr>=3.0,<4
-Pillow>=10,<13
-PyYAML>=6,<7
-requests>=2.31,<3
-yt-dlp>=2025.1.1
-faster-whisper>=1.1,<2
+-e .[asr]
 nvidia-cublas-cu12==12.6.4.1
 nvidia-cudnn-cu12==9.5.1.17

@@ -1,0 +1,12 @@
+# Copy this file to configs/reibosub.yaml. The copied file is local-only and
+# ignored by Git. These are the only startup settings most users need.
+
+# Video projects, downloaded media, and playable sidecar subtitles.
+media_dir: YoutubeDownloads
+
+# Only used for YouTube requests. Leave empty when no proxy is needed.
+youtube_proxy: ""
+
+# The UI has no login. Keep loopback unless you are on a trusted network.
+host: 127.0.0.1
+port: 7860

@@ -1,11 +1,12 @@
 .cache/
 models/
 .env*
-!.env.example
 configs/run.yaml
 configs/llm.yaml
 configs/app_settings.yaml
+configs/provider_profiles.yaml
 configs/provider_secrets.yaml
+configs/reibosub.yaml
 configs/local_runtime.yaml
 outputs/
 /build/
@@ -42,6 +43,8 @@ service-account*.json
 configs/*.bak
 configs/*.backup
 configs/provider_secrets.yaml.*
+configs/provider_profiles.yaml.*
+configs/reibosub.yaml.*
 configs/local_runtime.yaml.*
 configs/app_settings.yaml.*
 configs/providers/*.bak
@@ -76,5 +79,3 @@ configs/glossaries/*
 !configs/glossaries/examples/
 !configs/glossaries/examples/glossary.example.yaml
 configs/providers/*
-!configs/providers/README.md
-!configs/providers/*.yml.example

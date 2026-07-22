@@ -19,7 +19,7 @@ The project is designed for a human-in-the-loop workflow: the Agent can run mult
 - **Subtitle editing**: edit text and timing, keep 50 undo steps, preview one cue with a live sidecar overlay, and add/merge/delete/clean cues.
 - **Subtitle conversion**: convert to common formats including SRT, VTT, ASS/SSA, LRC, TXT, JSON, and Bilibili BCC.
 - **Video overlay tool**: place watermark/logo masks on a video and export a new video without overwriting the original.
-- **Generic LLM config**: one OpenAI-compatible configuration path; the examples use Volcengine Ark/Doubao, but the variable names are provider-neutral.
+- **Model provider settings**: add OpenAI-compatible services, discover their models, and bind a provider/model to each LLM task from the Web UI.
 
 For Agent routing design notes, see [docs/youtube_agent_workflows.md](docs/youtube_agent_workflows.md). That document includes background and future ideas, so not every item is necessarily implemented.
 
@@ -42,7 +42,7 @@ cd ReiboSub
 conda create -n reibosub python=3.11 -y
 conda activate reibosub
 python -m pip install -U pip
-python -m pip install -e ".[dev,asr]"
+python -m pip install -e ".[dev,asr,ocr-cpu]"
 ```
 
 If you prefer one conda command, use the provided environment file:
@@ -55,8 +55,22 @@ conda activate reibosub
 For a smaller install without ASR/test dependencies:
 
 ```bash
-python -m pip install -e .
+python -m pip install -e ".[ocr-cpu]"
 ```
+
+For a requirements-based setup, the standard CPU OCR + ASR install is:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Test dependencies are managed by the `dev` extra in `pyproject.toml`:
+
+```bash
+python -m pip install -e ".[dev]"
+```
+
+For GPU OCR, do not install the CPU requirements; follow the CUDA-specific steps below.
 
 Build the frontend once after cloning:
 
@@ -67,33 +81,30 @@ npm run build
 cd ..
 ```
 
-Optionally copy the machine-local runtime template. The defaults already start safely on the local machine; create this file only to change ports, download/cache paths, or the OCR device.
+Optionally copy the single machine-local startup template. The defaults already start safely, so create this file only when you want to change the media directory, YouTube proxy, listen address, or port.
 
 ```bash
-cp configs/local_runtime.example.yaml configs/local_runtime.yaml
+cp configs/reibosub.example.yaml configs/reibosub.yaml
 ```
 
 Example:
 
 ```yaml
-version: 1
-environment:
-  YTDLP_PROXY: ""
-  VIDEO_TRANSLATE_HOST: 127.0.0.1
-  VIDEO_TRANSLATE_PORT: 7860
-  VIDEO_TRANSLATE_DOWNLOAD_DIR: YoutubeDownloads
-  VIDEO_TRANSLATE_CACHE_DIR: models
-  VIDEO_TRANSLATE_OCR_DEVICE: auto
+media_dir: YoutubeDownloads
+youtube_proxy: ""
+host: 127.0.0.1
+port: 7860
 ```
 
-If YouTube needs a proxy on your network, set only `YTDLP_PROXY`, for example:
+If YouTube needs a proxy on your network, set `youtube_proxy`, for example:
 
 ```yaml
-environment:
-  YTDLP_PROXY: http://127.0.0.1:7890
+youtube_proxy: http://127.0.0.1:7890
 ```
 
 Local OCR/ASR/LLM child processes do not use generic `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` by default; this keeps a YouTube proxy from slowing down local processing.
+
+Existing installations can keep their old `configs/local_runtime.yaml`, `.env`, and `configs/llm.yaml` files. They remain compatibility inputs and do not need to be migrated or deleted.
 
 Start the Agent UI:
 
@@ -120,11 +131,11 @@ Then still open `http://127.0.0.1:7860` locally. Use `python run_agent_ui.py --h
 After opening the UI for the first time:
 
 1. Open **Settings → Add provider**.
-2. Enter a stable provider ID, label, OpenAI-compatible API base URL, API key, and default model.
-3. Fetch remote models; if the service has no `/models` endpoint, enter static model IDs instead.
-4. Bind providers/models to translation, glossary, OCR refinement, and the other LLM tasks, then save.
+2. Enter a stable provider ID, label, OpenAI-compatible API base URL, and API key.
+3. Click **Create and fetch models**; if the service has no `/models` endpoint, enter static model IDs instead.
+4. Choose the provider's default model, then bind providers/models to translation, glossary, OCR refinement, and the other LLM tasks.
 
-The connection URL and key are written to Git-ignored `configs/provider_secrets.yaml`. Keys are write-only and are never returned by the backend. You may also copy the [provider profile example](configs/providers/openai-compatible.yml.example) to create public metadata manually, then enter connection fields in Settings.
+The UI stores provider metadata in the Git-ignored `configs/provider_profiles.yaml` and connection URLs/API keys in the equally ignored `configs/provider_secrets.yaml`. Keys are write-only and are never returned by the backend. New installations do not need to copy or maintain files under `configs/providers/`.
 
 ## Frontend Development
 
@@ -146,81 +157,31 @@ Vite defaults to `http://127.0.0.1:5173` and proxies `/api` to port `7860`. Stil
 
 The project uses OpenAI-compatible chat-completions APIs. The Web UI **Settings** page can persist the default language for new tasks, the default provider profile, and the model used by every LLM module.
 
-Provider profiles come from local `configs/providers/*.yml` files. Creating one in Settings is the easiest route, or copy the public non-secret template:
+Create and manage providers from Settings. Enter the API base URL and key, fetch the provider's model list, choose its default model, and then bind models to translation, glossary, OCR refinement, and the other LLM tasks. When an endpoint has no `/models` support, you can maintain a static model list in the same page.
 
-```bash
-cp configs/providers/openai-compatible.yml.example configs/providers/example.yml
-```
-
-The filename stem (`example`) becomes the provider ID. The template stores only display/model metadata:
-
-```yaml
-label: Example OpenAI-compatible provider
-provider: openai-compatible
-backend: openai-compatible
-model_name: example-model
-model_names:
-  - example-model
-```
-
-Enter the base URL and key in Settings instead of the provider file. When the UI requests remote models, the Python server calls `/models` through the selected trusted profile and falls back to its static model list if discovery fails.
-
-API keys and endpoints are managed directly from Settings; `.env` is not required. They are stored in Git-ignored YAML file `configs/provider_secrets.yaml` with mode `0600`, using the precedence “local secret settings > process environment > provider profile.” Keys are write-only: the backend returns only configured/source status and never echoes the current key or a suffix. Legacy `.env` / profile connections can still be imported without exposing their keys.
+API keys and endpoints are managed directly from Settings; `.env` is not required. Provider names, model lists, and default models are stored in `configs/provider_profiles.yaml`; connection URLs and keys are stored in `configs/provider_secrets.yaml`. Both files are Git-ignored, and the secrets file is forced to mode `0600`. Keys are write-only: the backend returns only configured/source status and never echoes the current key or a suffix.
 
 Remote pages may write or replace a key, but changing the provider to a different origin requires a server-local connection or SSH port forwarding; model discovery URLs must share the API origin. Use HTTPS or an SSH tunnel when entering credentials remotely instead of sending them over an untrusted plaintext HTTP network.
 
-Settings also supports creating, editing, and deleting local OpenAI-compatible providers. Creating writes non-secret metadata to `configs/providers/<id>.yml` and connection data to `configs/provider_secrets.yaml`; it does not contact the new endpoint until model discovery or a task is explicitly requested. Editing can change the display label, default model, and static model list while connection fields remain in the write-only connection editor. Provider IDs are immutable because saved settings reference them. Deleting removes both records and migrates saved default/task bindings to the selected replacement provider, resetting affected task models to that provider's default. These management requests require same-origin JSON, while redirecting an existing credential to a different API origin remains restricted to loopback/SSH access.
+Settings also supports creating, editing, and deleting local OpenAI-compatible providers. Users do not need to edit these local files. Provider IDs stay immutable because saved task bindings reference them. Deleting a provider migrates affected bindings to the selected replacement and resets their model to that provider's default.
 
-The UI writes local overrides to `configs/app_settings.yaml`. These settings take precedence over legacy `configs/llm.yaml` values, which remain available as a compatibility fallback. Model selection order is:
-
-```text
-explicit --model or caller override
-> configs/app_settings.yaml task model / provider_profile
-> task-specific environment variable, e.g. ASR_CORRECTION_MODEL
-> configs/llm.yaml task model or model role
-> process environment (or legacy `.env`) global LLM_MODEL / ARK_MODEL
-> configs/llm.yaml default model
-```
-
-The recommended path is the Settings page. Existing installations can still use the legacy configuration path:
-
-1. Process environment or legacy `.env`: set `LLM_API_KEY` and optionally `LLM_BASE_URL` / `LLM_MODEL`.
-2. `configs/llm.yaml`: update `defaults.base_url` and `defaults.models.*` if model IDs changed.
-
-Example `configs/llm.yaml` values use Volcengine Ark / Doubao:
-
-```yaml
-defaults:
-  provider: openai-compatible
-  base_url: https://ark.cn-beijing.volces.com/api/coding/v3
-  api_key_env: LLM_API_KEY
-  models:
-    default: doubao-seed-2.0-pro
-    pro: doubao-seed-2.0-pro
-    lite: doubao-seed-2.0-lite
-```
-
-Legacy `ARK_*` environment variables remain compatible for older local installs, but new setups should use `LLM_*`.
+Older `.env`, `configs/llm.yaml`, and `configs/providers/*.yml` setups remain readable for compatibility, but they are no longer the setup path for a new installation.
 
 ## GPU and Model Cache
 
-Model caches default to the project-local `models/` directory. You can override the root in `configs/local_runtime.yaml`:
-
-```yaml
-environment:
-  VIDEO_TRANSLATE_CACHE_DIR: /srv/reibosub-models
-```
+Model caches default to the project-local `models/` directory.
 
 For PaddleOCR GPU support, install a PaddlePaddle GPU build that matches your CUDA runtime. Example for CUDA 12.6:
 
 ```bash
-python -m pip uninstall -y paddlepaddle
+python -m pip uninstall -y paddlepaddle paddlepaddle-gpu
 python -m pip install -r requirements-gpu-cu126.txt
 python -m pip install paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
-python -m pip install -e ".[dev,asr]" --no-deps
+# Optional for development and tests:
+python -m pip install -e ".[dev]"
 ```
 
-The GPU requirements file avoids installing CPU `paddlepaddle`; it only lists the common runtime packages plus CUDA Python wheels used by `faster-whisper`.
+The GPU requirements file installs the common project dependencies, `faster-whisper`, and its usual CUDA Python wheels, but not CPU Paddle. Install Paddle GPU itself from the CUDA-specific index in the next command.
 
 Check CUDA visibility:
 
@@ -228,12 +189,7 @@ Check CUDA visibility:
 python -c "import paddle; print(paddle.__version__); print(paddle.device.is_compiled_with_cuda()); print(paddle.device.get_device())"
 ```
 
-If `ocr.device` is `auto`, `configs/local_runtime.yaml` can choose the default device:
-
-```yaml
-environment:
-  VIDEO_TRANSLATE_OCR_DEVICE: gpu:0
-```
+When the OCR device is `auto`, ReiboSub selects an available device. Individual OCR routes can still choose CPU or a GPU explicitly. Advanced device overrides from an existing legacy local runtime file remain compatible.
 
 For ASR with `faster-whisper`, the project tries to prepend CUDA library paths from installed `nvidia-*` Python packages. If CUDA libraries are still missing, verify your environment's `nvidia-cublas-cu12` and `nvidia-cudnn-cu12` packages.
 
@@ -243,9 +199,9 @@ Typical UI flow:
 
 1. Paste a YouTube URL or video ID in **Agent**.
 2. Tell the Agent whether embedded subtitles are present if you know.
-3. Let it probe video metadata, available subtitles, title, and route options.
-4. Choose the recommended route or manually switch to OCR/ASR/downloaded subtitles.
-5. If OCR is needed, download/preview a frame and tune the crop region.
+3. Let it probe metadata and subtitle tracks, then show the route choice without waiting for a full video download.
+4. Choose the recommended route or manually switch to OCR/ASR/downloaded subtitles. After the route is chosen, the Agent downloads the project video or reuses an existing one before continuing.
+5. If OCR is needed, preview a frame and tune the crop region immediately.
 6. Generate a glossary draft and review terms in the glossary UI.
 7. Save the glossary; the Agent continues translation for that specific flow.
 8. Review the generated subtitle or convert it to another format.
@@ -281,11 +237,10 @@ The Agent frame preview lets you drag/resize the subtitle region and optionally 
 
 ## Manual Commands
 
-The Web UI does not require these files. Copy them only for YAML-driven or legacy CLI configuration:
+The Web UI does not require an extra pipeline configuration. For the advanced YAML-driven CLI only, copy the dedicated example and edit it:
 
 ```bash
-cp configs/llm.example.yaml configs/llm.yaml
-cp configs/run.example.yaml configs/run.yaml
+cp examples/cli/run.yaml configs/run.yaml
 ```
 
 The public command is `reibosub`. The legacy `video-translate` command, the
@@ -381,12 +336,12 @@ If sidecar copying is enabled, generated subtitles are copied next to the video 
 The repository ignores local data by default:
 
 - `configs/provider_secrets.yaml`
-- `configs/providers/*.yml` and `*.yaml` (commit only `*.yml.example` templates)
-- `configs/local_runtime.yaml`
+- `configs/provider_profiles.yaml`
+- `configs/providers/*.yml` and `*.yaml` (legacy compatibility profiles)
+- `configs/reibosub.yaml`
 - `configs/app_settings.yaml`
-- `.env*` (keep only the empty `.env.example` template)
-- `configs/run.yaml`
-- `configs/llm.yaml`
+- `.env*`
+- legacy/advanced local files: `configs/local_runtime.yaml`, `configs/run.yaml`, and `configs/llm.yaml`
 - `YoutubeDownloads/`
 - `outputs/`
 - `models/`
@@ -411,7 +366,7 @@ This repository does not ship user videos, subtitles, model caches, or real cred
 - **You cannot find the Conda environment**: run `conda info --envs` and `conda config --show envs_dirs`, or choose a path explicitly with `conda env create -p /path/to/envs/reibosub -f environment.yml`.
 - **A CPU Paddle build cannot use the GPU**: select `cpu`/`auto`, or uninstall `paddlepaddle` and install a `paddlepaddle-gpu` build matching your CUDA version. Do not keep both packages.
 - **Provider model discovery fails**: many compatible APIs do not expose `/models`; maintain static model IDs in Settings and continue normally.
-- **YouTube cannot connect**: configure `YTDLP_PROXY` for downloads only instead of applying a global proxy to OCR/ASR.
+- **YouTube cannot connect**: set `youtube_proxy` in `configs/reibosub.yaml`; it applies only to downloads and does not proxy OCR/ASR.
 - **Visible text is missing from OCR**: verify language, the green subtitle crop, the logo exclusion box, and the selected OCR version. A first run may also be downloading models. Compare 2.0 and 3.0 in their own directories.
 - **`h264 mmco: unref short failure` appears**: this is normally a decoder warning. If OCR progress keeps moving, the job has not necessarily failed.
 - **A running step no longer continues after restart**: active jobs, live logs, and worker processes are in memory. Agent task records and existing artifacts remain, so continue from task history, Assets, or OCR Lab and rerun the relevant stage.

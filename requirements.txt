@@ -1,10 +1,4 @@
-# Core runtime dependencies for CPU/local development.
-# Install with: python -m pip install -r requirements.txt
+# Standard CPU installation: PaddleOCR plus faster-whisper ASR.
+# Package versions are defined once in pyproject.toml.
 
-opencv-python>=4.8,<5
-paddleocr>=3.0,<4
-paddlepaddle>=3.0,<4
-Pillow>=10,<13
-PyYAML>=6,<7
-requests>=2.31,<3
-yt-dlp>=2025.1.1
+-e .[ocr-cpu,asr]

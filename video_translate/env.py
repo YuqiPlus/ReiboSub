@@ -7,6 +7,21 @@ from typing import Any
 import yaml
 
 
+REBOSUB_CONFIG_PATH = Path("configs") / "reibosub.yaml"
+REBOSUB_CONFIG_KEYS = frozenset({"media_dir", "youtube_proxy", "host", "port"})
+REBOSUB_ENV_MAP = {
+    "youtube_proxy": ("YTDLP_PROXY",),
+    "host": ("VIDEO_TRANSLATE_HOST",),
+    "port": ("VIDEO_TRANSLATE_PORT",),
+    # Keep the Agent asset library and the standalone YouTube commands on the
+    # same root. Older installations may still override either variable from
+    # local_runtime.yaml or .env.
+    "media_dir": ("VIDEO_TRANSLATE_DOWNLOAD_DIR", "YTDLP_OUTPUT_DIR"),
+}
+
+# Compatibility-only configuration. New installations use reibosub.yaml, but
+# this loader stays in place so existing advanced overrides (OCR device, cache
+# paths, and similar settings) continue to work unchanged.
 LOCAL_RUNTIME_CONFIG_PATH = Path("configs") / "local_runtime.yaml"
 LOCAL_RUNTIME_ENV_KEYS = frozenset(
     {
@@ -40,6 +55,11 @@ def load_dotenv(anchor: Path | str | None = None, *, override: bool = False) -> 
 
     seen: set[Path] = set()
     for root in roots:
+        reibosub_config = root / REBOSUB_CONFIG_PATH
+        if reibosub_config not in seen and reibosub_config.exists():
+            seen.add(reibosub_config)
+            _apply_environment(_read_reibosub_config(reibosub_config), override=override)
+
         runtime_config = root / LOCAL_RUNTIME_CONFIG_PATH
         if runtime_config not in seen and runtime_config.exists():
             seen.add(runtime_config)
@@ -57,6 +77,40 @@ def load_dotenv(anchor: Path | str | None = None, *, override: bool = False) -> 
             key, value = stripped.split("=", 1)
             values[key.strip()] = value.strip().strip("\"'")
         _apply_environment(values, override=override)
+
+
+def _read_reibosub_config(path: Path) -> dict[str, str]:
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError:
+        raise ValueError("reibosub.yaml 不是有效的 YAML") from None
+
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("reibosub.yaml 必须是 YAML 对象")
+
+    unknown = sorted(str(key) for key in data if str(key) not in REBOSUB_CONFIG_KEYS)
+    if unknown:
+        raise ValueError(f"reibosub.yaml 含有不支持的配置项: {', '.join(unknown)}")
+
+    result: dict[str, str] = {}
+    for key, value in data.items():
+        name = str(key)
+        if name == "port":
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+                raise ValueError("reibosub.yaml 的 port 必须是 1 到 65535 之间的整数")
+            text = str(value)
+        else:
+            if not isinstance(value, str):
+                raise ValueError(f"reibosub.yaml 的 {name} 必须是字符串")
+            text = value.strip()
+            if name in {"media_dir", "host"} and not text:
+                raise ValueError(f"reibosub.yaml 的 {name} 不能为空")
+
+        for env_key in REBOSUB_ENV_MAP[name]:
+            result[env_key] = text
+    return result
 
 
 def _read_local_runtime(path: Path) -> dict[str, str]:

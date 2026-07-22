@@ -8,7 +8,38 @@ import pytest
 from video_translate.env import load_dotenv
 
 
-def test_loads_local_runtime_yaml_without_dotenv(tmp_path: Path, monkeypatch) -> None:
+def test_loads_simple_reibosub_yaml_and_unifies_media_directory(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "configs" / "reibosub.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        """
+media_dir: /srv/reibosub-media
+youtube_proxy: http://127.0.0.1:7890
+host: 0.0.0.0
+port: 9080
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    for key in (
+        "VIDEO_TRANSLATE_DOWNLOAD_DIR",
+        "YTDLP_OUTPUT_DIR",
+        "YTDLP_PROXY",
+        "VIDEO_TRANSLATE_HOST",
+        "VIDEO_TRANSLATE_PORT",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    load_dotenv(tmp_path)
+
+    assert os.environ["VIDEO_TRANSLATE_DOWNLOAD_DIR"] == "/srv/reibosub-media"
+    assert os.environ["YTDLP_OUTPUT_DIR"] == "/srv/reibosub-media"
+    assert os.environ["YTDLP_PROXY"] == "http://127.0.0.1:7890"
+    assert os.environ["VIDEO_TRANSLATE_HOST"] == "0.0.0.0"
+    assert os.environ["VIDEO_TRANSLATE_PORT"] == "9080"
+
+
+def test_legacy_local_runtime_keeps_advanced_overrides(tmp_path: Path, monkeypatch) -> None:
     config = tmp_path / "configs" / "local_runtime.yaml"
     config.parent.mkdir(parents=True)
     config.write_text(
@@ -30,22 +61,66 @@ environment:
     assert os.environ["YTDLP_PROXY"] == "http://127.0.0.1:7890"
 
 
-def test_local_runtime_precedes_dotenv_unless_override_requested(tmp_path: Path, monkeypatch) -> None:
-    config = tmp_path / "configs" / "local_runtime.yaml"
-    config.parent.mkdir(parents=True)
-    config.write_text(
-        "version: 1\nenvironment:\n  VIDEO_TRANSLATE_PORT: 9000\n",
+def test_reibosub_config_precedes_legacy_files_without_losing_advanced_values(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    configs = tmp_path / "configs"
+    configs.mkdir(parents=True)
+    (configs / "reibosub.yaml").write_text(
+        "host: 127.0.0.1\nport: 9000\nmedia_dir: media\nyoutube_proxy: ''\n",
+        encoding="utf-8",
+    )
+    (configs / "local_runtime.yaml").write_text(
+        "version: 1\nenvironment:\n  VIDEO_TRANSLATE_PORT: 9050\n  VIDEO_TRANSLATE_OCR_DEVICE: gpu:1\n",
         encoding="utf-8",
     )
     (tmp_path / ".env").write_text("VIDEO_TRANSLATE_PORT=9100\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("VIDEO_TRANSLATE_PORT", raising=False)
+    for key in (
+        "VIDEO_TRANSLATE_HOST",
+        "VIDEO_TRANSLATE_PORT",
+        "VIDEO_TRANSLATE_DOWNLOAD_DIR",
+        "YTDLP_OUTPUT_DIR",
+        "YTDLP_PROXY",
+        "VIDEO_TRANSLATE_OCR_DEVICE",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
     load_dotenv(tmp_path)
     assert os.environ["VIDEO_TRANSLATE_PORT"] == "9000"
+    assert os.environ["VIDEO_TRANSLATE_OCR_DEVICE"] == "gpu:1"
 
     load_dotenv(tmp_path, override=True)
     assert os.environ["VIDEO_TRANSLATE_PORT"] == "9100"
+    assert os.environ["VIDEO_TRANSLATE_OCR_DEVICE"] == "gpu:1"
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ("host: [broken\n", "不是有效的 YAML"),
+        ("- host\n- port\n", "必须是 YAML 对象"),
+        ("api_key: secret\n", "不支持的配置项"),
+        ("media_dir: 123\n", "media_dir 必须是字符串"),
+        ("host: ''\n", "host 不能为空"),
+        ("port: '7860'\n", "port 必须是 1 到 65535"),
+        ("port: 0\n", "port 必须是 1 到 65535"),
+    ],
+)
+def test_reibosub_config_rejects_invalid_or_secret_fields(
+    tmp_path: Path,
+    monkeypatch,
+    content: str,
+    message: str,
+) -> None:
+    config = tmp_path / "configs" / "reibosub.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text(content, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match=message):
+        load_dotenv(tmp_path)
 
 
 @pytest.mark.parametrize(

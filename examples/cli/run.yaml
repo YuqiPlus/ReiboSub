@@ -1,4 +1,5 @@
-# 复制为 configs/run.yaml，然后按需修改。
+# 高级 CLI 流水线示例。Web UI 用户不需要这个文件。
+# 复制为 configs/run.yaml 后按需修改，或直接传给 reibosub run-config。
 
 # full: OCR 提取原文字幕后立刻翻译
 # extract: 只提取原文字幕

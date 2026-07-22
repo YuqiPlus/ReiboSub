@@ -19,7 +19,6 @@ classifiers = [
 dependencies = [
     "opencv-python>=4.8,<5",
     "paddleocr>=3.0,<4",
-    "paddlepaddle>=3.0,<4",
     "Pillow>=10,<13",
     "pyyaml>=6.0,<7",
     "requests>=2.31,<3",
@@ -27,6 +26,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+ocr-cpu = [
+    "paddlepaddle>=3.0,<4",
+]
 asr = [
     "faster-whisper>=1.1.0",
 ]

@@ -90,10 +90,11 @@ layered_refine: using existing refined SRT/OCR boxes; video decoding is skipped
 Git 不包含以下文件：
 
 - `configs/provider_secrets.yaml`
-- `configs/providers/*.yml`、`*.yaml`
+- `configs/provider_profiles.yaml`
+- `configs/reibosub.yaml`
 - `configs/local_runtime.yaml`
 - `configs/app_settings.yaml`
-- `configs/llm.yaml`、`configs/run.yaml`
+- 仍在使用时才迁移旧版 `configs/llm.yaml`、`configs/providers/*.yml` 或高级 CLI 的 `configs/run.yaml`
 - `YoutubeDownloads/`、`outputs/`、`models/`
 
 不要把真实 API Key 写进交接文档、聊天记录或 Git 提交。优先在目标机器的设置页重新录入；必须传输时使用 SSH、密码管理器或服务器 Secret 管理。
@@ -139,18 +140,16 @@ npm run build
 cd ..
 ```
 
-复制本机运行模板（可选）：
+复制本机启动模板（可选）：
 
 ```bash
-cp configs/local_runtime.example.yaml configs/local_runtime.yaml
+cp configs/reibosub.example.yaml configs/reibosub.yaml
 ```
 
-重新运行 PaddleOCR 时，安装与 CUDA 匹配的 PaddlePaddle GPU 包，并按需设置：
+重新运行 PaddleOCR 时，安装与 CUDA 匹配的 PaddlePaddle GPU 包。旧机器若已经在 `configs/local_runtime.yaml` 配置了设备，会继续兼容读取；临时指定设备也可以使用：
 
-```yaml
-version: 1
-environment:
-  VIDEO_TRANSLATE_OCR_DEVICE: gpu:0
+```bash
+VIDEO_TRANSLATE_OCR_DEVICE=gpu:0 python run_agent_ui.py
 ```
 
 只复用 JSON 执行 LLM 精修时，不需要重新下载 OCR 模型或重新解码视频。模型缓存 `models/` 可以安全地重新生成，也可以在机器之间单独复制。

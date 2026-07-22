@@ -23,10 +23,11 @@ in front of the service.
 
 The following paths are local-only and ignored by Git:
 
-- `.env*` except `.env.example`
+- `.env*`
 - `configs/provider_secrets.yaml`
 - `configs/providers/*.yml` and `*.yaml`
-- `configs/app_settings.yaml`, `configs/local_runtime.yaml`
+- `configs/reibosub.yaml`, `configs/app_settings.yaml`
+- legacy `configs/local_runtime.yaml`
 - `configs/llm.yaml`, `configs/run.yaml`
 - `YoutubeDownloads/`, `outputs/`, `models/`
 - generated media, subtitle, log, key, and certificate files

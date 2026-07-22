@@ -7,4 +7,4 @@ dependencies:
   - ffmpeg
   - nodejs>=20
   - pip:
-      - -e .[dev,asr]
+      - -e .[dev,asr,ocr-cpu]
