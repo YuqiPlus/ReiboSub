@@ -28,6 +28,9 @@ _EVENT_KEYS = {"cue_id", "layers"}
 _LAYER_KEYS = {"id", "role", "text", "attach_to", "evidence_layer_ids", "reason"}
 _TRAILING_SPEAKER_COLON_RE = re.compile(r"\s*[:：]+\s*$")
 _ORPHAN_TRACK_ID_BASE = -1_000_000
+# Immutable behavior marker for the stabilized OCR 3.0 baseline. Future OCR
+# policy changes must use a new revision so cached outputs remain reproducible.
+OCR_V3_POLICY_REVISION = "v3.1-moving-surface-v1"
 
 
 @dataclass(slots=True)
@@ -126,6 +129,8 @@ def refine_ocr_layers_with_llm(
                 progress_callback,
                 f"ocr_layered_refine_geometry_hint_warning: {geometry_hint_error}; continuing with text evidence",
             )
+    if config.pipeline_version == "v3":
+        debug["policy_revision"] = OCR_V3_POLICY_REVISION
 
     if not machine_cues:
         write_srt([], out_srt)
@@ -235,7 +240,11 @@ def build_layered_refinement_payload(
         "本次是 OCR 3.0，cue_evidence.geometry_hints 来自独立几何分类器，只是软先验而不是删除指令。"
         "即使 hint 中 server_action='drop' 或 classification='scene_text'，也必须结合逐帧文字层、语义和上下文重新判断；"
         "切镜、字幕动画和轨迹抖动会产生误导性的 motion/scale 证据。清晰的对白、节目主文案、人物姓名牌和效果说明"
-        "不得仅凭几何 hint 删除。stable_slanted_program_candidate 是保护提示；短暂乱码则仍应依据文字证据判 noise。"
+        "不得仅凭几何 hint 删除。stable_slanted_program_candidate 仅保护没有物体随动证据的斜体节目花字；"
+        "moving_slanted_surface_candidate 表示斜体文字随画面中的平面物体一起移动，常见于手机、卡片或包装，"
+        "它不是自动删除命令，但若同 cue 另有更大、水平且稳定的节目主文案，应优先把移动斜体层判为 scene_text/noise。"
+        "例如手机内斜着移动的 '사장 박영희' 与画面下方大号水平节目字 '클래식 명패' 共现时，只保留后者；"
+        "不能因前者像人名就输出 subject_label。短暂乱码仍应依据文字证据判 noise。"
         "相邻 context cue 的文字如果在当前 target 的 frame_observations 中又清晰出现至少两帧，不是所谓 previous-cue "
         "leakage，而是同一字幕跨过机器切分边界继续显示；当前 event 必须继续保留它，再与同时出现的新层组合。"
         "例如当前 machine_text='선물 줍줍'，但当前帧同时稳定出现上一句 '아니 왜냐면!'，应返回 dialogue='아니 왜냐면!'，"
@@ -1648,6 +1657,28 @@ def _load_geometry_hints(path: Path) -> list[dict[str, Any]]:
         server_features = item.get("server_features") if isinstance(item.get("server_features"), dict) else {}
         geometry = item.get("geometry") if isinstance(item.get("geometry"), dict) else {}
         angle = geometry.get("angle") if isinstance(geometry.get("angle"), dict) else {}
+        motion = geometry.get("motion") if isinstance(geometry.get("motion"), dict) else {}
+        dynamic_flags = list(server_features.get("dynamic_perspective_flags") or [])
+        median_abs_angle = angle.get("median_abs_degrees")
+        legacy_stable_slanted = bool(server_features.get("stable_slanted_program_candidate"))
+        try:
+            slanted_surface_motion = bool(
+                "center_motion" in dynamic_flags
+                or float(motion.get("center_range_box_diagonals") or 0.0) >= 0.3375
+                or float(motion.get("direct_displacement_box_diagonals") or 0.0) >= 0.2625
+            )
+            moving_slanted_surface = bool(
+                server_features.get("moving_slanted_surface_candidate")
+                or (
+                    legacy_stable_slanted
+                    and slanted_surface_motion
+                    and median_abs_angle is not None
+                    and float(median_abs_angle) >= 15.0
+                    and int(item.get("sample_count") or 0) >= 3
+                )
+            )
+        except (TypeError, ValueError):
+            moving_slanted_surface = False
         hint = {
             "track_id": int(item["track_id"]),
             "text": _clean_layer_text(item.get("text")),
@@ -1658,15 +1689,18 @@ def _load_geometry_hints(path: Path) -> list[dict[str, Any]]:
             "classification": str(action.get("classification") or "uncertain"),
             "server_action": str(action.get("action") or "keep"),
             "server_reason": str(action.get("reason") or ""),
-            "dynamic_perspective_flags": list(server_features.get("dynamic_perspective_flags") or []),
+            "dynamic_perspective_flags": dynamic_flags,
             "dynamic_perspective_evidence_count": int(
                 server_features.get("dynamic_perspective_evidence_count") or 0
             ),
             "stable_slanted_program_candidate": bool(
-                server_features.get("stable_slanted_program_candidate")
-            ),
+                legacy_stable_slanted
+            ) and not moving_slanted_surface,
+            "moving_slanted_surface_candidate": moving_slanted_surface,
             "persistent_logo_candidate": bool(server_features.get("persistent_logo_candidate")),
-            "median_abs_angle_degrees": angle.get("median_abs_degrees"),
+            "median_abs_angle_degrees": median_abs_angle,
+            "center_range_box_diagonals": motion.get("center_range_box_diagonals"),
+            "direct_displacement_box_diagonals": motion.get("direct_displacement_box_diagonals"),
             "average_bbox": item.get("average_bbox"),
             "soft_prior_only": True,
         }

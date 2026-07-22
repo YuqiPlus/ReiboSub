@@ -604,6 +604,20 @@ def test_start_agent_session_maps_explicit_v2_as_one_coherent_pipeline(monkeypat
     assert session.payload["ocr_shape_mode"] == "unrestricted"
 
 
+def test_start_agent_session_defaults_new_tasks_to_stable_v3(monkeypatch):
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    monkeypatch.setattr(web_agent, "_run_agent_async", lambda session_id, target: None)
+
+    session = web_agent.start_agent_session({"url": "abc123"})
+
+    assert web_agent.DEFAULT_AGENT_OCR_PIPELINE_VERSION == "v3"
+    assert session.payload["ocr_pipeline_version"] == "v3"
+    assert session.payload["ocr_extraction_mode"] == "region_v3"
+    assert session.payload["ocr_shape_mode"] == "horizontal_preferred"
+    assert session.payload["ocr_refinement_mode"] == "llm_geometry"
+    assert session.payload["ocr_translation_mode"] == "translate_only"
+
+
 def test_historical_unversioned_region_task_resumes_as_legacy_not_v2(monkeypatch, tmp_path):
     monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
     source = tmp_path / "source.srt"
@@ -816,6 +830,8 @@ def test_agent_session_ocr_extracts_then_generates_glossary(monkeypatch, tmp_pat
     assert snapshot["result"]["source_kind"] == "ocr"
     assert Path(snapshot["result"]["source_srt"]).parts[-3:] == ("agent_tasks", "abc123_demo", "source.srt")
     assert calls == ["video", f"ocr:{video}:region_v3:horizontal_strict", f"glossary:{snapshot['result']['source_srt']}:korean"]
+    task = yaml.safe_load((web_agent.TASK_DIR / "abc123_demo" / "task.yaml").read_text(encoding="utf-8"))
+    assert task["stages"]["ocr"]["ocr_policy_revision"] == web_agent.OCR_V3_POLICY_REVISION
 
 
 def test_agent_session_asr_generates_glossary(monkeypatch, tmp_path):
@@ -1043,7 +1059,9 @@ def test_ocr_full_job_chinese_ocr_uses_extract_mode(monkeypatch, tmp_path: Path)
     assert config["ocr"]["extraction_mode"] == "region_v3"
     assert config["ocr"]["shape_mode"] == "horizontal_strict"
     assert config["agent_cache"]["ocr_shape_mode"] == "horizontal_strict"
+    assert config["agent_cache"]["ocr_policy_revision"] == web_agent.OCR_V3_POLICY_REVISION
     assert job.result["ocr_shape_mode"] == "horizontal_strict"
+    assert job.result["ocr_policy_revision"] == web_agent.OCR_V3_POLICY_REVISION
     assert config["sidecar"]["copy_translated"] is False
     assert job.result["translated_srt"].endswith("zh.srt")
     assert Path(job.result["translated_srt"]).exists()
@@ -1292,6 +1310,8 @@ def test_reusable_ocr_job_cache_isolated_by_v3_shape_mode_and_keeps_old_region_c
     v3_dir.mkdir(parents=True)
     v3_source = v3_dir / "source.srt"
     v3_source.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕\n", encoding="utf-8")
+    v3_finalized = v3_dir / "source.v3.layered.srt"
+    v3_finalized.write_text(v3_source.read_text(encoding="utf-8"), encoding="utf-8")
     (v3_dir / "run.yaml").write_text(
         yaml.safe_dump(
             {
@@ -1303,6 +1323,7 @@ def test_reusable_ocr_job_cache_isolated_by_v3_shape_mode_and_keeps_old_region_c
                     "ocr_scope": "bottom",
                     "ocr_extraction_mode": "region_v3",
                     "ocr_shape_mode": "horizontal_preferred",
+                    "ocr_policy_revision": web_agent.OCR_V3_POLICY_REVISION,
                 },
             },
             sort_keys=False,
@@ -1358,6 +1379,54 @@ def test_reusable_ocr_job_cache_isolated_by_v3_shape_mode_and_keeps_old_region_c
     assert cached_region["ocr_shape_mode"] == "unrestricted"
 
 
+def test_reusable_v3_ocr_cache_requires_current_policy_revision(monkeypatch, tmp_path: Path):
+    jobs = tmp_path / "jobs"
+    monkeypatch.setattr(web_agent, "JOB_DIR", jobs)
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"video")
+    source = _write_cached_ocr_job(
+        jobs,
+        name="v3-policy",
+        input_video=video,
+        cache={
+            "normalized_url": "https://www.youtube.com/watch?v=abc123",
+            "ocr_pipeline_version": "v3",
+            "ocr_translation_mode": "translate_only",
+            "ocr_source_cleanup_mode": "none",
+            "ocr_scope": "bottom",
+            "ocr_extraction_mode": "region_v3",
+            "ocr_shape_mode": "horizontal_preferred",
+            "ocr_refinement_mode": "llm_geometry",
+        },
+    )
+    query = {
+        "url": "https://www.youtube.com/watch?v=abc123",
+        "title": "demo",
+        "translation_mode": "standard_cleanup",
+        "ocr_pipeline_version": "v3",
+    }
+
+    assert web_agent._find_reusable_ocr_result(**query) is None
+
+    run_yaml = source.parent / "run.yaml"
+    config = yaml.safe_load(run_yaml.read_text(encoding="utf-8"))
+    config["agent_cache"]["ocr_policy_revision"] = "obsolete-v3-policy"
+    run_yaml.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    assert web_agent._find_reusable_ocr_result(**query) is None
+
+    config["agent_cache"]["ocr_policy_revision"] = web_agent.OCR_V3_POLICY_REVISION
+    run_yaml.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    assert web_agent._find_reusable_ocr_result(**query) is None
+
+    finalized = source.parent / "source.v3.layered.srt"
+    finalized.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    cached = web_agent._find_reusable_ocr_result(**query)
+
+    assert cached is not None
+    assert cached["source_srt"] == str(finalized)
+    assert cached["ocr_policy_revision"] == web_agent.OCR_V3_POLICY_REVISION
+
+
 def test_reusable_ocr_task_cache_isolated_by_v3_shape_mode(monkeypatch, tmp_path):
     monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "missing-jobs")
     task_dir = web_agent.TASK_DIR / "abc123_demo"
@@ -1387,6 +1456,24 @@ def test_reusable_ocr_task_cache_isolated_by_v3_shape_mode(monkeypatch, tmp_path
         encoding="utf-8",
     )
 
+    preferred_query = {
+        "url": "https://www.youtube.com/watch?v=abc123",
+        "title": "demo",
+        "translation_mode": "standard_cleanup",
+        "ocr_extraction_mode": "region_v3",
+        "ocr_shape_mode": "horizontal_preferred",
+    }
+    assert web_agent._find_reusable_ocr_result(**preferred_query) is None
+
+    task_path = task_dir / "task.yaml"
+    task = yaml.safe_load(task_path.read_text(encoding="utf-8"))
+    task["stages"]["ocr"]["ocr_policy_revision"] = "obsolete-v3-policy"
+    task_path.write_text(yaml.safe_dump(task, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    assert web_agent._find_reusable_ocr_result(**preferred_query) is None
+
+    task["stages"]["ocr"]["ocr_policy_revision"] = web_agent.OCR_V3_POLICY_REVISION
+    task_path.write_text(yaml.safe_dump(task, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
     assert web_agent._find_reusable_ocr_result(
         url="https://www.youtube.com/watch?v=abc123",
         title="demo",
@@ -1394,13 +1481,7 @@ def test_reusable_ocr_task_cache_isolated_by_v3_shape_mode(monkeypatch, tmp_path
         ocr_extraction_mode="region_v3",
         ocr_shape_mode="horizontal_strict",
     ) is None
-    cached = web_agent._find_reusable_ocr_result(
-        url="https://www.youtube.com/watch?v=abc123",
-        title="demo",
-        translation_mode="standard_cleanup",
-        ocr_extraction_mode="region_v3",
-        ocr_shape_mode="horizontal_preferred",
-    )
+    cached = web_agent._find_reusable_ocr_result(**preferred_query)
     assert cached is not None
     assert cached["ocr_shape_mode"] == "horizontal_preferred"
 
@@ -1467,7 +1548,11 @@ def test_agent_session_reuses_cached_ocr_before_generating_glossary(monkeypatch,
         lambda payload: calls.append(f"glossary:{payload['source_srt']}:{payload.get('source_language')}") or done_job("glossary", {"glossary_path": str(glossary), "content": "characters: []\n"}),
     )
 
-    session = web_agent.start_agent_session({"url": "abc123", "embedded_subtitle_hint": "yes"})
+    # This fixture intentionally represents a historical, unversioned V1
+    # cache. New blank sessions now default to V3 and must not reuse it.
+    session = web_agent.start_agent_session(
+        {"url": "abc123", "embedded_subtitle_hint": "yes", "ocr_pipeline_version": "v1"}
+    )
     snapshot = _wait_agent_phase(session.id, "diagnose_ocr_asr")
 
     assert snapshot["status"] == "waiting"
@@ -2747,6 +2832,10 @@ def test_explicit_ocr_pipeline_version_overrides_conflicting_advanced_settings(
     assert config["ocr_refinement"]["mode"] == expected["refinement_mode"]
     assert config["source_cleanup"]["mode"] == expected["source_cleanup_mode"]
     assert config["translation"]["ocr_translation_mode"] == expected["translation_mode"]
+    if version == "v3":
+        assert config["ocr_pipeline"]["policy_revision"] == web_agent.OCR_V3_POLICY_REVISION
+    else:
+        assert "policy_revision" not in config["ocr_pipeline"]
 
 
 def test_unversioned_ocr_config_keeps_manual_advanced_settings_independent(tmp_path: Path):
@@ -2786,6 +2875,7 @@ def test_ocr_config_region_extraction_mode_keeps_old_mode_separate(tmp_path: Pat
     assert config["ocr"]["auto_trim_side_noise"] is False
     assert config["subtitle"]["snapshot_min_confidence"] == 0.35
     assert config["subtitle"]["min_duration_seconds"] == 0.35
+    assert "policy_revision" not in config["ocr_pipeline"]
 
 
 def test_ocr_config_region_v3_defaults_to_horizontal_preferred(tmp_path: Path):
@@ -2803,6 +2893,7 @@ def test_ocr_config_region_v3_defaults_to_horizontal_preferred(tmp_path: Path):
     assert config["ocr"]["scan_full_frame"] is False
     assert config["ocr"]["auto_trim_side_noise"] is False
     assert config["subtitle"]["snapshot_min_confidence"] == 0.35
+    assert config["ocr_pipeline"]["policy_revision"] == web_agent.OCR_V3_POLICY_REVISION
 
 
 def test_ocr_shape_mode_is_isolated_from_region_v2(tmp_path: Path):
@@ -4244,7 +4335,9 @@ def test_ocr_extract_job_uses_existing_file_matching_title(monkeypatch, tmp_path
     assert config["ocr"]["extraction_mode"] == "region_v3"
     assert config["ocr"]["shape_mode"] == "horizontal_strict"
     assert config["agent_cache"]["ocr_shape_mode"] == "horizontal_strict"
+    assert config["agent_cache"]["ocr_policy_revision"] == web_agent.OCR_V3_POLICY_REVISION
     assert snapshot["result"]["ocr_shape_mode"] == "horizontal_strict"
+    assert snapshot["result"]["ocr_policy_revision"] == web_agent.OCR_V3_POLICY_REVISION
     assert manifest["normalized_url"] == "https://www.youtube.com/watch?v=abc123"
 
 

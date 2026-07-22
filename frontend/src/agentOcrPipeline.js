@@ -19,7 +19,7 @@ const PIPELINES = Object.freeze({
   }),
   v3: Object.freeze({
     version: 'v3',
-    label: 'OCR 3.0（初版）',
+    label: 'OCR 3.0（稳定版）',
     description: '区域 OCR → 几何软提示 → V3 文字纠错 → 画面字/对白分层 → 锁定原时间轴翻译',
     ocrExtractionMode: 'region_v3',
     ocrRefinementMode: 'llm_geometry',
@@ -28,6 +28,8 @@ const PIPELINES = Object.freeze({
     ocrShapeMode: 'horizontal_preferred',
   }),
 })
+
+export const DEFAULT_AGENT_OCR_PIPELINE_VERSION = 'v3'
 
 export function normalizeAgentOcrPipelineVersion(value) {
   const normalized = String(value || '').trim().toLowerCase().replace(/[\s._-]+/g, '')

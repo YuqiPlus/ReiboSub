@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  DEFAULT_AGENT_OCR_PIPELINE_VERSION,
   buildAgentOcrPipelinePayload,
   getAgentOcrPipeline,
   inferAgentOcrPipelineVersion,
@@ -9,6 +10,7 @@ import {
 } from './agentOcrPipeline.js'
 
 test('normalizes the public OCR pipeline version names', () => {
+  assert.equal(DEFAULT_AGENT_OCR_PIPELINE_VERSION, 'v3')
   assert.equal(normalizeAgentOcrPipelineVersion('v2'), 'v2')
   assert.equal(normalizeAgentOcrPipelineVersion('OCR 2.0'), 'v2')
   assert.equal(normalizeAgentOcrPipelineVersion('OCR 3.0'), 'v3')
@@ -46,8 +48,8 @@ test('restores old task payloads without requiring the new version field', () =>
   assert.equal(inferAgentOcrPipelineVersion({}), 'v1')
 })
 
-test('maps OCR 3.0 initial release and preserves restored task settings', () => {
-  assert.match(getAgentOcrPipeline('v3').label, /初版/)
+test('maps the stable OCR 3.0 release and preserves restored task settings', () => {
+  assert.match(getAgentOcrPipeline('v3').label, /稳定版/)
   assert.match(getAgentOcrPipeline('v3').description, /分层/)
   assert.equal(buildAgentOcrPipelinePayload('v3', { ocrScope: 'smart_full' }).ocr_scope, 'bottom')
   assert.deepEqual(buildAgentOcrPipelinePayload('v3', {

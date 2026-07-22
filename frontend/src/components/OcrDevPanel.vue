@@ -17,7 +17,7 @@
         <span>OCR 提取方式</span>
         <select :value="ocrExtractionMode" @change="$emit('update:ocrExtractionMode', $event.target.value)">
           <option value="region">OCR 2.0（区域增强）</option>
-          <option value="region_v3">OCR 3.0（几何精修实验）</option>
+          <option value="region_v3">OCR 3.0（稳定版）</option>
         </select>
       </label>
       <label v-if="ocrExtractionMode === 'region_v3'">

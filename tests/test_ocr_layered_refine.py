@@ -915,6 +915,9 @@ def test_v3_geometry_hint_mapping_prioritizes_related_track_before_longer_unrela
     assert "[선물 줍줍]아니 왜냐면!" in system_prompt
     assert "[박보영] 이렇게 하고 나갔는데" in system_prompt
     assert "QC、AU、TDKO" in system_prompt
+    assert "moving_slanted_surface_candidate" in system_prompt
+    assert "사장 박영희" in system_prompt
+    assert "클래식 명패" in system_prompt
     assert "ocr3_refined 不确定时沿用 machine_text" in user_prompt
 
 
@@ -1028,6 +1031,98 @@ def test_v3_geometry_drop_is_only_a_prompt_hint_and_debug_records_its_source(
     debug = json.loads(debug_path.read_text(encoding="utf-8"))
     assert debug["version"] == 3
     assert debug["mode"] == "ocr3_geometry_assisted_layered_refinement"
+    assert debug["policy_revision"] == "v3.1-moving-surface-v1"
     assert debug["geometry_json"] == str(geometry_path)
     assert debug["geometry_hint_count"] == 1
     assert debug["batches"][0]["evidence"][0]["geometry_hints"][0]["track_id"] == 7
+
+
+def test_old_v3_geometry_hint_normalizes_moving_slanted_text_without_static_protection(
+    tmp_path: Path,
+) -> None:
+    geometry_path = tmp_path / "ocr_geometry.json"
+    geometry_path.write_text(
+        json.dumps(
+            {
+                "track_evidence": [
+                    {
+                        "track_id": 14,
+                        "text": "사장박영희",
+                        "start": 1.835,
+                        "end": 4.338,
+                        "sample_count": 14,
+                        "average_confidence": 0.91,
+                        "average_bbox": [861.86, 441.36, 1114.21, 604.43],
+                        "geometry": {
+                            "angle": {"median_abs_degrees": 26.251},
+                            "motion": {
+                                "center_range_box_diagonals": 0.4292,
+                                "direct_displacement_box_diagonals": 0.3203,
+                            },
+                        },
+                        "server_features": {
+                            "dynamic_perspective_flags": [],
+                            "dynamic_perspective_evidence_count": 0,
+                            # This is how the pre-3.1 artifact was stored.
+                            "stable_slanted_program_candidate": True,
+                        },
+                    }
+                ],
+                "actions": [
+                    {
+                        "track_id": 14,
+                        "classification": "program_caption",
+                        "action": "keep",
+                        "reason": "semantic class program_caption",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    hints = layered_refine._load_geometry_hints(geometry_path)
+
+    assert hints[0]["moving_slanted_surface_candidate"] is True
+    assert hints[0]["stable_slanted_program_candidate"] is False
+
+
+def test_old_v3_geometry_hint_does_not_infer_surface_text_without_legacy_stability(
+    tmp_path: Path,
+) -> None:
+    geometry_path = tmp_path / "ocr_geometry.json"
+    geometry_path.write_text(
+        json.dumps(
+            {
+                "track_evidence": [
+                    {
+                        "track_id": 9,
+                        "text": "회전하는 프로그램 자막",
+                        "start": 1.0,
+                        "end": 2.0,
+                        "sample_count": 6,
+                        "geometry": {
+                            "angle": {"median_abs_degrees": 22.0},
+                            "motion": {
+                                "center_range_box_diagonals": 0.8,
+                                "direct_displacement_box_diagonals": 0.6,
+                            },
+                        },
+                        "server_features": {
+                            "dynamic_perspective_flags": ["center_motion", "rotation_change"],
+                            "stable_slanted_program_candidate": False,
+                        },
+                    }
+                ],
+                "actions": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    hints = layered_refine._load_geometry_hints(geometry_path)
+
+    assert hints[0]["moving_slanted_surface_candidate"] is False
+    assert hints[0]["stable_slanted_program_candidate"] is False

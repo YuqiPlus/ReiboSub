@@ -77,6 +77,7 @@ class GeometryRefinementConfig:
     max_observations_per_track: int = 10
     min_output_duration_seconds: float = 0.35
     slanted_angle_degrees: float = 8.0
+    moving_slanted_surface_angle_degrees: float = 15.0
     stable_angle_std_degrees: float = 3.5
     motion_range_box_diagonals: float = 0.45
     motion_displacement_box_diagonals: float = 0.35
@@ -298,8 +299,10 @@ def build_geometry_refinement_payload(
                     "visual_annotation 是拟声、表情、动作和短效果字；scene_text 是印在真实物品、招牌、菜单、包装、"
                     "衣服或场景表面上的文字；logo 是台标、水印和品牌标识；无法可靠判断必须选 uncertain。"
                     "几何只是证据，不是结论。angle 的绝对值再大也不能单独证明 scene_text/logo，更不能据此删字。"
-                    "稳定、持续、斜着排版但位置/尺度/透视稳定的节目花字，优先考虑 program_caption 或 visual_annotation；"
-                    "server_features.stable_slanted_program_candidate=true 是强保护提示。真实物品字通常随物品或镜头出现"
+                    "稳定、持续、斜着排版且没有随画面物体平移的节目花字，优先考虑 program_caption 或 visual_annotation；"
+                    "server_features.stable_slanted_program_candidate=true 是保护提示。若斜排文字明显随画面物体移动，"
+                    "server_features.moving_slanted_surface_candidate=true 会取代上述保护：这通常是手机、卡片、包装等"
+                    "物体表面的文字，必须结合文字语义与共现的水平节目主文案优先考虑 scene_text。真实物品字通常还会出现"
                     "中心移动、尺度变化、旋转变化、透视畸变或透视变化等多个相互独立证据。"
                     "scene_text 应同时具备明确的场景物体语义和至少两类 dynamic_perspective_flags；不足时选 uncertain。"
                     "logo 必须有明确 logo_semantics，不能只因为固定、倾斜或位于角落就判 logo；"
@@ -409,6 +412,19 @@ def build_track_geometry_evidence(
         "perspective_change": perspective_change,
     }
     active_flags = [name for name in _DYNAMIC_PERSPECTIVE_FLAGS if flags[name]]
+    stable_position = not center_motion and not scale_change and not rotation_change and not perspective_change
+    slanted_surface_motion = len(ordered) >= 3 and (
+        range_normalized >= 0.75 * config.motion_range_box_diagonals
+        or displacement_normalized >= 0.75 * config.motion_displacement_box_diagonals
+    )
+    moving_slanted_surface = bool(
+        len(angles) >= 3
+        and angle_abs_median is not None
+        and angle_abs_median >= config.moving_slanted_surface_angle_degrees
+        and angle_std is not None
+        and angle_std <= config.stable_angle_std_degrees
+        and slanted_surface_motion
+    )
     stable_slanted = bool(
         len(angles) >= 2
         and angle_abs_median is not None
@@ -416,8 +432,8 @@ def build_track_geometry_evidence(
         and angle_std is not None
         and angle_std <= config.stable_angle_std_degrees
         and len(active_flags) <= 1
+        and not moving_slanted_surface
     )
-    stable_position = not center_motion and not scale_change and not rotation_change and not perspective_change
     persistent_logo_candidate = bool(
         stable_position
         and track.duration >= config.persistent_logo_min_duration_seconds
@@ -478,6 +494,7 @@ def build_track_geometry_evidence(
             "dynamic_perspective_evidence_count": len(active_flags),
             "stable_position": stable_position,
             "stable_slanted_program_candidate": stable_slanted,
+            "moving_slanted_surface_candidate": moving_slanted_surface,
             "persistent_logo_candidate": persistent_logo_candidate,
             "angle_alone_can_drop": False,
         },
@@ -862,6 +879,8 @@ def _validate_config(config: GeometryRefinementConfig) -> None:
         raise ValueError("scene_text_min_dynamic_perspective_evidence must be at least 2")
     if config.min_output_duration_seconds <= 0:
         raise ValueError("min_output_duration_seconds must be positive")
+    if config.moving_slanted_surface_angle_degrees <= 0:
+        raise ValueError("moving_slanted_surface_angle_degrees must be positive")
 
 
 def _write_debug(path: Path, data: dict[str, Any]) -> None:

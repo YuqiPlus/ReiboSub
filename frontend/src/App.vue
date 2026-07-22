@@ -339,7 +339,11 @@ import JobSidebar from './components/JobSidebar.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import { copyText } from './clipboard.js'
 import { createAgentSessionPoller } from './agentSessionPolling.js'
-import { buildAgentOcrPipelinePayload, inferAgentOcrPipelineVersion } from './agentOcrPipeline.js'
+import {
+  DEFAULT_AGENT_OCR_PIPELINE_VERSION,
+  buildAgentOcrPipelinePayload,
+  inferAgentOcrPipelineVersion,
+} from './agentOcrPipeline.js'
 import { createGlossaryReviewAutosave } from './glossaryReviewAutosave.js'
 import {
   isProbeResponseCurrent,
@@ -398,7 +402,7 @@ const ocrTranslationMode = ref('standard_cleanup')
 const ocrScope = ref('bottom')
 const ocrExtractionMode = ref('auto')
 const ocrShapeMode = ref('horizontal_preferred')
-const agentOcrPipelineVersion = ref('v2')
+const agentOcrPipelineVersion = ref(DEFAULT_AGENT_OCR_PIPELINE_VERSION)
 const agentRestoredOcrSettings = ref({})
 const ocrCropTopRatio = ref(0.58)
 const ocrCropBottomRatio = ref(0)
@@ -897,6 +901,10 @@ async function startAgent() {
       ocr_exclude_right_ratio: ocrExcludeRightRatio.value,
     })
     agentSession.value = session
+    // The new task must become the sole source of restored OCR settings.
+    // Otherwise a previously selected V1/V2 task can leak its shape/refinement
+    // settings into the first answer sent to this new V3 session.
+    restoreAgentOcrPipeline(session)
     await loadAgentSessions()
     await loadAgentTasks()
     setStatus(agentStatus, 'Agent 已启动。', 'ok')
@@ -918,7 +926,8 @@ async function answerAgent(action) {
     '',
   )
   try {
-    const agentOcrPipeline = buildAgentOcrPipelinePayload(agentOcrPipelineVersion.value, {
+    const sessionOcrPipelineVersion = inferAgentOcrPipelineVersion(agentSession.value?.payload || {})
+    const agentOcrPipeline = buildAgentOcrPipelinePayload(sessionOcrPipelineVersion, {
       ocrScope: ocrScope.value,
       restoredSettings: agentRestoredOcrSettings.value,
     })
@@ -939,6 +948,7 @@ async function answerAgent(action) {
       embedded_subtitle_goal: embeddedSubtitleGoal.value,
     })
     agentSession.value = session
+    restoreAgentOcrPipeline(session)
     await loadAgentSessions()
     await loadAgentTasks()
     scheduleAgentPoll(session.id, 500)
@@ -1112,7 +1122,6 @@ async function continueAgentTask(taskId) {
 function restoreAgentOcrPipeline(session) {
   const payload = session?.payload || {}
   agentRestoredOcrSettings.value = { ...payload }
-  agentOcrPipelineVersion.value = inferAgentOcrPipelineVersion(payload)
   if (['bottom', 'expanded', 'smart_full'].includes(payload.ocr_scope) && payload.ocr_scope !== ocrScope.value) {
     skipNextOcrScopeCropReset = true
     ocrScope.value = payload.ocr_scope

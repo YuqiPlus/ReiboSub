@@ -61,14 +61,14 @@
               <b>视频已下载，调整 OCR 字幕区域</b>
               <p>首帧会自动加载。直接拖动绿色字幕框，或拖右下角改变大小；调整会自动带入下一步 OCR。</p>
             </div>
-            <span class="badge done">视频已就绪</span>
+            <span class="badge done">视频已就绪 · {{ currentSessionOcrPipeline.label }}</span>
           </div>
           <OcrCropControls
             title="OCR 字幕位置预览"
             :input-video="inputVideo"
-            :ocr-scope="effectiveOcrScope"
-            :ocr-extraction-mode="activeOcrPipeline.ocrExtractionMode"
-            :ocr-shape-mode="activeOcrPipeline.ocrShapeMode"
+            :ocr-scope="currentSessionOcrScope"
+            :ocr-extraction-mode="currentSessionOcrPipeline.ocrExtractionMode"
+            :ocr-shape-mode="currentSessionOcrPipeline.ocrShapeMode"
             :source-language="sourceLanguage"
             :ocr-language="ocrLanguage"
             :ocr-crop-top-ratio="ocrCropTopRatio"
@@ -198,10 +198,10 @@
           <div class="segmented">
             <button type="button" :class="{ active: ocrPipelineVersion === 'v1' }" @click="$emit('update:ocrPipelineVersion', 'v1')">OCR 1.0（旧版）</button>
             <button type="button" :class="{ active: ocrPipelineVersion === 'v2' }" @click="$emit('update:ocrPipelineVersion', 'v2')">OCR 2.0（稳定）</button>
-            <button type="button" :class="{ active: ocrPipelineVersion === 'v3' }" @click="$emit('update:ocrPipelineVersion', 'v3')">OCR 3.0（初版）</button>
+            <button type="button" :class="{ active: ocrPipelineVersion === 'v3' }" @click="$emit('update:ocrPipelineVersion', 'v3')">OCR 3.0（稳定）</button>
           </div>
           <p class="agent-pipeline-note">{{ activeOcrPipeline.description }}</p>
-          <p class="agent-pipeline-note">仅在 Agent 选择 OCR 或 OCR 参考路线时生效；直接采用人工字幕时不会运行 OCR。</p>
+          <p class="agent-pipeline-note">用于整片 OCR 与 ASR + OCR 参考路线；“英文定轴 + 原声 OCR”保留独立流程，直接采用人工字幕时不会运行 OCR。</p>
         </div>
       </div>
 
@@ -410,7 +410,7 @@
 <script setup>
 import { computed } from 'vue'
 import OcrCropControls from './OcrCropControls.vue'
-import { getAgentOcrPipeline } from '../agentOcrPipeline.js'
+import { getAgentOcrPipeline, inferAgentOcrPipelineVersion } from '../agentOcrPipeline.js'
 import {
   agentOperationPresentation,
   buildAgentFlowSteps,
@@ -428,7 +428,7 @@ const props = defineProps({
   sourceLanguage: { type: String, default: 'auto' },
   ocrLanguage: { type: String, default: 'auto' },
   ocrScope: { type: String, default: 'bottom' },
-  ocrPipelineVersion: { type: String, default: 'v1' },
+  ocrPipelineVersion: { type: String, default: 'v3' },
   inputVideo: { type: String, default: '' },
   ocrCropTopRatio: { type: Number, default: 0.58 },
   ocrCropBottomRatio: { type: Number, default: 0 },
@@ -496,6 +496,13 @@ const activeTasks = computed(() => props.tasks.filter((task) => !task.is_complet
 const completedTasks = computed(() => props.tasks.filter((task) => task.is_completed))
 const activeOcrPipeline = computed(() => getAgentOcrPipeline(props.ocrPipelineVersion))
 const effectiveOcrScope = computed(() => ['v2', 'v3'].includes(props.ocrPipelineVersion) ? 'bottom' : props.ocrScope)
+const currentSessionOcrPipelineVersion = computed(() => inferAgentOcrPipelineVersion(props.session?.payload || {}))
+const currentSessionOcrPipeline = computed(() => getAgentOcrPipeline(currentSessionOcrPipelineVersion.value))
+const currentSessionOcrScope = computed(() => (
+  ['v2', 'v3'].includes(currentSessionOcrPipelineVersion.value)
+    ? 'bottom'
+    : (props.session?.payload?.ocr_scope || props.ocrScope)
+))
 
 const statusLabel = computed(() => {
   if (!props.session) return ''

@@ -51,7 +51,11 @@ from video_translate.ocr.llm_refine import (
     cleanup_ocr_source_with_llm,
     refine_ocr_source_with_llm,
 )
-from video_translate.ocr.layered_refine import LayeredOCRRefinementConfig, refine_ocr_layers_with_llm
+from video_translate.ocr.layered_refine import (
+    OCR_V3_POLICY_REVISION,
+    LayeredOCRRefinementConfig,
+    refine_ocr_layers_with_llm,
+)
 from video_translate.ocr.geometry_refine import GeometryRefinementConfig, refine_ocr_geometry_with_llm
 from video_translate.pipeline import CueTimingConfig, write_extraction_outputs
 from video_translate.projects import ProjectPathPolicy
@@ -114,6 +118,7 @@ FRONTEND_DIST = ROOT / "frontend" / "dist"
 DEFAULT_PROXY = os.environ.get("YTDLP_PROXY", "").strip()
 DEFAULT_HOST = os.environ.get("VIDEO_TRANSLATE_HOST", "127.0.0.1").strip() or "127.0.0.1"
 DEFAULT_PORT = int(os.environ.get("VIDEO_TRANSLATE_PORT", "7860"))
+DEFAULT_AGENT_OCR_PIPELINE_VERSION = "v3"
 PYTHON = sys.executable
 _HYBRID_TRANSLATION_PROMPT = """本次源字幕是 hybrid 格式：时间轴来自作者上传的英文人工字幕，文本中可能同时包含“韩文OCR”和“英文参考”。
 翻译时必须优先依据“韩文OCR”的韩文原文，英文参考只用于理解上下文和兜底。
@@ -761,9 +766,13 @@ def start_agent_session(payload: dict[str, Any]) -> AgentSession:
     normalized_payload = dict(payload)
     normalized_payload["source_language"] = normalize_source_language(normalized_payload.get("source_language") or "auto")
     normalized_payload["ocr_language"] = normalize_source_language(normalized_payload.get("ocr_language") or "auto")
+    requested_pipeline_version = normalized_payload.get("ocr_pipeline_version")
+    requested_extraction_mode = normalized_payload.get("ocr_extraction_mode")
+    if not str(requested_pipeline_version or "").strip() and not str(requested_extraction_mode or "").strip():
+        requested_pipeline_version = DEFAULT_AGENT_OCR_PIPELINE_VERSION
     pipeline_version = _normalize_agent_ocr_pipeline_version(
-        normalized_payload.get("ocr_pipeline_version"),
-        normalized_payload.get("ocr_extraction_mode"),
+        requested_pipeline_version,
+        requested_extraction_mode,
     )
     pipeline = _resolve_ocr_pipeline(
         pipeline_version,
@@ -2124,6 +2133,7 @@ def _agent_run_ocr(session: AgentSession, *, force: bool = False) -> None:
         refinement_mode=session.payload.get("ocr_refinement_mode"),
     )
     ocr_pipeline_version = pipeline["version"]
+    ocr_policy_revision = _ocr_policy_revision(ocr_pipeline_version, pipeline["extraction_mode"])
     translation_mode = pipeline["translation_mode"]
     ocr_scope = "bottom" if ocr_pipeline_version == "v2" else _normalize_ocr_scope(session.payload.get("ocr_scope"))
     ocr_extraction_mode = pipeline["extraction_mode"]
@@ -2238,6 +2248,7 @@ def _agent_run_ocr(session: AgentSession, *, force: bool = False) -> None:
             input_video=result.get("input_video"),
             output_dir=result.get("output_dir"),
             ocr_pipeline_version=ocr_pipeline_version,
+            ocr_policy_revision=result.get("ocr_policy_revision") or ocr_policy_revision,
             ocr_translation_mode=translation_mode,
             ocr_source_cleanup_mode=pipeline["source_cleanup_mode"],
             ocr_scope=ocr_scope,
@@ -2293,6 +2304,7 @@ def _agent_use_cached_ocr(session: AgentSession, cached: dict[str, Any]) -> None
             input_video=str(input_video) if input_video else "",
             output_dir=cached.get("output_dir"),
             ocr_pipeline_version=cached.get("ocr_pipeline_version"),
+            ocr_policy_revision=cached.get("ocr_policy_revision"),
             ocr_translation_mode=cached.get("ocr_translation_mode"),
             ocr_source_cleanup_mode=cached.get("ocr_source_cleanup_mode"),
             ocr_scope=cached.get("ocr_scope"),
@@ -3620,8 +3632,20 @@ def _find_reusable_ocr_result(
     exclude_left_ratio = _normalize_ocr_exclude_ratio(ocr_exclude_left_ratio)
     exclude_right_ratio = _normalize_ocr_exclude_ratio(ocr_exclude_right_ratio)
     normalized_source_language = normalize_source_language(source_language or "auto")
+    required_policy_revision = (
+        OCR_V3_POLICY_REVISION
+        if pipeline_version == "v3" or extraction_mode == "region_v3"
+        else ""
+    )
     candidates: list[dict[str, Any]] = []
-    candidates.extend(_reusable_ocr_from_tasks(normalized_url=normalized_url, title_key=title_key, mode=mode, pipeline_version=pipeline_version, source_cleanup_mode=source_cleanup_mode, scope=scope, extraction_mode=extraction_mode, shape_mode=shape_mode, refinement_mode=refinement_mode, crop_top_ratio=crop_top_ratio, crop_bottom_ratio=crop_bottom_ratio, crop_left_ratio=crop_left_ratio, crop_right_ratio=crop_right_ratio, exclude_enabled=exclude_enabled, exclude_top_ratio=exclude_top_ratio, exclude_bottom_ratio=exclude_bottom_ratio, exclude_left_ratio=exclude_left_ratio, exclude_right_ratio=exclude_right_ratio, source_language=normalized_source_language, exclude_session_id=exclude_session_id))
+    task_candidates = _reusable_ocr_from_tasks(normalized_url=normalized_url, title_key=title_key, mode=mode, pipeline_version=pipeline_version, source_cleanup_mode=source_cleanup_mode, scope=scope, extraction_mode=extraction_mode, shape_mode=shape_mode, refinement_mode=refinement_mode, crop_top_ratio=crop_top_ratio, crop_bottom_ratio=crop_bottom_ratio, crop_left_ratio=crop_left_ratio, crop_right_ratio=crop_right_ratio, exclude_enabled=exclude_enabled, exclude_top_ratio=exclude_top_ratio, exclude_bottom_ratio=exclude_bottom_ratio, exclude_left_ratio=exclude_left_ratio, exclude_right_ratio=exclude_right_ratio, source_language=normalized_source_language, exclude_session_id=exclude_session_id)
+    if required_policy_revision:
+        task_candidates = [
+            item
+            for item in task_candidates
+            if item.get("ocr_policy_revision") == required_policy_revision
+        ]
+    candidates.extend(task_candidates)
     if not JOB_DIR.exists():
         return sorted(candidates, key=lambda item: float(item.get("created_at") or 0), reverse=True)[0] if candidates else None
     for run_yaml in JOB_DIR.glob("*/run.yaml"):
@@ -3645,6 +3669,15 @@ def _find_reusable_ocr_result(
         cached_scope = str(cache.get("ocr_scope") or "bottom").strip()
         cached_extraction_mode = str(cache.get("ocr_extraction_mode") or "auto").strip()
         cached_pipeline_version = _cached_ocr_pipeline_version(cache.get("ocr_pipeline_version"), cached_extraction_mode)
+        cached_policy_revision = str(cache.get("ocr_policy_revision") or "").strip()
+        if required_policy_revision:
+            # A V3 run writes source.srt before the geometry/layered stages.
+            # Reuse only the finalized layered artifact so a failed partial run
+            # cannot masquerade as the stabilized OCR 3.0 output.
+            finalized_v3_source = job_dir / "source.v3.layered.srt"
+            if not finalized_v3_source.is_file() or finalized_v3_source.stat().st_size <= 0:
+                continue
+            source_srt = finalized_v3_source
         cached_pipeline_config = config.get("ocr_pipeline") if isinstance(config.get("ocr_pipeline"), dict) else {}
         cached_source_cleanup_mode = str(
             cache.get("ocr_source_cleanup_mode")
@@ -3669,6 +3702,8 @@ def _find_reusable_ocr_result(
         exact_url_match = bool(normalized_url and cached_url == normalized_url)
         title_match = _cached_ocr_title_matches(input_video, title_key)
         if pipeline_version and cached_pipeline_version != pipeline_version:
+            continue
+        if required_policy_revision and cached_policy_revision != required_policy_revision:
             continue
         if source_cleanup_mode and cached_source_cleanup_mode != source_cleanup_mode:
             continue
@@ -3712,6 +3747,7 @@ def _find_reusable_ocr_result(
                 "matched_by": "url" if exact_url_match else "title",
                 "created_at": run_yaml.stat().st_mtime,
                 "ocr_pipeline_version": cached_pipeline_version or "custom",
+                "ocr_policy_revision": cached_policy_revision,
                 "ocr_source_cleanup_mode": cached_source_cleanup_mode,
                 "ocr_translation_mode": cached_mode or mode,
                 "ocr_scope": _normalize_ocr_scope(cached_scope),
@@ -3759,6 +3795,8 @@ def _reusable_ocr_from_tasks(*, normalized_url: str, title_key: str, mode: str, 
             records.extend(item for item in raw_cache if isinstance(item, dict))
 
         for record in records:
+            if str(record.get("status") or "").strip() != "done":
+                continue
             source_srt = str(record.get("source_srt") or "").strip()
             source_path = Path(source_srt).expanduser() if source_srt else None
             if source_path is None or not source_path.exists() or source_path.stat().st_size <= 1:
@@ -3766,6 +3804,7 @@ def _reusable_ocr_from_tasks(*, normalized_url: str, title_key: str, mode: str, 
             cached_scope = _normalize_ocr_scope(record.get("ocr_scope") or "bottom")
             cached_extraction_mode = _normalize_ocr_extraction_mode(record.get("ocr_extraction_mode") or "auto")
             cached_pipeline_version = _cached_ocr_pipeline_version(record.get("ocr_pipeline_version"), cached_extraction_mode)
+            cached_policy_revision = str(record.get("ocr_policy_revision") or "").strip()
             cached_source_cleanup_mode = str(
                 record.get("ocr_source_cleanup_mode") or ({"v1": "llm_context", "v2": "none"}.get(cached_pipeline_version, ""))
             ).strip()
@@ -3814,6 +3853,7 @@ def _reusable_ocr_from_tasks(*, normalized_url: str, title_key: str, mode: str, 
                     "matched_by": "url" if exact_url_match else "title",
                     "created_at": float(record.get("updated_at") or record.get("cached_at") or task.get("updated_at") or task_yaml.stat().st_mtime),
                     "ocr_pipeline_version": cached_pipeline_version or "custom",
+                    "ocr_policy_revision": cached_policy_revision,
                     "ocr_source_cleanup_mode": cached_source_cleanup_mode,
                     "ocr_translation_mode": mode,
                     "ocr_scope": cached_scope,
@@ -4422,6 +4462,7 @@ def ocr_full_job(payload: dict[str, Any]) -> Job:
         preserve_timing=bool(payload.get("preserve_timing", False)),
     )
     ocr_pipeline_version = pipeline["version"]
+    ocr_policy_revision = _ocr_policy_revision(ocr_pipeline_version, pipeline["extraction_mode"])
     translation_mode = pipeline["translation_mode"]
     ocr_scope = "bottom" if ocr_pipeline_version == "v2" else _normalize_ocr_scope(payload.get("ocr_scope"))
     ocr_extraction_mode = pipeline["extraction_mode"]
@@ -4482,6 +4523,8 @@ def ocr_full_job(payload: dict[str, Any]) -> Job:
             "source_language": config_source_language,
             "ocr_language": ocr_language,
         }
+        if ocr_policy_revision:
+            config["agent_cache"]["ocr_policy_revision"] = ocr_policy_revision
         config_path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
         _append_log(job_id, f"config: {config_path}")
         _run_command(job_id, [PYTHON, str(ROOT / "run_from_config.py"), str(config_path)])
@@ -4503,6 +4546,8 @@ def ocr_full_job(payload: dict[str, Any]) -> Job:
             "ocr_shape_mode": ocr_shape_mode,
             "ocr_exclude_enabled": ocr_exclude_enabled,
         }
+        if ocr_policy_revision:
+            result["ocr_policy_revision"] = ocr_policy_revision
         if config_source_language == "chinese":
             result.update(_materialize_chinese_ocr_output(input_video, out_dir))
         return result
@@ -4529,6 +4574,7 @@ def ocr_extract_job(payload: dict[str, Any]) -> Job:
         preserve_timing=bool(payload.get("preserve_timing", False)),
     )
     ocr_pipeline_version = pipeline["version"]
+    ocr_policy_revision = _ocr_policy_revision(ocr_pipeline_version, pipeline["extraction_mode"])
     translation_mode = pipeline["translation_mode"]
     ocr_scope = "bottom" if ocr_pipeline_version == "v2" else _normalize_ocr_scope(payload.get("ocr_scope"))
     ocr_extraction_mode = pipeline["extraction_mode"]
@@ -4592,10 +4638,12 @@ def ocr_extract_job(payload: dict[str, Any]) -> Job:
             "source_language": config_source_language,
             "ocr_language": ocr_language,
         }
+        if ocr_policy_revision:
+            config["agent_cache"]["ocr_policy_revision"] = ocr_policy_revision
         config_path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
         _append_log(job_id, f"config: {config_path}")
         _run_command(job_id, [PYTHON, str(ROOT / "run_from_config.py"), str(config_path)])
-        return {
+        result = {
             "input_video": str(input_video),
             "output_dir": str(out_dir),
             **_ocr_geometry_result_artifacts(out_dir, ocr_refinement_mode),
@@ -4613,6 +4661,9 @@ def ocr_extract_job(payload: dict[str, Any]) -> Job:
             "ocr_shape_mode": ocr_shape_mode,
             "ocr_exclude_enabled": ocr_exclude_enabled,
         }
+        if ocr_policy_revision:
+            result["ocr_policy_revision"] = ocr_policy_revision
+        return result
 
     return start_job(f"OCR 提取 {job_slug}", target)
 
@@ -4631,6 +4682,7 @@ def ocr_local_video_job(payload: dict[str, Any]) -> Job:
         preserve_timing=bool(payload.get("preserve_timing", False)),
     )
     ocr_pipeline_version = pipeline["version"]
+    ocr_policy_revision = _ocr_policy_revision(ocr_pipeline_version, pipeline["extraction_mode"])
     translation_mode = pipeline["translation_mode"]
     ocr_scope = "bottom" if ocr_pipeline_version == "v2" else _normalize_ocr_scope(payload.get("ocr_scope"))
     ocr_extraction_mode = pipeline["extraction_mode"]
@@ -4682,6 +4734,8 @@ def ocr_local_video_job(payload: dict[str, Any]) -> Job:
             "ocr_shape_mode": ocr_shape_mode,
             "ocr_exclude_enabled": ocr_exclude_enabled,
         }
+        if ocr_policy_revision:
+            result["ocr_policy_revision"] = ocr_policy_revision
         if config_source_language == "chinese":
             result.update(_materialize_chinese_ocr_output(input_video, out_dir))
         return result
@@ -4708,6 +4762,7 @@ def ocr_development_job(payload: dict[str, Any]) -> Job:
     ocr_shape_mode = _normalize_ocr_shape_mode(payload.get("ocr_shape_mode"), ocr_extraction_mode)
     geometry_refinement = llm_cleanup and ocr_extraction_mode == "region_v3"
     track_refinement = llm_cleanup and ocr_extraction_mode == "region"
+    ocr_policy_revision = _ocr_policy_revision("v3" if ocr_extraction_mode == "region_v3" else "", ocr_extraction_mode)
     crop_top_ratio = _normalize_ocr_crop_top_ratio(payload.get("ocr_crop_top_ratio"), ocr_scope)
     crop_bottom_ratio = _normalize_ocr_vertical_crop_ratio(payload.get("ocr_crop_bottom_ratio"))
     crop_left_ratio = _normalize_ocr_crop_ratio(payload.get("ocr_crop_left_ratio"))
@@ -4790,6 +4845,14 @@ def ocr_development_job(payload: dict[str, Any]) -> Job:
             },
             "sidecar": {"enabled": False, "copy_source": False, "copy_translated": False},
         }
+        if ocr_policy_revision:
+            config["ocr_pipeline"] = {
+                "version": "v3",
+                "label": "OCR 3.0（稳定版）",
+                "policy_revision": ocr_policy_revision,
+                "extraction_mode": ocr_extraction_mode,
+                "refinement_mode": "llm_geometry" if geometry_refinement else "none",
+            }
         config_path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
         _append_log(job_id, f"input_video: {input_video}")
         _append_log(job_id, f"config: {config_path}")
@@ -4825,6 +4888,8 @@ def ocr_development_job(payload: dict[str, Any]) -> Job:
                 "llm_geometry" if geometry_refinement else "llm_boxes" if track_refinement else "none"
             ),
         }
+        if ocr_policy_revision:
+            result["ocr_policy_revision"] = ocr_policy_revision
         debug_variant = (
             f"ocr3_{ocr_shape_mode}"
             if ocr_extraction_mode == "region_v3"
@@ -5000,6 +5065,7 @@ def refine_ocr_debug_layers_job(payload: dict[str, Any]) -> Job:
                     "ocr_v3_layers": str(debug_layers_json),
                     "ocr_geometry": str(geometry_json) if geometry_json.is_file() else "",
                     "v3_layered_only": True,
+                    "ocr_policy_revision": OCR_V3_POLICY_REVISION,
                 }
             )
         else:
@@ -5055,6 +5121,7 @@ def refine_ocr_debug_geometry_job(payload: dict[str, Any]) -> Job:
             "ocr_geometry": str(debug_geometry_json),
             "tracks": str(tracks_path),
             "ocr_boxes": str(boxes_path),
+            "ocr_policy_revision": OCR_V3_POLICY_REVISION,
         }
 
     return start_job(f"OCR 3.0 geometry refine {_safe_slug(debug_dir.name)[:80]}", target)
@@ -5124,6 +5191,7 @@ def refine_ocr_debug_v3_job(payload: dict[str, Any]) -> Job:
             "ocr_v3_layers": str(debug_v3_layers),
             "ocr_geometry": str(geometry_json) if geometry_json.is_file() else "",
             "ocr_boxes": str(boxes_path),
+            "ocr_policy_revision": OCR_V3_POLICY_REVISION,
         }
 
     return start_job(f"OCR 3.0 final refine {_safe_slug(debug_dir.name)[:80]}", target)
@@ -5911,6 +5979,18 @@ def _ocr_config(
         prompt += "\n任务提示：" + extra_hint.strip()
     mode_prompt, translation = _ocr_translation_mode_config(translation_mode, prompt)
     prompt = mode_prompt
+    policy_revision = _ocr_policy_revision(ocr_pipeline_version, ocr_extraction_mode)
+    pipeline_metadata = {
+        "version": ocr_pipeline_version,
+        "label": pipeline["label"],
+        "extraction_mode": ocr_extraction_mode,
+        "scope": _normalize_ocr_scope(ocr_scope),
+        "refinement_mode": ocr_refinement_mode,
+        "source_cleanup_mode": pipeline["source_cleanup_mode"],
+        "translation_mode": translation_mode,
+    }
+    if policy_revision:
+        pipeline_metadata["policy_revision"] = policy_revision
     ocr_config = {
         "device": "auto",
         "sample_fps": 3.0,
@@ -5961,15 +6041,7 @@ def _ocr_config(
         "source_language": normalized_source_language,
         "target_language": "简体中文",
         "glossary": "",
-        "ocr_pipeline": {
-            "version": ocr_pipeline_version,
-            "label": pipeline["label"],
-            "extraction_mode": ocr_extraction_mode,
-            "scope": _normalize_ocr_scope(ocr_scope),
-            "refinement_mode": ocr_refinement_mode,
-            "source_cleanup_mode": pipeline["source_cleanup_mode"],
-            "translation_mode": translation_mode,
-        },
+        "ocr_pipeline": pipeline_metadata,
         "ocr": ocr_config,
         "ocr_refinement": refinement_config,
         "source_cleanup": {"mode": pipeline["source_cleanup_mode"], "batch_size": 18, "overlap": 3},
@@ -6138,6 +6210,12 @@ def _normalize_agent_ocr_pipeline_version(value: Any, extraction_mode: Any = "au
     return "v1"
 
 
+def _ocr_policy_revision(pipeline_version: Any, extraction_mode: Any = "") -> str:
+    version = str(pipeline_version or "").strip().lower()
+    extraction = str(extraction_mode or "").strip().lower()
+    return OCR_V3_POLICY_REVISION if version == "v3" or extraction == "region_v3" else ""
+
+
 def _cached_ocr_pipeline_version(value: Any, extraction_mode: Any) -> str:
     raw = str(value or "").strip().lower()
     if raw == "custom":
@@ -6199,11 +6277,12 @@ def _resolve_ocr_pipeline(
             "source_cleanup_mode": "none",
             "translation_mode": "translate_only",
         }
-    # OCR 3.0 remains isolated from the stable OCR 2.0 route. Geometry becomes
-    # a soft prior for independent V3 text and layered refinement artifacts.
+    # OCR 3.0 is the stable Agent default while remaining isolated from the
+    # preserved OCR 2.0 route. Geometry is a soft prior for independent V3
+    # text and layered refinement artifacts.
     return {
         "version": "v3",
-        "label": "OCR 3.0（几何精修实验）",
+        "label": "OCR 3.0（稳定版）",
         "extraction_mode": "region_v3",
         "refinement_mode": "llm_geometry",
         "source_cleanup_mode": "none",

@@ -93,6 +93,7 @@ def test_geometry_payload_contains_soft_angle_and_strict_decision_schema() -> No
     assert "angle 的绝对值再大也不能单独证明" in prompt
     assert "不得输出 keep/drop/action" in prompt
     assert "stable_slanted_program_candidate" in content
+    assert "moving_slanted_surface_candidate" in content
     assert '"angle_alone_can_drop":false' in content
     assert '"classification":"subtitle"' in content
     assert set(geometry_refine.GEOMETRY_CLASSIFICATIONS) == {
@@ -127,6 +128,33 @@ def test_stable_slanted_program_text_is_protected_from_scene_text_drop() -> None
     assert evidence["server_features"]["angle_alone_can_drop"] is False
     assert action.action == "keep"
     assert "protection" in action.reason
+
+
+def test_moving_slanted_surface_does_not_receive_static_program_protection() -> None:
+    boxes = [
+        _box("사장박영희", 1.8, 55, (827, 465, 1083, 629), angle=25.8),
+        _box("사장박영희", 2.6, 80, (780, 400, 1033, 562), angle=26.1),
+        _box("사장박영희", 3.5, 105, (864, 430, 1122, 598), angle=26.8),
+        _box("사장박영희", 4.3, 130, (925, 511, 1164, 667), angle=26.2),
+    ]
+    track = _track(14, "사장박영희", boxes)
+
+    evidence = build_track_geometry_evidence(track, boxes)
+    decision = GeometryDecision(
+        track_id=14,
+        classification="scene_text",
+        evidence=("scene_object_semantics", "center_motion"),
+        reason="휴대전화 화면과 함께 이동하는 글자",
+    )
+    action = derive_geometry_action(track, decision, evidence)
+
+    assert evidence["geometry"]["motion"]["center_motion"] is True
+    assert evidence["server_features"]["moving_slanted_surface_candidate"] is True
+    assert evidence["server_features"]["stable_slanted_program_candidate"] is False
+    # The composite hint is intentionally soft. One dynamic signal still
+    # cannot make the geometry-only diagnostic erase a programme caption.
+    assert action.action == "keep"
+    assert "only 1" in action.reason
 
 
 def test_scene_text_requires_two_server_computed_dynamic_or_perspective_signals() -> None:

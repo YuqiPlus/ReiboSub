@@ -11,7 +11,7 @@ The project is designed for a human-in-the-loop workflow: the Agent can run mult
 - **Agent cockpit**: paste a YouTube URL or video ID, let the Agent probe subtitles, choose a route, and wait for confirmation when needed.
 - **Project-based downloads**: each YouTube video is stored in its own folder with video, source subtitles, translated subtitles, thumbnail, and metadata.
 - **YouTube subtitles**: detect manual and auto subtitles, download selected tracks, and prefer source-language/manual tracks for translation.
-- **OCR subtitles**: keep the legacy pipeline while providing isolated OCR 2.0 stable and OCR 3.0 geometry/layered experimental workflows.
+- **OCR subtitles**: use the stabilized OCR 3.0 workflow for new Agent tasks while retaining isolated OCR 1.0 and 2.0 compatibility routes.
 - **ASR subtitles**: transcribe speech with `faster-whisper`, then optionally correct ASR text with an LLM.
 - **Video upload flow**: upload a local video from the browser and start an ASR-to-Chinese subtitle job directly.
 - **Hybrid workflows**: use a reliable uploaded subtitle timeline, such as English, while reconstructing original-language text from OCR when the embedded source subtitle is more accurate.
@@ -222,10 +222,12 @@ Common routes:
 | Version | Pipeline | Recommended use |
 | --- | --- | --- |
 | OCR 1.0 (legacy) | automatic main-subtitle OCR → legacy cleanup → legacy translation | Reproduce old results or keep old tasks compatible |
-| OCR 2.0 (stable) | region OCR → box/track-specific cleanup → locked-timeline translation | Normal bottom hard subtitles; preferred default |
-| OCR 3.0 (initial) | region OCR → geometry hints → text repair → scene/dialogue layering → locked timeline | Experiments with slanted text, scene captions, and dialogue together |
+| OCR 2.0 (preserved) | region OCR → box/track-specific cleanup → locked-timeline translation | Reproduce existing 2.0 results or use as a comparison |
+| OCR 3.0 (stable, default) | region OCR → geometry hints → text repair → scene/dialogue layering → locked timeline | New Agent tasks and videos combining slanted text, scene captions, and dialogue |
 
-The Agent frame preview lets you drag/resize the subtitle region and optionally mark a logo/fixed-text exclusion box. OCR Lab keeps 2.0 and 3.0 in separate debug directories. When `tracks.json` and `ocr_boxes.json` already exist, you can rerun only the matching refinement stages without decoding the video or rerunning PaddleOCR. OCR 3.0 remains experimental, so keep the 2.0 result for comparison.
+The Agent frame preview lets you drag/resize the subtitle region and optionally mark a logo/fixed-text exclusion box. OCR Lab keeps 2.0 and 3.0 in separate debug directories. When `tracks.json` and `ocr_boxes.json` already exist, you can rerun only the matching refinement stages without decoding the video or rerunning PaddleOCR. Existing tasks continue with their recorded OCR version instead of being silently migrated.
+
+This default applies to full-frame OCR and ASR-with-OCR-reference routes. The English-timeline + source-language OCR hybrid keeps its independent timeline-fusion implementation and is not silently switched to OCR 3.0.
 
 ### Subtitle refinement
 
