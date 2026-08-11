@@ -193,6 +193,87 @@ When the OCR device is `auto`, ReiboSub selects an available device. Individual 
 
 For ASR with `faster-whisper`, the project tries to prepend CUDA library paths from installed `nvidia-*` Python packages. If CUDA libraries are still missing, verify your environment's `nvidia-cublas-cu12` and `nvidia-cudnn-cu12` packages.
 
+### Optional speaker diarization
+
+ASR Lab can label speech segments as `Speaker 1`, `Speaker 2`, and so on. This is speaker diarization: it separates voices but does not identify a person's real name.
+
+Install the optional runtime in the same Python environment that runs ReiboSub:
+
+```bash
+python -m pip install -e ".[diarization]"
+```
+
+Then accept the access conditions for
+[`pyannote/speaker-diarization-community-1`](https://huggingface.co/pyannote/speaker-diarization-community-1),
+create a Hugging Face access token, and store it in the Git-ignored project `.env`:
+
+```dotenv
+HF_TOKEN=hf_your_token
+```
+
+Restart the service after changing `.env`. For an offline/local model, set
+`PYANNOTE_DIARIZATION_MODEL=/absolute/path/to/model` instead. ASR Lab uses
+Community-1's exclusive diarization timeline when available and aligns each
+faster-whisper subtitle cue with the speaker who overlaps it the most. Media is
+decoded through the project's FFmpeg runtime and passed to pyannote as a 16 kHz
+mono in-memory waveform, so this route does not depend on TorchCodec's FFmpeg
+dynamic-library integration.
+
+### ASR Lab versions
+
+ASR Lab keeps the original pipeline as **ASR 1.0** and adds an independent
+**ASR 2.x** path. The current ASR 2.x pipeline version is **2.2**. Existing API
+callers that omit `asr_version` continue to use 1.0 unchanged.
+
+ASR 2.2 retains faster-whisper word timestamps and confidence metadata. With
+the default high-recall option enabled, it runs a normal transcription followed
+by an independent low-VAD pass. Only second-pass phrases that fall fully inside
+primary transcript gaps and pass both word- and region-confidence checks are
+merged into the final word timeline. Lower-confidence candidates remain in the
+quality report as suspected missing-speech regions. ASR 2.2 then decodes only
+those short regions, applies bounded local loudness normalization, and runs an
+independent no-VAD focused pass. High-confidence or cross-pass-consistent phrases
+are merged automatically; the remaining candidates are exposed in ASR Lab for
+bounded audio playback, text editing, accept, or ignore decisions.
+
+The final cue builder splits internal sentence punctuation, meaningful
+faster-whisper segment boundaries, short speech pauses, long cues, and speaker
+changes. It also removes duplicate flashes, merges adjacent micro-cues, caps
+normal cues at 4.5 seconds / 30 characters, and does not introduce overlaps.
+ASR 2.2 is the recommended path for both single- and multi-speaker audio;
+speaker diarization remains a separate optional feature. Each high-recall run
+writes:
+
+- `source.raw.srt`: the untouched faster-whisper segment output;
+- `source.recovery.raw.srt`: the untouched low-VAD recovery-pass output;
+- `source.asr2.srt`: the rebuilt ASR 2.2 subtitle;
+- `words.json` and `segments.json`: detailed timing and confidence metadata;
+- `words.recovery.json` and `segments.recovery.json`: complete second-pass
+  diagnostics;
+- `words.focused.json` and `segments.focused.json`: focused local re-listening
+  evidence for unresolved gaps;
+- `quality.json`: low-confidence words, suspicious segments, recovered phrases,
+  and unresolved suspected missing-speech regions;
+- `cues.asr2.json`: the final cue-to-word mapping.
+
+Review decisions are stored in `asr_review.json`. Accepted candidates rebuild a
+separate `source.asr2.reviewed.srt` from the word timeline and synchronize the
+material-folder source subtitle, leaving the original ASR output available for
+comparison and rollback.
+
+Optional hotwords can bias names and domain terms. When speaker diarization is
+enabled, a known speaker count can be supplied and words are aligned against
+Community-1's exclusive speaker timeline before cue construction.
+
+High-recall recovery is enabled by default in ASR Lab and can be disabled for a
+faster single-pass comparison. It runs sequentially on one GPU and does not
+require a second GPU.
+
+Dual-GPU execution is optional and disabled by default. When enabled, ASR 2.0
+runs faster-whisper on GPU 0 and speaker diarization on GPU 1 only if at least
+two NVIDIA GPUs are detected. Single-GPU and CPU-only systems automatically
+fall back to sequential execution instead of failing.
+
 ## Agent Workflows
 
 Typical UI flow:
