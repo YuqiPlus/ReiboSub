@@ -41,6 +41,7 @@ class JobService:
                     job.result = result
                     job.status = "done"
                     job.current_process = None
+                    job.current_processes.clear()
                     job.logs.append("job_done")
                     job.updated_at = time.time()
             except JobCancelled:
@@ -54,6 +55,7 @@ class JobService:
                         job.status = "failed"
                         job.error = str(exc)
                         job.current_process = None
+                        job.current_processes.clear()
                         job.logs.append(f"job_failed: {exc}")
                         job.updated_at = time.time()
 
@@ -69,12 +71,17 @@ class JobService:
                 return job
             job.status = "cancel_requested"
             job.updated_at = time.time()
-            process = job.current_process
+            processes = list(job.current_processes)
+            if not processes and job.current_process is not None:
+                processes = [job.current_process]
         self._append_log(job_id, "job_cancel_requested")
-        if process and process.poll() is None:
-            self._terminate_process(process)
+        for process in processes:
+            if process.poll() is None:
+                self._terminate_process(process)
         with self._lock:
-            if job.status == "cancel_requested" and (process is None or process.poll() is not None):
+            if job.status == "cancel_requested" and all(
+                process.poll() is not None for process in processes
+            ):
                 self._finish_cancelled(job)
         return job
 
@@ -91,6 +98,7 @@ class JobService:
     def _finish_cancelled(job: Job) -> None:
         job.status = "cancelled"
         job.current_process = None
+        job.current_processes.clear()
         if not job.logs or job.logs[-1] != "job_cancelled":
             job.logs.append("job_cancelled")
         job.updated_at = time.time()

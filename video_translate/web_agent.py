@@ -5,6 +5,7 @@ import gc
 import hashlib
 import ipaddress
 import json
+import math
 import mimetypes
 import os
 import re
@@ -17,6 +18,7 @@ import threading
 import time
 import unicodedata
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
 from email.parser import BytesParser
 from email.policy import default as email_default_policy
@@ -32,6 +34,15 @@ import yt_dlp
 
 from video_translate.agent_planner import build_agent_plan
 from video_translate.agent.models import AgentSession
+from video_translate.asr_v2 import (
+    AsrWord,
+    assign_speakers_to_words,
+    build_asr_v2_cues,
+    enrich_asr_review_regions,
+    merge_cue_quality_report,
+    read_words_json,
+    write_asr_v2_outputs,
+)
 from video_translate.cache import cuda_library_dirs, prepend_library_path
 from video_translate.env import load_dotenv
 from video_translate.app_settings import get_app_settings_payload, save_app_settings
@@ -70,8 +81,12 @@ from video_translate.provider_secrets import (
     update_provider_connection_settings,
 )
 from video_translate.project_manifest import (
+    AUDIO_EXTENSIONS,
     PROJECT_MANIFEST_NAME,
+    VIDEO_EXTENSIONS,
     infer_project_manifest,
+    save_project_manifest,
+    update_local_media_project_manifest,
     update_local_project_manifest,
     update_youtube_project_manifest,
     update_youtube_project_metadata,
@@ -79,6 +94,12 @@ from video_translate.project_manifest import (
 from video_translate.subtitle.dual_reference import write_dual_reference_outputs
 from video_translate.subtitle.srt import read_srt, write_srt
 from video_translate.subtitle.sidecar import SidecarConfig, copy_sidecar_subtitles
+from video_translate.tools.diarize_speakers import (
+    ensure_diarization_ready,
+    read_turns_json,
+    speaker_transcript_text,
+    write_speaker_outputs,
+)
 from video_translate.translate.volcengine import (
     DEFAULT_BASE_URL,
     _chat_completions_url,
@@ -159,7 +180,12 @@ _LOCK = threading.Lock()
 _TASK_FILE_LOCK = threading.RLock()
 _AGENT_TRANSLATION_START_LOCK = threading.RLock()
 _YOUTUBE_PROJECT_BIND_LOCK = threading.RLock()
+_ASR_REVIEW_LOCK = threading.RLock()
 _OCR_PREVIEW_LOCK = threading.Lock()
+_VIDEO_OUTPUT_LOCK = threading.Lock()
+_RESERVED_VIDEO_OUTPUTS: set[str] = set()
+_MAX_VIDEO_OUTPUT_EDGE = 8192
+_MAX_VIDEO_OUTPUT_PIXELS = 33_177_600
 _OCR_PREVIEW_MODEL_KEY: tuple[str, str] | None = None
 _OCR_PREVIEW_MODEL: Any = None
 _OCR_ACTIVE_COMMANDS = 0
@@ -1144,45 +1170,60 @@ def delete_download_project(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def register_local_project(payload: dict[str, Any]) -> dict[str, Any]:
-    input_video = _resolve_project_path(_required_str(payload, "input_video"))
-    _ensure_under_root(input_video)
-    if not input_video.exists() or not input_video.is_file():
-        raise FileNotFoundError(f"视频文件不存在: {input_video}")
-    title = str(payload.get("title") or input_video.stem).strip()
-    manifest = update_local_project_manifest(input_video, download_dir=DOWNLOAD_DIR, title=title)
+    raw_media = str(payload.get("input_media") or payload.get("input_video") or "").strip()
+    if not raw_media:
+        raise ValueError("缺少参数: input_media")
+    input_media = _resolve_project_path(raw_media)
+    _ensure_under_root(input_media)
+    if not input_media.exists() or not input_media.is_file():
+        raise FileNotFoundError(f"媒体文件不存在: {input_media}")
+    if input_media.suffix.lower() not in VIDEO_EXTENSIONS | AUDIO_EXTENSIONS:
+        raise ValueError(f"不支持的媒体格式: {input_media.suffix.lower() or '<none>'}")
+    title = str(payload.get("title") or input_media.stem).strip()
+    manifest = update_local_media_project_manifest(input_media, download_dir=DOWNLOAD_DIR, title=title)
     project = _download_project_entry(Path(str(manifest["project_dir"])))
     return {"project": project, "manifest": manifest, "project_dir": manifest["project_dir"]}
 
 
-VIDEO_UPLOAD_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".ts", ".m2ts"}
+VIDEO_UPLOAD_EXTENSIONS = set(VIDEO_EXTENSIONS)
+AUDIO_UPLOAD_EXTENSIONS = set(AUDIO_EXTENSIONS)
+MEDIA_UPLOAD_EXTENSIONS = VIDEO_UPLOAD_EXTENSIONS | AUDIO_UPLOAD_EXTENSIONS
 COVER_UPLOAD_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
-def save_uploaded_video_file(*, filename: str, content: bytes, title: str = "") -> dict[str, Any]:
-    original_name = Path(str(filename or "uploaded_video.mp4")).name.strip()
+def save_uploaded_media_file(*, filename: str, content: bytes, title: str = "") -> dict[str, Any]:
+    original_name = Path(str(filename or "uploaded_media")).name.strip()
     if not original_name or original_name in {".", ".."}:
-        original_name = "uploaded_video.mp4"
+        original_name = "uploaded_media"
     suffix = Path(original_name).suffix.lower()
-    if suffix not in VIDEO_UPLOAD_EXTENSIONS:
-        allowed = ", ".join(sorted(VIDEO_UPLOAD_EXTENSIONS))
-        raise ValueError(f"不支持的视频格式: {suffix or '<none>'}。支持: {allowed}")
+    if suffix not in MEDIA_UPLOAD_EXTENSIONS:
+        allowed = ", ".join(sorted(MEDIA_UPLOAD_EXTENSIONS))
+        raise ValueError(f"不支持的媒体格式: {suffix or '<none>'}。支持: {allowed}")
+    media_kind = "video" if suffix in VIDEO_UPLOAD_EXTENSIONS else "audio"
     safe_name = filesystem_safe_title(Path(original_name).stem).strip() + suffix
     safe_title = filesystem_safe_title(str(title or Path(original_name).stem)).strip() or Path(safe_name).stem
     project_dir = (DOWNLOAD_DIR / safe_title).resolve()
     _ensure_under_root(project_dir)
     project_dir.mkdir(parents=True, exist_ok=True)
-    input_video = (project_dir / safe_name).resolve()
-    _ensure_under_root(input_video)
-    input_video.write_bytes(content)
-    manifest = update_local_project_manifest(input_video, download_dir=DOWNLOAD_DIR, title=safe_title)
+    input_media = (project_dir / safe_name).resolve()
+    _ensure_under_root(input_media)
+    input_media.write_bytes(content)
+    manifest = update_local_media_project_manifest(input_media, download_dir=DOWNLOAD_DIR, title=safe_title)
     project = _download_project_entry(Path(str(manifest["project_dir"])))
     return {
-        "input_video": str(input_video),
+        "input_media": str(input_media),
+        "input_video": str(input_media) if media_kind == "video" else "",
+        "input_audio": str(input_media) if media_kind == "audio" else "",
+        "media_kind": media_kind,
         "project_dir": manifest["project_dir"],
         "project_manifest": str(Path(str(manifest["project_dir"])) / PROJECT_MANIFEST_NAME),
         "manifest": manifest,
         "project": project,
     }
+
+
+def save_uploaded_video_file(*, filename: str, content: bytes, title: str = "") -> dict[str, Any]:
+    return save_uploaded_media_file(filename=filename, content=content, title=title)
 
 
 def save_uploaded_project_cover(*, project_path: str, filename: str, content: bytes) -> dict[str, Any]:
@@ -1213,13 +1254,7 @@ def save_uploaded_project_cover(*, project_path: str, filename: str, content: by
             thumbnail_path=cover_path,
         )
     else:
-        primary_video = Path(str(manifest.get("primary_video") or "")).expanduser()
-        if not str(primary_video) or not primary_video.exists():
-            videos = [path for path in project_dir.iterdir() if _is_real_file(path) and path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}]
-            primary_video = sorted(videos, key=lambda path: path.stat().st_mtime, reverse=True)[0] if videos else project_dir / "uploaded.mp4"
-        manifest = update_local_project_manifest(primary_video, download_dir=DOWNLOAD_DIR, title=title)
         manifest["thumbnail"] = str(cover_path)
-        from video_translate.project_manifest import save_project_manifest
         manifest = save_project_manifest(project_dir, manifest)
     project = _download_project_entry(project_dir)
     return {
@@ -3498,13 +3533,21 @@ def _project_video_path(project_dir: Any, value: Any) -> str:
 
 
 def _existing_video_path(value: Any) -> str:
+    return _existing_media_path(value, VIDEO_EXTENSIONS)
+
+
+def _existing_audio_path(value: Any) -> str:
+    return _existing_media_path(value, AUDIO_EXTENSIONS)
+
+
+def _existing_media_path(value: Any, extensions: set[str]) -> str:
     raw = str(value or "").strip()
     if not raw:
         return ""
     path = Path(raw).expanduser().resolve()
     if not path.exists() or not path.is_file():
         return ""
-    if path.suffix.lower() not in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}:
+    if path.suffix.lower() not in extensions:
         return ""
     try:
         if path.stat().st_size <= 0:
@@ -4241,6 +4284,222 @@ def _copy_corrected_source_sidecar_for_source(source_srt: Path, corrected_srt: P
         translated_suffix=str(raw_sidecar.get("translated_suffix", ".zh")),
     )
     return copy_sidecar_subtitles(input_video, source_srt=corrected_srt, config=config)
+
+
+def _asr_review_candidate(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_candidate = payload.get("candidate")
+    if not isinstance(raw_candidate, dict):
+        raise ValueError("缺少 ASR 复核候选内容")
+    try:
+        start = float(raw_candidate["start"])
+        end = float(raw_candidate["end"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("ASR 复核候选时间无效") from None
+    if start < 0 or end <= start or end - start > 30:
+        raise ValueError("ASR 复核候选时间范围无效")
+    text = str(raw_candidate.get("text") or "").strip()
+    if not text:
+        raise ValueError("ASR 复核候选文本不能为空")
+    if len(text) > 500:
+        raise ValueError("ASR 复核候选文本不能超过 500 个字符")
+    raw_probability = raw_candidate.get("average_probability")
+    if raw_probability is None:
+        raw_probability = raw_candidate.get("probability")
+    try:
+        probability = (
+            max(0.0, min(1.0, float(raw_probability)))
+            if raw_probability is not None
+            else 0.5
+        )
+    except (TypeError, ValueError):
+        probability = 0.5
+    return {
+        "start": round(start, 3),
+        "end": round(end, 3),
+        "text": text,
+        "probability": round(probability, 4),
+        "focused_text": str(raw_candidate.get("focused_text") or "").strip(),
+        "consensus_similarity": raw_candidate.get("consensus_similarity"),
+    }
+
+
+def _asr_review_id(payload: dict[str, Any], candidate: dict[str, Any]) -> str:
+    review_id = str(payload.get("review_id") or "").strip()
+    if review_id and re.fullmatch(r"[A-Za-z0-9._-]{1,120}", review_id):
+        return review_id
+    digest = hashlib.sha256(
+        json.dumps(candidate, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"gap-{digest}"
+
+
+def _write_asr_reviewed_outputs(
+    source_srt: Path,
+    reviewed_srt: Path,
+    words_path: Path,
+    decisions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    _words_payload, words = read_words_json(words_path)
+    accepted = [
+        item
+        for item in decisions
+        if str(item.get("action") or "") == "accept"
+        and isinstance(item.get("candidate"), dict)
+    ]
+    next_segment_id = max((word.segment_id for word in words), default=0) + 1
+    combined = list(words)
+    for offset, decision in enumerate(accepted):
+        candidate = dict(decision["candidate"])
+        combined.append(
+            AsrWord(
+                index=len(combined) + 1,
+                start=float(candidate["start"]),
+                end=float(candidate["end"]),
+                text=str(candidate["text"]),
+                probability=float(candidate.get("probability") or 0.5),
+                segment_id=next_segment_id + offset,
+            )
+        )
+
+    turns_path = source_srt.parent / "speaker_turns.json"
+    turns = read_turns_json(turns_path) if turns_path.is_file() else []
+    aligned_words = assign_speakers_to_words(combined, turns)
+    cues = build_asr_v2_cues(aligned_words)
+    write_srt(
+        [
+            SubtitleCue(
+                index=cue.index,
+                start=cue.start,
+                end=cue.end,
+                text=cue.subtitle_text(include_speaker=bool(turns)),
+            )
+            for cue in cues
+        ],
+        reviewed_srt,
+    )
+    transcript_text = "\n".join(
+        cue.subtitle_text(include_speaker=bool(turns))
+        for cue in cues
+    )
+    if transcript_text:
+        transcript_text += "\n"
+    return {
+        "source_srt": str(reviewed_srt),
+        "reviewed_srt": str(reviewed_srt),
+        "subtitle_path": str(reviewed_srt),
+        "transcript_text": transcript_text,
+        "cue_count": len(cues),
+        "review_word_count": len(combined),
+        "accepted_review_count": len(accepted),
+    }
+
+
+def apply_asr_review_decision(payload: dict[str, Any]) -> dict[str, Any]:
+    """Persist an ASR gap decision and rebuild the word-level ASR timeline."""
+
+    source_srt = _resolve_project_path(_required_str(payload, "source_srt"))
+    _ensure_under_root(source_srt)
+    if not source_srt.is_file():
+        raise FileNotFoundError(f"ASR 字幕不存在: {source_srt}")
+    action = str(payload.get("action") or "").strip().lower()
+    if action not in {"accept", "ignore"}:
+        raise ValueError("ASR 复核操作必须是 accept 或 ignore")
+    candidate = _asr_review_candidate(payload)
+    review_id = _asr_review_id(payload, candidate)
+    words_value = str(payload.get("words_path") or "").strip()
+    words_path = (
+        _resolve_project_path(words_value)
+        if words_value
+        else source_srt.parent / "words.json"
+    )
+    _ensure_under_root(words_path)
+    if not words_path.is_file():
+        raise FileNotFoundError(f"ASR 单词数据不存在: {words_path}")
+    out_value = str(payload.get("out") or "").strip()
+    reviewed_srt = (
+        _resolve_project_path(out_value)
+        if out_value
+        else source_srt.with_name(f"{source_srt.stem}.reviewed.srt")
+    )
+    _ensure_under_root(reviewed_srt)
+    decisions_path = source_srt.parent / "asr_review.json"
+
+    with _ASR_REVIEW_LOCK:
+        try:
+            review_payload = json.loads(decisions_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            review_payload = {}
+        raw_decisions = (
+            review_payload.get("decisions")
+            if isinstance(review_payload, dict)
+            else []
+        )
+        decisions_by_id = {
+            str(item.get("review_id")): dict(item)
+            for item in (raw_decisions or [])
+            if isinstance(item, dict) and item.get("review_id")
+        }
+        decisions_by_id[review_id] = {
+            "review_id": review_id,
+            "action": action,
+            "candidate": candidate,
+            "updated_at": time.time(),
+        }
+        decisions = sorted(
+            decisions_by_id.values(),
+            key=lambda item: (
+                float((item.get("candidate") or {}).get("start") or 0.0),
+                str(item.get("review_id") or ""),
+            ),
+        )
+        review_payload = {
+            "version": "1.0",
+            "source_srt": str(source_srt),
+            "reviewed_srt": str(reviewed_srt),
+            "words_path": str(words_path),
+            "decisions": decisions,
+        }
+        _atomic_write_text(
+            decisions_path,
+            json.dumps(review_payload, ensure_ascii=False, indent=2) + "\n",
+        )
+
+        result: dict[str, Any] = {
+            "review_id": review_id,
+            "action": action,
+            "review_decisions_path": str(decisions_path),
+            "review_source_srt": str(source_srt),
+        }
+        accepted_count = sum(
+            1 for item in decisions if item.get("action") == "accept"
+        )
+        if accepted_count:
+            result.update(
+                _write_asr_reviewed_outputs(
+                    source_srt,
+                    reviewed_srt,
+                    words_path,
+                    decisions,
+                )
+            )
+            copied = _copy_corrected_source_sidecar_for_source(
+                source_srt,
+                reviewed_srt,
+            )
+            result.update({name: str(path) for name, path in copied.items()})
+        else:
+            result.update(
+                {
+                    "source_srt": str(source_srt),
+                    "subtitle_path": str(source_srt),
+                    "accepted_review_count": 0,
+                    "cue_count": len(read_srt(source_srt)),
+                }
+            )
+        result["ignored_review_count"] = sum(
+            1 for item in decisions if item.get("action") == "ignore"
+        )
+        return result
 
 
 def _copy_source_sidecar_for_run_config(run_config: Path, source_srt: Path) -> dict[str, Path]:
@@ -5506,34 +5765,50 @@ def video_overlay_job(payload: dict[str, Any]) -> Job:
     if not input_video.exists():
         raise FileNotFoundError(f"视频文件不存在: {input_video}")
     layers = _normalize_overlay_layers(payload.get("layers") or [])
-    if not layers:
-        raise ValueError("至少启用一层贴图。")
+    transform_request = _normalize_video_transform(payload.get("transform"))
+    if not layers and not transform_request["active"]:
+        raise ValueError("至少启用一种画面变换，或添加一层贴图。")
     output_value = str(payload.get("out") or "").strip()
+    output_reserved = False
     if output_value:
         output_video = _resolve_project_path(output_value)
         _ensure_under_root(output_video)
     else:
-        output_video = _unique_overlay_output_path(input_video)
+        output_video = _reserve_unique_derived_video_path(
+            input_video,
+            "processed" if transform_request["active"] else "overlay",
+        )
+        output_reserved = True
     job_slug = _safe_slug(input_video.stem)[:80]
 
-    def target(job_id: str) -> dict[str, Any]:
+    def run_target(job_id: str) -> dict[str, Any]:
         out_dir = JOB_DIR / job_id
         asset_dir = out_dir / "overlay_assets"
-        asset_dir.mkdir(parents=True, exist_ok=True)
         video_width, video_height = _video_dimensions(input_video)
+        transform = _resolve_video_transform(transform_request, video_width, video_height)
+        output_width = int(transform["output_width"])
+        output_height = int(transform["output_height"])
         prepared_layers = []
+        if layers:
+            asset_dir.mkdir(parents=True, exist_ok=True)
         for index, layer in enumerate(layers, start=1):
             image_path = _save_overlay_image(layer, asset_dir, index)
-            width_px = max(1, int(round(video_width * float(layer["width"]))))
-            x_px = max(0, min(video_width - 1, int(round(video_width * float(layer["x"])))) )
-            y_px = max(0, min(video_height - 1, int(round(video_height * float(layer["y"])))) )
+            width_px = max(1, int(round(output_width * float(layer["width"]))))
+            x_px = max(0, min(output_width - 1, int(round(output_width * float(layer["x"])))) )
+            y_px = max(0, min(output_height - 1, int(round(output_height * float(layer["y"])))) )
             prepared_layers.append({**layer, "image_path": image_path, "width_px": width_px, "x_px": x_px, "y_px": y_px})
         output_video.parent.mkdir(parents=True, exist_ok=True)
-        args = _build_video_overlay_command(input_video, output_video, prepared_layers)
+        args = _build_video_overlay_command(
+            input_video,
+            output_video,
+            prepared_layers,
+            transform if transform_request["active"] else None,
+        )
         _run_command(job_id, args)
         return {
             "input_video": str(input_video),
             "output_video": str(output_video),
+            "transform": transform,
             "layers": [
                 {
                     "kind": layer["kind"],
@@ -5548,7 +5823,19 @@ def video_overlay_job(payload: dict[str, Any]) -> Job:
             ],
         }
 
-    return start_job(f"视频贴图处理 {job_slug}", target)
+    def target(job_id: str) -> dict[str, Any]:
+        try:
+            return run_target(job_id)
+        finally:
+            if output_reserved:
+                _release_reserved_video_output(output_video)
+
+    try:
+        return start_job(f"视频处理 {job_slug}", target)
+    except Exception:
+        if output_reserved:
+            _release_reserved_video_output(output_video)
+        raise
 
 
 def _normalize_overlay_layers(raw_layers: Any) -> list[dict[str, Any]]:
@@ -5584,15 +5871,186 @@ def _clamp_float(value: Any, minimum: float, maximum: float, default: float) -> 
     return max(minimum, min(maximum, parsed))
 
 
+def _normalize_video_transform(raw_transform: Any) -> dict[str, Any]:
+    if raw_transform is None:
+        raw_transform = {}
+    if not isinstance(raw_transform, dict):
+        raise ValueError("transform 必须是对象。")
+    horizontal_flip = _video_transform_bool(
+        raw_transform.get("horizontal_flip", raw_transform.get("mirror_horizontal", False)),
+        "horizontal_flip",
+    )
+    ratios = {
+        name: _video_transform_ratio(raw_transform.get(name), name)
+        for name in (
+            "crop_top_ratio",
+            "crop_right_ratio",
+            "crop_bottom_ratio",
+            "crop_left_ratio",
+        )
+    }
+    if ratios["crop_left_ratio"] + ratios["crop_right_ratio"] >= 0.98:
+        raise ValueError("左右裁剪比例合计必须小于 0.98。")
+    if ratios["crop_top_ratio"] + ratios["crop_bottom_ratio"] >= 0.98:
+        raise ValueError("上下裁剪比例合计必须小于 0.98。")
+    output_width = _video_transform_dimension(raw_transform.get("output_width"), "output_width")
+    output_height = _video_transform_dimension(raw_transform.get("output_height"), "output_height")
+    active = bool(horizontal_flip or any(ratios.values()) or output_width or output_height)
+    return {
+        "horizontal_flip": horizontal_flip,
+        **ratios,
+        "output_width": output_width,
+        "output_height": output_height,
+        "active": active,
+    }
+
+
+def _video_transform_ratio(value: Any, field: str) -> float:
+    if value in (None, ""):
+        return 0.0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} 必须是 0 到 0.95 之间的数字。") from exc
+    if not math.isfinite(parsed) or parsed < 0.0 or parsed > 0.95:
+        raise ValueError(f"{field} 必须是 0 到 0.95 之间的数字。")
+    return parsed
+
+
+def _video_transform_bool(value: Any, field: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in (None, "", 0, "0"):
+        return False
+    if value in (1, "1"):
+        return True
+    if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+        return value.strip().lower() == "true"
+    raise ValueError(f"{field} 必须是布尔值。")
+
+
+def _video_transform_dimension(value: Any, field: str) -> int:
+    if value in (None, "", 0, "0"):
+        return 0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} 必须是 2 到 {_MAX_VIDEO_OUTPUT_EDGE} 之间的整数。") from exc
+    if not math.isfinite(parsed) or not parsed.is_integer() or parsed < 2 or parsed > _MAX_VIDEO_OUTPUT_EDGE:
+        raise ValueError(f"{field} 必须是 2 到 {_MAX_VIDEO_OUTPUT_EDGE} 之间的整数。")
+    return int(parsed)
+
+
+def _resolve_video_transform(transform: dict[str, Any], video_width: int, video_height: int) -> dict[str, Any]:
+    crop_left = int(round(video_width * float(transform["crop_left_ratio"])))
+    crop_right = int(round(video_width * float(transform["crop_right_ratio"])))
+    crop_top = int(round(video_height * float(transform["crop_top_ratio"])))
+    crop_bottom = int(round(video_height * float(transform["crop_bottom_ratio"])))
+    crop_width = video_width - crop_left - crop_right
+    crop_height = video_height - crop_top - crop_bottom
+    if crop_width < 2:
+        raise ValueError("左右裁剪后没有足够的画面宽度。")
+    if crop_height < 2:
+        raise ValueError("上下裁剪后没有足够的画面高度。")
+
+    if not bool(transform.get("active")):
+        return {
+            **transform,
+            "source_width": int(video_width),
+            "source_height": int(video_height),
+            "crop_left_px": 0,
+            "crop_right_px": 0,
+            "crop_top_px": 0,
+            "crop_bottom_px": 0,
+            "crop_width": int(video_width),
+            "crop_height": int(video_height),
+            "output_width": int(video_width),
+            "output_height": int(video_height),
+            "resize_requested": False,
+        }
+
+    requested_width = int(transform.get("output_width") or 0)
+    requested_height = int(transform.get("output_height") or 0)
+    if requested_width and requested_height:
+        output_width = _even_video_dimension(requested_width)
+        output_height = _even_video_dimension(requested_height)
+        crop_aspect = crop_width / crop_height
+        output_aspect = output_width / output_height
+        if abs(crop_aspect - output_aspect) / crop_aspect > 0.01:
+            raise ValueError("输出宽高比与裁剪后画面不一致；请只指定一边，或先调整裁剪比例。")
+    elif requested_width:
+        output_width = _even_video_dimension(requested_width)
+        output_height = _even_video_dimension(output_width * crop_height / crop_width)
+    elif requested_height:
+        output_height = _even_video_dimension(requested_height)
+        output_width = _even_video_dimension(output_height * crop_width / crop_height)
+    else:
+        output_width = _even_video_dimension(crop_width)
+        output_height = _even_video_dimension(crop_height)
+    if output_width > _MAX_VIDEO_OUTPUT_EDGE or output_height > _MAX_VIDEO_OUTPUT_EDGE:
+        raise ValueError(f"输出尺寸单边不能超过 {_MAX_VIDEO_OUTPUT_EDGE} 像素。")
+    if output_width * output_height > _MAX_VIDEO_OUTPUT_PIXELS:
+        raise ValueError("输出总像素过大，请降低宽度或高度。")
+
+    return {
+        **transform,
+        "source_width": int(video_width),
+        "source_height": int(video_height),
+        "crop_left_px": crop_left,
+        "crop_right_px": crop_right,
+        "crop_top_px": crop_top,
+        "crop_bottom_px": crop_bottom,
+        "crop_width": crop_width,
+        "crop_height": crop_height,
+        "output_width": output_width,
+        "output_height": output_height,
+        "resize_requested": bool(requested_width or requested_height),
+    }
+
+
+def _even_video_dimension(value: Any) -> int:
+    parsed = int(float(value))
+    if parsed < 2:
+        raise ValueError("处理后的视频宽高不能小于 2 像素。")
+    return parsed - (parsed % 2)
+
+
 def _unique_overlay_output_path(input_video: Path) -> Path:
-    base = input_video.with_name(f"{input_video.stem}.overlay.mp4")
+    return _unique_derived_video_path(input_video, "overlay")
+
+
+def _unique_processed_output_path(input_video: Path) -> Path:
+    return _unique_derived_video_path(input_video, "processed")
+
+
+def _unique_derived_video_path(input_video: Path, tag: str) -> Path:
+    base = input_video.with_name(f"{input_video.stem}.{tag}.mp4")
     if not base.exists():
         return base
     for index in range(2, 1000):
-        candidate = input_video.with_name(f"{input_video.stem}.overlay-{index}.mp4")
+        candidate = input_video.with_name(f"{input_video.stem}.{tag}-{index}.mp4")
         if not candidate.exists():
             return candidate
     raise RuntimeError("无法生成不冲突的输出视频文件名。")
+
+
+def _reserve_unique_derived_video_path(input_video: Path, tag: str) -> Path:
+    with _VIDEO_OUTPUT_LOCK:
+        for index in range(1, 1000):
+            suffix = "" if index == 1 else f"-{index}"
+            candidate = input_video.with_name(f"{input_video.stem}.{tag}{suffix}.mp4")
+            key = str(candidate.expanduser().resolve())
+            if candidate.exists() or key in _RESERVED_VIDEO_OUTPUTS:
+                continue
+            _RESERVED_VIDEO_OUTPUTS.add(key)
+            return candidate
+    raise RuntimeError("无法生成不冲突的输出视频文件名。")
+
+
+def _release_reserved_video_output(output_video: Path) -> None:
+    key = str(output_video.expanduser().resolve())
+    with _VIDEO_OUTPUT_LOCK:
+        _RESERVED_VIDEO_OUTPUTS.discard(key)
 
 
 def _save_overlay_image(layer: dict[str, Any], asset_dir: Path, index: int) -> Path:
@@ -5657,12 +6115,37 @@ def _video_dimensions(video_path: Path) -> tuple[int, int]:
     return width, height
 
 
-def _build_video_overlay_command(input_video: Path, output_video: Path, layers: list[dict[str, Any]]) -> list[str]:
+def _build_video_overlay_command(
+    input_video: Path,
+    output_video: Path,
+    layers: list[dict[str, Any]],
+    transform: dict[str, Any] | None = None,
+) -> list[str]:
     args = ["ffmpeg", "-y", "-i", str(input_video)]
     for layer in layers:
         args.extend(["-i", str(layer["image_path"])])
     filter_parts: list[str] = []
     current = "[0:v]"
+    if transform:
+        base_filters: list[str] = []
+        if bool(transform.get("horizontal_flip")):
+            base_filters.append("hflip")
+        if any(int(transform.get(key) or 0) for key in ("crop_left_px", "crop_right_px", "crop_top_px", "crop_bottom_px")):
+            base_filters.append(
+                "crop="
+                f"{int(transform['crop_width'])}:{int(transform['crop_height'])}:"
+                f"{int(transform['crop_left_px'])}:{int(transform['crop_top_px'])}:exact=1"
+            )
+        if bool(transform.get("resize_requested")) or (
+            int(transform["output_width"]) != int(transform["crop_width"])
+            or int(transform["output_height"]) != int(transform["crop_height"])
+        ):
+            base_filters.append(
+                f"scale={int(transform['output_width'])}:{int(transform['output_height'])}:flags=lanczos"
+            )
+        base_filters.append("setsar=1")
+        filter_parts.append(f"[0:v]{','.join(base_filters)}[vbase]")
+        current = "[vbase]"
     for index, layer in enumerate(layers, start=1):
         overlay_label = f"ov{index}"
         output_label = f"v{index}"
@@ -5673,6 +6156,9 @@ def _build_video_overlay_command(input_video: Path, output_video: Path, layers: 
         filter_parts.append(f"[{index}:v]format=rgba,scale={width_px}:-1,colorchannelmixer=aa={opacity:.4f}[{overlay_label}]")
         filter_parts.append(f"{current}[{overlay_label}]overlay={x_px}:{y_px}[{output_label}]")
         current = f"[{output_label}]"
+    if transform:
+        filter_parts.append(f"{current}format=yuv420p[vout]")
+        current = "[vout]"
     filter_complex = ";".join(filter_parts)
     args.extend([
         "-filter_complex",
@@ -5816,6 +6302,422 @@ def audio_local_video_job(payload: dict[str, Any]) -> Job:
         return result
 
     return start_job(f"音频识别字幕 {job_slug}", target)
+
+
+def asr_lab_job(payload: dict[str, Any]) -> Job:
+    input_media = _resolve_project_path(_required_str(payload, "input_video"))
+    _ensure_under_root(input_media)
+    if not input_media.is_file():
+        raise FileNotFoundError(f"媒体文件不存在: {input_media}")
+    source_language = normalize_source_language(payload.get("source_language") or "auto")
+    language = str(payload.get("language") or asr_language_for_source(source_language)).strip()
+    model_size = str(payload.get("model_size") or "large-v3").strip()
+    if model_size not in {"large-v3", "medium", "small"}:
+        raise ValueError(f"不支持的 ASR 模型: {model_size}")
+    device = str(payload.get("device") or "cuda").strip()
+    compute_type = str(payload.get("compute_type") or "float16").strip()
+    raw_asr_version = str(payload.get("asr_version") or "1.0").strip().lower()
+    asr_version = {
+        "1": "1.0",
+        "1.0": "1.0",
+        "v1": "1.0",
+        "2": "2.0",
+        "2.0": "2.0",
+        "v2": "2.0",
+    }.get(raw_asr_version)
+    if not asr_version:
+        raise ValueError(f"不支持的 ASR 版本: {raw_asr_version}")
+    hotwords = str(payload.get("hotwords") or "").strip()
+    if len(hotwords) > 2000:
+        raise ValueError("ASR 2.0 专名提示不能超过 2000 个字符")
+    raw_high_recall = payload.get("high_recall", True)
+    high_recall = not (
+        raw_high_recall is False
+        or raw_high_recall == 0
+        or (
+            isinstance(raw_high_recall, str)
+            and raw_high_recall.strip().lower() in {"0", "false", "no", "off"}
+        )
+    )
+    raw_speaker_diarization = payload.get("speaker_diarization", False)
+    speaker_diarization = (
+        raw_speaker_diarization is True
+        or raw_speaker_diarization == 1
+        or (
+            isinstance(raw_speaker_diarization, str)
+            and raw_speaker_diarization.strip().lower() in {"1", "true", "yes", "on"}
+        )
+    )
+    diarization_device = str(payload.get("diarization_device") or "auto").strip()
+    raw_dual_gpu_parallel = payload.get("dual_gpu_parallel", False)
+    dual_gpu_parallel = (
+        raw_dual_gpu_parallel is True
+        or raw_dual_gpu_parallel == 1
+        or (
+            isinstance(raw_dual_gpu_parallel, str)
+            and raw_dual_gpu_parallel.strip().lower() in {"1", "true", "yes", "on"}
+        )
+    )
+    raw_known_speaker_count = payload.get("known_speaker_count")
+    if raw_known_speaker_count in (None, "", 0, "0", "auto"):
+        known_speaker_count = 0
+    else:
+        try:
+            known_speaker_count = int(raw_known_speaker_count)
+        except (TypeError, ValueError):
+            raise ValueError("已知说话人数必须是整数") from None
+        if not 1 <= known_speaker_count <= 20:
+            raise ValueError("已知说话人数必须在 1 到 20 之间")
+    if speaker_diarization:
+        ensure_diarization_ready()
+    job_slug = _safe_slug(input_media.stem)[:80]
+
+    def target(job_id: str) -> dict[str, Any]:
+        out_dir = JOB_DIR / job_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        source_srt = out_dir / "source.srt"
+        text_path = out_dir / "transcript.txt"
+        plain_text_path = out_dir / "transcript.plain.txt"
+        speaker_srt = out_dir / "speakers.srt"
+        speaker_turns_path = out_dir / "speaker_turns.json"
+        raw_source_srt = out_dir / "source.raw.srt"
+        recovery_raw_source_srt = out_dir / "source.recovery.raw.srt"
+        words_path = out_dir / "words.json"
+        recovery_words_path = out_dir / "words.recovery.json"
+        focused_words_path = out_dir / "words.focused.json"
+        segments_path = out_dir / "segments.json"
+        recovery_segments_path = out_dir / "segments.recovery.json"
+        focused_segments_path = out_dir / "segments.focused.json"
+        quality_path = out_dir / "quality.json"
+        config_path = out_dir / "run.yaml"
+        configured_source_srt = (
+            out_dir / "source.asr2.srt" if asr_version == "2.0" else source_srt
+        )
+        config = {
+            "mode": "asr_lab",
+            "asr_version": asr_version,
+            "input_video": str(input_media),
+            "source_srt": str(configured_source_srt),
+            "text_path": str(text_path),
+            "output_dir": str(out_dir),
+            "source_language": source_language,
+            "audio": {
+                "provider": "faster-whisper",
+                "model_size": model_size,
+                "language": language,
+                "device": device,
+                "compute_type": compute_type,
+                "speaker_diarization": speaker_diarization,
+                "diarization_provider": "pyannote-community-1" if speaker_diarization else None,
+                "diarization_device": diarization_device if speaker_diarization else None,
+                "known_speaker_count": known_speaker_count or None,
+                "hotwords": hotwords if asr_version == "2.0" else "",
+                "high_recall": bool(asr_version == "2.0" and high_recall),
+                "dual_gpu_parallel_requested": bool(
+                    asr_version == "2.0"
+                    and speaker_diarization
+                    and dual_gpu_parallel
+                ),
+            },
+            "sidecar": {
+                "enabled": True,
+                "copy_source": True,
+                "copy_translated": False,
+                "source_suffix": ".source",
+                "translated_suffix": ".zh",
+            },
+        }
+        config_path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        _append_log(job_id, f"input_video: {input_media}")
+        _append_log(job_id, f"config: {config_path}")
+        if asr_version == "2.0":
+            asr_command = [
+                *_module_command("video_translate.tools.transcribe_audio_v2", input_media),
+                "--output-dir",
+                str(out_dir),
+                "--model-size",
+                model_size,
+                "--language",
+                language,
+                "--device",
+                device,
+                "--compute-type",
+                compute_type,
+            ]
+            if hotwords:
+                asr_command.extend(["--hotwords", hotwords])
+            if not high_recall:
+                asr_command.append("--no-recovery")
+            diarization_command: list[str] | None = None
+            if speaker_diarization:
+                diarization_command = [
+                    *_module_command("video_translate.tools.diarize_speakers", input_media),
+                    "--out",
+                    str(speaker_turns_path),
+                    "--device",
+                    diarization_device,
+                ]
+                if known_speaker_count:
+                    diarization_command.extend(["--num-speakers", str(known_speaker_count)])
+
+            available_gpu_count = _nvidia_gpu_count()
+            dual_gpu_used = bool(
+                dual_gpu_parallel
+                and diarization_command
+                and device.lower().startswith("cuda")
+                and available_gpu_count >= 2
+            )
+            if dual_gpu_used:
+                _append_log(
+                    job_id,
+                    "asr_v2_dual_gpu: enabled (ASR GPU 0, diarization GPU 1)",
+                )
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [
+                        executor.submit(
+                            _run_command,
+                            job_id,
+                            asr_command,
+                            env_overrides={"CUDA_VISIBLE_DEVICES": "0"},
+                        ),
+                        executor.submit(
+                            _run_command,
+                            job_id,
+                            diarization_command,
+                            env_overrides={"CUDA_VISIBLE_DEVICES": "1"},
+                        ),
+                    ]
+                    for future in futures:
+                        future.result()
+            else:
+                if dual_gpu_parallel and diarization_command:
+                    _append_log(
+                        job_id,
+                        "asr_v2_dual_gpu: unavailable; falling back to sequential execution "
+                        f"(detected GPUs: {available_gpu_count})",
+                    )
+                _run_command(job_id, asr_command)
+                if diarization_command:
+                    _append_log(job_id, "speaker_diarization: starting pyannote Community-1")
+                    _run_command(job_id, diarization_command)
+        else:
+            dual_gpu_used = False
+            _run_command(
+                job_id,
+                [
+                    *_module_command("video_translate.tools.transcribe_audio", input_media),
+                    "--out",
+                    str(source_srt),
+                    "--model-size",
+                    model_size,
+                    "--language",
+                    language,
+                    "--device",
+                    device,
+                    "--compute-type",
+                    compute_type,
+                ],
+            )
+
+        if asr_version == "2.0":
+            turns = []
+            speaker_count = 0
+            if speaker_diarization:
+                turns = read_turns_json(speaker_turns_path)
+                speaker_count = len({turn.speaker for turn in turns})
+            words_payload, words = read_words_json(words_path)
+            v2_outputs = write_asr_v2_outputs(out_dir, words, turns=turns)
+            quality = merge_cue_quality_report(
+                quality_path,
+                cues=v2_outputs["cues"],
+            )
+            final_source_srt = Path(v2_outputs["source_srt"])
+            transcript_text = str(v2_outputs["transcript_text"])
+            low_word_count = int(
+                (quality.get("word_summary") or {}).get("low_confidence_word_count") or 0
+            )
+            recovery = (
+                quality.get("recovery")
+                if isinstance(quality.get("recovery"), dict)
+                else {}
+            )
+            recovered_word_count = int(recovery.get("recovered_word_count") or 0)
+            recovered_region_count = int(recovery.get("recovered_region_count") or 0)
+            suspected_missing_region_count = int(
+                recovery.get("suspected_missing_region_count") or 0
+            )
+            suspected_missing_regions = (
+                list(recovery.get("suspected_missing_regions") or [])
+                if isinstance(recovery.get("suspected_missing_regions"), list)
+                else []
+            )
+            suspected_missing_regions = enrich_asr_review_regions(
+                suspected_missing_regions,
+                words,
+                media_duration=float(
+                    (words_payload.get("info") or {}).get("duration") or 0.0
+                ),
+            )
+            focused_recovered_word_count = int(
+                recovery.get("focused_recovered_word_count") or 0
+            )
+            focused_recovered_region_count = int(
+                recovery.get("focused_recovered_region_count") or 0
+            )
+            _append_log(job_id, f"asr_v2_source_srt: {final_source_srt}")
+            _append_log(job_id, f"asr_v2_low_confidence_words: {low_word_count}")
+            if high_recall:
+                _append_log(
+                    job_id,
+                    "asr_v2_recovery_summary: "
+                    f"words={recovered_word_count} "
+                    f"regions={recovered_region_count} "
+                    f"suspected_missing={suspected_missing_region_count}",
+                )
+            if speaker_diarization:
+                _append_log(job_id, f"speaker_count: {speaker_count}")
+            result = {
+                "kind": "asr_lab",
+                "asr_version": asr_version,
+                "pipeline_version": str(words_payload.get("version") or asr_version),
+                "input_video": str(input_media),
+                "output_dir": str(out_dir),
+                "source_srt": str(final_source_srt),
+                "review_source_srt": str(final_source_srt),
+                "raw_source_srt": str(raw_source_srt),
+                "words_path": str(words_path),
+                "segments_path": str(segments_path),
+                "quality_path": str(quality_path),
+                "cues_path": str(v2_outputs["cues_path"]),
+                "text_path": str(v2_outputs["text_path"]),
+                "plain_text_path": str(v2_outputs["plain_text_path"]),
+                "transcript_text": transcript_text,
+                "plain_transcript_text": str(v2_outputs["plain_transcript_text"]),
+                "cue_count": int(v2_outputs["cue_count"]),
+                "word_count": len(words),
+                "low_confidence_word_count": low_word_count,
+                "low_confidence_cue_count": int(v2_outputs["low_confidence_cue_count"]),
+                "high_recall": high_recall,
+                "recovered_word_count": recovered_word_count,
+                "recovered_region_count": recovered_region_count,
+                "focused_recovered_word_count": focused_recovered_word_count,
+                "focused_recovered_region_count": focused_recovered_region_count,
+                "suspected_missing_region_count": suspected_missing_region_count,
+                "suspected_missing_regions": suspected_missing_regions,
+                "detected_language": str((words_payload.get("info") or {}).get("language") or ""),
+                "speaker_diarization": speaker_diarization,
+                "speaker_count": speaker_count,
+                "known_speaker_count": known_speaker_count,
+                "dual_gpu_parallel_requested": dual_gpu_parallel,
+                "dual_gpu_parallel_used": dual_gpu_used,
+                "available_gpu_count": available_gpu_count,
+            }
+            if recovery_raw_source_srt.exists():
+                result["recovery_raw_source_srt"] = str(recovery_raw_source_srt)
+            if recovery_segments_path.exists():
+                result["recovery_segments_path"] = str(recovery_segments_path)
+            if recovery_words_path.exists():
+                result["recovery_words_path"] = str(recovery_words_path)
+            if focused_segments_path.exists():
+                result["focused_segments_path"] = str(focused_segments_path)
+            if focused_words_path.exists():
+                result["focused_words_path"] = str(focused_words_path)
+            if speaker_diarization:
+                result.update(
+                    {
+                        "speaker_srt": str(final_source_srt),
+                        "speaker_turns_path": str(speaker_turns_path),
+                    }
+                )
+            copied = copy_sidecar_subtitles(
+                input_media,
+                source_srt=final_source_srt,
+                config=SidecarConfig(
+                    enabled=True,
+                    copy_source=True,
+                    copy_translated=False,
+                    source_suffix=".source",
+                    translated_suffix=".zh",
+                ),
+            )
+            result.update({name: str(path) for name, path in copied.items()})
+            if copied.get("source_sidecar"):
+                _append_log(job_id, f"source_sidecar: {copied['source_sidecar']}")
+            return result
+
+        cues = read_srt(source_srt)
+        plain_transcript_text = "\n".join(cue.text.strip() for cue in cues if cue.text.strip())
+        if plain_transcript_text:
+            plain_transcript_text += "\n"
+
+        transcript_text = plain_transcript_text
+        speaker_count = 0
+        if speaker_diarization:
+            plain_text_path.write_text(plain_transcript_text, encoding="utf-8")
+            _append_log(job_id, "speaker_diarization: starting pyannote Community-1")
+            _run_command(
+                job_id,
+                [
+                    *_module_command("video_translate.tools.diarize_speakers", input_media),
+                    "--out",
+                    str(speaker_turns_path),
+                    "--device",
+                    diarization_device,
+                ],
+            )
+            turns = read_turns_json(speaker_turns_path)
+            speakers = write_speaker_outputs(
+                cues,
+                turns,
+                srt_path=speaker_srt,
+                text_path=text_path,
+            )
+            transcript_text = speaker_transcript_text(cues, speakers)
+            speaker_count = len({turn.speaker for turn in turns})
+            _append_log(job_id, f"speaker_count: {speaker_count}")
+            _append_log(job_id, f"speaker_srt: {speaker_srt}")
+        else:
+            text_path.write_text(transcript_text, encoding="utf-8")
+        _append_log(job_id, f"transcript_txt: {text_path}")
+        result = {
+            "kind": "asr_lab",
+            "asr_version": asr_version,
+            "input_video": str(input_media),
+            "output_dir": str(out_dir),
+            "source_srt": str(source_srt),
+            "text_path": str(text_path),
+            "transcript_text": transcript_text,
+            "cue_count": len(cues),
+            "speaker_diarization": speaker_diarization,
+            "speaker_count": speaker_count,
+        }
+        if speaker_diarization:
+            result.update(
+                {
+                    "plain_text_path": str(plain_text_path),
+                    "plain_transcript_text": plain_transcript_text,
+                    "speaker_srt": str(speaker_srt),
+                    "speaker_turns_path": str(speaker_turns_path),
+                }
+            )
+        sidecar_source = speaker_srt if speaker_diarization else source_srt
+        copied = copy_sidecar_subtitles(
+            input_media,
+            source_srt=sidecar_source,
+            config=SidecarConfig(
+                enabled=True,
+                copy_source=True,
+                copy_translated=False,
+                source_suffix=".source",
+                translated_suffix=".zh",
+            ),
+        )
+        result.update({name: str(path) for name, path in copied.items()})
+        if copied.get("source_sidecar"):
+            _append_log(job_id, f"source_sidecar: {copied['source_sidecar']}")
+        return result
+
+    return start_job(f"ASR 实验室 {job_slug}", target)
 
 
 def mobile_asr_translate_job(payload: dict[str, Any]) -> Job:
@@ -6454,7 +7356,92 @@ def read_subtitle_file(payload: dict[str, Any]) -> dict[str, Any]:
         "path": str(path),
         "count": len(cues),
         "cues": [_subtitle_cue_to_editor_dict(cue) for cue in cues],
+        "speaker_dictionary": _subtitle_speaker_dictionary(path),
     }
+
+
+def _subtitle_speaker_dictionary(subtitle_path: Path) -> list[dict[str, Any]]:
+    """Return deterministic speaker-name evidence from the task glossary.
+
+    The editor uses this only to propose exact ``name + colon`` removals. It
+    never calls an LLM and never mutates the subtitle while reading it.
+    """
+
+    task = _find_agent_task_by_subtitle_path(subtitle_path)
+    if not task:
+        return []
+    glossary_value = (
+        _task_stage_value(task, "glossary", "glossary_path")
+        or _task_stage_value(task, "translate", "glossary_path")
+    )
+    glossary_path = Path(str(glossary_value or "")).expanduser()
+    if not glossary_path.is_file():
+        return []
+    try:
+        data = _load_yaml_file(glossary_path.resolve())
+    except (OSError, ValueError, yaml.YAMLError):
+        return []
+    characters = data.get("characters")
+    if not isinstance(characters, list):
+        return []
+
+    names: dict[str, dict[str, Any]] = {}
+    for item in characters:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source") or "").strip()
+        zh = str(item.get("zh") or "").strip()
+        suggested_zh = str(item.get("suggested_zh") or "").strip()
+        reviewed = bool(item.get("reviewed")) if "reviewed" in item else bool(zh)
+        canonical = zh or suggested_zh or source
+        aliases = item.get("aliases") if isinstance(item.get("aliases"), list) else []
+        values = [(value, reviewed) for value in (source, zh, *aliases)]
+        if suggested_zh:
+            values.append((suggested_zh, reviewed))
+        for raw_name, trusted in values:
+            name = str(raw_name or "").strip()
+            if not name or len(name) > 80 or "\n" in name:
+                continue
+            current = names.get(name)
+            names[name] = {
+                "name": name,
+                "canonical": canonical or name,
+                "trusted": bool(trusted or current and current.get("trusted")),
+                "source": "glossary",
+            }
+    return sorted(names.values(), key=lambda item: (-len(str(item["name"])), str(item["name"])))
+
+
+def _find_agent_task_by_subtitle_path(subtitle_path: Path) -> dict[str, Any] | None:
+    target = subtitle_path.expanduser().resolve()
+    targets = [target]
+    if target.stem.endswith(".edited"):
+        targets.append(target.with_name(f"{target.stem[:-7]}.srt"))
+    if not TASK_DIR.exists():
+        return None
+    for task_yaml in sorted(TASK_DIR.glob("*/task.yaml"), key=lambda item: item.stat().st_mtime, reverse=True):
+        try:
+            task = _read_task_file(task_yaml)
+        except (OSError, UnicodeError, yaml.YAMLError):
+            continue
+        stages = task.get("stages") if isinstance(task.get("stages"), dict) else {}
+        candidates: list[Any] = []
+        for stage_name in ("translate", "glossary", "ocr", "asr"):
+            stage = stages.get(stage_name) if isinstance(stages.get(stage_name), dict) else {}
+            candidates.extend(
+                stage.get(key)
+                for key in ("translated_srt", "translated_sidecar", "source_srt", "source_sidecar", "subtitle_path")
+            )
+            job_result = stage.get("job_result") if isinstance(stage.get("job_result"), dict) else {}
+            candidates.extend(
+                job_result.get(key)
+                for key in ("translated_srt", "translated_sidecar", "source_srt", "source_sidecar", "subtitle_path")
+            )
+        task_dir = Path(str(task.get("task_dir") or task_yaml.parent)).expanduser()
+        candidates.extend((task_dir / "source.srt", task_dir / "zh.srt"))
+        if any(_same_existing_path(value, possible) for value in candidates for possible in targets):
+            return task
+    return None
 
 
 def write_subtitle_file(payload: dict[str, Any]) -> dict[str, Any]:
@@ -7047,10 +8034,13 @@ def _katakana_to_hiragana(text: str) -> str:
 
 
 def list_local_assets() -> dict[str, Any]:
-    videos = _asset_entries(_iter_video_files(DOWNLOAD_DIR), kind="video")
+    media_files = _iter_media_files(DOWNLOAD_DIR)
+    videos = _asset_entries([path for path in media_files if path.suffix.lower() in VIDEO_EXTENSIONS], kind="video")
+    audios = _asset_entries([path for path in media_files if path.suffix.lower() in AUDIO_EXTENSIONS], kind="audio")
     subtitles = _asset_entries(_iter_subtitle_files(), kind="subtitle")
     return {
         "videos": videos,
+        "audios": audios,
         "subtitles": subtitles,
         "projects": _download_project_entries(DOWNLOAD_DIR),
         "ocr_jobs": _ocr_job_entries(),
@@ -7059,10 +8049,19 @@ def list_local_assets() -> dict[str, Any]:
 
 
 def _iter_video_files(directory: Path) -> list[Path]:
-    files: list[Path] = []
-    for pattern in ["*.mp4", "*.mkv", "*.webm", "*.mov", "*.m4v"]:
-        files.extend(path for path in directory.rglob(pattern) if _is_real_file(path))
-    return sorted(set(files), key=lambda path: path.stat().st_mtime, reverse=True)
+    return [path for path in _iter_media_files(directory) if path.suffix.lower() in VIDEO_EXTENSIONS]
+
+
+def _iter_audio_files(directory: Path) -> list[Path]:
+    return [path for path in _iter_media_files(directory) if path.suffix.lower() in AUDIO_EXTENSIONS]
+
+
+def _iter_media_files(directory: Path) -> list[Path]:
+    if not directory.exists():
+        return []
+    extensions = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
+    files = [path for path in directory.rglob("*") if _is_real_file(path) and path.suffix.lower() in extensions]
+    return sorted(files, key=lambda path: path.stat().st_mtime, reverse=True)
 
 
 def _iter_subtitle_files() -> list[Path]:
@@ -7087,7 +8086,7 @@ def _asset_entry(path: Path, *, kind: str) -> dict[str, Any]:
         "size_mb": round(stat.st_size / 1024 / 1024, 2),
         "modified_at": stat.st_mtime,
         "modified_label": time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime)),
-        "role": _subtitle_role(path) if kind == "subtitle" else "video",
+        "role": _subtitle_role(path) if kind == "subtitle" else kind,
     }
 
 
@@ -7106,21 +8105,28 @@ def _download_project_entry(project_dir: Path) -> dict[str, Any]:
     files = [path for path in project_dir.iterdir() if _is_real_file(path) and path.name != PROJECT_MANIFEST_NAME] if project_dir.exists() else []
     if str(manifest.get("source_type") or "") == "local":
         primary_video_value = _existing_video_path(manifest.get("primary_video"))
+        primary_audio_value = _existing_audio_path(manifest.get("primary_audio"))
     else:
         primary_video_value = _project_video_path(project_dir, manifest.get("primary_video"))
+        primary_audio_value = ""
     primary_video = Path(primary_video_value) if primary_video_value else None
+    primary_audio = Path(primary_audio_value) if primary_audio_value else None
     if primary_video is not None and primary_video not in files:
         files.insert(0, primary_video)
+    if primary_audio is not None and primary_audio not in files:
+        files.insert(0, primary_audio)
     thumbnail = Path(str(manifest.get("thumbnail") or "")).expanduser()
     if str(thumbnail) and thumbnail.exists() and thumbnail.is_file() and thumbnail not in files:
         files.append(thumbnail.resolve())
     if not files and not manifest:
         return {}
-    videos = _asset_entries([path for path in files if path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}], kind="video", limit=50)
+    videos = _asset_entries([path for path in files if path.suffix.lower() in VIDEO_EXTENSIONS], kind="video", limit=50)
+    audios = _asset_entries([path for path in files if path.suffix.lower() in AUDIO_EXTENSIONS], kind="audio", limit=50)
     subtitles = _asset_entries([path for path in files if path.suffix.lower() in {".srt", ".vtt", ".ass", ".ssa", ".bcc"}], kind="subtitle", limit=80)
     images = _asset_entries([path for path in files if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}], kind="image", limit=20)
     others = _asset_entries([path for path in files if path.suffix.lower() not in {
-        ".mp4", ".mkv", ".webm", ".mov", ".m4v",
+        *VIDEO_EXTENSIONS,
+        *AUDIO_EXTENSIONS,
         ".srt", ".vtt", ".ass", ".ssa", ".bcc",
         ".jpg", ".jpeg", ".png", ".webp",
     }], kind="file", limit=20)
@@ -7136,17 +8142,20 @@ def _download_project_entry(project_dir: Path) -> dict[str, Any]:
         "normalized_url": str(manifest.get("normalized_url") or ""),
         "video_id": str(manifest.get("video_id") or ""),
         "primary_video": str(primary_video or (videos[0]["path"] if len(videos) == 1 else "")),
+        "primary_audio": str(primary_audio or (audios[0]["path"] if len(audios) == 1 else "")),
         "thumbnail": str(manifest.get("thumbnail") or (images[0]["path"] if images else "")),
         "manifest_path": str(project_dir / PROJECT_MANIFEST_NAME),
         "manifest": manifest,
         "modified_at": newest,
         "modified_label": time.strftime("%Y-%m-%d %H:%M", time.localtime(newest)),
         "videos": videos,
+        "audios": audios,
         "subtitles": subtitles,
         "images": images,
         "others": others,
         "counts": {
             "videos": len(videos),
+            "audios": len(audios),
             "subtitles": len(subtitles),
             "images": len(images),
             "others": len(others),
@@ -7448,20 +8457,32 @@ def _is_real_file(path: Path) -> bool:
     return path.is_file() and not path.name.startswith("._") and path.name != ".DS_Store"
 
 
-def _run_command(job_id: str, args: list[str]) -> None:
+def _run_command(
+    job_id: str,
+    args: list[str],
+    *,
+    env_overrides: dict[str, str] | None = None,
+) -> None:
     uses_ocr_gpu = _command_uses_ocr_gpu(args)
     if uses_ocr_gpu:
         _begin_ocr_gpu_command()
     try:
-        _run_command_process(job_id, args)
+        _run_command_process(job_id, args, env_overrides=env_overrides)
     finally:
         if uses_ocr_gpu:
             _end_ocr_gpu_command()
 
 
-def _run_command_process(job_id: str, args: list[str]) -> None:
+def _run_command_process(
+    job_id: str,
+    args: list[str],
+    *,
+    env_overrides: dict[str, str] | None = None,
+) -> None:
     _append_log(job_id, "$ " + " ".join(_quote_arg(arg) for arg in args))
     env = _child_process_env()
+    if env_overrides:
+        env.update(env_overrides)
     process = subprocess.Popen(
         args,
         cwd=str(ROOT),
@@ -7477,6 +8498,7 @@ def _run_command_process(job_id: str, args: list[str]) -> None:
         job = _JOBS.get(job_id)
         if job:
             job.current_process = process
+            job.current_processes.append(process)
             job.updated_at = time.time()
             if job.status == "cancel_requested":
                 should_cancel = True
@@ -7493,8 +8515,14 @@ def _run_command_process(job_id: str, args: list[str]) -> None:
     with _LOCK:
         job = _JOBS.get(job_id)
         cancelled = bool(job and job.status == "cancel_requested")
-        if job and job.current_process is process:
-            job.current_process = None
+        if job:
+            job.current_processes = [
+                current for current in job.current_processes if current is not process
+            ]
+            if job.current_process is process:
+                job.current_process = (
+                    job.current_processes[-1] if job.current_processes else None
+                )
             job.updated_at = time.time()
     if cancelled:
         raise JobCancelled()
@@ -7538,6 +8566,23 @@ def _child_process_env() -> dict[str, str]:
         env.pop(proxy_name, None)
     prepend_library_path(env, cuda_library_dirs())
     return env
+
+
+def _nvidia_gpu_count() -> int:
+    executable = shutil.which("nvidia-smi")
+    if not executable:
+        return 0
+    try:
+        completed = subprocess.run(
+            [executable, "--query-gpu=index", "--format=csv,noheader"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    return sum(1 for line in completed.stdout.splitlines() if line.strip())
 
 
 def _snapshot_files(directory: Path, pattern: str) -> dict[Path, float]:
@@ -8196,8 +9241,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(job.to_dict())
                 return
-            if self.path == "/api/upload-video":
-                self._send_json(self._read_video_upload())
+            if self.path in {"/api/upload-media", "/api/upload-video"}:
+                self._send_json(self._read_media_upload())
                 return
             if self.path == "/api/upload-project-cover":
                 self._send_json(self._read_project_cover_upload())
@@ -8339,6 +9384,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send_json(hybrid_anchor_ocr_job(payload).to_dict())
             elif self.path == "/api/jobs/audio-local":
                 self._send_json(audio_local_video_job(payload).to_dict())
+            elif self.path == "/api/jobs/asr-lab":
+                self._send_json(asr_lab_job(payload).to_dict())
+            elif self.path == "/api/asr-review/decision":
+                self._send_json(apply_asr_review_decision(payload))
             elif self.path == "/api/jobs/mobile-asr-translate":
                 self._send_json(mobile_asr_translate_job(payload).to_dict())
             elif self.path == "/api/jobs/video-overlay":
@@ -8435,7 +9484,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             raise ValueError("请求体必须是 JSON 对象")
         return data
 
-    def _read_video_upload(self) -> dict[str, Any]:
+    def _read_media_upload(self) -> dict[str, Any]:
         fields = self._read_multipart_fields()
         file_field = fields.get("file") or {}
         filename = str(file_field.get("filename") or "")
@@ -8443,7 +9492,7 @@ class AgentHandler(BaseHTTPRequestHandler):
         title = str((fields.get("title") or {}).get("text") or "")
         if not filename or not content:
             raise ValueError("上传文件为空")
-        return save_uploaded_video_file(filename=filename, content=content, title=title)
+        return save_uploaded_media_file(filename=filename, content=content, title=title)
 
     def _read_project_cover_upload(self) -> dict[str, Any]:
         fields = self._read_multipart_fields()
@@ -8488,7 +9537,10 @@ class AgentHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def _send_html(self, html: str) -> None:
         body = html.encode("utf-8")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import time
@@ -2445,6 +2446,108 @@ def test_subtitle_editor_read_and_save_as(tmp_path: Path, monkeypatch):
     assert web_agent.read_subtitle_file({"path": str(out)})["cues"][0]["text"] == "第一行 第二行"
 
 
+def test_subtitle_editor_reads_speaker_dictionary_from_matching_task_glossary(tmp_path: Path, monkeypatch):
+    downloads = tmp_path / "YoutubeDownloads"
+    task_dir = tmp_path / "outputs" / "agent_tasks" / "demo-task"
+    downloads.mkdir()
+    task_dir.mkdir(parents=True)
+    subtitle = downloads / "demo.zh.srt"
+    subtitle.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n朴宝英：你好\n",
+        encoding="utf-8",
+    )
+    glossary = task_dir / "glossary.draft.yaml"
+    glossary.write_text(
+        yaml.safe_dump(
+            {
+                "characters": [
+                    {
+                        "source": "박보영",
+                        "zh": "朴宝英",
+                        "suggested_zh": "朴宝英（演员）",
+                        "aliases": ["보영"],
+                        "reviewed": True,
+                    },
+                    {
+                        "source": "차태현",
+                        "zh": "车太贤（待确认）",
+                        "suggested_zh": "车太贤",
+                        "reviewed": False,
+                    },
+                ]
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (task_dir / "task.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "id": "demo-task",
+                "task_dir": str(task_dir),
+                "stages": {
+                    "glossary": {"glossary_path": str(glossary)},
+                    "translate": {"translated_sidecar": str(subtitle)},
+                },
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
+    monkeypatch.setattr(web_agent, "TASK_DIR", task_dir.parent)
+
+    loaded = web_agent.read_subtitle_file({"path": str(subtitle)})
+    dictionary = {item["name"]: item for item in loaded["speaker_dictionary"]}
+
+    assert dictionary["朴宝英"]["trusted"] is True
+    assert dictionary["박보영"]["canonical"] == "朴宝英"
+    assert dictionary["보영"]["trusted"] is True
+    assert dictionary["车太贤"]["trusted"] is False
+    assert dictionary["车太贤（待确认）"]["trusted"] is False
+
+
+def test_subtitle_editor_skips_broken_unrelated_task_yaml(tmp_path: Path, monkeypatch):
+    downloads = tmp_path / "YoutubeDownloads"
+    task_root = tmp_path / "outputs" / "agent_tasks"
+    good_task = task_root / "good-task"
+    broken_task = task_root / "newer-broken-task"
+    downloads.mkdir()
+    good_task.mkdir(parents=True)
+    broken_task.mkdir(parents=True)
+    subtitle = downloads / "demo.zh.srt"
+    subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\n朴宝英：你好\n", encoding="utf-8")
+    glossary = good_task / "glossary.draft.yaml"
+    glossary.write_text(
+        yaml.safe_dump(
+            {"characters": [{"source": "박보영", "zh": "朴宝英", "reviewed": True}]},
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    (good_task / "task.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "stages": {
+                    "glossary": {"glossary_path": str(glossary)},
+                    "translate": {"translated_sidecar": str(subtitle)},
+                }
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    (broken_task / "task.yaml").write_bytes(b"\xff\xfe\x00broken")
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", downloads)
+    monkeypatch.setattr(web_agent, "TASK_DIR", task_root)
+
+    loaded = web_agent.read_subtitle_file({"path": str(subtitle)})
+
+    assert any(item["name"] == "朴宝英" for item in loaded["speaker_dictionary"])
+
+
 def test_subtitle_editor_rejects_non_srt_save(tmp_path: Path, monkeypatch):
     downloads = tmp_path / "YoutubeDownloads"
     downloads.mkdir()
@@ -3993,10 +4096,12 @@ def test_list_local_assets_collects_videos_subtitles_and_ocr_jobs(tmp_path: Path
     project.mkdir()
     debug_dir.mkdir(parents=True)
     video = project / "demo.mp4"
+    audio = project / "demo.flac"
     subtitle = project / "demo.ko.srt"
     source = job_dir / "source.srt"
     run_yaml = job_dir / "run.yaml"
     video.write_text("video", encoding="utf-8")
+    audio.write_text("audio", encoding="utf-8")
     subtitle.write_text("1\n", encoding="utf-8")
     source.write_text("1\n", encoding="utf-8")
     run_yaml.write_text("mode: full\n", encoding="utf-8")
@@ -4018,10 +4123,12 @@ def test_list_local_assets_collects_videos_subtitles_and_ocr_jobs(tmp_path: Path
     assets = web_agent.list_local_assets()
 
     assert [item["name"] for item in assets["videos"]] == ["demo.mp4"]
+    assert [item["name"] for item in assets["audios"]] == ["demo.flac"]
     assert any(item["path"].endswith("demo.ko.srt") for item in assets["subtitles"])
     assert assets["projects"][0]["name"] == "demo"
-    assert assets["projects"][0]["counts"] == {"videos": 1, "subtitles": 1, "images": 0, "others": 0}
+    assert assets["projects"][0]["counts"] == {"videos": 1, "audios": 1, "subtitles": 1, "images": 0, "others": 0}
     assert assets["projects"][0]["videos"][0]["path"] == str(video)
+    assert assets["projects"][0]["audios"][0]["path"] == str(audio)
     assert assets["projects"][0]["subtitles"][0]["path"] == str(subtitle)
     assert assets["ocr_jobs"][0]["source_srt"].endswith("source.srt")
     assert assets["ocr_debug_folders"][0]["source_srt"].endswith("source.v3.layered.srt")
@@ -4404,6 +4511,53 @@ def test_cancel_job_stops_running_subprocess():
     assert any("job_cancelled" in line for line in job.logs)
 
 
+def test_cancel_job_stops_parallel_subprocesses():
+    def target(job_id):
+        with web_agent.ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    web_agent._run_command,
+                    job_id,
+                    [web_agent.PYTHON, "-c", "import time; time.sleep(30)"],
+                )
+                for _ in range(2)
+            ]
+            for future in futures:
+                future.result()
+        return {}
+
+    job = web_agent.start_job("parallel-sleepy", target)
+    deadline = time.time() + 3
+    while len(job.current_processes) < 2 and time.time() < deadline:
+        time.sleep(0.01)
+    processes = list(job.current_processes)
+
+    web_agent.cancel_job(job.id)
+
+    deadline = time.time() + 3
+    while job.status not in {"cancelled", "failed"} and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert len(processes) == 2
+    assert job.status == "cancelled"
+    assert all(process.poll() is not None for process in processes)
+
+
+def test_nvidia_gpu_count_uses_nvidia_smi(monkeypatch):
+    monkeypatch.setattr(web_agent.shutil, "which", lambda name: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr(
+        web_agent.subprocess,
+        "run",
+        lambda *args, **kwargs: type(
+            "Completed",
+            (),
+            {"stdout": "0\n1\n"},
+        )(),
+    )
+
+    assert web_agent._nvidia_gpu_count() == 2
+
+
 def test_cancel_finished_job_is_noop():
     job = web_agent.start_job("quick", lambda job_id: {"ok": True})
     deadline = __import__("time").time() + 2
@@ -4449,6 +4603,365 @@ def test_audio_local_video_job_builds_transcription_command(monkeypatch, tmp_pat
     assert (video.parent / "demo.source.srt").exists()
 
 
+def test_asr_lab_job_extracts_plain_text_and_copies_sidecar(monkeypatch, tmp_path: Path):
+    video = tmp_path / "YoutubeDownloads" / "demo" / "clip.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "YoutubeDownloads")
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "outputs" / "agent_jobs")
+    monkeypatch.setattr(web_agent, "PYTHON", "/python")
+    calls = []
+
+    def fake_run_command(job_id, args):
+        calls.append(args)
+        out = tmp_path / "outputs" / "agent_jobs" / job_id / "source.srt"
+        out.write_text(
+            "1\n00:00:00,000 --> 00:00:01,000\n안녕하세요\n\n"
+            "2\n00:00:01,200 --> 00:00:02,000\n반갑습니다\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(web_agent, "_run_command", fake_run_command)
+
+    job = web_agent.asr_lab_job({
+        "input_video": str(video),
+        "source_language": "korean",
+        "model_size": "small",
+    })
+    deadline = time.time() + 2
+    while job.status == "running" and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert job.status == "done"
+    assert calls[0][:3] == ["/python", "-m", "video_translate.tools.transcribe_audio"]
+    assert job.result["kind"] == "asr_lab"
+    assert job.result["asr_version"] == "1.0"
+    assert job.result["cue_count"] == 2
+    assert job.result["transcript_text"] == "안녕하세요\n반갑습니다\n"
+    assert Path(job.result["text_path"]).read_text(encoding="utf-8") == "안녕하세요\n반갑습니다\n"
+    assert Path(job.result["source_sidecar"]) == video.parent / "clip.source.srt"
+    assert (video.parent / "clip.source.srt").read_text(encoding="utf-8").endswith("반갑습니다\n")
+
+
+def test_asr_lab_job_can_label_speakers(monkeypatch, tmp_path: Path):
+    video = tmp_path / "YoutubeDownloads" / "demo" / "conversation.wav"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"audio")
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "YoutubeDownloads")
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "outputs" / "agent_jobs")
+    monkeypatch.setattr(web_agent, "PYTHON", "/python")
+    monkeypatch.setattr(web_agent, "ensure_diarization_ready", lambda: None)
+    calls = []
+
+    def fake_run_command(job_id, args):
+        calls.append(args)
+        out_dir = tmp_path / "outputs" / "agent_jobs" / job_id
+        if "video_translate.tools.transcribe_audio" in args:
+            (out_dir / "source.srt").write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHello\n\n"
+                "2\n00:00:01,000 --> 00:00:02,000\nHi\n",
+                encoding="utf-8",
+            )
+        if "video_translate.tools.diarize_speakers" in args:
+            (out_dir / "speaker_turns.json").write_text(
+                json.dumps(
+                    {
+                        "model": "test",
+                        "speaker_count": 2,
+                        "turns": [
+                            {"start": 0.0, "end": 1.0, "speaker": "Speaker 1"},
+                            {"start": 1.0, "end": 2.0, "speaker": "Speaker 2"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr(web_agent, "_run_command", fake_run_command)
+
+    job = web_agent.asr_lab_job(
+        {
+            "input_video": str(video),
+            "source_language": "english",
+            "model_size": "small",
+            "speaker_diarization": True,
+        }
+    )
+    deadline = time.time() + 2
+    while job.status == "running" and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert job.status == "done"
+    assert len(calls) == 2
+    assert "video_translate.tools.diarize_speakers" in calls[1]
+    assert job.result["speaker_diarization"] is True
+    assert job.result["speaker_count"] == 2
+    assert job.result["transcript_text"] == "Speaker 1: Hello\nSpeaker 2: Hi\n"
+    assert Path(job.result["speaker_srt"]).exists()
+    assert Path(job.result["speaker_turns_path"]).exists()
+    assert Path(job.result["plain_text_path"]).read_text(encoding="utf-8") == "Hello\nHi\n"
+    assert (video.parent / "conversation.source.srt").read_text(encoding="utf-8").endswith(
+        "Speaker 2: Hi\n"
+    )
+
+
+def test_asr_lab_v2_uses_independent_word_level_pipeline(monkeypatch, tmp_path: Path):
+    audio = tmp_path / "YoutubeDownloads" / "demo" / "conversation.wav"
+    audio.parent.mkdir(parents=True)
+    audio.write_bytes(b"audio")
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "YoutubeDownloads")
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "outputs" / "agent_jobs")
+    monkeypatch.setattr(web_agent, "PYTHON", "/python")
+    calls = []
+
+    def fake_run_command(job_id, args):
+        calls.append(args)
+        out_dir = tmp_path / "outputs" / "agent_jobs" / job_id
+        (out_dir / "source.raw.srt").write_text(
+            "1\n00:00:00,000 --> 00:00:01,000\nHello there.\n",
+            encoding="utf-8",
+        )
+        (out_dir / "words.json").write_text(
+            json.dumps(
+                {
+                    "version": "2.0",
+                    "info": {"language": "en"},
+                    "words": [
+                        {
+                            "index": 1,
+                            "segment_id": 0,
+                            "start": 0.0,
+                            "end": 0.4,
+                            "text": " Hello",
+                            "probability": 0.92,
+                        },
+                        {
+                            "index": 2,
+                            "segment_id": 0,
+                            "start": 0.4,
+                            "end": 1.0,
+                            "text": " there.",
+                            "probability": 0.88,
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (out_dir / "segments.json").write_text(
+            json.dumps({"version": "2.0", "segments": []}),
+            encoding="utf-8",
+        )
+        (out_dir / "quality.json").write_text(
+            json.dumps(
+                {
+                    "word_summary": {
+                        "word_count": 2,
+                        "low_confidence_word_count": 0,
+                    },
+                    "recovery": {
+                        "enabled": True,
+                        "recovered_word_count": 1,
+                        "recovered_region_count": 1,
+                        "focused_recovered_word_count": 1,
+                        "focused_recovered_region_count": 1,
+                        "suspected_missing_region_count": 2,
+                        "suspected_missing_regions": [
+                            {
+                                "review_id": "gap-001-1200",
+                                "start": 1.2,
+                                "end": 1.5,
+                                "text": "maybe",
+                                "average_probability": 0.61,
+                            }
+                        ],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(web_agent, "_run_command", fake_run_command)
+
+    job = web_agent.asr_lab_job(
+        {
+            "input_video": str(audio),
+            "asr_version": "2.0",
+            "source_language": "english",
+            "model_size": "small",
+            "hotwords": "ReiboSub",
+        }
+    )
+    deadline = time.time() + 2
+    while job.status == "running" and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert job.status == "done"
+    assert "video_translate.tools.transcribe_audio_v2" in calls[0]
+    assert "--hotwords" in calls[0]
+    assert "--no-recovery" not in calls[0]
+    assert job.result["asr_version"] == "2.0"
+    assert job.result["high_recall"] is True
+    assert job.result["recovered_word_count"] == 1
+    assert job.result["recovered_region_count"] == 1
+    assert job.result["focused_recovered_word_count"] == 1
+    assert job.result["suspected_missing_region_count"] == 2
+    assert job.result["suspected_missing_regions"][0]["review_id"] == "gap-001-1200"
+    assert job.result["suspected_missing_regions"][0]["review_end"] > 1.5
+    assert job.result["suspected_missing_regions"][0]["context_before"] == "Hello there."
+    assert job.result["word_count"] == 2
+    assert job.result["cue_count"] == 1
+    assert job.result["transcript_text"] == "Hello there.\n"
+    assert Path(job.result["source_srt"]).name == "source.asr2.srt"
+    assert Path(job.result["words_path"]).exists()
+    assert Path(job.result["quality_path"]).exists()
+    assert Path(job.result["source_sidecar"]) == audio.parent / "conversation.source.srt"
+    assert (audio.parent / "conversation.source.srt").read_text(encoding="utf-8").endswith(
+        "Hello there.\n"
+    )
+
+
+def test_asr_review_accept_rebuilds_word_timeline_and_copies_sidecar(
+    monkeypatch,
+    tmp_path: Path,
+):
+    audio = tmp_path / "YoutubeDownloads" / "demo" / "conversation.wav"
+    audio.parent.mkdir(parents=True)
+    audio.write_bytes(b"audio")
+    job_dir = tmp_path / "outputs" / "agent_jobs" / "asr-job"
+    job_dir.mkdir(parents=True)
+    source_srt = job_dir / "source.asr2.srt"
+    source_srt.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n앞\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\n뒤\n",
+        encoding="utf-8",
+    )
+    words_path = job_dir / "words.json"
+    words_path.write_text(
+        json.dumps(
+            {
+                "version": "2.2",
+                "words": [
+                    {
+                        "index": 1,
+                        "segment_id": 1,
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": "앞",
+                        "probability": 0.95,
+                    },
+                    {
+                        "index": 2,
+                        "segment_id": 2,
+                        "start": 3.0,
+                        "end": 4.0,
+                        "text": "뒤",
+                        "probability": 0.95,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (job_dir / "run.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "input_video": str(audio),
+                "sidecar": {
+                    "enabled": True,
+                    "copy_source": True,
+                    "source_suffix": ".source",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+
+    payload = {
+        "source_srt": str(source_srt),
+        "words_path": str(words_path),
+        "review_id": "gap-001-1400",
+        "action": "accept",
+        "candidate": {
+            "start": 1.4,
+            "end": 2.2,
+            "text": "들린 말",
+            "average_probability": 0.61,
+        },
+    }
+    first = web_agent.apply_asr_review_decision(payload)
+    second = web_agent.apply_asr_review_decision(payload)
+
+    reviewed = Path(first["reviewed_srt"])
+    assert reviewed.exists()
+    assert "들린 말" in reviewed.read_text(encoding="utf-8")
+    assert first["accepted_review_count"] == 1
+    assert second["accepted_review_count"] == 1
+    assert Path(first["source_sidecar"]) == audio.parent / "conversation.source.srt"
+    assert "들린 말" in Path(first["source_sidecar"]).read_text(encoding="utf-8")
+    decisions = json.loads(
+        Path(first["review_decisions_path"]).read_text(encoding="utf-8")
+    )
+    assert len(decisions["decisions"]) == 1
+
+
+def test_asr_review_ignore_persists_without_creating_reviewed_srt(
+    monkeypatch,
+    tmp_path: Path,
+):
+    job_dir = tmp_path / "outputs" / "agent_jobs" / "asr-job"
+    job_dir.mkdir(parents=True)
+    source_srt = job_dir / "source.asr2.srt"
+    source_srt.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n원문\n",
+        encoding="utf-8",
+    )
+    words_path = job_dir / "words.json"
+    words_path.write_text(
+        json.dumps(
+            {
+                "version": "2.2",
+                "words": [
+                    {
+                        "index": 1,
+                        "segment_id": 1,
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": "원문",
+                        "probability": 0.95,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+
+    result = web_agent.apply_asr_review_decision(
+        {
+            "source_srt": str(source_srt),
+            "words_path": str(words_path),
+            "review_id": "gap-001-1200",
+            "action": "ignore",
+            "candidate": {
+                "start": 1.2,
+                "end": 1.5,
+                "text": "잡음",
+                "average_probability": 0.4,
+            },
+        }
+    )
+
+    assert result["source_srt"] == str(source_srt)
+    assert result["accepted_review_count"] == 0
+    assert result["ignored_review_count"] == 1
+    assert not source_srt.with_name("source.asr2.reviewed.srt").exists()
+
+
 
 
 def test_save_uploaded_project_cover_updates_manifest(monkeypatch, tmp_path: Path):
@@ -4487,6 +5000,27 @@ def test_save_uploaded_video_creates_local_project(monkeypatch, tmp_path: Path):
     assert result["project"]["source_type"] == "local"
     assert result["project"]["name"] == "手机上传测试"
     assert Path(result["project_manifest"]).exists()
+
+
+def test_save_uploaded_audio_creates_local_material_project(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "YoutubeDownloads")
+
+    result = web_agent.save_uploaded_media_file(
+        filename="../采访录音.flac",
+        content=b"audio-bytes",
+        title="采访素材",
+    )
+
+    saved = Path(result["input_media"])
+    assert saved == tmp_path / "YoutubeDownloads" / "采访素材" / "采访录音.flac"
+    assert saved.read_bytes() == b"audio-bytes"
+    assert result["media_kind"] == "audio"
+    assert result["input_audio"] == str(saved)
+    assert result["input_video"] == ""
+    assert result["manifest"]["primary_audio"] == str(saved)
+    assert "primary_video" not in result["manifest"]
+    assert result["project"]["audios"][0]["path"] == str(saved)
+    assert result["project"]["counts"]["audios"] == 1
 
 
 def test_mobile_asr_translate_job_runs_asr_then_translation(monkeypatch, tmp_path: Path):

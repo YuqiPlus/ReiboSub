@@ -11,7 +11,8 @@ import yaml
 from video_translate.youtube_url import normalize_youtube_url
 
 PROJECT_MANIFEST_NAME = 'project.yaml'
-VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.webm', '.mov', '.m4v'}
+VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.webm', '.mov', '.m4v', '.avi', '.ts', '.m2ts'}
+AUDIO_EXTENSIONS = {'.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.opus', '.wma'}
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
 SUBTITLE_EXTENSIONS = {'.srt', '.vtt', '.ass', '.ssa', '.bcc'}
 
@@ -84,12 +85,23 @@ def update_youtube_project_metadata(
 
 
 def update_local_project_manifest(video_path: Path, *, download_dir: Path, title: str = '') -> dict[str, Any]:
-    video_path = Path(video_path).resolve()
+    return update_local_media_project_manifest(video_path, download_dir=download_dir, title=title)
+
+
+def update_local_media_project_manifest(media_path: Path, *, download_dir: Path, title: str = '') -> dict[str, Any]:
+    media_path = Path(media_path).resolve()
     download_dir = Path(download_dir).resolve()
-    if is_relative_to(video_path, download_dir) and video_path.parent != download_dir:
-        project_dir = video_path.parent
+    suffix = media_path.suffix.lower()
+    if suffix in VIDEO_EXTENSIONS:
+        primary_key = 'primary_video'
+    elif suffix in AUDIO_EXTENSIONS:
+        primary_key = 'primary_audio'
     else:
-        project_dir = download_dir / safe_project_id(title or video_path.stem)
+        raise ValueError(f'unsupported local media format: {suffix or "<none>"}')
+    if is_relative_to(media_path, download_dir) and media_path.parent != download_dir:
+        project_dir = media_path.parent
+    else:
+        project_dir = download_dir / safe_project_id(title or media_path.stem)
     manifest = load_project_manifest(project_dir)
     manifest.update(
         {
@@ -97,8 +109,8 @@ def update_local_project_manifest(video_path: Path, *, download_dir: Path, title
             'source_url': '',
             'normalized_url': '',
             'video_id': '',
-            'title': title or manifest.get('title') or video_path.stem,
-            'primary_video': str(video_path),
+            'title': title or manifest.get('title') or media_path.stem,
+            primary_key: str(media_path),
         }
     )
     return save_project_manifest(project_dir, manifest)
@@ -109,6 +121,11 @@ def infer_project_manifest(project_dir: Path) -> dict[str, Any]:
     manifest = load_project_manifest(project_dir)
     videos = sorted(
         [path for path in project_dir.iterdir() if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS and not path.name.startswith('._')],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    ) if project_dir.exists() else []
+    audios = sorted(
+        [path for path in project_dir.iterdir() if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS and not path.name.startswith('._')],
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     ) if project_dir.exists() else []
@@ -128,6 +145,8 @@ def infer_project_manifest(project_dir: Path) -> dict[str, Any]:
     data.setdefault('project_dir', str(project_dir))
     if not data.get('primary_video') and videos:
         data['primary_video'] = str(videos[0].resolve())
+    if not data.get('primary_audio') and audios:
+        data['primary_audio'] = str(audios[0].resolve())
     if not data.get('thumbnail') and images:
         data['thumbnail'] = str(images[0].resolve())
     return data

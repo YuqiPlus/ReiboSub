@@ -19,6 +19,11 @@ class Job:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     current_process: subprocess.Popen[str] | None = field(default=None, repr=False, compare=False)
+    current_processes: list[subprocess.Popen[str]] = field(
+        default_factory=list,
+        repr=False,
+        compare=False,
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return {

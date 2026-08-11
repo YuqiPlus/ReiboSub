@@ -32,6 +32,9 @@ ocr-cpu = [
 asr = [
     "faster-whisper>=1.1.0",
 ]
+diarization = [
+    "pyannote.audio>=4.0,<5",
+]
 dev = [
     "pytest>=8.0",
 ]
