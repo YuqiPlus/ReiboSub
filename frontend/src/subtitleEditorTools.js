@@ -3,6 +3,12 @@ const MILLISECONDS_PER_SECOND = 1000
 
 let fallbackUidCounter = 0
 
+export function isSubtitleEditorSavePathReady(requestedPath, loadedPath) {
+  const requested = String(requestedPath || '').trim()
+  const loaded = String(loadedPath || '').trim()
+  return Boolean(requested && loaded && requested === loaded)
+}
+
 /**
  * Parse a numeric second value or an SRT timestamp into seconds.
  */

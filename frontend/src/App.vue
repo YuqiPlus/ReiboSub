@@ -107,19 +107,19 @@
           <div v-else-if="activeView === 'assets'" class="page-stack">
             <AssetLibrary
               v-model:local-video="localVideo"
-              v-model:audio-language="audioLanguage"
-              v-model:audio-model-size="audioModelSize"
               :assets="assets"
               :status="assetStatus.text"
               :status-class="assetStatus.class"
-              :upload-busy="mobileUploadBusy"
+              :upload-busy="materialUploadBusy"
               @refresh="loadAssets"
               @local-ocr="runLocalOcr"
-              @local-audio="runLocalAudio"
-              @upload-asr-translate="uploadAndTranslateMobileVideo"
+              @open-asr-lab="openAsrLab"
+              @upload-media="uploadLocalMedia"
               @register-local-project="registerLocalProject"
               @use-project="useProject"
               @use-video="useVideo"
+              @use-audio="useAudio"
+              @use-media-asr="openMediaInAsrLab"
               @use-video-ocr="useVideoAndOcr"
               @use-subtitle="useSubtitle"
               @edit-subtitle="editSubtitle"
@@ -131,8 +131,8 @@
           <div v-else-if="activeView === 'video-overlay'" class="page-stack">
             <section class="panel overlay-page-intro">
               <div>
-                <h2>当前视频</h2>
-                <p class="panel-subtitle">从素材里点“选为视频”会直接进入这里，也可以手动改路径。</p>
+                <h2>处理视频</h2>
+                <p class="panel-subtitle">镜像、裁剪、调整输出尺寸或添加水印；原视频不会被覆盖。</p>
               </div>
               <div class="path-row">
                 <input v-model="localVideo" placeholder="选择或填写要处理的视频路径" />
@@ -179,6 +179,29 @@
             />
           </div>
 
+          <div v-else-if="activeView === 'asr-dev'" class="page-stack">
+            <AsrLabPanel
+              v-model:input-video="localVideo"
+              v-model:asr-version="asrLabVersion"
+              v-model:source-language="asrLabSourceLanguage"
+              v-model:model-size="asrLabModelSize"
+              v-model:speaker-diarization="asrLabSpeakerDiarization"
+              v-model:known-speaker-count="asrLabKnownSpeakerCount"
+              v-model:hotwords="asrLabHotwords"
+              v-model:high-recall="asrLabHighRecall"
+              v-model:dual-gpu-parallel="asrLabDualGpuParallel"
+              :running="asrLabRunning"
+              :review-busy-id="asrLabReviewBusyId"
+              :result="asrLabResult"
+              :status="asrLabStatus.text"
+              :status-class="asrLabStatus.class"
+              @open-assets="activeView = 'assets'"
+              @run="runAsrLab"
+              @copy-status="handleAsrLabCopyStatus"
+              @review-decision="handleAsrReviewDecision"
+            />
+          </div>
+
           <div v-else-if="activeView === 'subtitles'" class="page-stack">
             <TranslationFlow
               v-model:source-srt="sourceSrt"
@@ -204,14 +227,19 @@
               :cues="subtitleEditorCues"
               :loading="subtitleEditorLoading"
               :dirty="subtitleEditorDirty"
+              :save-ready="subtitleEditorSaveReady"
               :status="subtitleEditorStatus.text"
               :status-class="subtitleEditorStatus.class"
               :prefix-names="subtitlePrefixNames"
+              :speaker-candidates="subtitleSpeakerCandidates"
+              :selected-speaker-candidate-ids="subtitleSelectedSpeakerCandidateIds"
               :pair-issues="subtitlePairIssues"
               :focused-cue-uid="subtitleFocusedCueUid"
               :can-undo="subtitleEditorUndoStack.length > 0"
               :undo-count="subtitleEditorUndoStack.length"
               @update:prefix-names="subtitlePrefixNames = $event"
+              @toggle-speaker-candidate="toggleSubtitleSpeakerCandidate"
+              @strip-speaker-candidates="stripDetectedSubtitleSpeakerPrefixes"
               @load-subtitle="loadSubtitleEditor"
               @save-subtitle="saveSubtitleEditor(true)"
               @save-subtitle-as="saveSubtitleEditor(false)"
@@ -229,10 +257,10 @@
               @strip-breaks="stripSubtitleEditorBreaks"
               @strip-all-breaks="stripAllSubtitleEditorBreaks"
               @strip-trailing-commas="stripSubtitleEditorTrailingCommas"
-              @detect-pair-issues="detectSubtitleEditorPairIssues"
               @focus-pair-issue="focusSubtitleEditorCue"
               @copy-pair-symbol="copySubtitleEditorPairSymbol"
-              @resolve-pair-issue="resolveSubtitleEditorPairIssue"
+              @repair-pair-issue="repairSubtitleEditorPairIssue"
+              @repair-auto-pair-issues="repairAutomaticSubtitleEditorPairIssues"
               @remove-empty="removeEmptySubtitleEditorCues"
               @strip-prefixes="stripSubtitleEditorPrefixes"
               @undo="undoSubtitleEditorChange"
@@ -323,7 +351,7 @@
 
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { api, deleteJson, getJson, patchJson, uploadProjectCover, uploadVideoFile } from './api'
+import { api, deleteJson, getJson, patchJson, uploadMediaFile, uploadProjectCover } from './api'
 import SideNav from './components/SideNav.vue'
 import HeaderBar from './components/HeaderBar.vue'
 import AgentSessionPanel from './components/AgentSessionPanel.vue'
@@ -335,6 +363,7 @@ import SubtitleEditorPanel from './components/SubtitleEditorPanel.vue'
 import AssetLibrary from './components/AssetLibrary.vue'
 import VideoOverlayPanel from './components/VideoOverlayPanel.vue'
 import OcrDevPanel from './components/OcrDevPanel.vue'
+import AsrLabPanel from './components/AsrLabPanel.vue'
 import JobSidebar from './components/JobSidebar.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import { copyText } from './clipboard.js'
@@ -358,10 +387,19 @@ import {
   glossaryReviewKey,
   isGlossaryReviewPathForSession,
 } from './glossaryReviewFlow.js'
-import { detectCuePairSymbolIssues, parsePrefixNames, stripCueSpeakerPrefixes, stripCueTrailingCommas } from './subtitlePrefixTools.js'
+import {
+  applyCuePairIssueRepairs,
+  applySpeakerPrefixCandidates,
+  detectCuePairSymbolIssues,
+  detectCueSpeakerPrefixCandidates,
+  parsePrefixNames,
+  stripCueSpeakerPrefixes,
+  stripCueTrailingCommas,
+} from './subtitlePrefixTools.js'
 import {
   insertSubtitleCueAtTime,
   insertSubtitleCueRelative,
+  isSubtitleEditorSavePathReady,
   parseSrtTime,
   renumberSubtitleCues,
   setSubtitleCueBoundary,
@@ -376,9 +414,13 @@ let linkProbeSequence = 0
 const titleBox = ref('')
 const sourceSrt = ref('')
 const subtitleEditorPath = ref('')
+const subtitleEditorLoadedPath = ref('')
 const subtitleEditorVideoPath = ref('')
 const subtitleEditorCues = ref([])
 const subtitlePrefixNames = ref('')
+const subtitleSpeakerDictionary = ref([])
+const subtitleSpeakerCandidates = ref([])
+const subtitleSelectedSpeakerCandidateIds = ref([])
 const subtitlePairIssues = ref([])
 const subtitleFocusedCueUid = ref('')
 const subtitleEditorUndoStack = ref([])
@@ -386,6 +428,10 @@ const subtitleEditorSavedCues = ref([])
 const subtitleEditorPendingFieldEdit = ref(null)
 const subtitleEditorLoading = ref(false)
 const subtitleEditorDirty = ref(false)
+const subtitleEditorSaveReady = computed(() => isSubtitleEditorSavePathReady(
+  subtitleEditorPath.value,
+  subtitleEditorLoadedPath.value,
+))
 const glossaryPath = ref('')
 const extraHint = ref('')
 const glossaryEditor = ref('')
@@ -422,6 +468,18 @@ const ocrDevRefineTimingBoundaries = ref(true)
 const ocrDevFlickerSmoothingMaxDurationSeconds = ref(0.55)
 const ocrDevLlmCleanup = ref(true)
 const ocrDevRunning = ref(false)
+const asrLabSourceLanguage = ref('auto')
+const asrLabModelSize = ref('large-v3')
+const asrLabVersion = ref('2.0')
+const asrLabSpeakerDiarization = ref(false)
+const asrLabKnownSpeakerCount = ref('auto')
+const asrLabHotwords = ref('')
+const asrLabHighRecall = ref(true)
+const asrLabDualGpuParallel = ref(false)
+const asrLabRunning = ref(false)
+const asrLabReviewBusyId = ref('')
+const asrLabResult = ref(null)
+const asrLabJobId = ref('')
 const ocrRefinementMode = ref('none')
 const thumbnailFormat = ref('jpg')
 const videoQuality = ref('1080p')
@@ -435,8 +493,6 @@ const embeddedSubtitleGoal = ref('screen_subtitle')
 const sourceLanguage = ref('korean')
 const ocrLanguage = ref('auto')
 const localVideo = ref('')
-const audioLanguage = ref('auto')
-const audioModelSize = ref('large-v3')
 const activeJobId = ref('')
 const activeView = ref('agent')
 const agentSession = ref(null)
@@ -445,7 +501,7 @@ const agentTasks = ref([])
 const agentStarting = ref(false)
 const openedGlossaryReviewKey = ref('')
 const openingGlossaryReviewKey = ref('')
-const mobileUploadBusy = ref(false)
+const materialUploadBusy = ref(false)
 const settingsEditor = ref(null)
 const settingsProviders = ref([])
 const settingsModelsByProvider = ref({})
@@ -463,7 +519,7 @@ const settingsProviderManaging = ref(false)
 let settingsModelFetchSequence = 0
 const settingsModelFetchTokens = new Map()
 
-const assets = reactive({ videos: [], subtitles: [], projects: [], ocr_jobs: [], ocr_debug_folders: [] })
+const assets = reactive({ videos: [], audios: [], subtitles: [], projects: [], ocr_jobs: [], ocr_debug_folders: [] })
 const jobs = reactive({})
 const pollTimers = new Map()
 
@@ -473,6 +529,7 @@ const titleStatus = reactive({ text: '', class: '' })
 const flowStatus = reactive({ text: '', class: '' })
 const subtitleEditorStatus = reactive({ text: '', class: '' })
 const ocrDevStatus = reactive({ text: '', class: '' })
+const asrLabStatus = reactive({ text: '', class: '' })
 const assetStatus = reactive({ text: '', class: '' })
 const agentStatus = reactive({ text: '', class: '' })
 const settingsStatus = reactive({ text: '', class: '' })
@@ -502,8 +559,8 @@ const pages = {
     description: '管理已下载视频、字幕文件、OCR 和音频识别输出。',
   },
   'video-overlay': {
-    title: '贴图处理',
-    description: '给当前视频叠加水印或遮 Logo，输出新视频。',
+    title: '视频处理',
+    description: '镜像、裁剪、调整尺寸，或给当前视频叠加水印与遮挡。',
   },
   subtitles: {
     title: '字幕处理',
@@ -524,6 +581,10 @@ const pages = {
   'ocr-dev': {
     title: 'OCR Lab',
     description: '独立维护 OCR V2 / V3，裁框、复跑并比较调试结果。',
+  },
+  'asr-dev': {
+    title: 'ASR Lab',
+    description: '从本地视频或音频中提取语音文本，不进入翻译流程。',
   },
   settings: {
     title: '设置中心',
@@ -546,7 +607,7 @@ const doneJobCount = computed(() => jobList.value.filter((job) => job.status ===
 const waitingAgentCount = computed(() => agentSessions.value.filter((session) => session.status === 'waiting').length)
 const runningAgentCount = computed(() => agentSessions.value.filter((session) => session.status === 'running').length)
 const topbarMetrics = computed(() => ({
-  videos: assets.videos.length,
+  media: assets.videos.length + assets.audios.length,
   subtitles: assets.subtitles.length,
   jobs: jobList.value.length,
 }))
@@ -593,6 +654,10 @@ watch(activeView, (view) => {
   if (view === 'new-task' && !availableVideoFormats.value.length) scheduleVideoFormats(url.value, 150)
 })
 
+watch(subtitleEditorCues, () => {
+  refreshSubtitleEditorMechanicalDiagnostics()
+})
+
 watch(ocrScope, (scope) => {
   if (skipNextOcrScopeCropReset) {
     skipNextOcrScopeCropReset = false
@@ -604,13 +669,14 @@ watch(ocrScope, (scope) => {
 
 const navItems = computed(() => [
   { id: 'agent', group: '日常流程', label: 'Agent 路线', hint: '自动完成字幕', icon: 'A', badge: waitingAgentCount.value ? `${waitingAgentCount.value} 待确认` : runningAgentCount.value || '' },
-  { id: 'assets', group: '日常流程', label: '素材库', hint: '项目、视频与字幕', icon: 'M', badge: assets.videos.length + assets.subtitles.length || '' },
+  { id: 'assets', group: '日常流程', label: '素材库', hint: '视频、音频与字幕', icon: 'M', badge: assets.videos.length + assets.audios.length + assets.subtitles.length || '' },
   { id: 'subtitle-edit', group: '字幕制作', label: '字幕精修', hint: '新增与微调 SRT', icon: 'E', badge: subtitleEditorCues.value.length || '' },
   { id: 'glossary', group: '字幕制作', label: '术语审核', hint: '人名与固定译法', icon: 'G', badge: glossaryItems.value.length || '' },
   { id: 'subtitles', group: '字幕制作', label: '翻译与转换', hint: '字幕后续处理', icon: 'S', badge: sourceSrt.value ? '已选' : '' },
   { id: 'ocr-dev', group: '实验室', label: 'OCR Lab', hint: 'V2 / V3 独立测试', icon: 'O', badge: '' },
+  { id: 'asr-dev', group: '实验室', label: 'ASR Lab', hint: '提取音频文本', icon: 'R', badge: asrLabRunning.value ? '运行中' : '' },
   { id: 'new-task', group: '日常流程', label: '链接处理', hint: '直接下载、字幕检测', icon: 'L', badge: probe.value?.subtitles?.length || '' },
-  { id: 'video-overlay', group: '其他工具', label: '视频贴图', hint: '水印与遮 Logo', icon: 'V', badge: localVideo.value ? '已选' : '' },
+  { id: 'video-overlay', group: '其他工具', label: '视频处理', hint: '镜像、裁剪与水印', icon: 'V', badge: localVideo.value ? '已选' : '' },
   { id: 'settings', group: '系统', label: '设置', hint: '语言、服务与模型', icon: '⚙', badge: '' },
   { id: 'jobs', group: '系统', label: '任务日志', hint: '进度、错误与输出', icon: 'J', badge: runningJobCount.value || failedJobCount.value || '' },
 ])
@@ -661,7 +727,6 @@ function applyAppSettingDefaults(settings) {
   const defaults = settings?.defaults || {}
   if (defaults.source_language) {
     sourceLanguage.value = defaults.source_language
-    if (audioLanguage.value === 'auto') audioLanguage.value = defaults.source_language
   }
   if (defaults.ocr_language) ocrLanguage.value = defaults.ocr_language
 }
@@ -1668,55 +1733,127 @@ async function runOcrV3Refine(debugDir) {
   }
 }
 
-async function runLocalAudio() {
+async function runAsrLab() {
   if (!localVideo.value.trim()) {
-    setStatus(assetStatus, '先选择本地视频。', 'bad')
+    setStatus(asrLabStatus, '请先选择本地视频或音频。', 'bad')
     return
   }
+  asrLabRunning.value = true
+  asrLabResult.value = null
+  setStatus(
+    asrLabStatus,
+    asrLabSpeakerDiarization.value
+      ? `正在启动 ASR ${asrLabVersion.value === '2.0' ? '2.2' : asrLabVersion.value} 与说话人分离…`
+      : `正在启动 ASR ${asrLabVersion.value === '2.0' ? '2.2' : asrLabVersion.value}…`,
+    '',
+  )
   try {
-    const job = await api('/api/jobs/audio-local', {
+    const job = await api('/api/jobs/asr-lab', {
       input_video: localVideo.value.trim(),
-      language: audioLanguage.value,
-      source_language: sourceLanguage.value,
-      model_size: audioModelSize.value,
+      asr_version: asrLabVersion.value,
+      source_language: asrLabSourceLanguage.value,
+      model_size: asrLabModelSize.value,
+      speaker_diarization: asrLabSpeakerDiarization.value,
+      known_speaker_count: asrLabKnownSpeakerCount.value,
+      hotwords: asrLabVersion.value === '2.0' ? asrLabHotwords.value.trim() : '',
+      high_recall: asrLabVersion.value === '2.0' && asrLabHighRecall.value,
+      dual_gpu_parallel: asrLabVersion.value === '2.0'
+        && asrLabSpeakerDiarization.value
+        && asrLabDualGpuParallel.value,
+      diarization_device: 'auto',
       device: 'cuda',
       compute_type: 'float16',
     })
+    asrLabJobId.value = job.id
     watchJob(job)
+    setStatus(
+      asrLabStatus,
+      asrLabSpeakerDiarization.value
+        ? `ASR ${asrLabVersion.value === '2.0' ? '2.2' : asrLabVersion.value} 与说话人分离任务运行中；完成后会显示 Speaker 标签。`
+        : `ASR ${asrLabVersion.value === '2.0' ? '2.2' : asrLabVersion.value} 任务运行中；识别完成后文本会显示在本页。`,
+      '',
+    )
   } catch (error) {
-    setStatus(assetStatus, error.message, 'bad')
+    asrLabRunning.value = false
+    asrLabJobId.value = ''
+    setStatus(asrLabStatus, error.message, 'bad')
   }
 }
 
-async function uploadAndTranslateMobileVideo({ file, title }) {
-  if (!file) {
-    setStatus(assetStatus, '先选择要上传的视频。', 'bad')
+function handleAsrLabCopyStatus(text, className) {
+  setStatus(asrLabStatus, text, className)
+}
+
+async function handleAsrReviewDecision({ region, action }) {
+  const current = asrLabResult.value
+  if (!current || !region?.review_id || asrLabReviewBusyId.value) return
+  asrLabReviewBusyId.value = region.review_id
+  setStatus(
+    asrLabStatus,
+    action === 'accept'
+      ? `正在把 ${region.start.toFixed?.(1) || region.start} 秒处候选内容合回词级时间轴…`
+      : '正在记录忽略决定…',
+    '',
+  )
+  try {
+    const response = await api('/api/asr-review/decision', {
+      source_srt: current.review_source_srt || current.source_srt,
+      words_path: current.words_path,
+      out: current.reviewed_srt || '',
+      review_id: region.review_id,
+      action,
+      candidate: region,
+    })
+    const remaining = (current.suspected_missing_regions || [])
+      .filter((item) => item.review_id !== region.review_id)
+    asrLabResult.value = {
+      ...current,
+      ...response,
+      suspected_missing_regions: remaining,
+      suspected_missing_region_count: remaining.length,
+      word_count: response.review_word_count || current.word_count,
+    }
+    if (response.subtitle_path) sourceSrt.value = response.subtitle_path
+    setStatus(
+      asrLabStatus,
+      action === 'accept'
+        ? `已采纳候选内容并重新打轴；还有 ${remaining.length} 处待复核，素材文件夹字幕已同步更新。`
+        : `已忽略该候选；还有 ${remaining.length} 处待复核。`,
+      'ok',
+    )
+  } catch (error) {
+    setStatus(asrLabStatus, error.message, 'bad')
+  } finally {
+    asrLabReviewBusyId.value = ''
+  }
+}
+
+function openAsrLab() {
+  if (!localVideo.value.trim()) {
+    setStatus(assetStatus, '先选择视频或音频素材。', 'bad')
     return
   }
-  mobileUploadBusy.value = true
-  setStatus(assetStatus, '正在上传视频...', '')
+  activeView.value = 'asr-dev'
+  setStatus(asrLabStatus, `已选择素材：${localVideo.value}`, 'ok')
+}
+
+async function uploadLocalMedia({ file, title }) {
+  if (!file) {
+    setStatus(assetStatus, '先选择要上传的视频或音频。', 'bad')
+    return
+  }
+  materialUploadBusy.value = true
+  setStatus(assetStatus, '正在上传素材...', '')
   try {
-    const uploaded = await uploadVideoFile(file, { title })
-    localVideo.value = uploaded.input_video || ''
+    const uploaded = await uploadMediaFile(file, { title })
+    localVideo.value = uploaded.input_media || uploaded.input_video || uploaded.input_audio || ''
     await loadAssets()
-    setStatus(assetStatus, '上传完成，正在启动 ASR 翻译...', 'ok')
-    const job = await api('/api/jobs/mobile-asr-translate', {
-      input_video: localVideo.value,
-      language: audioLanguage.value,
-      source_language: sourceLanguage.value !== 'auto' ? sourceLanguage.value : audioLanguage.value,
-      model_size: audioModelSize.value,
-      device: 'cuda',
-      compute_type: 'float16',
-      translation_mode: 'standard_cleanup',
-      extra_hint: extraHint.value,
-    })
-    watchJob(job)
-    activeView.value = 'jobs'
-    setStatus(assetStatus, '已创建手机 ASR 翻译任务。', 'ok')
+    const kindLabel = uploaded.media_kind === 'audio' ? '音频' : '视频'
+    setStatus(assetStatus, `${kindLabel}素材上传完成，尚未启动任何处理任务。`, 'ok')
   } catch (error) {
     setStatus(assetStatus, error.message, 'bad')
   } finally {
-    mobileUploadBusy.value = false
+    materialUploadBusy.value = false
   }
 }
 
@@ -1729,7 +1866,7 @@ async function runVideoOverlay(payload) {
     const job = await api('/api/jobs/video-overlay', payload)
     watchJob(job)
     activeView.value = 'jobs'
-    setStatus(assetStatus, '已创建视频贴图处理任务。', 'ok')
+    setStatus(assetStatus, '已创建视频处理任务。', 'ok')
   } catch (error) {
     setStatus(assetStatus, error.message, 'bad')
   }
@@ -1737,16 +1874,16 @@ async function runVideoOverlay(payload) {
 
 async function registerLocalProject() {
   if (!localVideo.value.trim()) {
-    setStatus(assetStatus, '先选择或填写一个本地视频路径。', 'bad')
+    setStatus(assetStatus, '先选择或填写一个本地视频或音频路径。', 'bad')
     return
   }
   try {
     const result = await api('/api/assets/register-local-project', {
-      input_video: localVideo.value.trim(),
+      input_media: localVideo.value.trim(),
       title: localVideo.value.split('/').pop()?.replace(/\.[^.]+$/, '') || '',
     })
     await loadAssets()
-    setStatus(assetStatus, `已登记视频项目：${result.project?.name || result.project_dir}`, 'ok')
+    setStatus(assetStatus, `已登记素材项目：${result.project?.name || result.project_dir}`, 'ok')
   } catch (error) {
     setStatus(assetStatus, error.message, 'bad')
   }
@@ -2007,11 +2144,12 @@ async function loadAssets() {
   try {
     const result = await getJson('/api/assets')
     assets.videos = result.videos || []
+    assets.audios = result.audios || []
     assets.subtitles = result.subtitles || []
     assets.projects = result.projects || []
     assets.ocr_jobs = result.ocr_jobs || []
     assets.ocr_debug_folders = result.ocr_debug_folders || []
-    setStatus(assetStatus, `已扫描：${assets.projects.length} 个项目，${assets.videos.length} 个视频，${assets.subtitles.length} 个字幕。`, 'ok')
+    setStatus(assetStatus, `已扫描：${assets.projects.length} 个项目，${assets.videos.length} 个视频，${assets.audios.length} 个音频，${assets.subtitles.length} 个字幕。`, 'ok')
   } catch (error) {
     setStatus(assetStatus, error.message, 'bad')
   }
@@ -2019,13 +2157,13 @@ async function loadAssets() {
 
 async function deleteDownloadProject(project) {
   if (!project?.path) return
-  if (!window.confirm(`删除已下载视频项目目录：${project.name || project.path}？\n\n会删除该目录下的视频、字幕、封面和其他文件。`)) return
+  if (!window.confirm(`删除素材项目目录：${project.name || project.path}？\n\n会删除该目录下的视频、音频、字幕、封面和其他文件。`)) return
   try {
     await api('/api/assets/delete-project', { path: project.path })
     if (localVideo.value && localVideo.value.startsWith(project.path)) localVideo.value = ''
     if (sourceSrt.value && sourceSrt.value.startsWith(project.path)) sourceSrt.value = ''
     await loadAssets()
-    setStatus(assetStatus, `已删除视频项目目录：${project.name}`, 'ok')
+    setStatus(assetStatus, `已删除素材项目目录：${project.name}`, 'ok')
   } catch (error) {
     setStatus(assetStatus, error.message, 'bad')
   }
@@ -2123,6 +2261,31 @@ async function pollJob(jobId) {
 
 function applyJobResult(job) {
   const result = job.result || {}
+  if (result.kind === 'asr_lab' || job.id === asrLabJobId.value) {
+    asrLabRunning.value = false
+    asrLabJobId.value = ''
+    if (job.status === 'done') {
+      asrLabResult.value = result
+      const speakerSummary = result.speaker_diarization ? `，识别出 ${result.speaker_count || 0} 位说话人` : ''
+      const qualitySummary = result.asr_version === '2.0' && result.low_confidence_cue_count
+        ? `，${result.low_confidence_cue_count} 条建议复核`
+        : ''
+      const recoverySummary = result.asr_version === '2.0' && result.high_recall
+        ? `，补回 ${result.recovered_word_count || 0} 个词块（${result.recovered_region_count || 0} 处）`
+        : ''
+      const missingSummary = result.suspected_missing_region_count
+        ? `，仍有 ${result.suspected_missing_region_count} 处疑似漏听`
+        : ''
+      const materialSummary = result.source_sidecar ? '，已保存到素材文件夹' : ''
+      setStatus(
+        asrLabStatus,
+        `ASR ${result.pipeline_version || result.asr_version || '1.0'} 完成，共 ${result.cue_count || 0} 条语音片段${speakerSummary}${recoverySummary}${missingSummary}${qualitySummary}${materialSummary}。`,
+        'ok',
+      )
+    } else {
+      setStatus(asrLabStatus, job.error || (job.status === 'cancelled' ? 'ASR 任务已终止。' : 'ASR 任务失败。'), 'bad')
+    }
+  }
   if (result.subtitle_path) sourceSrt.value = result.subtitle_path
   if (result.source_srt) sourceSrt.value = result.source_srt
   if (result.source_track_refined_srt) sourceSrt.value = result.source_track_refined_srt
@@ -2148,7 +2311,7 @@ function applyJobResult(job) {
   if (result.input_video) localVideo.value = result.input_video
   if (result.output_video) {
     localVideo.value = result.output_video
-    setStatus(assetStatus, `视频贴图处理完成：${result.output_video}`, 'ok')
+    setStatus(assetStatus, `视频处理完成：${result.output_video}`, 'ok')
   }
   if (result.glossary_path) {
     if (activeView.value !== 'glossary' || !glossaryPath.value.trim() || glossaryPath.value === result.glossary_path) {
@@ -2174,7 +2337,8 @@ function applyJobResult(job) {
 
 function useProject(project) {
   if (!project) return
-  if (project.primary_video) localVideo.value = project.primary_video
+  const primaryMedia = project.primary_video || project.primary_audio
+  if (primaryMedia) localVideo.value = primaryMedia
   if (project.source_url) url.value = project.normalized_url || project.source_url
   const sourceSubtitle = (project.subtitles || []).find((item) => item.role === 'source') || (project.subtitles || [])[0]
   if (sourceSubtitle?.path) sourceSrt.value = sourceSubtitle.path
@@ -2184,8 +2348,20 @@ function useProject(project) {
 
 function useVideo(path) {
   localVideo.value = path
-  activeView.value = 'video-overlay'
-  setStatus(assetStatus, `已选择视频，进入贴图处理：${path}`, 'ok')
+  activeView.value = 'assets'
+  setStatus(assetStatus, `已选择当前视频：${path}`, 'ok')
+}
+
+function useAudio(path) {
+  localVideo.value = path
+  activeView.value = 'assets'
+  setStatus(assetStatus, `已选择当前音频：${path}`, 'ok')
+}
+
+function openMediaInAsrLab(path) {
+  localVideo.value = path
+  activeView.value = 'asr-dev'
+  setStatus(asrLabStatus, `已选择素材：${path}`, 'ok')
 }
 
 function useVideoAndOcr(path) {
@@ -2203,7 +2379,7 @@ async function editSubtitle(payload) {
   const path = typeof payload === 'object' ? payload?.path : payload
   const videoPath = typeof payload === 'object' ? payload?.videoPath : ''
   const nextSubtitlePath = path || sourceSrt.value || ''
-  const isSameSubtitle = nextSubtitlePath === subtitleEditorPath.value
+  const isSameSubtitle = nextSubtitlePath === subtitleEditorLoadedPath.value
   subtitleEditorPath.value = nextSubtitlePath
   subtitleEditorVideoPath.value = videoPath || inferVideoForSubtitle(nextSubtitlePath) || (isSameSubtitle ? subtitleEditorVideoPath.value : '')
   activeView.value = 'subtitle-edit'
@@ -2223,34 +2399,50 @@ function inferVideoForSubtitle(path) {
 }
 
 async function loadSubtitleEditor() {
-  if (!subtitleEditorPath.value.trim()) {
+  const requestedPath = subtitleEditorPath.value.trim()
+  if (!requestedPath) {
     setStatus(subtitleEditorStatus, '先选择或填写字幕路径。', 'bad')
     return
   }
   subtitleEditorLoading.value = true
   setStatus(subtitleEditorStatus, '正在加载字幕...', '')
   try {
-    const result = await api('/api/subtitle/read', { path: subtitleEditorPath.value.trim() })
+    const result = await api('/api/subtitle/read', { path: requestedPath })
     subtitleEditorPath.value = result.path
+    subtitleEditorLoadedPath.value = result.path
+    subtitleSpeakerDictionary.value = result.speaker_dictionary || []
     subtitleEditorCues.value = renumberSubtitleCues(result.cues || [])
     subtitleEditorSavedCues.value = cloneSubtitleEditorCues(subtitleEditorCues.value)
     if (!subtitleEditorVideoPath.value) subtitleEditorVideoPath.value = inferVideoForSubtitle(result.path)
     subtitleEditorDirty.value = false
-    subtitlePairIssues.value = []
     subtitleFocusedCueUid.value = ''
     subtitleEditorUndoStack.value = []
     subtitleEditorPendingFieldEdit.value = null
-    setStatus(subtitleEditorStatus, `已加载 ${result.count || 0} 条字幕。`, 'ok')
+    const diagnostics = refreshSubtitleEditorMechanicalDiagnostics({ resetSpeakerSelection: true })
+    setStatus(
+      subtitleEditorStatus,
+      `已加载 ${result.count || 0} 条字幕。机械检查：${diagnostics.recommendedSpeakerCueCount} 条可安全去除说话者，${diagnostics.pairIssueCount} 处符号待检查。`,
+      diagnostics.pairIssueCount ? 'bad' : 'ok',
+    )
   } catch (error) {
-    setStatus(subtitleEditorStatus, error.message, 'bad')
+    if (subtitleEditorLoadedPath.value) subtitleEditorPath.value = subtitleEditorLoadedPath.value
+    setStatus(
+      subtitleEditorStatus,
+      `${error.message}${subtitleEditorLoadedPath.value ? '；已恢复到当前成功加载的字幕路径。' : ''}`,
+      'bad',
+    )
   } finally {
     subtitleEditorLoading.value = false
   }
 }
 
 async function saveSubtitleEditor(overwrite) {
-  if (!subtitleEditorPath.value.trim()) {
+  if (!subtitleEditorLoadedPath.value) {
     setStatus(subtitleEditorStatus, '先加载字幕。', 'bad')
+    return
+  }
+  if (!subtitleEditorSaveReady.value) {
+    setStatus(subtitleEditorStatus, '字幕路径已经改变，请先点击“加载”；当前内容不会写入未加载的文件。', 'bad')
     return
   }
   const emptyCueIndex = subtitleEditorCues.value.findIndex((cue) => !String(cue.text || '').trim())
@@ -2270,18 +2462,19 @@ async function saveSubtitleEditor(overwrite) {
   setStatus(subtitleEditorStatus, overwrite ? '正在覆盖保存字幕...' : '正在另存 edited 字幕...', '')
   try {
     const result = await api('/api/subtitle/write', {
-      path: subtitleEditorPath.value.trim(),
+      path: subtitleEditorLoadedPath.value,
       overwrite,
       cues: normalizedCues,
     })
     subtitleEditorPath.value = result.path
+    subtitleEditorLoadedPath.value = result.path
     sourceSrt.value = result.path
     subtitleEditorCues.value = renumberSubtitleCues(result.cues || [])
     subtitleEditorSavedCues.value = cloneSubtitleEditorCues(subtitleEditorCues.value)
     subtitleEditorDirty.value = false
-    subtitlePairIssues.value = []
     subtitleFocusedCueUid.value = ''
     subtitleEditorPendingFieldEdit.value = null
+    refreshSubtitleEditorMechanicalDiagnostics()
     setStatus(subtitleEditorStatus, `已保存 ${result.count || 0} 条字幕：${result.path}`, 'ok')
     await loadAssets()
   } catch (error) {
@@ -2348,7 +2541,6 @@ function updateSubtitleEditorCue({ uid, patch }) {
     return nextCue
   })
   refreshSubtitleEditorDirty()
-  subtitlePairIssues.value = []
 }
 
 function subtitleEditorFieldEditLabel(field) {
@@ -2431,7 +2623,6 @@ function snapSubtitleEditorCue(uid, boundary, direction) {
 function applySubtitleEditorMutation(cues, focusedUid = '') {
   subtitleEditorCues.value = renumberSubtitleCues(cues)
   refreshSubtitleEditorDirty()
-  subtitlePairIssues.value = []
   subtitleFocusedCueUid.value = focusedUid
 }
 
@@ -2518,15 +2709,51 @@ function stripSubtitleEditorTrailingCommas() {
   setStatus(subtitleEditorStatus, `已处理 ${result.changedCueCount} 条字幕，删除 ${result.removedCommaCount} 个结尾逗号。`, 'ok')
 }
 
-function detectSubtitleEditorPairIssues() {
-  const issues = detectCuePairSymbolIssues(subtitleEditorCues.value)
-  subtitlePairIssues.value = issues
-  subtitleFocusedCueUid.value = ''
-  if (issues.length) {
-    setStatus(subtitleEditorStatus, `检测到 ${issues.length} 处半边符号，请定位后手动修。`, 'bad')
-  } else {
-    setStatus(subtitleEditorStatus, '未发现半边符号。', 'ok')
+function refreshSubtitleEditorMechanicalDiagnostics({ resetSpeakerSelection = false } = {}) {
+  subtitlePairIssues.value = detectCuePairSymbolIssues(subtitleEditorCues.value)
+  subtitleSpeakerCandidates.value = detectCueSpeakerPrefixCandidates(
+    subtitleEditorCues.value,
+    subtitleSpeakerDictionary.value,
+  )
+  const validIds = new Set(subtitleSpeakerCandidates.value.map((candidate) => candidate.id))
+  subtitleSelectedSpeakerCandidateIds.value = resetSpeakerSelection
+    ? subtitleSpeakerCandidates.value.filter((candidate) => candidate.recommended).map((candidate) => candidate.id)
+    : subtitleSelectedSpeakerCandidateIds.value.filter((id) => validIds.has(id))
+  return {
+    pairIssueCount: subtitlePairIssues.value.length,
+    recommendedSpeakerCueCount: subtitleSpeakerCandidates.value
+      .filter((candidate) => candidate.recommended)
+      .reduce((count, candidate) => count + Number(candidate.count || 0), 0),
   }
+}
+
+function toggleSubtitleSpeakerCandidate({ id, selected }) {
+  const values = new Set(subtitleSelectedSpeakerCandidateIds.value)
+  if (selected) values.add(id)
+  else values.delete(id)
+  subtitleSelectedSpeakerCandidateIds.value = [...values]
+}
+
+function stripDetectedSubtitleSpeakerPrefixes() {
+  if (!subtitleSelectedSpeakerCandidateIds.value.length) {
+    setStatus(subtitleEditorStatus, '先勾选要去除的说话者候选。', 'bad')
+    return
+  }
+  const result = applySpeakerPrefixCandidates(
+    subtitleEditorCues.value,
+    subtitleSpeakerCandidates.value,
+    subtitleSelectedSpeakerCandidateIds.value,
+  )
+  if (!result.changedCueCount) {
+    refreshSubtitleEditorMechanicalDiagnostics()
+    setStatus(subtitleEditorStatus, '候选内容已经变化，请按当前字幕重新确认。', '')
+    return
+  }
+  pushSubtitleEditorUndo('去除检测到的说话者')
+  subtitleEditorCues.value = result.cues
+  refreshSubtitleEditorDirty()
+  refreshSubtitleEditorMechanicalDiagnostics()
+  setStatus(subtitleEditorStatus, `已去除 ${result.removedPrefixCount} 个说话者前缀；如有误可立即撤回。`, 'ok')
 }
 
 async function focusSubtitleEditorCue(uid) {
@@ -2545,15 +2772,35 @@ async function copySubtitleEditorPairSymbol(symbol) {
   setStatus(subtitleEditorStatus, ok ? `已复制缺失符号：${symbol}` : '复制失败，请手动输入缺失符号。', ok ? 'ok' : 'bad')
 }
 
-function resolveSubtitleEditorPairIssue(issue) {
-  const key = pairIssueKey(issue)
-  subtitlePairIssues.value = subtitlePairIssues.value.filter((item) => pairIssueKey(item) !== key)
-  if (subtitleFocusedCueUid.value === issue.uid) subtitleFocusedCueUid.value = ''
-  setStatus(subtitleEditorStatus, subtitlePairIssues.value.length ? `已标记处理，还剩 ${subtitlePairIssues.value.length} 处。` : '半边符号问题已全部标记处理。', 'ok')
+function repairSubtitleEditorPairIssue(issue) {
+  const result = applyCuePairIssueRepairs(
+    subtitleEditorCues.value,
+    [issue],
+    { includeBoundarySuggestions: true },
+  )
+  if (!result.repairedIssueCount) {
+    setStatus(subtitleEditorStatus, '这个问题需要定位后人工调整符号顺序。', 'bad')
+    return
+  }
+  pushSubtitleEditorUndo('修复成对符号')
+  subtitleEditorCues.value = result.cues
+  refreshSubtitleEditorDirty()
+  refreshSubtitleEditorMechanicalDiagnostics()
+  setStatus(subtitleEditorStatus, '已应用符号修复；如位置不合适可立即撤回。', 'ok')
 }
 
-function pairIssueKey(issue) {
-  return `${issue.uid}|${issue.missingSymbol}|${issue.type}`
+function repairAutomaticSubtitleEditorPairIssues() {
+  const repairable = subtitlePairIssues.value.filter((issue) => issue.autoRepairable)
+  const result = applyCuePairIssueRepairs(subtitleEditorCues.value, repairable)
+  if (!result.repairedIssueCount) {
+    setStatus(subtitleEditorStatus, '当前没有可安全自动修复的全/半角符号错配。', '')
+    return
+  }
+  pushSubtitleEditorUndo('自动修复明确符号错配')
+  subtitleEditorCues.value = result.cues
+  refreshSubtitleEditorDirty()
+  refreshSubtitleEditorMechanicalDiagnostics()
+  setStatus(subtitleEditorStatus, `已自动修复 ${result.repairedIssueCount} 处明确符号错配；其余问题仍需确认。`, 'ok')
 }
 
 function cssEscape(value) {
@@ -2596,7 +2843,6 @@ function undoSubtitleEditorChange() {
   subtitleEditorPendingFieldEdit.value = null
   subtitleEditorUndoStack.value = stack
   subtitleEditorCues.value = cloneSubtitleEditorCues(snapshot.cues)
-  subtitlePairIssues.value = []
   subtitleFocusedCueUid.value = subtitleEditorCues.value.some((cue) => cue.uid === snapshot.focusedCueUid)
     ? snapshot.focusedCueUid
     : ''

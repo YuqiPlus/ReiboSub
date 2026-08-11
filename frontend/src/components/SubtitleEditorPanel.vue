@@ -33,8 +33,8 @@
             title="撤回最近一次文字、时间或结构修改"
             @click="$emit('undo')"
           >↶ 撤回上一步<template v-if="undoCount">（{{ undoCount }}）</template></button>
-          <button class="warning" :disabled="loading || !cues.length" @click="$emit('save-subtitle')">覆盖保存</button>
-          <button :disabled="loading || !cues.length" @click="$emit('save-subtitle-as')">另存 edited</button>
+          <button class="warning" :disabled="loading || !saveReady || !cues.length" @click="$emit('save-subtitle')">覆盖保存</button>
+          <button :disabled="loading || !saveReady || !cues.length" @click="$emit('save-subtitle-as')">另存 edited</button>
         </div>
       </div>
     </div>
@@ -84,19 +84,57 @@
       <div v-if="previewError" class="status bad">{{ previewError }}</div>
     </div>
 
-    <details class="prefix-tool">
+    <details class="prefix-tool" :open="Boolean(speakerCandidates.length || pairIssues.length)">
       <summary class="section-title">
         <b>批量工具</b>
-        <span class="muted">换行、逗号、符号、空字幕和名前缀</span>
+        <span class="muted">加载即自动检查说话者和成对符号</span>
       </summary>
+      <div v-if="cues.length" class="mechanical-check-summary">
+        <span class="badge done">实时机械检查</span>
+        <b>{{ speakerCandidates.length }} 类说话者候选 · {{ pairIssues.length }} 处符号待检查</b>
+        <span class="muted">字幕文字或结构变化后会自动重新计算，不调用大模型。</span>
+      </div>
       <div class="toolbar editor-tools">
         <button class="secondary mini" :disabled="!cues.length" @click="$emit('strip-all-breaks')">全部去异常换行</button>
         <button class="secondary mini" :disabled="!cues.length" @click="$emit('strip-trailing-commas')">删除结尾逗号</button>
-        <button class="secondary mini" :disabled="!cues.length" @click="$emit('detect-pair-issues')">检测半边符号</button>
         <button class="ghost mini" :disabled="!cues.length" @click="$emit('remove-empty')">删除空字幕</button>
       </div>
+      <div class="speaker-candidate-tool">
+        <div class="speaker-candidate-head">
+          <div>
+            <b>说话者前缀候选</b>
+            <span class="muted">Glossary 已确认人物会默认勾选；重复短标签只提示，不自动选。</span>
+          </div>
+          <button
+            class="secondary mini"
+            type="button"
+            :disabled="!selectedSpeakerCandidateCount"
+            @click="$emit('strip-speaker-candidates')"
+          >去除已选（{{ selectedSpeakerCandidateCount }} 类）</button>
+        </div>
+        <div v-if="speakerCandidates.length" class="speaker-candidate-list">
+          <label
+            v-for="candidate in speakerCandidates"
+            :key="candidate.id"
+            class="speaker-candidate-item"
+            :class="candidate.recommended ? 'recommended' : 'review'"
+          >
+            <input
+              type="checkbox"
+              :checked="selectedSpeakerCandidateIds.includes(candidate.id)"
+              @change="$emit('toggle-speaker-candidate', { id: candidate.id, selected: $event.target.checked })"
+            />
+            <span>
+              <b>{{ candidate.name }}</b>
+              <small>{{ candidate.count }} 条 · {{ candidate.reason }}</small>
+            </span>
+            <em>{{ candidate.recommended ? '可安全去除' : '待确认' }}</em>
+          </label>
+        </div>
+        <p v-else class="muted">没有发现符合安全规则的“说话者 + 冒号”前缀。</p>
+      </div>
       <div>
-        <label for="subtitlePrefixNames">名前缀处理</label>
+        <label for="subtitlePrefixNames">手动补充名前缀（高级）</label>
         <div class="prefix-tool-row">
           <input
             id="subtitlePrefixNames"
@@ -107,31 +145,44 @@
           />
           <button class="secondary mini" :disabled="!cues.length || !prefixNames.trim()" @click="$emit('strip-prefixes')">删除名前缀</button>
         </div>
-        <p class="muted">只删除“名字 + 空格 / 冒号”的开头前缀，不删除“名字作为句子主语”的内容。</p>
+        <p class="muted">手动工具仍支持“名字 + 空格 / 冒号”；自动候选只处理更安全的“人物名 + 冒号”。</p>
       </div>
     </details>
 
     <div v-if="pairIssues.length" class="pair-issue-panel">
       <div class="pair-issue-head">
-        <b>半边符号待检查</b>
-        <span>{{ pairIssues.length }} 处</span>
+        <div>
+          <b>成对符号待检查</b>
+          <span>{{ pairIssues.length }} 处，已自动随字幕更新</span>
+        </div>
+        <button
+          v-if="pairAutoRepairCount"
+          class="secondary mini"
+          type="button"
+          @click="$emit('repair-auto-pair-issues')"
+        >修复明确错配（{{ pairAutoRepairCount }}）</button>
       </div>
       <div class="pair-issue-list">
         <article
           v-for="issue in pairIssues"
-          :key="`${issue.uid}-${issue.missingSymbol}-${issue.type}`"
+          :key="issue.issueId"
           class="pair-issue-item"
           :class="{ active: focusedCueUid === issue.uid }"
         >
           <div>
             <b>#{{ issue.cueNumber }} · {{ issue.start_time || '--' }} → {{ issue.end_time || '--' }}</b>
-            <span>{{ issue.type === 'missing_close' ? '缺右符号' : '缺左符号' }}：{{ issue.missingSymbol }} · {{ issue.pairName }}</span>
+            <span>{{ pairIssueLabel(issue) }}</span>
             <p>{{ issue.text }}</p>
           </div>
           <div class="pair-issue-actions">
             <button class="secondary mini" type="button" @click="$emit('focus-pair-issue', issue.uid)">定位</button>
-            <button class="ghost mini" type="button" @click="$emit('copy-pair-symbol', issue.missingSymbol)">复制 {{ issue.missingSymbol }}</button>
-            <button class="ghost mini" type="button" @click="$emit('resolve-pair-issue', issue)">标记已处理</button>
+            <button
+              v-if="issue.suggestionAvailable"
+              class="ghost mini"
+              type="button"
+              @click="$emit('repair-pair-issue', issue)"
+            >{{ pairRepairActionLabel(issue) }}</button>
+            <button v-if="issue.missingSymbol" class="ghost mini" type="button" @click="$emit('copy-pair-symbol', issue.missingSymbol)">复制 {{ issue.missingSymbol }}</button>
           </div>
         </article>
       </div>
@@ -224,9 +275,12 @@ const props = defineProps({
   cues: { type: Array, default: () => [] },
   loading: { type: Boolean, default: false },
   dirty: { type: Boolean, default: false },
+  saveReady: { type: Boolean, default: false },
   status: { type: String, default: '' },
   statusClass: { type: String, default: '' },
   prefixNames: { type: String, default: '' },
+  speakerCandidates: { type: Array, default: () => [] },
+  selectedSpeakerCandidateIds: { type: Array, default: () => [] },
   canUndo: { type: Boolean, default: false },
   undoCount: { type: Number, default: 0 },
   pairIssues: { type: Array, default: () => [] },
@@ -237,6 +291,8 @@ const emit = defineEmits([
   'update:subtitlePath',
   'update:videoPath',
   'update:prefixNames',
+  'toggle-speaker-candidate',
+  'strip-speaker-candidates',
   'load-subtitle',
   'save-subtitle',
   'save-subtitle-as',
@@ -249,10 +305,10 @@ const emit = defineEmits([
   'strip-breaks',
   'strip-all-breaks',
   'strip-trailing-commas',
-  'detect-pair-issues',
   'focus-pair-issue',
   'copy-pair-symbol',
-  'resolve-pair-issue',
+  'repair-pair-issue',
+  'repair-auto-pair-issues',
   'remove-empty',
   'strip-prefixes',
   'undo',
@@ -277,6 +333,26 @@ const videoUrl = computed(() => {
   const path = String(props.videoPath || '').trim()
   return path ? `/api/file?path=${encodeURIComponent(path)}` : ''
 })
+const selectedSpeakerCandidateCount = computed(() => props.selectedSpeakerCandidateIds.length)
+const pairAutoRepairCount = computed(() => props.pairIssues.filter((issue) => issue.autoRepairable).length)
+
+function pairIssueLabel(issue) {
+  if (issue.type === 'mismatched_close') {
+    return `全/半角错配：${issue.actualSymbol} 应为 ${issue.replacementSymbol} · ${issue.pairName}`
+  }
+  if (issue.type === 'distant_pair') {
+    return `配对跨度异常：#${issue.relatedCueNumber} → #${issue.cueNumber}，跨 ${issue.cueSpan} 条 · ${issue.pairName}`
+  }
+  if (issue.type === 'crossed_pair') return `符号嵌套顺序交叉 · ${issue.pairName}`
+  if (issue.type === 'missing_close') return `缺右符号：${issue.missingSymbol} · ${issue.pairName}`
+  return `缺左符号：${issue.missingSymbol} · ${issue.pairName}`
+}
+
+function pairRepairActionLabel(issue) {
+  if (issue.type === 'mismatched_close') return `替换为 ${issue.replacementSymbol}`
+  if (issue.type === 'missing_close') return `补到本条末尾 ${issue.missingSymbol}`
+  return `补到本条开头 ${issue.missingSymbol}`
+}
 const currentTimeLabel = computed(() => formatSrtTime(currentTime.value))
 const durationLabel = computed(() => videoDuration.value > 0 ? formatSrtTime(videoDuration.value) : '')
 const previewCue = computed(() => props.cues.find((cue) => cue.uid === previewCueUid.value) || null)

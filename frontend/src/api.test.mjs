@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { deleteJson, patchJson, uploadProjectCover, uploadVideoFile } from "./api.js"
+import { deleteJson, patchJson, uploadMediaFile, uploadProjectCover, uploadVideoFile } from "./api.js"
 
 test("deleteJson sends a JSON DELETE request and surfaces API errors", async () => {
   const previousFetch = globalThis.fetch
@@ -65,6 +65,32 @@ test("uploadVideoFile posts multipart form data without json content type", asyn
   try {
     const result = await uploadVideoFile(file, { title: "手机视频" })
     assert.equal(result.input_video, "/tmp/demo.mp4")
+    assert.equal(calls.length, 1)
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+})
+
+
+test("uploadMediaFile accepts audio through the media-only endpoint", async () => {
+  const calls = []
+  const file = new File(["audio"], "interview.flac", { type: "audio/flac" })
+  const previousFetch = globalThis.fetch
+  globalThis.fetch = async (path, options) => {
+    calls.push({ path, options })
+    assert.equal(path, "/api/upload-media")
+    assert.equal(options.method, "POST")
+    assert.equal(options.body.get("file"), file)
+    assert.equal(options.body.get("title"), "采访素材")
+    return new Response(JSON.stringify({
+      input_media: "/tmp/interview.flac",
+      media_kind: "audio",
+    }), { status: 200 })
+  }
+
+  try {
+    const result = await uploadMediaFile(file, { title: "采访素材" })
+    assert.equal(result.media_kind, "audio")
     assert.equal(calls.length, 1)
   } finally {
     globalThis.fetch = previousFetch

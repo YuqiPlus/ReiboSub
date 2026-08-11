@@ -32,11 +32,19 @@ export async function getJson(path) {
   return data
 }
 
+export async function uploadMediaFile(file, { title = '' } = {}) {
+  return uploadFile('/api/upload-media', file, { title })
+}
+
 export async function uploadVideoFile(file, { title = '' } = {}) {
+  return uploadFile('/api/upload-video', file, { title })
+}
+
+async function uploadFile(path, file, { title = '' } = {}) {
   const form = new FormData()
   form.append('file', file)
   if (title) form.append('title', title)
-  const response = await fetch('/api/upload-video', {
+  const response = await fetch(path, {
     method: 'POST',
     body: form,
   })

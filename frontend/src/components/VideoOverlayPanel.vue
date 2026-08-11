@@ -2,8 +2,8 @@
   <section class="video-overlay-panel">
     <div class="overlay-head">
       <div>
-        <h3>视频贴图处理</h3>
-        <p class="panel-subtitle">水印和遮 Logo 可以同时启用，输出新视频，不覆盖原文件。</p>
+        <h3>视频处理</h3>
+        <p class="panel-subtitle">镜像、裁剪和调整尺寸后再叠加贴图，输出新视频，不覆盖原文件。</p>
       </div>
       <button class="secondary mini" type="button" :disabled="loading || !inputVideo" @click="loadPreview()">
         {{ preview.image_data_url ? (loading ? '换帧中' : '换一帧') : (loading ? '抽帧中' : '抽一帧') }}
@@ -12,6 +12,67 @@
 
     <div class="overlay-layout">
       <div class="overlay-configs">
+        <div class="overlay-transform-card">
+          <div class="overlay-layer-head">
+            <div>
+              <b>画面变换</b>
+              <small>按照 镜像 → 裁剪 → 尺寸 → 贴图 的顺序处理</small>
+            </div>
+            <button class="ghost mini" type="button" @click="resetTransform">重置画面</button>
+          </div>
+
+          <label class="check-row">
+            <input type="checkbox" v-model="transformSettings.horizontal_flip" />
+            <span>水平镜像翻转</span>
+          </label>
+          <p class="muted compact-note">只翻转原视频，水印和遮挡图片保持正向。</p>
+
+          <label class="check-row">
+            <input type="checkbox" v-model="transformSettings.crop_enabled" />
+            <span>裁掉画面边缘</span>
+          </label>
+          <div v-if="transformSettings.crop_enabled" class="video-crop-input-grid">
+            <label v-for="side in cropSides" :key="side.key">
+              <span>裁掉{{ side.label }}（%）</span>
+              <input
+                type="number"
+                min="0"
+                max="95"
+                step="0.1"
+                v-model.number="transformSettings[side.key]"
+              />
+              <small>{{ cropPixelLabel(side.side) }}</small>
+            </label>
+          </div>
+
+          <label class="check-row">
+            <input type="checkbox" v-model="transformSettings.resize_enabled" />
+            <span>设置最终输出尺寸</span>
+          </label>
+          <div v-if="transformSettings.resize_enabled" class="video-output-size-row">
+            <label>
+              <span>宽度（px）</span>
+              <input type="number" min="2" max="8192" step="2" placeholder="自动" v-model="transformSettings.output_width" />
+            </label>
+            <span>×</span>
+            <label>
+              <span>高度（px）</span>
+              <input type="number" min="2" max="8192" step="2" placeholder="自动" v-model="transformSettings.output_height" />
+            </label>
+          </div>
+          <p v-if="transformSettings.resize_enabled" class="muted compact-note">只填一边会等比例计算；两边都填时需与裁剪后的宽高比一致。奇数会向下取偶数。</p>
+
+          <div v-if="transformInspection.error" class="status bad compact-status">{{ transformInspection.error }}</div>
+          <div v-else-if="preview.width && preview.height" class="video-transform-summary">
+            <span>保留 {{ transformInspection.cropped_width }} × {{ transformInspection.cropped_height }}</span>
+            <span>输出 {{ transformInspection.output_width }} × {{ transformInspection.output_height }}</span>
+          </div>
+        </div>
+
+        <div class="overlay-config-section-title">
+          <b>贴图（可选）</b>
+          <span>水印与遮 Logo 可单独或同时启用</span>
+        </div>
         <div v-for="layer in layerList" :key="layer.kind" class="overlay-layer-card" :class="{ active: activeLayerKind === layer.kind }">
           <div class="overlay-layer-head">
             <label class="check-row">
@@ -52,27 +113,39 @@
         </div>
 
         <div class="toolbar overlay-actions">
-          <button class="warning" type="button" :disabled="!canRun" @click="runOverlay">生成新视频</button>
-          <button class="secondary" type="button" @click="resetLayers">重置位置</button>
+          <button class="warning" type="button" :disabled="!canRun" @click="runProcessing">生成处理后视频</button>
+          <button class="secondary" type="button" @click="resetLayers">重置贴图位置</button>
         </div>
       </div>
 
       <div class="overlay-preview-box">
         <div v-if="!inputVideo" class="overlay-empty">先从素材列表选择一个视频。</div>
-        <div v-else-if="!preview.image_data_url" class="overlay-empty">抽一帧后可以拖动贴图看位置。</div>
-        <div v-else ref="previewRef" class="video-overlay-preview" @pointermove="onDragMove" @pointerup="endDrag" @pointercancel="endDrag" @pointerleave="endDrag">
-          <img :src="preview.image_data_url" alt="video preview" draggable="false" />
+        <div v-else-if="!preview.image_data_url" class="overlay-empty">抽一帧后可以预览镜像、裁剪和贴图位置。</div>
+        <div v-else class="video-overlay-preview" @pointermove="onDragMove" @pointerup="endDrag" @pointercancel="endDrag" @pointerleave="endDrag">
+          <img
+            :src="preview.image_data_url"
+            :class="{ mirrored: transformSettings.horizontal_flip }"
+            alt="video preview"
+            draggable="false"
+          />
           <div
-            v-for="layer in visibleLayers"
-            :key="layer.kind"
-            class="overlay-preview-layer"
-            :class="{ active: activeLayerKind === layer.kind }"
-            :style="layerPreviewStyle(layer)"
-            @pointerdown.stop.prevent="startDrag(layer, $event)"
-            @click.stop="activeLayerKind = layer.kind"
+            ref="cropFrameRef"
+            class="video-transform-crop-frame"
+            :class="{ cropped: cropActive }"
+            :style="cropFrameStyle"
           >
-            <img :src="layer.image_data_url" :alt="layer.label" draggable="false" />
-            <span>{{ layer.label }}</span>
+            <div
+              v-for="layer in visibleLayers"
+              :key="layer.kind"
+              class="overlay-preview-layer"
+              :class="{ active: activeLayerKind === layer.kind }"
+              :style="layerPreviewStyle(layer)"
+              @pointerdown.stop.prevent="startDrag(layer, $event)"
+              @click.stop="activeLayerKind = layer.kind"
+            >
+              <img :src="layer.image_data_url" :alt="layer.label" draggable="false" />
+              <span>{{ layer.label }}</span>
+            </div>
           </div>
         </div>
         <div class="crop-preview-meta">
@@ -83,13 +156,20 @@
     </div>
 
     <div v-if="error" class="status bad">{{ error }}</div>
-    <div v-else class="muted overlay-note">扣背景使用图片边缘颜色做简易透明处理，适合白底/纯色底水印图。</div>
+    <div v-else class="muted overlay-note">裁剪方向以当前预览为准；开启镜像后，左/右也按镜像后的画面计算。扣背景适合白底或纯色底贴图。</div>
   </section>
 </template>
 
 <script setup>
 import { computed, reactive, ref, watch } from 'vue'
 import { api } from '../api'
+import {
+  buildVideoTransformPayload,
+  createDefaultVideoTransform,
+  hasVideoTransform,
+  inspectVideoTransform,
+  videoCropFrameStyle,
+} from '../videoTransformTools.js'
 
 const props = defineProps({
   inputVideo: { type: String, default: '' },
@@ -97,12 +177,20 @@ const props = defineProps({
 const emit = defineEmits(['run'])
 
 const preview = reactive({ image_data_url: '', time_seconds: 0, duration_seconds: 0, width: 0, height: 0 })
-const previewRef = ref(null)
+const cropFrameRef = ref(null)
 const previewTimeInput = ref('')
 const loading = ref(false)
 const error = ref('')
 const activeLayerKind = ref('watermark')
 const dragState = ref(null)
+let previewRequestSequence = 0
+const transformSettings = reactive(createDefaultVideoTransform())
+const cropSides = [
+  { key: 'crop_top_percent', side: 'top', label: '上边' },
+  { key: 'crop_right_percent', side: 'right', label: '右边' },
+  { key: 'crop_bottom_percent', side: 'bottom', label: '下边' },
+  { key: 'crop_left_percent', side: 'left', label: '左边' },
+]
 
 const layers = reactive({
   watermark: makeLayer('watermark', '水印', 0.70, 0.08, 0.18, 0.90),
@@ -111,9 +199,26 @@ const layers = reactive({
 
 const layerList = computed(() => [layers.watermark, layers.logo_cover])
 const visibleLayers = computed(() => layerList.value.filter((layer) => layer.enabled && layer.image_data_url))
-const canRun = computed(() => Boolean(props.inputVideo) && visibleLayers.value.length > 0)
+const transformInspection = computed(() => inspectVideoTransform(transformSettings, preview.width, preview.height))
+const cropFrameStyle = computed(() => videoCropFrameStyle(transformSettings))
+const cropActive = computed(() => Boolean(
+  transformSettings.crop_enabled
+  && (
+    Number(transformSettings.crop_top_percent)
+    || Number(transformSettings.crop_right_percent)
+    || Number(transformSettings.crop_bottom_percent)
+    || Number(transformSettings.crop_left_percent)
+  )
+))
+const canRun = computed(() => Boolean(
+  String(props.inputVideo || '').trim()
+  && !loading.value
+  && !transformInspection.value.error
+  && (visibleLayers.value.length > 0 || hasVideoTransform(transformSettings))
+))
 
 watch(() => props.inputVideo, () => {
+  previewRequestSequence += 1
   preview.image_data_url = ''
   preview.time_seconds = 0
   preview.duration_seconds = 0
@@ -121,6 +226,9 @@ watch(() => props.inputVideo, () => {
   preview.height = 0
   previewTimeInput.value = ''
   error.value = ''
+  loading.value = false
+  dragState.value = null
+  resetTransform()
 })
 
 function makeLayer(kind, label, x, y, width, opacity) {
@@ -151,6 +259,15 @@ function resetLayers() {
     image_data_url: layers.logo_cover.image_data_url,
     remove_background: layers.logo_cover.remove_background,
   })
+}
+
+function resetTransform() {
+  Object.assign(transformSettings, createDefaultVideoTransform())
+}
+
+function cropPixelLabel(side) {
+  if (!preview.width || !preview.height) return '抽帧后显示像素'
+  return `${transformInspection.value.crop_pixels[side]} px`
 }
 
 function percent(value) {
@@ -193,16 +310,19 @@ function nextPreviewTime() {
 }
 
 async function loadPreview(timeSeconds = nextPreviewTime()) {
-  if (!props.inputVideo) {
+  const requestVideo = String(props.inputVideo || '').trim()
+  if (!requestVideo) {
     error.value = '先选择一个本地视频。'
     return
   }
+  const requestId = ++previewRequestSequence
   loading.value = true
   error.value = ''
   try {
-    const payload = { input_video: props.inputVideo }
+    const payload = { input_video: requestVideo }
     if (timeSeconds !== undefined && timeSeconds !== '') payload.time_seconds = Number(timeSeconds)
     const result = await api('/api/ocr-preview-frame', payload)
+    if (requestId !== previewRequestSequence || requestVideo !== String(props.inputVideo || '').trim()) return
     preview.image_data_url = result.image_data_url || ''
     preview.time_seconds = result.time_seconds || 0
     preview.duration_seconds = result.duration_seconds || preview.duration_seconds || 0
@@ -210,9 +330,10 @@ async function loadPreview(timeSeconds = nextPreviewTime()) {
     preview.height = result.height || 0
     previewTimeInput.value = String(Number(preview.time_seconds || 0).toFixed(1))
   } catch (err) {
+    if (requestId !== previewRequestSequence || requestVideo !== String(props.inputVideo || '').trim()) return
     error.value = err.message || String(err)
   } finally {
-    loading.value = false
+    if (requestId === previewRequestSequence) loading.value = false
   }
 }
 
@@ -232,7 +353,7 @@ function layerPreviewStyle(layer) {
 
 function startDrag(layer, event) {
   activeLayerKind.value = layer.kind
-  const rect = previewRef.value?.getBoundingClientRect()
+  const rect = cropFrameRef.value?.getBoundingClientRect()
   if (!rect) return
   dragState.value = {
     kind: layer.kind,
@@ -261,8 +382,9 @@ function endDrag() {
   dragState.value = null
 }
 
-function runOverlay() {
-  if (!props.inputVideo) {
+function runProcessing() {
+  const inputVideo = String(props.inputVideo || '').trim()
+  if (!inputVideo) {
     error.value = '先选择一个本地视频。'
     return
   }
@@ -276,11 +398,20 @@ function runOverlay() {
     width: layer.width,
     opacity: layer.opacity,
   }))
-  if (!payloadLayers.length) {
-    error.value = '至少启用一层贴图并选择图片。'
+  if (transformInspection.value.error) {
+    error.value = transformInspection.value.error
     return
   }
-  emit('run', { input_video: props.inputVideo, layers: payloadLayers })
+  if (!payloadLayers.length && !hasVideoTransform(transformSettings)) {
+    error.value = '至少启用一种画面变换，或添加一层贴图。'
+    return
+  }
+  error.value = ''
+  emit('run', {
+    input_video: inputVideo,
+    layers: payloadLayers,
+    transform: buildVideoTransformPayload(transformSettings),
+  })
 }
 
 function formatTime(value) {

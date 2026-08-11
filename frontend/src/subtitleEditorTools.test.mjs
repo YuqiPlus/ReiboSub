@@ -8,6 +8,7 @@ import {
   getSubtitlePreviewState,
   insertSubtitleCueAtTime,
   insertSubtitleCueRelative,
+  isSubtitleEditorSavePathReady,
   isSubtitlePreviewActive,
   normalizeSubtitleCue,
   parseSrtTime,
@@ -18,6 +19,13 @@ import {
 function cue(uid, start, end, text = uid) {
   return { uid, index: 99, start, end, text }
 }
+
+test('allows saving only to the path that was actually loaded', () => {
+  assert.equal(isSubtitleEditorSavePathReady('/project/a.srt', '/project/a.srt'), true)
+  assert.equal(isSubtitleEditorSavePathReady('/project/b.srt', '/project/a.srt'), false)
+  assert.equal(isSubtitleEditorSavePathReady('', '/project/a.srt'), false)
+  assert.equal(isSubtitleEditorSavePathReady('/project/a.srt', ''), false)
+})
 
 test('parses numeric seconds and SRT timestamps and formats millisecond rounding', () => {
   assert.equal(parseSrtTime(62.345), 62.345)
