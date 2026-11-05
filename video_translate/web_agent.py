@@ -39,6 +39,7 @@ except ImportError:  # pragma: no cover - Windows fallback keeps the UI usable.
 
 from video_translate.agent_planner import build_agent_plan
 from video_translate.agent.models import AgentSession
+from video_translate.asr_review_web import ExperimentReviewService, ReviewConflict
 from video_translate.asr_v2 import (
     AsrWord,
     assign_speakers_to_words,
@@ -188,6 +189,8 @@ _TASK_FILE_LOCK = threading.RLock()
 _AGENT_TRANSLATION_START_LOCK = threading.RLock()
 _YOUTUBE_PROJECT_BIND_LOCK = threading.RLock()
 _ASR_REVIEW_LOCK = threading.RLock()
+_EXPERIMENT_REVIEW_SERVICE: ExperimentReviewService | None = None
+_EXPERIMENT_REVIEW_SERVICE_LOCK = threading.Lock()
 _OCR_PREVIEW_LOCK = threading.Lock()
 _VIDEO_OUTPUT_LOCK = threading.Lock()
 _RESERVED_VIDEO_OUTPUTS: set[str] = set()
@@ -786,6 +789,17 @@ def _caption_label(lang: str, kind: str) -> str:
 
 def start_job(name: str, target: Callable[[str], dict[str, Any] | None]) -> Job:
     return _job_service().start(name, target)
+
+
+def _experiment_review_service() -> ExperimentReviewService:
+    global _EXPERIMENT_REVIEW_SERVICE
+    with _EXPERIMENT_REVIEW_SERVICE_LOCK:
+        if _EXPERIMENT_REVIEW_SERVICE is None:
+            _EXPERIMENT_REVIEW_SERVICE = ExperimentReviewService(
+                ROOT, python=PYTHON, start_job=start_job,
+                run_command=_run_command, get_job=get_job,
+            )
+        return _EXPERIMENT_REVIEW_SERVICE
 
 
 def cancel_job(job_id: str) -> Job | None:
@@ -9640,6 +9654,13 @@ class AgentHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/asr-experiments/review":
+            try:
+                raw_path = (parse_qs(parsed.query).get("path") or [""])[0]
+                self._send_json(_experiment_review_service().status(raw_path))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
         if parsed.path == "/api/settings":
             try:
                 result = get_app_settings_payload(root=ROOT)
@@ -9746,6 +9767,20 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send_json(self._read_project_cover_upload())
                 return
             parsed = urlparse(self.path)
+            if parsed.path == "/api/asr-experiments/review":
+                origin = str(self.headers.get("Origin") or "")
+                host = str(self.headers.get("Host") or "").lower()
+                if (str(self.headers.get("Sec-Fetch-Site") or "") == "cross-site"
+                    or (origin and (urlparse(origin).scheme not in {"http", "https"}
+                                    or urlparse(origin).netloc.lower() != host))):
+                    self._send_json({"error": "请从当前服务网页提交审核"}, status=HTTPStatus.FORBIDDEN)
+                    return
+                payload = self._read_json(max_bytes=65536, require_json_content_type=True)
+                try:
+                    self._send_json(_experiment_review_service().submit(payload))
+                except ReviewConflict as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+                return
             if parsed.path == "/api/settings/providers":
                 payload = self._read_json(
                     max_bytes=_SECRET_SETTINGS_MAX_BODY_BYTES,
