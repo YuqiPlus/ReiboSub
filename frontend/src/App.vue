@@ -197,6 +197,7 @@
             <AsrLabPanel
               v-model:input-video="localVideo"
               v-model:asr-version="asrLabVersion"
+              v-model:test-ranges="asrLabTestRanges"
               v-model:source-language="asrLabSourceLanguage"
               v-model:model-size="asrLabModelSize"
               v-model:speaker-diarization="asrLabSpeakerDiarization"
@@ -487,6 +488,7 @@ const ocrDevRunning = ref(false)
 const asrLabSourceLanguage = ref('auto')
 const asrLabModelSize = ref('large-v3')
 const asrLabVersion = ref('2.0')
+const asrLabTestRanges = ref([{ start: '00:00', end: '01:30' }])
 const asrLabSpeakerDiarization = ref(false)
 const asrLabKnownSpeakerCount = ref('auto')
 const asrLabHotwords = ref('')
@@ -607,7 +609,7 @@ const pages = {
   },
   'asr-dev': {
     title: 'ASR Lab',
-    description: '从本地视频或音频中提取语音文本，不进入翻译流程。',
+    description: '测试语音识别；原有 ASR 2.2 提取文本，实验 Agent 可复核、翻译并校准时间轴。',
   },
   settings: {
     title: '设置中心',
@@ -1939,7 +1941,7 @@ async function runAsrLab() {
   asrLabResult.value = null
   setStatus(
     asrLabStatus,
-    asrLabSpeakerDiarization.value
+    asrLabVersion.value === 'agent-experimental' ? '正在启动多模型 Agent 实验…' : asrLabSpeakerDiarization.value
       ? `正在启动 ASR ${asrLabVersion.value === '2.0' ? '2.2' : asrLabVersion.value} 与说话人分离…`
       : `正在启动 ASR ${asrLabVersion.value === '2.0' ? '2.2' : asrLabVersion.value}…`,
     '',
@@ -1948,7 +1950,8 @@ async function runAsrLab() {
     const job = await api('/api/jobs/asr-lab', {
       input_video: localVideo.value.trim(),
       asr_version: asrLabVersion.value,
-      source_language: asrLabSourceLanguage.value,
+      test_ranges: asrLabVersion.value === 'agent-experimental' ? asrLabTestRanges.value : undefined,
+      source_language: asrLabVersion.value === 'agent-experimental' ? 'korean' : asrLabSourceLanguage.value,
       model_size: asrLabModelSize.value,
       speaker_diarization: asrLabSpeakerDiarization.value,
       known_speaker_count: asrLabKnownSpeakerCount.value,
@@ -1962,10 +1965,13 @@ async function runAsrLab() {
       compute_type: 'float16',
     })
     asrLabJobId.value = job.id
+    if (asrLabVersion.value === 'agent-experimental') {
+      try { localStorage.setItem('reibosub-asr-experiment-job', JSON.stringify({ id: job.id, input_video: localVideo.value, test_ranges: asrLabTestRanges.value })) } catch {}
+    }
     watchJob(job)
     setStatus(
       asrLabStatus,
-      asrLabSpeakerDiarization.value
+      asrLabVersion.value === 'agent-experimental' ? '实验任务已启动，正在截取所选音频…' : asrLabSpeakerDiarization.value
         ? `ASR ${asrLabVersion.value === '2.0' ? '2.2' : asrLabVersion.value} 与说话人分离任务运行中；完成后会显示 Speaker 标签。`
         : `ASR ${asrLabVersion.value === '2.0' ? '2.2' : asrLabVersion.value} 任务运行中；识别完成后文本会显示在本页。`,
       '',
@@ -2390,6 +2396,18 @@ async function loadJobs() {
   try {
     const result = await getJson('/api/jobs')
     const loadedJobs = result.jobs || []
+    try {
+      const saved = JSON.parse(localStorage.getItem('reibosub-asr-experiment-job') || 'null')
+      const experiment = saved && loadedJobs.find(job => job.id === saved.id)
+      if (experiment) {
+        asrLabVersion.value = 'agent-experimental'
+        localVideo.value = saved.input_video || localVideo.value
+        if (Array.isArray(saved.test_ranges)) asrLabTestRanges.value = saved.test_ranges
+        asrLabJobId.value = experiment.id
+        asrLabRunning.value = ['running', 'queued', 'cancel_requested'].includes(experiment.status)
+        if (!asrLabRunning.value) applyJobResult(experiment)
+      }
+    } catch {}
     for (const job of loadedJobs) {
       jobs[job.id] = job
       if (['running', 'cancel_requested'].includes(job.status)) {
@@ -2410,6 +2428,10 @@ async function cancelJob(jobId) {
     const job = await api(`/api/jobs/${jobId}/cancel`, {})
     jobs[job.id] = job
     if (['running', 'cancel_requested'].includes(job.status)) {
+      if (job.id === asrLabJobId.value && asrLabVersion.value === 'agent-experimental') {
+        const stage = [...(job.logs || [])].reverse().find(line => line.includes('experiment_stage: '))
+        if (stage) setStatus(asrLabStatus, stage.slice(stage.indexOf('experiment_stage: ') + 18), '')
+      }
       schedulePoll(job.id, 1000)
     }
   } catch (error) {
@@ -2436,6 +2458,10 @@ async function pollJob(jobId) {
     const job = await getJson(`/api/jobs/${jobId}`)
     jobs[job.id] = job
     if (['running', 'cancel_requested'].includes(job.status)) {
+      if (job.id === asrLabJobId.value && asrLabVersion.value === 'agent-experimental') {
+        const stage = [...(job.logs || [])].reverse().find(line => line.includes('experiment_stage: '))
+        if (stage) setStatus(asrLabStatus, stage.split('experiment_stage: ').pop(), '')
+      }
       schedulePoll(job.id, 1000)
       return
     }
@@ -2466,6 +2492,15 @@ async function pollJob(jobId) {
 
 function applyJobResult(job) {
   const result = job.result || {}
+  if (result.kind === 'asr_experiment_lab') {
+    asrLabRunning.value = false
+    asrLabJobId.value = ''
+    asrLabResult.value = result
+    setStatus(asrLabStatus, result.pending_questions
+      ? `字幕草稿已生成：${result.cue_count} 条，还有 ${result.pending_questions} 处人名需要你确认。`
+      : `实验字幕已生成：${result.cue_count} 条，可试听或下载；请留意标记的时间边界。`, 'ok')
+    return
+  }
   if (result.kind === 'asr_lab' || job.id === asrLabJobId.value) {
     asrLabRunning.value = false
     asrLabJobId.value = ''

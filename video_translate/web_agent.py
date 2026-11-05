@@ -6817,6 +6817,9 @@ def audio_local_video_job(payload: dict[str, Any]) -> Job:
 
 
 def asr_lab_job(payload: dict[str, Any]) -> Job:
+    if payload.get('asr_version') == 'agent-experimental':
+        from video_translate.asr_experiment_lab import launch
+        return launch(payload,sys.modules[__name__])
     input_media = _resolve_project_path(_required_str(payload, "input_video"))
     _ensure_under_root(input_media)
     if not input_media.is_file():

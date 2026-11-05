@@ -4,7 +4,7 @@
       <div>
         <h2>ASR 开发测试</h2>
         <p class="panel-subtitle">
-          {{ asrVersion === '2.0'
+          {{ asrVersion === 'agent-experimental' ? '两套本地识别 → Agent按需复核 → 中文翻译 → 时间轴校准。单独保存实验结果，不覆盖原来的2.2或素材字幕。' : asrVersion === '2.0'
             ? 'ASR 2.2 会先做双遍高召回识别，再对可疑缺口做局部增益重听；仍不确定的片段可直接试听复核。'
             : 'ASR 1.0 是原有兼容流程，直接使用模型原始分段，仅建议用于历史对照和回退。' }}
         </p>
@@ -23,12 +23,13 @@
     <div class="ocr-dev-settings asr-lab-settings">
       <label>
         <span>ASR 版本</span>
-        <select :value="asrVersion" @change="$emit('update:asrVersion', $event.target.value)">
+        <select :value="asrVersion" :disabled="running" @change="$emit('update:asrVersion', $event.target.value)">
           <option value="1.0">ASR 1.0（原始兼容模式）</option>
           <option value="2.0">ASR 2.2（定向补漏，推荐）</option>
+          <option value="agent-experimental">多模型 Agent（实验版 · 韩语）</option>
         </select>
       </label>
-      <label>
+      <label v-if="asrVersion !== 'agent-experimental'">
         <span>音频语言</span>
         <select :value="sourceLanguage" @change="$emit('update:sourceLanguage', $event.target.value)">
           <option value="auto">自动识别</option>
@@ -38,7 +39,7 @@
           <option value="english">英语</option>
         </select>
       </label>
-      <label>
+      <label v-if="asrVersion !== 'agent-experimental'">
         <span>ASR 模型</span>
         <select :value="modelSize" @change="$emit('update:modelSize', $event.target.value)">
           <option value="large-v3">large-v3（质量优先）</option>
@@ -68,7 +69,7 @@
           {{ highRecall ? '已开启' : '已关闭' }}
         </button>
       </div>
-      <div class="ocr-dev-timing">
+      <div v-if="asrVersion !== 'agent-experimental'" class="ocr-dev-timing">
         <div>
           <b>区分说话人（可选）</b>
           <span>只有多人音频需要开启；单人音频保持关闭即可，不影响使用 ASR 2.2。</span>
@@ -110,22 +111,46 @@
       </div>
     </div>
 
+    <div v-if="asrVersion === 'agent-experimental'" class="experiment-ranges">
+      <h3>测试区间</h3>
+      <p class="panel-subtitle">当前仅支持韩语。每段5秒到3分钟，最多3段；填写原视频的秒数或分:秒，例如 01:30。只处理选定区间。</p>
+      <div v-for="(range, index) in testRanges" :key="index" class="experiment-range-row">
+        <label><span>开始</span><input :value="range.start" :aria-label="`片段${index + 1}开始`" @input="updateRange(index, 'start', $event.target.value)" /></label>
+        <label><span>结束</span><input :value="range.end" :aria-label="`片段${index + 1}结束`" @input="updateRange(index, 'end', $event.target.value)" /></label>
+        <button class="secondary mini" type="button" :disabled="running || testRanges.length === 1" @click="$emit('update:testRanges', testRanges.filter((_, i) => i !== index))">移除</button>
+      </div>
+      <button class="secondary mini" type="button" :disabled="running || testRanges.length >= 3" @click="$emit('update:testRanges', [...testRanges, { start: '', end: '' }])">添加测试区间</button>
+      <p class="panel-subtitle">音频只在本机识别；复核和翻译会调用设置中的模型服务，消耗相应额度。测试结果仍可能有识别和时间轴误差。</p>
+    </div>
+
     <div class="ocr-dev-actions">
       <button :disabled="running || !inputVideo.trim()" type="button" @click="$emit('run')">
-        {{ running
+        {{ asrVersion === 'agent-experimental' ? (running ? '实验 Agent 处理中…' : '运行实验 Agent') : running
           ? (speakerDiarization
             ? `正在运行 ASR ${asrVersion === '2.0' ? '2.2' : asrVersion} 并区分说话人…`
             : `正在运行 ASR ${asrVersion === '2.0' ? '2.2' : asrVersion}…`)
           : `运行 ASR ${asrVersion === '2.0' ? '2.2' : asrVersion}` }}
       </button>
-      <p v-if="asrVersion === '2.0' && speakerDiarization">2.0 会把单词对齐到说话人，并优先在 Speaker 切换点拆句；重叠说话仍可能需要人工复核。</p>
+      <p v-if="asrVersion === 'agent-experimental'">完成后可直接试听中文字幕；需要确认人名时，可在实验结果页补线索，让 Agent 继续。</p>
+      <p v-else-if="asrVersion === '2.0' && speakerDiarization">2.0 会把单词对齐到说话人，并优先在 Speaker 切换点拆句；重叠说话仍可能需要人工复核。</p>
       <p v-else-if="speakerDiarization">1.0 保持原有整条字幕匹配方式，不改变历史行为。</p>
       <p v-else>当前实验室不翻译、不调用 LLM，也不会覆盖视频旁已有字幕。</p>
     </div>
 
     <div v-if="status" class="status" :class="statusClass">{{ status }}</div>
 
-    <div v-if="result" class="asr-lab-output">
+    <div v-if="result?.kind === 'asr_experiment_lab'" class="asr-lab-output">
+      <h3>{{ result.pending_questions ? '字幕草稿已生成 · 有人名需要确认' : '实验字幕已生成' }}</h3>
+      <p>{{ result.cue_count }} 条字幕 · {{ result.pending_questions }} 处人名待确认 · {{ result.timing_needs_review }} 条时间边界需检查</p>
+      <p class="panel-subtitle">{{ result.notice }}</p>
+      <p v-if="result.pending_questions && result.human_review_available !== false" class="panel-subtitle">这里下载的是本次初稿；确认人名后，请从审核页下载更新后的字幕。</p>
+      <div class="toolbar">
+        <a class="button-link" :href="result.report_url" target="_blank" rel="noopener">{{ result.pending_questions && result.human_review_available !== false ? '确认人名，让 Agent 继续' : '打开字幕试听' }}</a>
+        <a class="button-link secondary" :href="fileUrl(result.translated_srt)" download>下载中文字幕</a>
+        <a class="button-link secondary" :href="fileUrl(result.source_srt)" download>下载韩语字幕</a>
+      </div>
+    </div>
+    <div v-else-if="result" class="asr-lab-output">
       <div class="section-title">
         <div>
           <h3>识别文本</h3>
@@ -281,6 +306,7 @@ import { copyText } from '../clipboard.js'
 const props = defineProps({
   inputVideo: { type: String, default: '' },
   asrVersion: { type: String, default: '1.0' },
+  testRanges: { type: Array, default: () => [{ start: '00:00', end: '01:30' }] },
   sourceLanguage: { type: String, default: 'auto' },
   modelSize: { type: String, default: 'large-v3' },
   speakerDiarization: { type: Boolean, default: false },
@@ -298,6 +324,7 @@ const props = defineProps({
 const emit = defineEmits([
   'update:inputVideo',
   'update:asrVersion',
+  'update:testRanges',
   'update:sourceLanguage',
   'update:modelSize',
   'update:speakerDiarization',
@@ -312,6 +339,9 @@ const emit = defineEmits([
 ])
 
 const reviewAudio = ref(null)
+function updateRange(index, key, value) {
+  emit('update:testRanges', props.testRanges.map((r, i) => i === index ? { ...r, [key]: value } : r))
+}
 const activeReviewId = ref('')
 const reviewTexts = reactive({})
 let reviewStopAt = 0
@@ -437,3 +467,11 @@ onBeforeUnmount(() => {
   reviewAudio.value?.pause()
 })
 </script>
+
+<style scoped>
+.experiment-ranges { margin: 18px 0; padding: 16px; border: 1px solid var(--border, #dce2ec); border-radius: 12px; }
+.experiment-range-row { display: flex; align-items: end; gap: 12px; margin: 12px 0; }
+.experiment-range-row label { flex: 1; min-width: 0; display: grid; gap: 5px; }
+.experiment-range-row input { width: 100%; min-width: 0; }
+@media (max-width: 600px) { .experiment-range-row { gap: 7px; flex-wrap: wrap; } }
+</style>
