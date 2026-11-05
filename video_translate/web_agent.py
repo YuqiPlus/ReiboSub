@@ -32,6 +32,11 @@ import requests
 import yaml
 import yt_dlp
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback keeps the UI usable.
+    fcntl = None
+
 from video_translate.agent_planner import build_agent_plan
 from video_translate.agent.models import AgentSession
 from video_translate.asr_v2 import (
@@ -140,6 +145,8 @@ DEFAULT_PROXY = os.environ.get("YTDLP_PROXY", "").strip()
 DEFAULT_HOST = os.environ.get("VIDEO_TRANSLATE_HOST", "127.0.0.1").strip() or "127.0.0.1"
 DEFAULT_PORT = int(os.environ.get("VIDEO_TRANSLATE_PORT", "7860"))
 DEFAULT_AGENT_OCR_PIPELINE_VERSION = "v3"
+AGENT_TASK_SCHEMA_VERSION = 2
+AGENT_TASK_RUNS_DIRNAME = "runs"
 PYTHON = sys.executable
 _HYBRID_TRANSLATION_PROMPT = """本次源字幕是 hybrid 格式：时间轴来自作者上传的英文人工字幕，文本中可能同时包含“韩文OCR”和“英文参考”。
 翻译时必须优先依据“韩文OCR”的韩文原文，英文参考只用于理解上下文和兜底。
@@ -197,10 +204,38 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
     JOB_DIR.mkdir(parents=True, exist_ok=True)
     TASK_DIR.mkdir(parents=True, exist_ok=True)
     server = ThreadingHTTPServer((host, port), AgentHandler)
-    print(f"ReiboSub UI listening on {host}:{port}", flush=True)
-    for url in _browse_urls(host, port):
-        print(f"  {url}", flush=True)
-    server.serve_forever()
+    instance_lock = None
+    try:
+        instance_lock = _acquire_server_instance_lock()
+        # Bind the port before touching persisted state. A mistakenly started
+        # second instance must fail here without marking the live instance's
+        # tasks as interrupted.
+        _reconcile_interrupted_agent_tasks()
+        print(f"ReiboSub UI listening on {host}:{port}", flush=True)
+        for url in _browse_urls(host, port):
+            print(f"  {url}", flush=True)
+        server.serve_forever()
+    finally:
+        if instance_lock is not None:
+            instance_lock.close()
+        server.server_close()
+
+
+def _acquire_server_instance_lock() -> Any:
+    if fcntl is None:
+        return None
+    path = TASK_DIR / ".server.lock"
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RuntimeError(f"已有 ReiboSub 服务正在使用任务目录: {TASK_DIR}")
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"pid: {os.getpid()}\n")
+    handle.flush()
+    return handle
 
 
 def _browse_urls(host: str, port: int) -> list[str]:
@@ -788,7 +823,7 @@ def list_jobs() -> list[dict[str, Any]]:
     return _job_service().list()
 
 
-def start_agent_session(payload: dict[str, Any]) -> AgentSession:
+def start_agent_session(payload: dict[str, Any], *, prepared_task: dict[str, Any] | None = None) -> AgentSession:
     normalized_payload = dict(payload)
     normalized_payload["source_language"] = normalize_source_language(normalized_payload.get("source_language") or "auto")
     normalized_payload["ocr_language"] = normalize_source_language(normalized_payload.get("ocr_language") or "auto")
@@ -817,6 +852,15 @@ def start_agent_session(payload: dict[str, Any]) -> AgentSession:
         normalized_payload["ocr_extraction_mode"],
     )
     session = AgentSession(id=uuid.uuid4().hex[:12], payload=normalized_payload)
+    if prepared_task:
+        session.result.update(
+            {
+                "task_id": str(prepared_task.get("id") or ""),
+                "task_dir": str(prepared_task.get("task_dir") or ""),
+                "run_generation": int(prepared_task.get("run_generation") or 0),
+                "normalized_url": str(prepared_task.get("url") or normalized_payload.get("url") or ""),
+            }
+        )
     with _LOCK:
         _AGENT_SESSIONS[session.id] = session
     _run_agent_async(session.id, _agent_start)
@@ -864,6 +908,59 @@ def continue_agent_task(task_id: str) -> AgentSession:
         _run_agent_async(session.id, lambda item: _agent_generate_glossary_review(item, str(item.result.get("source_srt") or "")))
     else:
         _run_agent_async(session.id, _agent_start)
+    return session
+
+
+def restart_agent_task(task_id: str) -> AgentSession:
+    task = _read_task(task_id)
+    safe_task_id = str(task.get("id") or Path(str(task_id)).name)
+    payload = dict(task.get("payload") if isinstance(task.get("payload"), dict) else {})
+    url = str(task.get("url") or payload.get("url") or "").strip()
+    if not url:
+        raise RuntimeError("历史任务没有可重新运行的原始链接")
+    payload["url"] = url
+    prepared_task = _ensure_agent_task(
+        normalized_url=url,
+        title=str(task.get("title") or ""),
+        payload=payload,
+        task_id=safe_task_id,
+    )
+
+    superseded_jobs: list[str] = []
+    with _LOCK:
+        for session in _AGENT_SESSIONS.values():
+            if str(session.result.get("task_id") or "") != safe_task_id:
+                continue
+            if session.status not in {"running", "waiting"}:
+                continue
+            session.status = "cancelled"
+            session.phase = "cancelled"
+            session.logs.append("agent_task_full_restart_requested")
+            session.updated_at = time.time()
+            if session.result.get("current_job_id"):
+                superseded_jobs.append(str(session.result["current_job_id"]))
+    for job_id in superseded_jobs:
+        cancel_job(job_id)
+
+    try:
+        session = start_agent_session(payload, prepared_task=prepared_task)
+    except Exception as exc:
+        _update_task_stage(
+            safe_task_id,
+            "probe",
+            "failed",
+            current_stage="probe_failed",
+            error=str(exc),
+            expected_generation=int(prepared_task.get("run_generation") or 0),
+        )
+        raise
+    with _LOCK:
+        current = _AGENT_SESSIONS.get(session.id)
+        if current:
+            current.result["restart_task_id"] = safe_task_id
+            current.logs.append(f"agent_task_full_restart: {safe_task_id}")
+            current.updated_at = time.time()
+            session = current
     return session
 
 
@@ -1119,18 +1216,21 @@ def rerun_agent_task_stage(task_id: str, stage: str) -> AgentSession:
             raise RuntimeError("任务已被新一轮处理替代，无法重跑 Glossary")
         _run_agent_async(session.id, lambda item: _agent_generate_glossary_review(item, source_srt))
     elif stage == "translate":
-        if not session.result.get("glossary_path"):
+        use_glossary = _task_stage_value(task, "translate", "use_glossary")
+        if not isinstance(use_glossary, bool):
+            use_glossary = bool(session.result.get("glossary_path"))
+        if use_glossary and not session.result.get("glossary_path"):
             raise RuntimeError("没有 glossary，不能重新翻译")
         if not _invalidate_task_after(task_id, "translate", expected_generation=run_generation):
             raise RuntimeError("任务已被新一轮处理替代，无法重跑翻译")
         with _LOCK:
             _AGENT_SESSIONS.pop(session.id, None)
-        return _start_agent_translation(_read_task(task_id), use_glossary=True)
+        return _start_agent_translation(_read_task(task_id), use_glossary=use_glossary)
     return session
 
 
 def delete_agent_task(task_id: str) -> dict[str, Any]:
-    safe_task_id = Path(task_id).name
+    safe_task_id = _validate_task_id(task_id)
     task_dir = _task_yaml_path(safe_task_id).parent
     _ensure_task_dir(task_dir)
     if not task_dir.exists():
@@ -1377,11 +1477,32 @@ def _agent_start(session: AgentSession) -> None:
         probe_result["input_video"] = input_video
     _agent_update_result(session.id, probe_result)
     title = str(probe.get("title") or "")
-    task = _ensure_agent_task(
-        normalized_url=str(probe.get("normalized_url") or ""),
-        title=title,
-        payload=payload,
-    )
+    prepared_task_id = str(session.result.get("task_id") or "").strip()
+    prepared_generation = _session_run_generation(session)
+    if prepared_task_id and prepared_generation > 0:
+        task = _read_task(prepared_task_id)
+        if int(task.get("run_generation") or 0) != prepared_generation:
+            raise RuntimeError("任务已被更新的一轮处理替代")
+        persisted_payload = dict(task.get("payload") if isinstance(task.get("payload"), dict) else {})
+        persisted_payload.update(payload)
+        if not _update_task_fields(
+            prepared_task_id,
+            {
+                "url": str(probe.get("normalized_url") or task.get("url") or ""),
+                "source_type": "youtube",
+                "title": title or task.get("title") or "",
+                "payload": persisted_payload,
+            },
+            expected_generation=prepared_generation,
+        ):
+            raise RuntimeError("任务已被更新的一轮处理替代")
+        task = _read_task(prepared_task_id)
+    else:
+        task = _ensure_agent_task(
+            normalized_url=str(probe.get("normalized_url") or ""),
+            title=title,
+            payload=payload,
+        )
     _bind_session_to_task_run(session.id, task)
     if not _update_task_stage(
         task["id"],
@@ -1821,6 +1942,11 @@ def _agent_use_recommended_subtitle(session: AgentSession) -> None:
     source_srt = str(subtitle_result.get("subtitle_path") or "")
     project_context = _agent_project_context(subtitle_result)
     _agent_update_result(session.id, {"source_srt": source_srt, "download_subtitle": subtitle_result, **project_context})
+    source_srt = _agent_persist_source_ready(
+        get_agent_session(session.id) or session,
+        source_srt,
+        source_kind="target_subtitle" if not plan.get("requires_translation", True) else "source_subtitle",
+    )
     if not plan.get("requires_translation", True):
         current = get_agent_session(session.id) or session
         task_id = str(current.result.get("task_id") or "")
@@ -1849,6 +1975,7 @@ def _agent_use_recommended_subtitle(session: AgentSession) -> None:
 def _agent_generate_glossary_review(session: AgentSession, source_srt: str) -> None:
     if not _session_task_is_current(session):
         raise RuntimeError("任务已被新一轮处理替代，停止生成 Glossary")
+    source_srt = _agent_persist_source_ready(session, source_srt)
     _agent_set_phase(session.id, "generate_glossary")
     is_hybrid = session.result.get("source_kind") == "hybrid_anchor_ocr"
     is_dual_reference = session.result.get("source_kind") == "dual_subtitle_reference"
@@ -1912,6 +2039,31 @@ def _agent_generate_glossary_review(session: AgentSession, source_srt: str) -> N
             ],
         },
     )
+
+
+def _agent_persist_source_ready(session: AgentSession, source_srt: str, *, source_kind: str = "") -> str:
+    task_id = str(session.result.get("task_id") or "").strip()
+    if not task_id or not source_srt:
+        return source_srt
+    persisted_source = _materialize_task_artifact(session, source_srt, "source.srt") or source_srt
+    resolved_kind = str(source_kind or session.result.get("source_kind") or _infer_source_kind_from_session(session)).strip()
+    stage = "asr" if resolved_kind in {"asr", "asr_ocr_reference"} else "ocr"
+    input_video = _agent_input_video_path(session)
+    if not _update_task_stage(
+        task_id,
+        stage,
+        "done",
+        current_stage=f"{stage}_done",
+        source_srt=persisted_source,
+        source_kind=resolved_kind,
+        input_video=str(input_video) if input_video else "",
+        project_dir=str(session.result.get("project_dir") or ""),
+        expected_generation=_session_run_generation(session),
+    ):
+        raise RuntimeError("任务已被新一轮处理替代，停止保存原文字幕")
+    # Keep the live session's original path stable for compatibility with the
+    # running pipeline; only the persisted task points at its durable copy.
+    return source_srt
 
 
 def _agent_source_language_for_glossary(session: AgentSession, prefer_source: bool) -> str:
@@ -2724,6 +2876,8 @@ def _agent_confirm_options(plan: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def _agent_set_phase(session_id: str, phase: str) -> None:
+    task_id = ""
+    generation = 0
     with _LOCK:
         session = _AGENT_SESSIONS.get(session_id)
         if not session or session.status == "cancelled":
@@ -2732,6 +2886,19 @@ def _agent_set_phase(session_id: str, phase: str) -> None:
         session.status = "running"
         session.updated_at = time.time()
         session.logs.append(f"agent_phase: {phase}")
+        task_id = str(session.result.get("task_id") or "")
+        generation = _session_run_generation(session)
+    stage = _task_stage_for_phase(phase)
+    if task_id and stage and not _update_task_stage(
+        task_id,
+        stage,
+        "running",
+        current_stage=f"{stage}_running",
+        phase=phase,
+        started_at=time.time(),
+        expected_generation=generation,
+    ):
+        raise RuntimeError("任务已被新一轮处理替代")
 
 
 def _agent_workspace(session: AgentSession) -> Path:
@@ -2750,11 +2917,93 @@ def _agent_glossary_path(session: AgentSession) -> Path:
     return _agent_workspace(session) / "glossary.draft.yaml"
 
 
-def _ensure_agent_task(*, normalized_url: str, title: str, payload: dict[str, Any]) -> dict[str, Any]:
+_AGENT_TASK_ARCHIVE_FIELDS = {
+    "source_srt",
+    "reference_srt",
+    "glossary_path",
+    "translated_srt",
+    "translated_sidecar",
+    "subtitle_path",
+}
+_AGENT_TASK_ARCHIVE_EXTENSIONS = {".srt", ".vtt", ".ass", ".ssa", ".yaml", ".yml", ".json"}
+
+
+def _archive_agent_task_run(task_dir: Path, data: dict[str, Any]) -> Path | None:
+    generation = int(data.get("run_generation") or 0)
+    if generation <= 0:
+        return None
+    run_dir = task_dir / AGENT_TASK_RUNS_DIRNAME / f"generation_{generation}"
+    run_path = run_dir / "run.yaml"
+    if run_path.exists():
+        return run_path
+
+    snapshot = _task_serializable(data)
+    snapshot["schema_version"] = AGENT_TASK_SCHEMA_VERSION
+    snapshot["archived_at"] = time.time()
+    snapshot["is_current"] = False
+    _archive_agent_task_artifacts(run_dir, snapshot)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    tmp = run_path.with_suffix(".yaml.tmp")
+    tmp.write_text(yaml.safe_dump(snapshot, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    tmp.replace(run_path)
+    return run_path
+
+
+def _archive_agent_task_artifacts(run_dir: Path, snapshot: dict[str, Any]) -> None:
+    stages = snapshot.get("stages") if isinstance(snapshot.get("stages"), dict) else {}
+    artifact_dir = run_dir / "artifacts"
+    copied: dict[str, str] = {}
+    for stage_name, raw_stage in stages.items():
+        if not isinstance(raw_stage, dict):
+            continue
+        for field in _AGENT_TASK_ARCHIVE_FIELDS:
+            raw_value = str(raw_stage.get(field) or "").strip()
+            if not raw_value:
+                continue
+            try:
+                source = Path(raw_value).expanduser().resolve()
+                if not source.is_file() or source.suffix.lower() not in _AGENT_TASK_ARCHIVE_EXTENSIONS:
+                    continue
+                if not any(_is_relative_to(source, root) for root in _allowed_path_roots()):
+                    continue
+            except OSError:
+                continue
+            source_key = str(source)
+            if source_key in copied:
+                raw_stage[field] = copied[source_key]
+                continue
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            suffix = source.suffix.lower()
+            destination = artifact_dir / f"{_safe_slug(str(stage_name))}.{_safe_slug(field)}{suffix}"
+            counter = 2
+            while destination.exists():
+                destination = artifact_dir / f"{_safe_slug(str(stage_name))}.{_safe_slug(field)}.{counter}{suffix}"
+                counter += 1
+            try:
+                shutil.copy2(source, destination)
+            except OSError:
+                continue
+            copied[source_key] = str(destination)
+            raw_stage[field] = str(destination)
+
+
+def _ensure_agent_task(
+    *,
+    normalized_url: str,
+    title: str,
+    payload: dict[str, Any],
+    task_id: str | None = None,
+) -> dict[str, Any]:
     TASK_DIR.mkdir(parents=True, exist_ok=True)
     normalized = normalize_youtube_url(normalized_url)
     video_key = _youtube_task_key(normalized)
-    existing = _find_task_dir(video_key)
+    if task_id:
+        task_dir = _task_yaml_path(task_id).parent
+        if not (task_dir / "task.yaml").exists():
+            raise KeyError("agent task not found")
+        existing = task_dir
+    else:
+        existing = _find_task_dir(video_key)
     task_dir = existing or (TASK_DIR / f"{video_key}_{_safe_slug(title)[:64]}").resolve()
     task_dir.mkdir(parents=True, exist_ok=True)
     path = task_dir / "task.yaml"
@@ -2762,6 +3011,14 @@ def _ensure_agent_task(*, normalized_url: str, title: str, payload: dict[str, An
     with _TASK_FILE_LOCK:
         data = _read_task_file(path) if path.exists() else {}
         previous_generation = int(data.get("run_generation") or 0)
+        # Older task files predate run_generation. Treat their existing state
+        # as generation 1 so the first new run archives it instead of silently
+        # replacing it.
+        if data and previous_generation <= 0:
+            previous_generation = 1
+            data["run_generation"] = previous_generation
+        if data:
+            _archive_agent_task_run(task_dir, data)
         previous_stages = data.get("stages") if isinstance(data.get("stages"), dict) else {}
         previous_ocr = previous_stages.get("ocr") if isinstance(previous_stages.get("ocr"), dict) else {}
         raw_cache = data.get("ocr_cache")
@@ -2796,6 +3053,7 @@ def _ensure_agent_task(*, normalized_url: str, title: str, payload: dict[str, An
             ocr_cache.insert(0, cache_entry)
         data.update(
             {
+                "schema_version": AGENT_TASK_SCHEMA_VERSION,
                 "id": task_dir.name,
                 "video_key": video_key,
                 "url": normalized,
@@ -2804,7 +3062,7 @@ def _ensure_agent_task(*, normalized_url: str, title: str, payload: dict[str, An
                 "task_dir": str(task_dir),
                 "payload": {**(data.get("payload") if isinstance(data.get("payload"), dict) else {}), **dict(payload)},
                 "created_at": data.get("created_at") or now,
-                "run_generation": int(data.get("run_generation") or 0) + 1,
+                "run_generation": previous_generation + 1,
                 "run_started_at": now,
                 "current_stage": "created",
                 "workflow_status": "active",
@@ -2816,7 +3074,8 @@ def _ensure_agent_task(*, normalized_url: str, title: str, payload: dict[str, An
                 "updated_at": now,
             }
         )
-        data.pop("completed_at", None)
+        for stale_key in ("completed_at", "interrupted_at", "interruption_reason", "error", "failed_at"):
+            data.pop(stale_key, None)
         _write_task_file(path, data)
         return data
 
@@ -2926,6 +3185,7 @@ def _import_legacy_agent_jobs() -> None:
             continue
         now = time.time()
         data = {
+            "schema_version": AGENT_TASK_SCHEMA_VERSION,
             "id": task_dir.name,
             "video_key": task_dir.name,
             "url": normalized_url,
@@ -3065,8 +3325,26 @@ def _read_task(task_id: str) -> dict[str, Any]:
 
 
 def _task_yaml_path(task_id: str) -> Path:
-    safe = Path(str(task_id)).name
-    return (TASK_DIR / safe / "task.yaml").resolve()
+    safe = _validate_task_id(task_id)
+    task_root = TASK_DIR.resolve()
+    path = (task_root / safe / "task.yaml").resolve()
+    if path.parent.parent != task_root:
+        raise ValueError("任务目录不在允许范围内：非法的 Agent 任务 ID")
+    return path
+
+
+def _validate_task_id(task_id: Any) -> str:
+    raw = str(task_id or "").strip()
+    if (
+        not raw
+        or raw in {".", ".."}
+        or "/" in raw
+        or "\\" in raw
+        or "\x00" in raw
+        or Path(raw).name != raw
+    ):
+        raise ValueError("任务目录不在允许范围内：非法的 Agent 任务 ID")
+    return raw
 
 
 def _deleted_tasks_path() -> Path:
@@ -3089,7 +3367,7 @@ def _deleted_task_ids() -> set[str]:
 def _mark_task_deleted(task_id: str) -> None:
     TASK_DIR.mkdir(parents=True, exist_ok=True)
     deleted = _deleted_task_ids()
-    deleted.add(Path(str(task_id)).name)
+    deleted.add(_validate_task_id(task_id))
     _deleted_tasks_path().write_text(yaml.safe_dump(sorted(deleted), allow_unicode=True), encoding="utf-8")
 
 
@@ -3112,6 +3390,7 @@ def _ensure_download_project_dir(path: Path) -> None:
 
 def _task_to_dict(path: Path) -> dict[str, Any]:
     data = _read_task_file(path)
+    data["schema_version"] = int(data.get("schema_version") or 1)
     data["id"] = data.get("id") or path.parent.name
     data["task_dir"] = data.get("task_dir") or str(path.parent)
     workflow_status = str(data.get("workflow_status") or "").strip()
@@ -3120,7 +3399,120 @@ def _task_to_dict(path: Path) -> dict[str, Any]:
     data["workflow_status"] = workflow_status
     data["is_completed"] = workflow_status == "completed"
     data["stage_items"] = _task_stage_items(data)
+    archived_runs = _agent_task_run_summaries(path.parent)
+    data["archived_runs"] = archived_runs
+    data["archived_run_count"] = len(archived_runs)
+    data["run_count"] = max(int(data.get("run_generation") or 1), len(archived_runs) + 1)
+    payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+    data["can_restart"] = bool(str(data.get("url") or payload.get("url") or "").strip())
     return data
+
+
+def _agent_task_run_summaries(task_dir: Path) -> list[dict[str, Any]]:
+    runs_dir = task_dir / AGENT_TASK_RUNS_DIRNAME
+    if not runs_dir.exists():
+        return []
+    summaries: list[dict[str, Any]] = []
+    for path in runs_dir.glob("generation_*/run.yaml"):
+        try:
+            data = _read_task_file(path)
+        except (OSError, UnicodeError, yaml.YAMLError):
+            continue
+        stages = data.get("stages") if isinstance(data.get("stages"), dict) else {}
+        stage_statuses = {
+            str(name): str(item.get("status") or "pending")
+            for name, item in stages.items()
+            if isinstance(item, dict)
+        }
+        artifacts: list[dict[str, str]] = []
+        artifact_root = (path.parent / "artifacts").resolve()
+        seen_artifacts: set[str] = set()
+        for stage_name, item in stages.items():
+            if not isinstance(item, dict):
+                continue
+            for field in _AGENT_TASK_ARCHIVE_FIELDS:
+                raw_value = str(item.get(field) or "").strip()
+                if not raw_value:
+                    continue
+                try:
+                    artifact_path = Path(raw_value).expanduser().resolve()
+                except OSError:
+                    continue
+                artifact_key = str(artifact_path)
+                if (
+                    artifact_key in seen_artifacts
+                    or not artifact_path.is_file()
+                    or not _is_relative_to(artifact_path, artifact_root)
+                ):
+                    continue
+                seen_artifacts.add(artifact_key)
+                artifacts.append({"stage": str(stage_name), "kind": field, "path": artifact_key})
+        error = str(data.get("error") or "").strip()
+        if not error:
+            for item in stages.values():
+                if isinstance(item, dict) and str(item.get("error") or "").strip():
+                    error = str(item["error"]).strip()
+                    break
+        summaries.append(
+            {
+                "generation": int(data.get("run_generation") or 0),
+                "current_stage": str(data.get("current_stage") or ""),
+                "workflow_status": str(
+                    data.get("workflow_status")
+                    or ("completed" if str(data.get("current_stage") or "") == "done" else "active")
+                ),
+                "run_started_at": float(data.get("run_started_at") or data.get("created_at") or 0),
+                "completed_at": float(data.get("completed_at") or 0),
+                "updated_at": float(data.get("updated_at") or 0),
+                "archived_at": float(data.get("archived_at") or 0),
+                "stage_statuses": stage_statuses,
+                "artifacts": artifacts,
+                "error": error,
+                "run_path": str(path),
+            }
+        )
+    return sorted(summaries, key=lambda item: int(item.get("generation") or 0), reverse=True)
+
+
+def _reconcile_interrupted_agent_tasks() -> int:
+    TASK_DIR.mkdir(parents=True, exist_ok=True)
+    reconciled = 0
+    running_statuses = {"running", "queued", "rerunning", "cancel_requested"}
+    running_stage_suffixes = ("_running", "_pending", "_rerun")
+    with _TASK_FILE_LOCK:
+        for path in TASK_DIR.glob("*/task.yaml"):
+            try:
+                data = _read_task_file(path)
+            except (OSError, UnicodeError, yaml.YAMLError):
+                continue
+            if str(data.get("workflow_status") or "") == "completed" or str(data.get("current_stage") or "") == "done":
+                continue
+            stages = data.get("stages") if isinstance(data.get("stages"), dict) else {}
+            interrupted_stages: list[str] = []
+            for stage_name, item in stages.items():
+                if not isinstance(item, dict) or str(item.get("status") or "") not in running_statuses:
+                    continue
+                item["status"] = "interrupted"
+                item.setdefault("error", "服务重启，任务已中断，可从任务历史重新运行。")
+                item["interrupted_at"] = time.time()
+                item["updated_at"] = time.time()
+                interrupted_stages.append(str(stage_name))
+
+            current_stage = str(data.get("current_stage") or "")
+            created_without_progress = current_stage == "created" and int(data.get("run_generation") or 0) > 0 and not stages
+            stage_claims_running = current_stage.endswith(running_stage_suffixes)
+            if not interrupted_stages and not created_without_progress and not stage_claims_running:
+                continue
+            interrupted_stage = interrupted_stages[-1] if interrupted_stages else current_stage.removesuffix("_running").removesuffix("_pending").removesuffix("_rerun")
+            data["current_stage"] = f"{interrupted_stage or 'task'}_interrupted"
+            data["workflow_status"] = "active"
+            data["interrupted_at"] = time.time()
+            data["interruption_reason"] = "service_restart"
+            data["schema_version"] = AGENT_TASK_SCHEMA_VERSION
+            data.pop("completed_at", None)
+            _write_task_file(path, data)
+            reconciled += 1
+    return reconciled
 
 
 def _read_task_file(path: Path) -> dict[str, Any]:
@@ -3587,9 +3979,73 @@ def _task_stage_path(task: dict[str, Any], stage: str, key: str) -> str:
 
 
 def _task_stage_items(task: dict[str, Any]) -> list[dict[str, Any]]:
-    labels = {"probe": "检测", "ocr": "OCR 原文", "glossary": "Glossary", "translate": "翻译"}
     stages = task.get("stages") if isinstance(task.get("stages"), dict) else {}
-    return [{"id": key, "label": label, **(stages.get(key) if isinstance(stages.get(key), dict) else {"status": "pending"})} for key, label in labels.items()]
+
+    def stage_data(name: str) -> dict[str, Any]:
+        value = stages.get(name)
+        return dict(value) if isinstance(value, dict) else {}
+
+    ocr_stage = stage_data("ocr")
+    asr_stage = stage_data("asr")
+    glossary_stage = stage_data("glossary")
+    translate_stage = stage_data("translate")
+    source_kind = str(
+        glossary_stage.get("source_kind")
+        or translate_stage.get("source_kind")
+        or asr_stage.get("source_kind")
+        or ocr_stage.get("source_kind")
+        or ""
+    ).strip()
+    asr_source = str(asr_stage.get("source_srt") or "").strip()
+    ocr_source = str(ocr_stage.get("source_srt") or "").strip()
+    downstream_source = str(glossary_stage.get("source_srt") or translate_stage.get("source_srt") or "").strip()
+    probe_stage = stage_data("probe")
+    agent_plan = probe_stage.get("agent_plan") if isinstance(probe_stage.get("agent_plan"), dict) else {}
+    route = str(agent_plan.get("route") or "").strip()
+    current_stage = str(task.get("current_stage") or "").strip()
+
+    # The history UI has one source-subtitle slot. ASR tasks persist their
+    # final source under stages.asr (including ASR corrected with an OCR
+    # reference), so expose that stage through the unified slot instead of
+    # leaving the user with an empty/stale OCR card.
+    uses_asr_source = source_kind in {"asr", "asr_ocr_reference"}
+    if not uses_asr_source and asr_source:
+        uses_asr_source = bool(
+            (downstream_source and downstream_source == asr_source and downstream_source != ocr_source)
+            or (not ocr_source and str(asr_stage.get("status") or "") not in {"", "pending"})
+        )
+    if not uses_asr_source and not ocr_source:
+        uses_asr_source = current_stage.startswith("asr_") or (
+            route == "asr" and str(asr_stage.get("status") or "") not in {"", "pending"}
+        )
+
+    if uses_asr_source:
+        if not source_kind:
+            source_kind = "asr_ocr_reference" if asr_stage.get("reference_srt") else "asr"
+        source_stage = {
+            **asr_stage,
+            "id": "ocr",
+            "label": "ASR + OCR 纠错原文" if source_kind == "asr_ocr_reference" else "ASR 原文",
+            "status": str(asr_stage.get("status") or "pending"),
+            "source_stage": "asr",
+            "source_kind": source_kind,
+            # The existing stage-rerun endpoint accepts `ocr`; presenting that
+            # action for an ASR source would silently run the wrong pipeline.
+            "can_rerun": False,
+        }
+    else:
+        source_stage = {
+            "id": "ocr",
+            "label": "OCR 原文",
+            **(ocr_stage or {"status": "pending"}),
+        }
+
+    return [
+        {"id": "probe", "label": "检测", **(probe_stage or {"status": "pending"})},
+        source_stage,
+        {"id": "glossary", "label": "Glossary", **(glossary_stage or {"status": "pending"})},
+        {"id": "translate", "label": "翻译", **(translate_stage or {"status": "pending"})},
+    ]
 
 
 def _task_serializable(value: Any) -> Any:
@@ -3961,6 +4417,8 @@ def _agent_log(session_id: str, line: str) -> None:
 
 
 def _agent_wait(session_id: str, phase: str, question: dict[str, Any]) -> None:
+    task_id = ""
+    generation = 0
     with _LOCK:
         session = _AGENT_SESSIONS.get(session_id)
         if not session or session.status == "cancelled":
@@ -3970,6 +4428,27 @@ def _agent_wait(session_id: str, phase: str, question: dict[str, Any]) -> None:
         session.question = question
         session.logs.append(f"agent_wait: {phase}")
         session.updated_at = time.time()
+        task_id = str(session.result.get("task_id") or "")
+        generation = _session_run_generation(session)
+    stage = _task_stage_for_phase(phase)
+    if task_id and stage:
+        if phase == "review_glossary":
+            waiting_status = "waiting_review"
+        elif stage == "probe":
+            # Probe/diagnosis work has finished; only the user's route choice
+            # is pending. Keep the persisted probe stage completed.
+            waiting_status = "done"
+        else:
+            waiting_status = "waiting"
+        current_stage = "glossary_review" if phase == "review_glossary" else f"{stage}_waiting"
+        _update_task_stage(
+            task_id,
+            stage,
+            waiting_status,
+            current_stage=current_stage,
+            phase=phase,
+            expected_generation=generation,
+        )
 
 
 def _agent_done(session_id: str, values: dict[str, Any]) -> None:
@@ -4055,17 +4534,36 @@ def _agent_fail(session_id: str, exc: Exception) -> None:
 
 
 def _task_stage_for_phase(phase: str) -> str:
-    if phase in {"ocr_full", "confirm_ocr_reuse", "download_video_for_ocr"}:
+    if phase in {
+        "ocr_full",
+        "confirm_ocr_reuse",
+        "confirm_hybrid_ocr_settings",
+        "download_video_for_ocr",
+        "download_video_for_preview",
+        "download_video_for_hybrid",
+        "download_anchor_subtitle",
+        "download_subtitle",
+        "download_reference_subtitle",
+        "download_video_for_subtitle",
+        "hybrid_anchor_ocr",
+        "dual_subtitle_reference",
+        "ocr_reference",
+    }:
         return "ocr"
+    if phase in {"download_video_for_asr", "audio_asr", "asr_ocr_refine"}:
+        return "asr"
     if phase in {"generate_glossary", "review_glossary"}:
         return "glossary"
     if phase in {"translate_pending", "translate", "download_video_for_translation"}:
         return "translate"
     if phase in {
         "probe",
+        "confirm_subtitle",
+        "diagnose_ocr_asr",
+        "probe_audio_language",
+        "download_video_for_audio_probe",
         "download_video_for_project",
         "download_video_for_manual",
-        "download_video_for_subtitle",
     }:
         return "probe"
     return ""
@@ -9312,6 +9810,9 @@ class AgentHandler(BaseHTTPRequestHandler):
             elif self.path.startswith("/api/agent-tasks/") and self.path.rstrip("/").endswith("/continue"):
                 task_id = _api_path_segment(self.path, -2)
                 self._send_json(continue_agent_task(task_id).to_dict())
+            elif self.path.startswith("/api/agent-tasks/") and self.path.rstrip("/").endswith("/restart"):
+                task_id = _api_path_segment(self.path, -2)
+                self._send_json(restart_agent_task(task_id).to_dict())
             elif self.path.startswith("/api/agent-tasks/") and self.path.rstrip("/").endswith("/rerun"):
                 task_id = _api_path_segment(self.path, -2)
                 self._send_json(rerun_agent_task_stage(task_id, str(payload.get("stage") or "")).to_dict())

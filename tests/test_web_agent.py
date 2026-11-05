@@ -1681,6 +1681,333 @@ def test_same_video_new_agent_run_clears_stale_downstream_stages(tmp_path):
     assert "completed_at" not in restarted
 
 
+def test_same_video_new_agent_run_archives_previous_generation(monkeypatch, tmp_path):
+    # TASK_DIR is intentionally outside ROOT to cover configured absolute
+    # task roots; archived artifacts must still become immutable copies.
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path / "separate-root")
+    url = "https://www.youtube.com/watch?v=abc123"
+    first = web_agent._ensure_agent_task(normalized_url=url, title="demo", payload={"url": url, "ocr_pipeline_version": "v3"})
+    task_dir = Path(first["task_dir"])
+    source = task_dir / "source.srt"
+    glossary = task_dir / "glossary.draft.yaml"
+    translated = task_dir / "zh.srt"
+    source.write_text("old source", encoding="utf-8")
+    glossary.write_text("characters: []\n", encoding="utf-8")
+    translated.write_text("old translation", encoding="utf-8")
+    web_agent._update_task_stage(first["id"], "ocr", "done", source_srt=str(source))
+    web_agent._update_task_stage(first["id"], "glossary", "reviewed", source_srt=str(source), glossary_path=str(glossary))
+    web_agent._update_task_stage(first["id"], "translate", "done", current_stage="done", translated_srt=str(translated))
+
+    restarted = web_agent._ensure_agent_task(normalized_url=url, title="demo", payload={"url": url, "ocr_pipeline_version": "v2"})
+
+    run_path = task_dir / "runs" / "generation_1" / "run.yaml"
+    archived = yaml.safe_load(run_path.read_text(encoding="utf-8"))
+    archived_source = Path(archived["stages"]["ocr"]["source_srt"])
+    archived_translation = Path(archived["stages"]["translate"]["translated_srt"])
+    listed = web_agent.get_agent_task(first["id"])
+    assert restarted["run_generation"] == 2
+    assert archived["run_generation"] == 1
+    assert archived["current_stage"] == "done"
+    assert archived_source.read_text(encoding="utf-8") == "old source"
+    assert archived_translation.read_text(encoding="utf-8") == "old translation"
+    assert archived_source.parent == task_dir / "runs" / "generation_1" / "artifacts"
+    assert listed["archived_run_count"] == 1
+    assert listed["archived_runs"][0]["generation"] == 1
+    assert {item["kind"] for item in listed["archived_runs"][0]["artifacts"]} >= {"source_srt", "translated_srt"}
+
+
+def test_legacy_task_without_generation_is_archived_before_new_run(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_agent, "ROOT", tmp_path)
+    url = "https://www.youtube.com/watch?v=abc123"
+    task_dir = web_agent.TASK_DIR / "abc123_legacy"
+    task_dir.mkdir(parents=True)
+    source = task_dir / "source.srt"
+    source.write_text("legacy source", encoding="utf-8")
+    web_agent._write_task_file(
+        task_dir / "task.yaml",
+        {
+            "id": task_dir.name,
+            "video_key": "abc123",
+            "url": url,
+            "current_stage": "ocr_done",
+            "stages": {"ocr": {"status": "done", "source_srt": str(source)}},
+        },
+    )
+
+    restarted = web_agent._ensure_agent_task(normalized_url=url, title="legacy", payload={"url": url})
+    archived = yaml.safe_load((task_dir / "runs" / "generation_1" / "run.yaml").read_text(encoding="utf-8"))
+
+    assert restarted["run_generation"] == 2
+    assert archived["run_generation"] == 1
+    assert Path(archived["stages"]["ocr"]["source_srt"]).read_text(encoding="utf-8") == "legacy source"
+
+
+def test_serve_binds_port_before_reconciling_persisted_tasks(monkeypatch, tmp_path):
+    events = []
+
+    class FakeServer:
+        def __init__(self, address, handler):
+            events.append(("bind", address, handler))
+
+        def serve_forever(self):
+            events.append(("serve",))
+
+        def server_close(self):
+            events.append(("close",))
+
+    monkeypatch.setattr(web_agent, "DOWNLOAD_DIR", tmp_path / "downloads")
+    monkeypatch.setattr(web_agent, "GLOSSARY_DIR", tmp_path / "glossary")
+    monkeypatch.setattr(web_agent, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(web_agent, "ThreadingHTTPServer", FakeServer)
+    monkeypatch.setattr(web_agent, "_reconcile_interrupted_agent_tasks", lambda: events.append(("reconcile",)))
+
+    web_agent.serve("127.0.0.1", 7860)
+
+    assert [event[0] for event in events] == ["bind", "reconcile", "serve", "close"]
+
+
+def test_server_instance_lock_rejects_second_task_directory_owner():
+    web_agent.TASK_DIR.mkdir(parents=True)
+    first = web_agent._acquire_server_instance_lock()
+    try:
+        with pytest.raises(RuntimeError, match="已有 ReiboSub 服务"):
+            web_agent._acquire_server_instance_lock()
+    finally:
+        first.close()
+    second = web_agent._acquire_server_instance_lock()
+    second.close()
+
+
+def test_restart_agent_task_uses_persisted_payload(monkeypatch, tmp_path):
+    task_dir = web_agent.TASK_DIR / "task1"
+    task_dir.mkdir(parents=True)
+    task = {
+        "id": "task1",
+        "url": "https://www.youtube.com/watch?v=abc123",
+        "payload": {"url": "stale", "source_language": "korean", "ocr_pipeline_version": "v3"},
+        "run_generation": 1,
+        "current_stage": "done",
+        "stages": {},
+    }
+    web_agent._write_task_file(task_dir / "task.yaml", task)
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    captured = []
+
+    def fake_start(payload, *, prepared_task=None):
+        captured.append({"payload": dict(payload), "prepared_task": dict(prepared_task or {})})
+        return web_agent.AgentSession(id="restart1", payload=dict(payload))
+
+    monkeypatch.setattr(web_agent, "start_agent_session", fake_start)
+
+    session = web_agent.restart_agent_task("task1")
+
+    assert session.id == "restart1"
+    assert captured[0]["payload"] == {
+            "url": "https://www.youtube.com/watch?v=abc123",
+            "source_language": "korean",
+            "ocr_pipeline_version": "v3",
+        }
+    assert captured[0]["prepared_task"]["id"] == "task1"
+    assert captured[0]["prepared_task"]["run_generation"] == 2
+
+
+def test_restart_agent_task_persists_probe_failure(monkeypatch):
+    task_dir = web_agent.TASK_DIR / "task1"
+    task_dir.mkdir(parents=True)
+    web_agent._write_task_file(
+        task_dir / "task.yaml",
+        {
+            "id": "task1",
+            "url": "https://www.youtube.com/watch?v=abc123",
+            "payload": {"url": "https://www.youtube.com/watch?v=abc123"},
+            "run_generation": 1,
+            "current_stage": "done",
+            "workflow_status": "completed",
+            "stages": {},
+        },
+    )
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {})
+    monkeypatch.setattr(web_agent, "probe_video", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("probe offline")))
+
+    session = web_agent.restart_agent_task("task1")
+    snapshot = _wait_agent_status(session.id, "failed")
+    task = web_agent.get_agent_task("task1")
+
+    assert snapshot["error"] == "probe offline"
+    assert task["run_generation"] == 2
+    assert task["current_stage"] == "probe_failed"
+    assert task["stages"]["probe"]["status"] == "failed"
+    assert task["stages"]["probe"]["error"] == "probe offline"
+    assert (task_dir / "runs" / "generation_1" / "run.yaml").exists()
+
+
+def test_task_id_rejects_path_aliases(tmp_path):
+    for task_id in ("", ".", "..", "../task1", "folder/task1", "folder\\task1"):
+        with pytest.raises(ValueError, match="非法的 Agent 任务 ID"):
+            web_agent._task_yaml_path(task_id)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    web_agent.TASK_DIR.mkdir(parents=True)
+    (web_agent.TASK_DIR / "linked-task").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="非法的 Agent 任务 ID"):
+        web_agent._task_yaml_path("linked-task")
+
+
+def test_reconcile_interrupted_agent_tasks_marks_running_stage(tmp_path):
+    task_dir = web_agent.TASK_DIR / "task1"
+    task_dir.mkdir(parents=True)
+    web_agent._write_task_file(
+        task_dir / "task.yaml",
+        {
+            "id": "task1",
+            "run_generation": 1,
+            "current_stage": "translate_pending",
+            "workflow_status": "active",
+            "stages": {"translate": {"status": "queued"}},
+        },
+    )
+
+    count = web_agent._reconcile_interrupted_agent_tasks()
+    task = web_agent.get_agent_task("task1")
+
+    assert count == 1
+    assert task["current_stage"] == "translate_interrupted"
+    assert task["workflow_status"] == "active"
+    assert task["stages"]["translate"]["status"] == "interrupted"
+    assert task["interruption_reason"] == "service_restart"
+
+
+def test_reconcile_does_not_demote_completed_task_with_stale_stage_status():
+    task_dir = web_agent.TASK_DIR / "task1"
+    task_dir.mkdir(parents=True)
+    web_agent._write_task_file(
+        task_dir / "task.yaml",
+        {
+            "id": "task1",
+            "run_generation": 1,
+            "current_stage": "done",
+            "workflow_status": "completed",
+            "stages": {"ocr": {"status": "running"}, "translate": {"status": "done"}},
+        },
+    )
+
+    count = web_agent._reconcile_interrupted_agent_tasks()
+    task = web_agent.get_agent_task("task1")
+
+    assert count == 0
+    assert task["current_stage"] == "done"
+    assert task["workflow_status"] == "completed"
+
+
+def test_agent_phase_and_waiting_state_are_persisted(monkeypatch):
+    task_dir = web_agent.TASK_DIR / "task1"
+    task_dir.mkdir(parents=True)
+    web_agent._write_task_file(
+        task_dir / "task.yaml",
+        {
+            "id": "task1",
+            "run_generation": 3,
+            "current_stage": "probe_done",
+            "workflow_status": "active",
+            "stages": {"probe": {"status": "done"}},
+        },
+    )
+    session = web_agent.AgentSession(id="session1", payload={})
+    session.result.update({"task_id": "task1", "task_dir": str(task_dir), "run_generation": 3})
+    monkeypatch.setattr(web_agent, "_AGENT_SESSIONS", {session.id: session})
+
+    web_agent._agent_set_phase(session.id, "audio_asr")
+    running = web_agent.get_agent_task("task1")
+    assert running["current_stage"] == "asr_running"
+    assert running["stages"]["asr"]["status"] == "running"
+
+    web_agent._agent_wait(session.id, "review_glossary", {"kind": "review_glossary"})
+    waiting = web_agent.get_agent_task("task1")
+    assert waiting["current_stage"] == "glossary_review"
+    assert waiting["stages"]["glossary"]["status"] == "waiting_review"
+
+
+def test_task_stage_items_exposes_asr_source_in_unified_source_stage(tmp_path):
+    source = tmp_path / "source.srt"
+    source.write_text("ASR source", encoding="utf-8")
+    task = {
+        "current_stage": "glossary_review",
+        "stages": {
+            "probe": {"status": "done", "agent_plan": {"route": "asr"}},
+            "asr": {"status": "done", "source_srt": str(source)},
+            "glossary": {"status": "waiting_review", "source_srt": str(source)},
+        },
+    }
+
+    source_item = web_agent._task_stage_items(task)[1]
+
+    assert source_item["id"] == "ocr"
+    assert source_item["label"] == "ASR 原文"
+    assert source_item["status"] == "done"
+    assert source_item["source_stage"] == "asr"
+    assert source_item["source_kind"] == "asr"
+    assert source_item["source_srt"] == str(source)
+    assert source_item["can_rerun"] is False
+
+
+def test_task_stage_items_exposes_asr_ocr_corrected_source_not_stale_ocr_stage(tmp_path):
+    source = tmp_path / "source.srt"
+    reference = tmp_path / "source.ocr_reference.srt"
+    source.write_text("corrected ASR source", encoding="utf-8")
+    reference.write_text("OCR reference", encoding="utf-8")
+    task = {
+        "current_stage": "glossary_review",
+        "stages": {
+            "ocr": {"status": "running", "phase": "ocr_reference"},
+            "asr": {
+                "status": "done",
+                "source_srt": str(source),
+                "reference_srt": str(reference),
+            },
+            "glossary": {
+                "status": "waiting_review",
+                "source_srt": str(source),
+                "source_kind": "asr_ocr_reference",
+            },
+        },
+    }
+
+    source_item = web_agent._task_stage_items(task)[1]
+
+    assert source_item["id"] == "ocr"
+    assert source_item["label"] == "ASR + OCR 纠错原文"
+    assert source_item["status"] == "done"
+    assert source_item["source_stage"] == "asr"
+    assert source_item["source_kind"] == "asr_ocr_reference"
+    assert source_item["source_srt"] == str(source)
+    assert source_item["reference_srt"] == str(reference)
+    assert source_item["can_rerun"] is False
+
+
+def test_task_stage_items_keeps_ocr_source_when_downstream_uses_ocr(tmp_path):
+    old_asr_source = tmp_path / "old-asr.srt"
+    ocr_source = tmp_path / "source.srt"
+    task = {
+        "current_stage": "glossary_review",
+        "stages": {
+            "asr": {"status": "done", "source_srt": str(old_asr_source)},
+            "ocr": {"status": "done", "source_srt": str(ocr_source)},
+            "glossary": {
+                "status": "waiting_review",
+                "source_srt": str(ocr_source),
+                "source_kind": "ocr",
+            },
+        },
+    }
+
+    source_item = web_agent._task_stage_items(task)[1]
+
+    assert source_item["label"] == "OCR 原文"
+    assert source_item["source_srt"] == str(ocr_source)
+    assert source_item.get("source_stage") != "asr"
+    assert source_item.get("can_rerun") is not False
+
+
 def test_old_generation_stage_update_does_not_mutate_new_task(tmp_path):
     task_dir = web_agent.TASK_DIR / "task1"
     task_dir.mkdir(parents=True)

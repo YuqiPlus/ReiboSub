@@ -33,7 +33,6 @@
               v-model:extra-hint="extraHint"
               :session="agentSession"
               :sessions="agentSessions"
-              :tasks="agentTasks"
               :starting="agentStarting"
               :status="agentStatus.text"
               :status-class="agentStatus.class"
@@ -42,12 +41,27 @@
               @cancel-agent="cancelAgent"
               @retry-agent="retryAgent"
               @select-agent="selectAgentSession"
-              @continue-task="continueAgentTask"
-              @rerun-task="rerunAgentTask"
-              @complete-task="completeAgentTask"
-              @reopen-task="reopenAgentTask"
-              @delete-task="deleteAgentTask"
+              @open-task-history="activeView = 'task-history'"
               @open-glossary="openGlossaryFromAgent"
+            />
+          </div>
+
+          <div v-else-if="activeView === 'task-history'" class="page-stack">
+            <TaskHistoryPanel
+              :tasks="agentTasks"
+              :loading="agentTasksLoading"
+              :busy-task-id="taskHistoryBusyId"
+              :status="taskHistoryStatus.text"
+              :status-class="taskHistoryStatus.class"
+              @refresh="refreshAgentTasks"
+              @continue-task="continueTaskFromHistory"
+              @rerun-task="rerunTaskFromHistory"
+              @restart-task="restartTaskFromHistory"
+              @complete-task="completeTaskFromHistory"
+              @reopen-task="reopenTaskFromHistory"
+              @delete-task="deleteTaskFromHistory"
+              @open-glossary="openTaskHistoryGlossary"
+              @open-artifact="openTaskArtifact"
             />
           </div>
 
@@ -355,6 +369,7 @@ import { api, deleteJson, getJson, patchJson, uploadMediaFile, uploadProjectCove
 import SideNav from './components/SideNav.vue'
 import HeaderBar from './components/HeaderBar.vue'
 import AgentSessionPanel from './components/AgentSessionPanel.vue'
+import TaskHistoryPanel from './components/TaskHistoryPanel.vue'
 import VideoInputPanel from './components/VideoInputPanel.vue'
 import VideoInfoPanel from './components/VideoInfoPanel.vue'
 import TranslationFlow from './components/TranslationFlow.vue'
@@ -442,6 +457,7 @@ const glossaryTextDirty = ref(false)
 const glossarySaveState = ref('idle')
 const glossaryContinueBusy = ref(false)
 let glossaryLoadGeneration = 0
+let glossaryLoadFailure = ''
 const subtitleTranslationMode = ref('translate_only')
 const subtitleConvertFormat = ref('bcc')
 const ocrTranslationMode = ref('standard_cleanup')
@@ -498,6 +514,8 @@ const activeView = ref('agent')
 const agentSession = ref(null)
 const agentSessions = ref([])
 const agentTasks = ref([])
+const agentTasksLoading = ref(false)
+const taskHistoryBusyId = ref('')
 const agentStarting = ref(false)
 const openedGlossaryReviewKey = ref('')
 const openingGlossaryReviewKey = ref('')
@@ -532,6 +550,7 @@ const ocrDevStatus = reactive({ text: '', class: '' })
 const asrLabStatus = reactive({ text: '', class: '' })
 const assetStatus = reactive({ text: '', class: '' })
 const agentStatus = reactive({ text: '', class: '' })
+const taskHistoryStatus = reactive({ text: '', class: '' })
 const settingsStatus = reactive({ text: '', class: '' })
 
 const glossaryAutosave = createGlossaryReviewAutosave({
@@ -549,6 +568,10 @@ const pages = {
   agent: {
     title: 'Agent 字幕流程',
     description: '自动判断字幕来源，提取原文，审核术语并完成翻译。',
+  },
+  'task-history': {
+    title: '任务历史',
+    description: '持久保存 Agent 流程、阶段结果和旧轮次，可继续处理或按阶段重新运行。',
   },
   'new-task': {
     title: '链接处理',
@@ -606,10 +629,23 @@ const failedJobCount = computed(() => jobList.value.filter((job) => job.status =
 const doneJobCount = computed(() => jobList.value.filter((job) => job.status === 'done').length)
 const waitingAgentCount = computed(() => agentSessions.value.filter((session) => session.status === 'waiting').length)
 const runningAgentCount = computed(() => agentSessions.value.filter((session) => session.status === 'running').length)
+const taskAttentionCount = computed(() => agentTasks.value.filter((task) => {
+  if (task.is_completed || task.workflow_status === 'completed') return false
+  const current = String(task.current_stage || '')
+  const stages = task.stage_items || []
+  const failed = task.status === 'failed'
+    || task.workflow_status === 'failed'
+    || current.endsWith('_failed')
+    || stages.some((stage) => stage.status === 'failed')
+  if (failed) return false
+  if (['waiting', 'needs_input', 'interrupted'].includes(String(task.status || ''))) return true
+  if (/(review|confirm|waiting|interrupted|attention)/.test(current)) return true
+  return stages.some((stage) => ['waiting', 'waiting_review', 'needs_input', 'interrupted'].includes(stage.status))
+}).length)
 const topbarMetrics = computed(() => ({
   media: assets.videos.length + assets.audios.length,
   subtitles: assets.subtitles.length,
-  jobs: jobList.value.length,
+  jobs: activeView.value === 'task-history' ? agentTasks.value.length : jobList.value.length,
 }))
 const agentPreviewVideo = computed(() => (
   agentSession.value
@@ -652,6 +688,7 @@ watch(url, (nextUrl, previousUrl) => {
 
 watch(activeView, (view) => {
   if (view === 'new-task' && !availableVideoFormats.value.length) scheduleVideoFormats(url.value, 150)
+  if (view === 'task-history') refreshAgentTasks()
 })
 
 watch(subtitleEditorCues, () => {
@@ -669,6 +706,7 @@ watch(ocrScope, (scope) => {
 
 const navItems = computed(() => [
   { id: 'agent', group: '日常流程', label: 'Agent 路线', hint: '自动完成字幕', icon: 'A', badge: waitingAgentCount.value ? `${waitingAgentCount.value} 待确认` : runningAgentCount.value || '' },
+  { id: 'task-history', group: '日常流程', label: '任务历史', hint: '继续、重跑与归档', icon: 'H', badge: taskAttentionCount.value ? `${taskAttentionCount.value} 待处理` : agentTasks.value.length || '' },
   { id: 'assets', group: '日常流程', label: '素材库', hint: '视频、音频与字幕', icon: 'M', badge: assets.videos.length + assets.audios.length + assets.subtitles.length || '' },
   { id: 'subtitle-edit', group: '字幕制作', label: '字幕精修', hint: '新增与微调 SRT', icon: 'E', badge: subtitleEditorCues.value.length || '' },
   { id: 'glossary', group: '字幕制作', label: '术语审核', hint: '人名与固定译法', icon: 'G', badge: glossaryItems.value.length || '' },
@@ -1143,12 +1181,29 @@ async function openWaitingGlossaryReviewFromSessions() {
   return openGlossaryReviewForSession(reviewSession)
 }
 
-async function loadAgentTasks() {
+async function loadAgentTasks({ throwOnError = false } = {}) {
   try {
     const result = await getJson('/api/agent-tasks')
     agentTasks.value = result.tasks || []
-  } catch {
+    return agentTasks.value
+  } catch (error) {
     agentTasks.value = agentTasks.value || []
+    if (throwOnError) throw error
+    return agentTasks.value
+  }
+}
+
+async function refreshAgentTasks() {
+  if (agentTasksLoading.value) return
+  agentTasksLoading.value = true
+  setStatus(taskHistoryStatus, '正在刷新任务历史...', '')
+  try {
+    const tasks = await loadAgentTasks({ throwOnError: true })
+    setStatus(taskHistoryStatus, `已加载 ${tasks.length} 个持久化任务。`, 'ok')
+  } catch (error) {
+    setStatus(taskHistoryStatus, `任务历史加载失败：${error.message}`, 'bad')
+  } finally {
+    agentTasksLoading.value = false
   }
 }
 
@@ -1181,6 +1236,32 @@ async function continueAgentTask(taskId) {
   } catch (error) {
     setStatus(agentStatus, error.message, 'bad')
     return null
+  }
+}
+
+async function continueTaskFromHistory(taskId) {
+  if (!taskId || taskHistoryBusyId.value) return
+  taskHistoryBusyId.value = String(taskId)
+  setStatus(taskHistoryStatus, '正在恢复任务现场...', '')
+  try {
+    const liveSession = (agentSessions.value || []).find((session) => (
+      ['running', 'waiting'].includes(session.status)
+      && String(session.result?.task_id || '') === String(taskId)
+    ))
+    if (liveSession) {
+      const openedGlossaryReview = await selectAgentSession(liveSession.id)
+      setStatus(taskHistoryStatus, `已切换到正在运行的任务 ${taskId}。`, 'ok')
+      if (!openedGlossaryReview) activeView.value = 'agent'
+      return
+    }
+    const continued = await continueAgentTask(taskId)
+    if (!continued) throw new Error(agentStatus.text || '任务恢复失败')
+    setStatus(taskHistoryStatus, `任务 ${taskId} 已恢复。`, 'ok')
+    if (!continued.openedGlossaryReview) activeView.value = 'agent'
+  } catch (error) {
+    setStatus(taskHistoryStatus, error.message, 'bad')
+  } finally {
+    taskHistoryBusyId.value = ''
   }
 }
 
@@ -1221,8 +1302,63 @@ async function rerunAgentTask({ taskId, stage }) {
     await loadAgentSessions()
     await loadAgentTasks()
     scheduleAgentPoll(session.id, 500)
+    return session
   } catch (error) {
     setStatus(agentStatus, error.message, 'bad')
+    return null
+  }
+}
+
+async function rerunTaskFromHistory(payload) {
+  const taskId = String(payload?.taskId || '')
+  const stage = String(payload?.stage || '')
+  if (!taskId || !stage || taskHistoryBusyId.value) return
+  const task = agentTasks.value.find((item) => String(item?.id || '') === taskId)
+  const title = task?.title || taskId
+  const stageLabels = { ocr: '原文字幕', glossary: 'Glossary', translate: '中文字幕' }
+  const consequences = {
+    ocr: '会重新执行原文字幕提取，并使现有 Glossary 和中文字幕失效；这一步可能耗时较长。',
+    glossary: '会重新生成 Glossary，并使现有中文字幕失效；生成后需要重新审核。',
+    translate: '会重新调用翻译模型，并替换当前轮次的中文字幕产物。',
+  }
+  const stageLabel = stageLabels[stage] || stage
+  if (!window.confirm(`重跑“${title}”的${stageLabel}阶段？\n\n${consequences[stage] || '该阶段及其下游结果会重新生成。'}`)) return
+  taskHistoryBusyId.value = taskId
+  setStatus(taskHistoryStatus, `正在启动${stageLabel}阶段重跑...`, '')
+  try {
+    const session = await rerunAgentTask({ taskId, stage })
+    if (!session) throw new Error(agentStatus.text || '阶段重跑启动失败')
+    setStatus(taskHistoryStatus, `已启动${stageLabel}阶段重跑。`, 'ok')
+    activeView.value = 'agent'
+  } catch (error) {
+    setStatus(taskHistoryStatus, error.message, 'bad')
+  } finally {
+    taskHistoryBusyId.value = ''
+  }
+}
+
+async function restartTaskFromHistory(task) {
+  const taskId = String(task?.id || task || '')
+  if (!taskId || taskHistoryBusyId.value) return
+  const title = typeof task === 'object' ? (task.title || task.id) : taskId
+  const generation = Number(task?.run_generation || 1)
+  if (!window.confirm(`从头重跑：${title}？\n\n当前第 ${generation} 轮的配置和字幕产物会先归档，然后按原任务配置重新开始。`)) return
+  taskHistoryBusyId.value = taskId
+  setStatus(taskHistoryStatus, '正在归档当前轮次并从头启动...', '')
+  try {
+    const session = await api(`/api/agent-tasks/${encodeURIComponent(taskId)}/restart`, {})
+    agentSession.value = session
+    restoreAgentOcrPipeline(session)
+    await loadAgentSessions()
+    await loadAgentTasks()
+    setStatus(agentStatus, `已从头重跑：${title}`, 'ok')
+    setStatus(taskHistoryStatus, `已从头重跑：${title}`, 'ok')
+    activeView.value = 'agent'
+    scheduleAgentPoll(session.id, 500)
+  } catch (error) {
+    setStatus(taskHistoryStatus, error.message, 'bad')
+  } finally {
+    taskHistoryBusyId.value = ''
   }
 }
 
@@ -1234,8 +1370,23 @@ async function completeAgentTask(task) {
     await api(`/api/agent-tasks/${taskId}/complete`, {})
     await loadAgentTasks()
     setStatus(agentStatus, `已完成流程：${title}`, 'ok')
+    return true
   } catch (error) {
     setStatus(agentStatus, error.message, 'bad')
+    return false
+  }
+}
+
+async function completeTaskFromHistory(task) {
+  const taskId = String(task?.id || task || '')
+  if (!taskId || taskHistoryBusyId.value) return
+  taskHistoryBusyId.value = taskId
+  setStatus(taskHistoryStatus, '正在标记任务完成...', '')
+  try {
+    const completed = await completeAgentTask(task)
+    setStatus(taskHistoryStatus, completed ? '任务已标记完成。' : (agentStatus.text || '操作失败'), completed ? 'ok' : 'bad')
+  } finally {
+    taskHistoryBusyId.value = ''
   }
 }
 
@@ -1247,8 +1398,23 @@ async function reopenAgentTask(task) {
     await api(`/api/agent-tasks/${taskId}/reopen`, {})
     await loadAgentTasks()
     setStatus(agentStatus, `已恢复流程：${title}`, 'ok')
+    return true
   } catch (error) {
     setStatus(agentStatus, error.message, 'bad')
+    return false
+  }
+}
+
+async function reopenTaskFromHistory(task) {
+  const taskId = String(task?.id || task || '')
+  if (!taskId || taskHistoryBusyId.value) return
+  taskHistoryBusyId.value = taskId
+  setStatus(taskHistoryStatus, '正在恢复为活动任务...', '')
+  try {
+    const reopened = await reopenAgentTask(task)
+    setStatus(taskHistoryStatus, reopened ? '任务已恢复为活动状态。' : (agentStatus.text || '操作失败'), reopened ? 'ok' : 'bad')
+  } finally {
+    taskHistoryBusyId.value = ''
   }
 }
 
@@ -1256,16 +1422,52 @@ async function deleteAgentTask(task) {
   const taskId = typeof task === 'string' ? task : task?.id
   if (!taskId) return
   const title = typeof task === 'object' ? (task.title || task.id) : taskId
-  if (!window.confirm(`删除任务档案：${title}？\n\n只删除任务状态和任务目录，不会删除已下载视频。`)) return
+  if (!window.confirm(`删除任务档案：${title}？\n\n只删除任务状态和任务目录，不会删除已下载视频。`)) return false
   try {
     await api(`/api/agent-tasks/${taskId}/delete`, {})
     if (agentSession.value?.result?.task_id === taskId) agentSession.value = null
     await loadAgentTasks()
     await loadAgentSessions()
     setStatus(agentStatus, `已删除任务：${title}`, 'ok')
+    return true
   } catch (error) {
     setStatus(agentStatus, error.message, 'bad')
+    return false
   }
+}
+
+async function deleteTaskFromHistory(task) {
+  const taskId = String(task?.id || task || '')
+  if (!taskId || taskHistoryBusyId.value) return
+  taskHistoryBusyId.value = taskId
+  try {
+    const deleted = await deleteAgentTask(task)
+    if (deleted) setStatus(taskHistoryStatus, '任务档案已删除；下载素材仍然保留。', 'ok')
+  } finally {
+    taskHistoryBusyId.value = ''
+  }
+}
+
+async function openTaskHistoryGlossary(payload) {
+  const path = typeof payload === 'string' ? payload : payload?.path
+  if (!path) {
+    setStatus(taskHistoryStatus, '这个阶段没有可打开的 Glossary 文件。', 'bad')
+    return
+  }
+  const loaded = await loadGlossary(path)
+  if (!loaded && glossaryLoadFailure) {
+    setStatus(taskHistoryStatus, `Glossary 加载失败：${glossaryLoadFailure}`, 'bad')
+  }
+}
+
+async function openTaskArtifact(payload) {
+  const path = String(payload?.path || '')
+  if (!path) {
+    setStatus(taskHistoryStatus, '这个阶段没有可打开的字幕文件。', 'bad')
+    return
+  }
+  if (payload?.kind === 'source_srt') sourceSrt.value = path
+  await editSubtitle({ path })
 }
 
 async function openGlossaryFromAgent(payload) {
@@ -1277,9 +1479,7 @@ async function openGlossaryFromAgent(payload) {
     const continued = await continueAgentTask(taskId)
     if (continued?.openedGlossaryReview) return
   }
-  glossaryPath.value = path || ''
-  activeView.value = 'glossary'
-  await loadGlossary()
+  await loadGlossary(path || '')
 }
 
 async function openGlossaryReviewForSession(session) {
@@ -1298,15 +1498,12 @@ async function openGlossaryReviewForSession(session) {
     activeView.value = 'glossary'
     return true
   }
-  if (openingGlossaryReviewKey.value === reviewKey && glossaryPath.value.trim() === reviewPath) {
-    activeView.value = 'glossary'
+  if (openingGlossaryReviewKey.value === reviewKey) {
     return true
   }
   openingGlossaryReviewKey.value = reviewKey
-  glossaryPath.value = reviewPath
-  activeView.value = 'glossary'
   try {
-    const loaded = await loadGlossary()
+    const loaded = await loadGlossary(reviewPath)
     if (!loaded) return false
     openedGlossaryReviewKey.value = reviewKey
     setStatus(agentStatus, 'Glossary 已生成，已打开审核。保存后 Agent 将继续翻译。', 'ok')
@@ -1927,9 +2124,12 @@ async function correctAsrSubtitle() {
   }
 }
 
-async function loadGlossary() {
-  const requestedPath = glossaryPath.value.trim()
+async function loadGlossary(pathOverride) {
+  glossaryLoadFailure = ''
+  const hasPathOverride = typeof pathOverride === 'string'
+  const requestedPath = String(hasPathOverride ? pathOverride : glossaryPath.value).trim()
   if (!requestedPath) {
+    glossaryLoadFailure = '未提供 Glossary 路径。'
     setStatus(flowStatus, '先填写 glossary 路径。', 'bad')
     return false
   }
@@ -1937,7 +2137,7 @@ async function loadGlossary() {
     return false
   }
   const loadGeneration = ++glossaryLoadGeneration
-  activeView.value = 'glossary'
+  if (!hasPathOverride) activeView.value = 'glossary'
   glossaryLoading.value = true
   setStatus(flowStatus, '正在加载 glossary，并生成盲翻候选...', '')
   try {
@@ -1947,7 +2147,9 @@ async function loadGlossary() {
       api('/api/read-text', { path: requestedPath }),
       api('/api/read-glossary-items', { path: requestedPath, include_blind_candidates: true }),
     ])
-    if (loadGeneration !== glossaryLoadGeneration || glossaryPath.value.trim() !== requestedPath) return false
+    if (loadGeneration !== glossaryLoadGeneration) return false
+    if (!hasPathOverride && glossaryPath.value.trim() !== requestedPath) return false
+    glossaryPath.value = requestedPath
     glossaryEditor.value = text.content || ''
     glossaryItems.value = review.items || []
     loadedGlossaryPath.value = requestedPath
@@ -1957,7 +2159,10 @@ async function loadGlossary() {
     activeView.value = 'glossary'
     return true
   } catch (error) {
-    if (loadGeneration === glossaryLoadGeneration) setStatus(flowStatus, error.message, 'bad')
+    if (loadGeneration === glossaryLoadGeneration) {
+      glossaryLoadFailure = error.message
+      setStatus(flowStatus, error.message, 'bad')
+    }
     return false
   } finally {
     if (loadGeneration === glossaryLoadGeneration) glossaryLoading.value = false

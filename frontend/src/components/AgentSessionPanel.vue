@@ -14,9 +14,10 @@
         </div>
       </div>
 
-      <div v-if="session" class="toolbar agent-current-actions">
-        <button v-if="session.retryable" class="secondary mini" type="button" @click="$emit('retry-agent')">重试当前阶段</button>
-        <button v-if="session.cancellable" class="danger secondary mini" type="button" @click="$emit('cancel-agent')">中断</button>
+      <div class="toolbar agent-current-actions">
+        <button class="secondary mini" type="button" @click="$emit('open-task-history')">任务历史</button>
+        <button v-if="session?.retryable" class="secondary mini" type="button" @click="$emit('retry-agent')">重试当前阶段</button>
+        <button v-if="session?.cancellable" class="danger secondary mini" type="button" @click="$emit('cancel-agent')">中断</button>
       </div>
 
       <div v-if="operationStatus" class="agent-operation-status" role="status" aria-live="polite">
@@ -289,73 +290,9 @@
       </details>
     </details>
 
-    <details v-if="activeTasks.length" class="agent-session-strip agent-task-section">
-      <summary class="section-title">
-        <h3>活动视频任务</h3>
-        <span class="badge">{{ activeTasks.length }}</span>
-      </summary>
-      <div v-if="activeTasks.length" class="agent-task-list">
-        <article v-for="task in activeTasks" :key="task.id" class="agent-task-card">
-          <div class="agent-task-head">
-            <div>
-              <b>{{ task.title || task.url || task.id }}</b>
-              <span>{{ taskStageLabel(task.current_stage) }} · {{ task.id }}</span>
-            </div>
-            <div class="agent-task-head-actions">
-              <button class="secondary mini" type="button" @click="$emit('continue-task', task.id)">继续</button>
-              <button class="secondary mini" type="button" @click="$emit('complete-task', task)">完成流程</button>
-              <button class="danger secondary mini" type="button" @click="$emit('delete-task', task)">删除任务</button>
-            </div>
-          </div>
-          <div class="agent-task-stages">
-            <div v-for="stage in task.stage_items || []" :key="stage.id" class="agent-task-stage" :class="taskStageStatusClass(stage, task)">
-              <span>{{ taskStageDisplayLabel(stage) }}</span>
-              <b>{{ stageStatusLabel(stage, task) }}</b>
-              <div class="agent-task-actions">
-                <button v-if="stage.id === 'glossary' && stage.glossary_path" class="secondary mini" type="button" @click="$emit('open-glossary', taskGlossaryPayload(task, stage))">{{ taskGlossaryActionLabel(task) }}</button>
-                <button v-if="canRerun(stage)" class="secondary mini" type="button" @click="$emit('rerun-task', { taskId: task.id, stage: stage.id })">重跑</button>
-              </div>
-            </div>
-          </div>
-        </article>
-      </div>
-    </details>
-
-    <details v-if="completedTasks.length" class="agent-session-strip completed-task-panel">
-      <summary class="section-title">
-        <h3>已完成视频任务</h3>
-        <span class="badge">{{ completedTasks.length }}</span>
-      </summary>
-      <div class="agent-task-list">
-        <article v-for="task in completedTasks" :key="task.id" class="agent-task-card completed">
-          <div class="agent-task-head">
-            <div>
-              <b>{{ task.title || task.url || task.id }}</b>
-              <span>{{ taskStageLabel(task.current_stage) }} · {{ completedLabel(task) }} · {{ task.id }}</span>
-            </div>
-            <div class="agent-task-head-actions">
-              <button class="secondary mini" type="button" @click="$emit('reopen-task', task)">恢复</button>
-              <button class="secondary mini" type="button" @click="$emit('continue-task', task.id)">继续</button>
-              <button class="danger secondary mini" type="button" @click="$emit('delete-task', task)">删除任务</button>
-            </div>
-          </div>
-          <div class="agent-task-stages">
-            <div v-for="stage in task.stage_items || []" :key="stage.id" class="agent-task-stage" :class="taskStageStatusClass(stage, task)">
-              <span>{{ taskStageDisplayLabel(stage) }}</span>
-              <b>{{ stageStatusLabel(stage, task) }}</b>
-              <div class="agent-task-actions">
-                <button v-if="stage.id === 'glossary' && stage.glossary_path" class="secondary mini" type="button" @click="$emit('open-glossary', taskGlossaryPayload(task, stage))">{{ taskGlossaryActionLabel(task) }}</button>
-                <button v-if="canRerun(stage)" class="secondary mini" type="button" @click="$emit('rerun-task', { taskId: task.id, stage: stage.id })">重跑</button>
-              </div>
-            </div>
-          </div>
-        </article>
-      </div>
-    </details>
-
     <details v-if="sessions.length" class="agent-session-strip agent-run-history">
       <summary class="section-title">
-        <h3>运行记录</h3>
+        <h3>本次服务运行记录</h3>
         <span class="badge">{{ sessions.length }}</span>
       </summary>
       <div class="agent-session-list">
@@ -419,7 +356,6 @@ import {
   sessionPhaseLabel,
   shouldShowAgentOcrWorkbench,
 } from '../agentFlowPresentation.js'
-import { effectiveTaskStageStatus, taskGlossaryOpenPayload, taskHasCurrentTranslation } from '../glossaryReviewFlow.js'
 
 const props = defineProps({
   url: { type: String, default: '' },
@@ -442,7 +378,6 @@ const props = defineProps({
   extraHint: { type: String, default: '' },
   session: { type: Object, default: null },
   sessions: { type: Array, default: () => [] },
-  tasks: { type: Array, default: () => [] },
   starting: { type: Boolean, default: false },
   status: { type: String, default: '' },
   statusClass: { type: String, default: '' },
@@ -471,11 +406,7 @@ const emit = defineEmits([
   'cancel-agent',
   'retry-agent',
   'select-agent',
-  'continue-task',
-  'rerun-task',
-  'complete-task',
-  'reopen-task',
-  'delete-task',
+  'open-task-history',
   'open-glossary',
 ])
 
@@ -492,8 +423,6 @@ function isCropPreset(topRatio) {
   return Math.abs(Number(props.ocrCropTopRatio || 0) - topRatio) < 0.005
 }
 
-const activeTasks = computed(() => props.tasks.filter((task) => !task.is_completed))
-const completedTasks = computed(() => props.tasks.filter((task) => task.is_completed))
 const activeOcrPipeline = computed(() => getAgentOcrPipeline(props.ocrPipelineVersion))
 const effectiveOcrScope = computed(() => ['v2', 'v3'].includes(props.ocrPipelineVersion) ? 'bottom' : props.ocrScope)
 const currentSessionOcrPipelineVersion = computed(() => inferAgentOcrPipelineVersion(props.session?.payload || {}))
@@ -540,11 +469,6 @@ function sessionGlossaryActionLabel(item) {
   return item?.status === 'done' ? '查看 Glossary' : '审核 Glossary'
 }
 
-function completedLabel(task) {
-  if (!task?.completed_at) return '已完成'
-  return new Date(task.completed_at * 1000).toLocaleString()
-}
-
 function itemLabel(item) {
   const title = item.result?.probe?.title || item.payload?.url || 'Agent 任务'
   return String(title).slice(0, 42)
@@ -553,70 +477,6 @@ function itemLabel(item) {
 function reuseLabel(item) {
   const matchedBy = item.matched_by === 'url' ? '标准链接匹配' : '标题兼容匹配'
   return `${matchedBy} · ${item.job_id || '历史任务'}`
-}
-
-function taskStageLabel(stage) {
-  const labels = {
-    created: '刚创建',
-    probe_done: '已检测',
-    ocr_done: 'OCR 已完成',
-    asr_done: 'ASR 原文已完成',
-    asr_ocr_done: 'ASR + OCR 原文已完成',
-    glossary_review: '等待 glossary 审核',
-    done: '已完成',
-    ocr_rerun: '正在重跑 OCR',
-    glossary_rerun: '正在重跑 Glossary',
-    translate_rerun: '正在重跑翻译',
-    ocr_failed: 'OCR 失败',
-    glossary_failed: 'Glossary 失败',
-    translate_failed: '翻译失败',
-  }
-  return labels[stage] || stage || '未开始'
-}
-
-function taskStageDisplayLabel(stage) {
-  return stage?.id === 'ocr' ? '原文字幕' : stage?.label
-}
-
-function stageStatusLabel(stage, task) {
-  const status = resolvedTaskStageStatus(stage, task)
-  if (stage?.id === 'glossary' && status === 'done' && stage?.status === 'waiting_review') return '已用于翻译'
-  const labels = {
-    pending: '未开始',
-    done: '完成',
-    waiting_review: '待审核',
-    failed: '失败',
-    invalidated: '已失效',
-    rerunning: '重跑中',
-  }
-  return labels[status] || status || '未开始'
-}
-
-function resolvedTaskStageStatus(stage, task) {
-  if (stage?.id === 'glossary' && stage?.status === 'waiting_review' && taskHasCurrentTranslation(task)) return 'done'
-  let status = effectiveTaskStageStatus(stage, task)
-  if (stage?.id === 'ocr' && (!status || status === 'pending')) {
-    const asrStage = task?.stages?.asr
-    if (asrStage?.status) status = asrStage.status
-    else if (task?.stages?.glossary?.source_srt) status = 'done'
-  }
-  return status || 'pending'
-}
-
-function taskStageStatusClass(stage, task) {
-  return resolvedTaskStageStatus(stage, task)
-}
-
-function taskGlossaryActionLabel(task) {
-  return taskHasCurrentTranslation(task) ? '查看' : '审核'
-}
-
-function taskGlossaryPayload(task, stage) {
-  return taskGlossaryOpenPayload(task, stage)
-}
-
-function canRerun(stage) {
-  return stage.can_rerun !== false && ['ocr', 'glossary', 'translate'].includes(stage.id) && ['done', 'waiting_review', 'failed', 'invalidated'].includes(stage.status)
 }
 
 const agentPlan = computed(() => props.session?.result?.agent_plan || null)
