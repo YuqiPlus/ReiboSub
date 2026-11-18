@@ -15,13 +15,25 @@ The project is designed for a human-in-the-loop workflow: the Agent can run mult
 - **ASR subtitles**: transcribe speech with `faster-whisper`, then optionally correct ASR text with an LLM.
 - **Video upload flow**: upload a local video from the browser and start an ASR-to-Chinese subtitle job directly.
 - **Hybrid workflows**: use a reliable uploaded subtitle timeline, such as English, while reconstructing original-language text from OCR when the embedded source subtitle is more accurate.
-- **Glossary review**: generate draft terms, review names/nicknames/program titles in the UI, use romanization and blind candidates, then continue translation.
+- **Glossary review**: review names, nicknames and titles with romanization and context translations. Play evidence from the associated video/audio inside each term card, switch occurrences, slow down/repeat playback, and inspect adjacent source subtitles. Clips include 3 seconds on each side, expandable to 10; playback never confirms or edits a translation.
 - **Subtitle editing**: edit text and timing, keep 50 undo steps, preview one cue with a live sidecar overlay, and add/merge/delete/clean cues.
 - **Subtitle conversion**: convert to common formats including SRT, VTT, ASS/SSA, LRC, TXT, JSON, and Bilibili BCC.
 - **Video overlay tool**: place watermark/logo masks on a video and export a new video without overwriting the original.
 - **Model provider settings**: add OpenAI-compatible services, discover their models, and bind a provider/model to each LLM task from the Web UI.
 
 For Agent routing design notes, see [docs/youtube_agent_workflows.md](docs/youtube_agent_workflows.md). That document includes background and future ideas, so not every item is necessarily implemented.
+
+### Independent goal-driven Agent experiment
+
+Choose the experimental autonomous mode in the Agent cockpit and provide a YouTube link. New sessions use an evidence-linked controller: the model chooses each next tool, revises a short plan after observations or failures, and selects delivery when artifact checks allow it. There is no mandatory run-through of every tool. The legacy workflow and saved older experimental sessions retain their existing protocols.
+
+Tools include caption discovery and reuse, subtitle-context queries, frame sampling at model-selected times, vision/OCR trials, ASR, bounded 4–30 second audio checks, source comparison, and local translation review. Vision requires a configured image-capable model; local recognition requires its optional dependencies. The model cannot run arbitrary commands, select arbitrary files, change providers, bypass human glossary review for translation, or overwrite existing translated results. Reusing existing Chinese captions does not require glossary generation or retranslation.
+
+Normal new tasks must save both the video and Chinese subtitles. The Agent may inspect captions and decide its approach before scheduling the download, and reuses an existing project video when available. Missing video prevents completion even when Chinese captions are ready. The UI shows saved-video status and a download link. Explicit verification-only, local-review and source-reuse continuations retain their original narrower scope.
+
+The UI shows concise evidence summaries, the current action, its expected observable result, and a revisable plan—not private reasoning. Recognition candidates, structural checks and sampled semantic checks are not ground truth or a full human audit. Current limits include one-hour media for whole-video download/re-recognition, 24 decisions per invocation, and per-tool budgets. Exhausted or failed runs retain their artifacts and report the actual internal failure instead of asking users to approve it as a subtitle issue.
+
+Verification identifies specific empty cues and count/timing mismatches. A narrowly recognized Korean rolling-caption ending may be omitted only from delivery copies when its neighboring source text and overlapping interval cover it, and both the local proposal and independent checker approve keeping its translation empty. Original files and an explicit original-to-delivery ID mapping are preserved. Other empty translations remain errors; placeholder text is not used to force acceptance.
 
 > [!IMPORTANT]
 > This is a trusted-user local tool. The Web UI has no accounts or login layer. It listens on `127.0.0.1` by default; do not expose it directly to the public Internet. Use SSH forwarding for a remote server and read [SECURITY.md](SECURITY.md).
@@ -276,7 +288,30 @@ fall back to sequential execution instead of failing.
 
 ## Agent Workflows
 
-Typical UI flow:
+The Agent page defaults to **自主 Agent · 实验** (autonomous tool selection).
+Paste a YouTube link; no test interval is required. A bounded controller chooses
+among existing subtitle tracks, frame sampling, visual analysis, OCR 3.0, ASR 2.2,
+local Korean audio review, translation, and verification. It records each tool
+choice and asks for a short clue or explicit candidate confirmation when evidence
+is insufficient. Tool limits and prerequisites are enforced outside the model.
+
+Source selection is autonomous, but **Glossary review is a required human step**
+before formal translation. The Agent prepares context translations before opening
+the Glossary page; names and terminology are not automatically
+confirmed: fill or confirm them and save to continue. Translation and local review
+use the frozen, user-approved glossary; the autonomous route cannot skip this gate.
+
+Configure **视频画面分析** in Settings with an image-capable model to enable visual
+inspection. Logo exclusions must pass a sampled OCR comparison; original frames
+and OCR Lab results are retained. This first experimental mode limits video
+download and fresh recognition to one hour; longer videos may still use existing
+subtitle tracks. Semantic checks are sampled, not a guarantee of word-for-word
+accuracy. Downloadable source/Chinese SRT files remain drafts for user review.
+
+Select **经典工作流** to keep using the original guided route below. Its processing
+steps and the ASR 2.2 baseline are unchanged.
+
+Typical guided UI flow:
 
 1. Paste a YouTube URL or video ID in **Agent**.
 2. Tell the Agent whether embedded subtitles are present if you know.
