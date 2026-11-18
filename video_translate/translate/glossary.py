@@ -57,6 +57,14 @@ class Glossary:
         context["glossary"] = [entry.to_dict() for entry in self.relevant_entries(texts)]
         return context
 
+    def to_reviewed_context(self, texts: list[str]) -> dict[str, Any]:
+        """Frozen human choices; draft uncertainty notes must not reopen review."""
+        context=self.to_context(texts)
+        for entry in [*context.get('glossary',[]),*([context['program']] if context.get('program') else [])]:
+            entry.pop('note',None)
+            entry['human_approved']=True
+        return context
+
 
 def load_glossary(path: Path | None) -> Glossary:
     if path is None:

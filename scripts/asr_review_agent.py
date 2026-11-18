@@ -1388,6 +1388,8 @@ def report(output):
         payload['timing_summary']=load_json(output/'timing-summary.json')
         payload['note']+=' Agent已用最终韩文重新对齐原音；中文仅同步时间，未重译。失败或可疑边界保留标记，不代表人工核准。'
         payload['timing_audits']=[{'sample_id':s['id'],'path':str(output/s['id']/'timing-alignment.json')} for s in samples]
+    if (output/'autonomous-trace.json').exists():
+        payload['autonomous_agent']=load_json(output/'autonomous-trace.json')
     if (output/'runtime-status.json').exists():
         payload['runtime_status']=load_json(output/'runtime-status.json')
         payload['note']+=' 本轮文字LLM额度受限，新增本地复核没有伪称完成新LLM裁决；中文使用可追溯的上轮对应译文缓存。'
@@ -1406,6 +1408,7 @@ HTML=r'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="vie
 <section id="main-player"><select id="sample"></select><p id="origin" class="muted"></p><audio id="audio" controls preload="metadata"></audio><p id="clock"></p><div id="columns" class="columns"></div><p id="stats" class="muted lab-only"></p></section>
 <section class="lab-only"><h2>低音量 / 停顿试听</h2><div id="points"></div></section>
 <section id="timing-section" class="lab-only" hidden><h2>最终文本时间轴校准</h2><p id="timing-summary"></p><div id="timing-links"></div></section>
+<section id="autonomous-section" class="lab-only" hidden><h2>自主Agent操作记录</h2><p>这是工具调用及结果记录，不是音频真值或准确率证明。</p><ol id="autonomous-actions"></ol></section>
 <section id="human-questions-section" hidden><div class="review-stepbar"><span id="review-progress"></span><div><button id="review-previous" type="button">上一句</button><button id="review-skip" type="button">先跳过 →</button></div></div><div id="human-questions"></div><div class="review-composer"><input id="review-hint" class="answer-hint" aria-label="补充人名线索" placeholder="我猜是……（名字、角色或作品都行）"><button id="submit-human-answers" type="button">继续</button></div><p id="human-answer-status" class="review-status" role="status" aria-live="polite"></p><p class="review-footnote">点选音译，或补一句线索就可以。原结果会保留。<a id="review-download">下载当前中文字幕</a></p></section>
 <section class="lab-only"><h2>局部重新识别的证据</h2><p>展开查看原音与有限增益重试。相同模型的两次输出不算两张独立选票；这些候选也不是人工真值。</p><div id="evidence"></div></section>
 <section id="continuation-section" class="lab-only" hidden><h2>上轮待审项逐条复查</h2><div class="scroll"><table><thead><tr><th>原视频</th><th>疑点</th><th>本轮状态 / 原因</th></tr></thead><tbody id="continuation-cases"></tbody></table></div></section>
@@ -1426,11 +1429,12 @@ function activeReviewQuestion(){return reviewQuestions()[reviewIndex]}
 function reviewDraft(q){const old=readHumanDrafts()[q.case_id]||{};return {mode:old.mode||'hint',hint:old.hint||'',choices:old.candidate_signature===JSON.stringify(q.candidates)?{...old.choices}: {},candidate_signature:JSON.stringify(q.candidates)}}
 function setReviewView(view){
   reviewView=view;document.body.dataset.view=view;const count=reviewQuestions().length;
-  document.getElementById('review-view').textContent=count?'确认人名':'字幕结果';
+  const autonomous=data.policy?.autonomous_subtitle_agent;
+  document.getElementById('review-view').textContent=count?(autonomous?'确认疑点':'确认人名'):'字幕结果';
   document.getElementById('review-view').setAttribute('aria-pressed',String(view!=='lab'));
   document.getElementById('lab-view').setAttribute('aria-pressed',String(view==='lab'));
-  document.getElementById('review-title').textContent=view==='lab'?'实验对照':count?'有几个名字，想请你听一下':'字幕已更新';
-  document.getElementById('review-subtitle').textContent=view==='lab'?'原音、不同路线的字幕和复核记录。':count?'一次看一句。认得就补个线索，不认识也可以选音译。':'可以直接试听，或下载中文字幕。';
+  document.getElementById('review-title').textContent=view==='lab'?'实验对照':count?(autonomous?'有几处还想请你确认':'有几个名字，想请你听一下'):'字幕已更新';
+  document.getElementById('review-subtitle').textContent=view==='lab'?'原音、不同路线的字幕和复核记录。':count?(autonomous?'Agent已保留证据与候选；一次看一句，也可以补线索。':'一次看一句。认得就补个线索，不认识也可以选音译。'):'可以直接试听，或下载中文字幕。';
   for(const b of Object.keys(labels))document.getElementById(b+'zh').parentElement.querySelector('h2').textContent=view==='result'&&b==='agent'?'中文字幕':labels[b];
   if(view==='review')renderHumanQuestions();
   if(view==='lab'){renderEvidence();renderContinuation()}
@@ -1453,7 +1457,7 @@ function updateReviewPrimary(){
   const button=document.getElementById('submit-human-answers');if(reviewSubmitting){button.disabled=true;button.textContent='正在处理…';return}
   const q=activeReviewQuestion();if(!q)return;const draft=reviewDraft(q);const slots=[...new Set(q.candidates.map(c=>c.slot_zh))];
   const hasHint=!!draft.hint.trim();const complete=slots.every(s=>draft.choices[s]);
-  button.textContent=hasHint?'用线索继续':complete?'按音译继续':draft.choices[slots[reviewSlot]]?'下一位':'继续';
+  button.textContent=hasHint?'用线索继续':complete?(q.kind==='subtitle'?'使用这个版本':'按音译继续'):draft.choices[slots[reviewSlot]]?'下一位':'继续';
   button.disabled=!hasHint&&!complete&&!draft.choices[slots[reviewSlot]];
 }
 function moveReviewQuestion(delta){
@@ -1483,6 +1487,7 @@ function renderHumanQuestions(){
     if(contextReview){const uncertainty=document.createElement('p');uncertainty.className='recognition-note';uncertainty.textContent='上下文推荐 ≠ 身份确认；仍可给线索或按音译继续。';box.append(uncertainty)}card.append(box);
   }
   const hint=document.getElementById('review-hint');hint.value=draft.hint;
+  if(q.kind==='subtitle'){hint.placeholder='补一句线索（这句在说什么、人名或作品都行）';document.querySelector('.review-footnote').firstChild.textContent='可选一个版本或补线索，不确定可先跳过。原结果保留。'}
   hint.oninput=()=>{const current=reviewDraft(q);current.hint=hint.value;current.mode=hint.value.trim()?'hint':Object.keys(current.choices).length?'transliteration':'hint';saveHumanDraft(q.case_id,current);updateReviewPrimary()};
   hint.onkeydown=event=>{if(event.key==='Enter'&&!event.isComposing){event.preventDefault();submitHumanAnswers()}};
   function choose(i,j,toggle){const current=reviewDraft(q);const value=i+':'+j;if(toggle&&current.choices[slot]===value)delete current.choices[slot];else current.choices[slot]=value;current.mode=current.hint.trim()?'hint':'transliteration';saveHumanDraft(q.case_id,current);renderHumanQuestions();document.querySelector('[data-candidate-index="'+i+'"]')?.focus({preventScroll:true})}
@@ -1574,6 +1579,7 @@ function renderEvidence(){
 }
 document.getElementById('sample').addEventListener('change',()=>queueMicrotask(renderEvidence));
 document.addEventListener('DOMContentLoaded',renderEvidence);
+document.addEventListener('DOMContentLoaded',()=>{if(!data.autonomous_agent)return;document.getElementById('autonomous-section').hidden=false;const names={relisten:'局部重听',judge:'核对证据',translate:'翻译',check_translation:'检查译文',align:'校准时间',ask_user:'请求用户确认',finish:'生成草稿',user_input_then_recheck:'根据回答继续复核'};const states={completed:'已完成',rejected:'不符合证据或权限要求，已拒绝',partially_rejected:'部分建议被保护规则拒绝'};for(const event of data.autonomous_agent.actions||[]){const li=document.createElement('li');li.textContent=[names[event.tool]||event.tool,event.reason||event.message||'',states[event.status]||event.status].filter(Boolean).join(' · ');document.getElementById('autonomous-actions').append(li)}});
 document.addEventListener('DOMContentLoaded',()=>{if(!data.timing_summary)return;document.getElementById('timing-section').hidden=false;document.getElementById('timing-summary').textContent=data.timing_summary.samples.map(s=>s.sample_id+'：'+s.aligned+'/'+s.total+' 条采用新对齐，'+s.timing_needs_review+' 条边界仍需检查').join('；')+'。韩文与中文原文不变，失败条目保留旧时间，疑点没有强行抹平。';for(const item of data.timing_audits||[]){const p=document.createElement('p');const a=document.createElement('a');a.href=url(item.path);a.textContent=item.sample_id+' · 逐条查看校准前后与标记';p.append(a);document.getElementById('timing-links').append(p)}});
 document.getElementById('sample').addEventListener('change',()=>queueMicrotask(renderContinuation));
 document.addEventListener('DOMContentLoaded',renderContinuation);

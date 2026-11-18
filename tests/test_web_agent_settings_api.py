@@ -302,6 +302,13 @@ def test_post_provider_connection_updates_local_override(monkeypatch, http_serve
             "base_url": payload["base_url"],
         }
 
+    # This HTTP contract test must also work on a fresh clone with no local
+    # provider registry or credentials configured.
+    monkeypatch.setattr(
+        web_agent,
+        "get_provider_connection_settings",
+        lambda provider_id, *, root: {"provider_id": provider_id, "base_url": "https://provider.example/v1"},
+    )
     monkeypatch.setattr(web_agent, "update_provider_connection_settings", fake_update)
 
     status, payload = _request(

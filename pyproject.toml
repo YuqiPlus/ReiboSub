@@ -54,3 +54,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["video_translate*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

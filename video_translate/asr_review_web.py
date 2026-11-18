@@ -210,8 +210,11 @@ class ExperimentReviewService:
                 with self.lock:
                     current=self._state(base);current.update(status='running',job_id=job_id);self._save(base,current)
                 try:
-                    self.run_command(job_id,[self.python,'-u',str(self.root/'scripts/asr_review_agent.py'),
-                        'human-continue','--seed-experiment',str(base),'--answers',str(request_file),'--output',str(child)])
+                    autonomous=read_json(base/'manifest.json').get('policy',{}).get('autonomous_subtitle_agent') is True
+                    script='autonomous_subtitle_agent.py' if autonomous else 'asr_review_agent.py'
+                    command='respond' if autonomous else 'human-continue'
+                    self.run_command(job_id,[self.python,'-u',str(self.root/'scripts'/script),
+                        command,'--seed-experiment',str(base),'--answers',str(request_file),'--output',str(child)])
                     result=self._completed_result(base,self._state(base))
                     if result is None: raise RuntimeError('新实验结果未完整生成或与本次回答不符')
                     with self.lock:

@@ -39,6 +39,7 @@ def ranges(raw, duration):
 
 
 def launch(payload, app):
+    autonomous=payload.get('asr_version')=='autonomous-experimental'
     media=app._resolve_project_path(app._required_str(payload,'input_video'))
     app._ensure_under_root(media)
     if not media.is_file():raise FileNotFoundError('请选择存在的视频或音频文件')
@@ -65,7 +66,7 @@ def launch(payload, app):
 
     def target(job_id):
         from scripts.asr3_benchmark import load_json, save_json
-        root=app.ROOT/'outputs/asr3_experiments'/f'lab_{job_id}'
+        root=app.ROOT/'outputs/asr3_experiments'/f'{"autonomous_lab" if autonomous else "lab"}_{job_id}'
         if root.exists():raise FileExistsError('实验目录已存在，不覆盖过往结果')
         baseline=root/'baseline';baseline.mkdir(parents=True)
         save_json(root/'lab-request.json',{'input_video':str(media),'test_ranges':selected,
@@ -85,10 +86,13 @@ def launch(payload, app):
                     '--qwen-python',str(qwen)],None),
                 ('7/7 最终文本时间轴校准',[app.PYTHON,'-u',review,'calibrate-timing','--seed-experiment',str(root/'review'),
                     '--output',str(root/'calibrated'),'--qwen-python',str(qwen)],None)]
+        if autonomous:
+            stages=stages[:5]+[('自主字幕Agent检查与工具执行',[app.PYTHON,'-u',str(app.ROOT/'scripts/autonomous_subtitle_agent.py'),
+                'run','--manifest',str(manifest),'--output',str(root/'autonomous'),'--qwen-python',str(qwen)],None)]
         for label,command,gpu in stages:
             app._append_log(job_id,'experiment_stage: '+label)
             app._run_command(job_id,command,env_overrides={**env,**({'CUDA_VISIBLE_DEVICES':gpu} if gpu else {})})
-        final=root/'calibrated';questions=load_json(final/'human-review-questions.json')
+        final=root/('autonomous' if autonomous else 'calibrated');questions=load_json(final/'human-review-questions.json')
         summary=load_json(final/'timing-summary.json')
         ko=final/'agent.original-timeline.ko.srt';zh=final/'agent.original-timeline.zh.srt'
         result={'kind':'asr_experiment_lab','asr_version':'agent-experimental','pipeline_version':'多模型Agent（实验版）',
@@ -102,6 +106,13 @@ def launch(payload, app):
                 'notice':'仅包含选定测试区间，SRT使用原视频时间；实验稿不代表人工确认。'+(
                     ' 人名审核卡暂不可用，未确认人名保留韩文。' if questions.get('status')=='unavailable' else '')}
         save_json(root/'lab-result.json',result)
+        if autonomous:
+            trace=load_json(final/'autonomous-trace.json')
+            result.update(asr_version='autonomous-experimental',pipeline_version='自主字幕Agent（实验版）',
+                          translation_needs_review=sum(len(v) for v in trace.get('quality',{}).get('translation_issues',{}).values()),
+                          agent_stop_reason=trace.get('quality',{}).get('stop_reason'),
+                          autonomous_trace_url='/api/file?path='+quote(str((final/'autonomous-trace.json').relative_to(app.ROOT))))
+            save_json(root/'lab-result.json',result)
         app._append_log(job_id,'experiment_stage: 完成，可试听或确认人名')
         return result
-    return app.start_job('多模型Agent实验 · '+media.stem[:60],target)
+    return app.start_job(('自主字幕Agent实验 · ' if autonomous else '多模型Agent实验 · ')+media.stem[:60],target)

@@ -14,6 +14,35 @@ from video_translate import web_agent
 @pytest.fixture(autouse=True)
 def isolate_agent_task_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(web_agent, "TASK_DIR", tmp_path / "agent_tasks")
+    # Integration tests of other stages must not make auxiliary provider calls.
+    monkeypatch.setattr(web_agent,'_agent_prepare_glossary_candidates',lambda *a:{'state':'ready','pending':0})
+
+
+def test_autonomous_glossary_save_dispatches_back_to_agent_with_reviewed_snapshot(monkeypatch,tmp_path):
+    from video_translate.agent import autonomous
+    monkeypatch.setattr(web_agent,'ROOT',tmp_path)
+    monkeypatch.setattr(web_agent,'_AGENT_SESSIONS',{})
+    task=web_agent._ensure_agent_task(normalized_url='https://www.youtube.com/watch?v=abcdefghijk',title='glossary gate',payload={'agent_mode':'autonomous'})
+    task_dir=Path(task['task_dir']);source=task_dir/'source.srt';glossary=task_dir/'glossary.yaml'
+    source.write_text('1\n00:00:00,000 --> 00:00:01,000\n레이\n')
+    glossary.write_text("characters:\n- source: 레이\n  zh: ''\n  reviewed: false\n")
+    web_agent._update_task_stage(task['id'],'glossary','waiting_review',current_stage='glossary_review',source_srt=str(source),glossary_path=str(glossary))
+    session=web_agent._agent_session_from_task(web_agent._read_task(task['id']))
+    web_agent._agent_wait(session.id,'review_glossary',{'kind':'review_glossary','glossary_path':str(glossary)})
+    with pytest.raises(ValueError,match='不能跳过'):
+        web_agent._start_agent_translation(web_agent._read_task(task['id']),use_glossary=False)
+    with pytest.raises(ValueError,match='未审核'):
+        web_agent._start_agent_translation(web_agent._read_task(task['id']),use_glossary=True)
+    called=[]
+    monkeypatch.setattr(autonomous,'resume_after_glossary',lambda item,app:called.append(item))
+    monkeypatch.setattr(web_agent,'_agent_translate_after_glossary',lambda *a,**k:pytest.fail('不可跳回旧路线直接翻译'))
+    monkeypatch.setattr(web_agent,'_run_agent_async',lambda sid,fn:fn(web_agent._AGENT_SESSIONS[sid]))
+    result=web_agent.save_glossary_review_and_continue({'path':str(glossary),
+        'items':[{'section':'characters','index':0,'source':'레이','zh':'用户确认的译名','reviewed':True}]})
+    assert called==[session] and result['session']['id']==session.id
+    snapshot=Path(session.result['translation_glossary_path'])
+    assert snapshot!=glossary and '用户确认的译名' in snapshot.read_text()
+    assert web_agent.get_agent_task(task['id'])['stages']['glossary']['status']=='reviewed'
 
 
 def _stub_agent_project_video(monkeypatch, video: Path) -> None:
@@ -1899,6 +1928,17 @@ def test_reconcile_does_not_demote_completed_task_with_stale_stage_status():
     assert task["workflow_status"] == "completed"
 
 
+@pytest.mark.parametrize('stage',['autonomous_failed','autonomous_waiting','autonomous_review_required','glossary_review'])
+def test_reconcile_preserves_autonomous_terminal_and_human_gate_states(stage):
+    task_dir=web_agent.TASK_DIR/'autonomous-test';task_dir.mkdir(parents=True)
+    path=task_dir/'task.yaml'
+    web_agent._write_task_file(path,{'id':'autonomous-test','payload':{'agent_mode':'autonomous'},
+        'current_stage':stage,'stages':{'translate':{'status':'running'}}})
+    before=path.read_bytes()
+    assert web_agent._reconcile_interrupted_agent_tasks()==0
+    assert path.read_bytes()==before
+
+
 def test_agent_phase_and_waiting_state_are_persisted(monkeypatch):
     task_dir = web_agent.TASK_DIR / "task1"
     task_dir.mkdir(parents=True)
@@ -2006,6 +2046,14 @@ def test_task_stage_items_keeps_ocr_source_when_downstream_uses_ocr(tmp_path):
     assert source_item["source_srt"] == str(ocr_source)
     assert source_item.get("source_stage") != "asr"
     assert source_item.get("can_rerun") is not False
+
+
+def test_existing_chinese_history_does_not_invent_glossary_ocr_or_translation_stages():
+    items=web_agent._task_stage_items({'stages':{'probe':{'status':'done'},'translate':{
+        'status':'done','delivery_mode':'existing_target_subtitle','translated_srt':'creator.zh.srt'}}})
+    assert len(items)==2 and items[1]['label']=='现成中文字幕交付（未重译）'
+    assert items[1]['can_rerun'] is False
+    assert not any(row['id'] in {'ocr','glossary'} for row in items)
 
 
 def test_old_generation_stage_update_does_not_mutate_new_task(tmp_path):
@@ -4078,10 +4126,17 @@ characters:
     read = web_agent.read_glossary_items({"path": str(path), "include_blind_candidates": True})
 
     assert read["items"][0]["context_text"] == "천승 좋아해요"
-    assert read["items"][0]["blind_candidate_zh"] == "我喜欢天胜"
+    assert 'blind_candidate_zh' not in read['items'][0]
+    assert read['candidates']['pending']==1 and calls==[]
+    prepared=web_agent.prepare_glossary_candidates_job({'path':str(path)})
+    web_agent._wait_for_job(prepared,timeout=5)
+    read=web_agent.read_glossary_items({'path':str(path),'include_blind_candidates':True})
+    assert read['items'][0]['blind_candidate_zh']=='我喜欢天胜'
     assert read["items"][1]["context_text"] == "안녕하세요"
     assert "blind_candidate_zh" not in read["items"][1]
     assert calls == ["천승 좋아해요"]
+    again=web_agent.read_glossary_items({'path':str(path),'include_blind_candidates':True})
+    assert again['candidates']['state']=='ready' and calls==['천승 좋아해요']
 
     written = web_agent.write_glossary_items(
         {

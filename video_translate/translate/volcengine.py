@@ -1005,8 +1005,9 @@ def _request_translation(
     payload: dict[str, Any],
     *,
     max_attempts: int | None = None,
+    timeout_seconds: float | None = None,
 ) -> str:
-    timeout = _request_timeout_seconds()
+    timeout = _request_timeout_seconds() if timeout_seconds is None else max(0.1,float(timeout_seconds))
     max_attempts = max(1, max_attempts or _request_max_attempts())
     for attempt in range(1, max_attempts + 1):
         try:

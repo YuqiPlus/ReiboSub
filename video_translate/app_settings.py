@@ -25,6 +25,7 @@ LLM_TASK_KEYS = (
     "ocr_source_refinement",
     "ocr_geometry_refinement",
     "ocr_source_cleanup",
+    "video_analysis",
 )
 
 SOURCE_LANGUAGES = frozenset({"auto", "korean", "japanese", "english", "chinese"})

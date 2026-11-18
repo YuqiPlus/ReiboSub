@@ -9,6 +9,7 @@ configs/provider_secrets.yaml
 configs/reibosub.yaml
 configs/local_runtime.yaml
 outputs/
+*.candidates.json
 /build/
 /dist/
 frontend/node_modules/

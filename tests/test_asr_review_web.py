@@ -55,6 +55,14 @@ def test_submission_starts_once_persists_answers_and_publishes_separate_result(s
     assert (base/'comparison.html').read_text()=='<html>original</html>'
 
 
+def test_autonomous_experiment_uses_its_own_resume_worker(setup_review):
+    service,payload,base,_,_,tasks,calls=setup_review
+    write_json_atomic(base/'manifest.json',{'policy':{'autonomous_subtitle_agent':True}})
+    job=service.submit(payload);tasks[job['job_id']](job['job_id'])
+    assert calls[0][2].endswith('/scripts/autonomous_subtitle_agent.py')
+    assert calls[0][3]=='respond' and service.status(payload['experiment_path'])['status']=='done'
+
+
 def test_changed_request_or_competing_job_is_rejected(setup_review):
     service,payload,*_=setup_review
     service.submit(payload)

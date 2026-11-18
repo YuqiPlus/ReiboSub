@@ -26,7 +26,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 import requests
 import yaml
@@ -838,6 +838,8 @@ def list_jobs() -> list[dict[str, Any]]:
 
 
 def start_agent_session(payload: dict[str, Any], *, prepared_task: dict[str, Any] | None = None) -> AgentSession:
+    if payload.get('agent_mode') not in {None,'','autonomous','workflow'}:
+        raise ValueError('不支持的Agent模式')
     normalized_payload = dict(payload)
     normalized_payload["source_language"] = normalize_source_language(normalized_payload.get("source_language") or "auto")
     normalized_payload["ocr_language"] = normalize_source_language(normalized_payload.get("ocr_language") or "auto")
@@ -877,7 +879,11 @@ def start_agent_session(payload: dict[str, Any], *, prepared_task: dict[str, Any
         )
     with _LOCK:
         _AGENT_SESSIONS[session.id] = session
-    _run_agent_async(session.id, _agent_start)
+    if normalized_payload.get('agent_mode') == 'autonomous':
+        from video_translate.agent.autonomous import run
+        _run_agent_async(session.id,lambda item:run(item,sys.modules[__name__]))
+    else:
+        _run_agent_async(session.id, _agent_start)
     return session
 
 
@@ -909,6 +915,11 @@ def get_agent_task(task_id: str) -> dict[str, Any] | None:
 
 def continue_agent_task(task_id: str) -> AgentSession:
     task = _read_task(task_id)
+    if task.get('payload',{}).get('agent_mode') == 'autonomous':
+        from video_translate.agent.autonomous import run
+        session=_agent_session_from_task(task)
+        _run_agent_async(session.id,lambda item:run(item,sys.modules[__name__]))
+        return session
     stage = str(task.get("current_stage") or "")
     glossary_status = str(_task_stage_value(task, "glossary", "status") or "")
     if stage == "glossary_review" and glossary_status == "waiting_review":
@@ -1018,7 +1029,7 @@ def _restore_agent_glossary_review(task: dict[str, Any]) -> AgentSession:
             "glossary_path": glossary_path,
             "options": [
                 {"action": "continue_after_glossary", "label": "我已审核，继续翻译"},
-                {"action": "skip_glossary", "label": "跳过 glossary 直接翻译"},
+                *([] if task.get('payload',{}).get('agent_mode')=='autonomous' else [{"action": "skip_glossary", "label": "跳过 glossary 直接翻译"}]),
             ],
         },
     )
@@ -1037,6 +1048,7 @@ def _start_agent_translation(
     with _AGENT_TRANSLATION_START_LOCK:
         task = _read_task(task_id)
         run_generation = int(task.get("run_generation") or 0)
+        autonomous=task.get('payload',{}).get('agent_mode')=='autonomous'
         if use_glossary is None:
             persisted_choice = _task_stage_value(task, "translate", "use_glossary")
             use_glossary = persisted_choice if isinstance(persisted_choice, bool) else True
@@ -1045,6 +1057,11 @@ def _start_agent_translation(
             return active
         glossary_path = _task_stage_path(task, "glossary", "glossary_path")
         source_srt = _task_stage_path(task, "glossary", "source_srt") or _task_stage_path(task, "ocr", "source_srt")
+        if autonomous:
+            if not use_glossary:raise ValueError('自主路线必须等待Glossary人工审核，不能跳过人名和术语确认')
+            if not glossary_path or not Path(glossary_path).is_file():raise ValueError('请先生成并审核Glossary')
+            summary=_glossary_review_summary(_glossary_items(_load_yaml_file(Path(glossary_path))))
+            if not summary['all_reviewed']:raise ValueError('Glossary仍有未审核项，不能启动正式翻译')
         if use_glossary and not glossary_path:
             raise RuntimeError("Glossary 文件不存在，无法继续翻译")
         if not source_srt:
@@ -1100,7 +1117,11 @@ def _start_agent_translation(
                 current.result["run_generation"] = run_generation
                 current.updated_at = time.time()
                 session = current
-        _run_agent_async(session.id, lambda item: _agent_translate_after_glossary(item, use_glossary=use_glossary))
+        if autonomous:
+            from video_translate.agent.autonomous import resume_after_glossary
+            _run_agent_async(session.id,lambda item:resume_after_glossary(item,sys.modules[__name__]))
+        else:
+            _run_agent_async(session.id, lambda item: _agent_translate_after_glossary(item, use_glossary=use_glossary))
         return session
 
 
@@ -1385,6 +1406,24 @@ def answer_agent_session(session_id: str, answer: dict[str, Any]) -> AgentSessio
     if not session:
         raise KeyError("agent session not found")
     action = str(answer.get("action") or "")
+    if session.payload.get('agent_mode')=='autonomous' and session.question.get('kind')=='autonomous_verification_review':
+        raise ValueError('本轮仅验收且仍有具体疑点，不能确认跳过或重翻；请另行授权修订或针对性核查')
+    if session.payload.get('agent_mode')=='autonomous' and action=='skip_glossary':
+        raise ValueError('自主路线必须等待Glossary人工审核，不能跳过')
+    if session.payload.get('agent_mode')=='autonomous' and session.phase=='review_glossary' and action!='continue_after_glossary':
+        raise ValueError('请在Glossary页面填写并保存审核结果，普通回复不能替代人名和术语审核')
+    glossary_answer=session.status=='waiting' and session.phase=='review_glossary' and action=='continue_after_glossary'
+    target_question=session.question.get('kind')=='autonomous_target_review'
+    target_answer=session.status=='waiting' and target_question and action in {'use_target_caption','translate_from_source'}
+    if target_question and not target_answer:raise ValueError('请明确选择是否采用这份现成中文字幕，不能通过普通回复跳过覆盖提示')
+    if session.payload.get('agent_mode')=='autonomous' and action not in {'autonomous_reply','autonomous_fallback'} and not glossary_answer and not target_answer:
+        raise ValueError('自主Agent当前只接受补充线索、确认候选或切回旧流程')
+    if session.payload.get('agent_mode')=='autonomous' and action=='autonomous_reply':
+        if len(str(answer.get('clue','')))>4000:raise ValueError('线索不能超过4000字')
+        if not str(answer.get('clue','')).strip() and answer.get('confirmed_text') is None:
+            raise ValueError('请补一句线索，或明确选择一个候选')
+        if answer.get('confirmed_text') is not None and answer['confirmed_text'] not in session.question.get('candidates',[]):
+            raise ValueError('请从当前问题的候选中确认')
     if session.status == "waiting" and session.phase == "review_glossary" and action in {
         "continue_after_glossary",
         "skip_glossary",
@@ -1634,6 +1673,10 @@ def _agent_enter_manual_mode(session: AgentSession) -> None:
 
 
 def _agent_continue(session: AgentSession, answer: dict[str, Any]) -> None:
+    if session.payload.get('agent_mode') == 'autonomous':
+        from video_translate.agent.autonomous import run
+        run(session,sys.modules[__name__],answer)
+        return
     _agent_update_ocr_settings_from_answer(session, answer)
     action = str(answer.get("action") or "")
     if action == "manual_mode":
@@ -1855,6 +1898,10 @@ def _agent_confirm_hybrid_ocr_settings(session: AgentSession) -> None:
 
 
 def _agent_retry_current_phase(session: AgentSession) -> None:
+    if session.payload.get('agent_mode') == 'autonomous':
+        from video_translate.agent.autonomous import run
+        run(session,sys.modules[__name__])
+        return
     phase = session.phase
     if phase in {"created", "probe"}:
         _agent_start(session)
@@ -1986,7 +2033,7 @@ def _agent_use_recommended_subtitle(session: AgentSession) -> None:
     _agent_generate_glossary_review(session, source_srt)
 
 
-def _agent_generate_glossary_review(session: AgentSession, source_srt: str) -> None:
+def _agent_generate_glossary_review(session: AgentSession, source_srt: str, *, defer_wait: bool = False) -> None:
     if not _session_task_is_current(session):
         raise RuntimeError("任务已被新一轮处理替代，停止生成 Glossary")
     source_srt = _agent_persist_source_ready(session, source_srt)
@@ -1995,19 +2042,22 @@ def _agent_generate_glossary_review(session: AgentSession, source_srt: str) -> N
     is_dual_reference = session.result.get("source_kind") == "dual_subtitle_reference"
     is_ocr = session.result.get("source_kind") == "ocr"
     is_asr = session.result.get("source_kind") in {"asr", "asr_ocr_reference"}
+    autonomous=session.payload.get('agent_mode')=='autonomous'
+    glossary_filename=(f'glossary.{hashlib.sha256(Path(source_srt).read_bytes()).hexdigest()[:12]}.{session.id}.{session.result.get("autonomous_glossary_attempt") or uuid.uuid4().hex[:8]}.draft.yaml'
+                       if autonomous else 'glossary.draft.yaml')
     glossary_job = generate_glossary_job(
         {
             "source_srt": source_srt,
             "extra_hint": str(session.payload.get("extra_hint") or ""),
             "source_language": _agent_source_language_for_glossary(session, is_hybrid or is_dual_reference or is_ocr or is_asr),
-            "out": str(_agent_glossary_path(session)),
+            "out": str(_agent_workspace(session)/glossary_filename if autonomous else _agent_glossary_path(session)),
         }
     )
     glossary_result = _wait_for_job(glossary_job, session_id=session.id)
     glossary_path = str(glossary_result.get("glossary_path") or "")
     task_id = str(session.result.get("task_id") or "")
     if task_id:
-        glossary_path = _materialize_task_artifact(session, glossary_path, "glossary.draft.yaml")
+        glossary_path = _materialize_task_artifact(session, glossary_path, glossary_filename)
         if not glossary_path:
             raise RuntimeError("Glossary 生成完成，但没有可保存的产物")
         glossary_result["glossary_path"] = glossary_path
@@ -2039,6 +2089,19 @@ def _agent_generate_glossary_review(session: AgentSession, source_srt: str) -> N
         message = "ASR 原文字幕已生成。请审核 glossary，尤其是人名、昵称和同音误识别词，然后继续翻译。"
     if session.result.get("source_kind") == "asr_ocr_reference":
         message = "完整听译源字幕已生成：ASR 时间轴为主，并参考内嵌字幕 OCR 做了原文纠错。请审核 glossary 后继续翻译。"
+    if autonomous:
+        # Also invalidate approval for explicit glossary reruns from task history.
+        from video_translate.agent.autonomous import Runtime,source_text_digest
+        runtime=Runtime(sys.modules[__name__],session)
+        if not runtime.state.get('selected'):
+            restored=runtime.add_source(source_srt,str(session.result.get('source_kind') or 'captions'))
+            runtime.state['selected']=restored['source_id']
+        previous=runtime.state.get('glossary_review',{})
+        if previous.get('human_approved'):runtime.state.setdefault('glossary_history',[]).append(previous)
+        runtime.state['glossary_review']={'path':glossary_path,'human_approved':False,'source_text_sha256':source_text_digest(runtime.state)}
+        runtime.state['pending_glossary']=True;runtime.save()
+    _agent_prepare_glossary_candidates(session,glossary_path)
+    if defer_wait:return
     _agent_wait(
         session.id,
         "review_glossary",
@@ -2049,7 +2112,7 @@ def _agent_generate_glossary_review(session: AgentSession, source_srt: str) -> N
             "glossary_path": glossary_path,
             "options": [
                 {"action": "continue_after_glossary", "label": "我已审核，继续翻译"},
-                {"action": "skip_glossary", "label": "跳过 glossary 直接翻译"},
+                *([] if autonomous else [{"action": "skip_glossary", "label": "跳过 glossary 直接翻译"}]),
             ],
         },
     )
@@ -3501,6 +3564,10 @@ def _reconcile_interrupted_agent_tasks() -> int:
                 continue
             if str(data.get("workflow_status") or "") == "completed" or str(data.get("current_stage") or "") == "done":
                 continue
+            if data.get('payload',{}).get('agent_mode')=='autonomous' and data.get('current_stage') in {
+                'autonomous_failed','autonomous_waiting','autonomous_review_required','glossary_review'}:
+                # Old child-stage statuses must not replace a known human gate or failure.
+                continue
             stages = data.get("stages") if isinstance(data.get("stages"), dict) else {}
             interrupted_stages: list[str] = []
             for stage_name, item in stages.items():
@@ -4003,6 +4070,11 @@ def _task_stage_items(task: dict[str, Any]) -> list[dict[str, Any]]:
     asr_stage = stage_data("asr")
     glossary_stage = stage_data("glossary")
     translate_stage = stage_data("translate")
+    if translate_stage.get('delivery_mode')=='existing_target_subtitle':
+        return [
+            {'id':'probe','label':'检测可用字幕',**(stage_data('probe') or {'status':'done'})},
+            {**translate_stage,'id':'translate','label':'现成中文字幕交付（未重译）','can_rerun':False},
+        ]
     source_kind = str(
         glossary_stage.get("source_kind")
         or translate_stage.get("source_kind")
@@ -4519,7 +4591,6 @@ def _agent_fail(session_id: str, exc: Exception) -> None:
         session = _AGENT_SESSIONS.get(session_id)
         if not session or session.status == "cancelled":
             return
-        session.status = "failed"
         session.result["translation_pending"] = False
         session.error = str(exc)
         session.question = {}
@@ -4545,6 +4616,9 @@ def _agent_fail(session_id: str, exc: Exception) -> None:
                         current.phase = "cancelled"
                         current.logs.append("agent_failure_not_persisted_superseded")
                         current.updated_at = time.time()
+    with _LOCK:
+        current=_AGENT_SESSIONS.get(session_id)
+        if current and current.status!='cancelled':current.status='failed'
 
 
 def _task_stage_for_phase(phase: str) -> str:
@@ -4566,7 +4640,7 @@ def _task_stage_for_phase(phase: str) -> str:
         return "ocr"
     if phase in {"download_video_for_asr", "audio_asr", "asr_ocr_refine"}:
         return "asr"
-    if phase in {"generate_glossary", "review_glossary"}:
+    if phase in {"generate_glossary", "prepare_glossary_candidates", "review_glossary"}:
         return "glossary"
     if phase in {"translate_pending", "translate", "download_video_for_translation"}:
         return "translate"
@@ -4606,20 +4680,22 @@ def download_subtitle_job(payload: dict[str, Any]) -> Job:
     lang = _required_str(payload, "lang")
     kind = str(payload.get("kind") or "manual")
     title = str(payload.get("title") or "").strip()
-    before = _snapshot_files(DOWNLOAD_DIR, "*.srt")
+    output_dir=_resolve_project_path(payload['output_dir']) if payload.get('output_dir') else DOWNLOAD_DIR
+    _ensure_under_root(output_dir)
+    before = _snapshot_files(output_dir, "*.srt")
 
     def target(job_id: str) -> dict[str, Any]:
-        args = _module_command("video_translate.youtube.download_subtitles", url, "--output-dir", DOWNLOAD_DIR, "--sub-langs", lang)
+        args = _module_command("video_translate.youtube.download_subtitles", url, "--output-dir", output_dir, "--sub-langs", lang)
         if kind == "manual":
             args.append("--no-auto")
         elif kind == "auto":
             args.append("--auto-only")
         _run_command(job_id, args)
-        changed = _changed_files(DOWNLOAD_DIR, "*.srt", before)
+        changed = _changed_files(output_dir, "*.srt", before)
         if not changed:
-            changed = _matching_subtitle_files(DOWNLOAD_DIR, title, lang)
+            changed = _matching_subtitle_files(output_dir, title, lang)
         if not changed and not title:
-            changed = _newest_files(DOWNLOAD_DIR, "*.srt", limit=3)
+            changed = _newest_files(output_dir, "*.srt", limit=3)
         if not changed:
             raise RuntimeError(f"字幕下载完成后没有找到匹配文件: title={title or '<unknown>'}, lang={lang}")
         manifest = update_youtube_project_metadata(changed[0].parent, source_url=url, title=title or changed[0].parent.name)
@@ -5666,13 +5742,14 @@ def ocr_development_job(payload: dict[str, Any]) -> Job:
             if ocr_extraction_mode == "region_v3"
             else ""
         )
-        result.update(
-            _materialize_ocr_debug_bundle(
-                input_video,
-                out_dir,
-                debug_variant=debug_variant,
+        if payload.get('materialize_debug_bundle', True):
+            result.update(
+                _materialize_ocr_debug_bundle(
+                    input_video,
+                    out_dir,
+                    debug_variant=debug_variant,
+                )
             )
-        )
         return result
 
     return start_job(f"OCR 开发测试 {job_slug}", target)
@@ -6817,7 +6894,7 @@ def audio_local_video_job(payload: dict[str, Any]) -> Job:
 
 
 def asr_lab_job(payload: dict[str, Any]) -> Job:
-    if payload.get('asr_version') == 'agent-experimental':
+    if payload.get('asr_version') in {'agent-experimental','autonomous-experimental'}:
         from video_translate.asr_experiment_lab import launch
         return launch(payload,sys.modules[__name__])
     input_media = _resolve_project_path(_required_str(payload, "input_video"))
@@ -7850,6 +7927,7 @@ def _build_subtitle_pair_issue(cue: SubtitleCue, pair: dict[str, str], issue_typ
 def read_text_file(payload: dict[str, Any]) -> dict[str, Any]:
     path = _resolve_project_path(_required_str(payload, "path"))
     _ensure_under_root(path)
+    _ensure_web_readable(path)
     return {"path": str(path), "content": path.read_text(encoding="utf-8")}
 
 
@@ -8036,20 +8114,153 @@ def _ensure_writable_subtitle_path(path: Path) -> None:
 def read_glossary_items(payload: dict[str, Any]) -> dict[str, Any]:
     path = _resolve_project_path(_required_str(payload, "path"))
     _ensure_under_root(path)
+    _ensure_web_readable(path)
     text = path.read_text(encoding="utf-8")
     data = _load_yaml_text(text, path)
     source_srt = _source_srt_from_glossary_text(text, path)
     cue_texts = _cue_texts_by_id(source_srt)
     english_reference_texts = _english_references_by_id(source_srt)
-    return {
-        "path": str(path),
-        "items": _glossary_items(
-            data,
-            cue_texts=cue_texts,
-            english_reference_texts=english_reference_texts,
-            include_blind_candidates=bool(payload.get("include_blind_candidates", False)),
-        ),
-    }
+    items=_glossary_items(data,cue_texts=cue_texts,english_reference_texts=english_reference_texts)
+    from video_translate.glossary_candidates import cached
+    contexts=_glossary_candidate_contexts(items)
+    existing=cached(path,contexts,_glossary_candidate_profile())
+    if payload.get('include_blind_candidates'):
+        for item in items:
+            context=item.get('context_text','')
+            if context not in contexts:continue
+            if context in existing['values']:item['blind_candidate_zh']=existing['values'][context]
+            elif context in existing['errors']:item['blind_candidate_error']=existing['errors'][context]
+            else:item['blind_candidate_pending']=True
+    return {'path':str(path),'items':items,'candidates':existing['summary']}
+
+
+def read_glossary_evidence(payload: dict[str, Any]) -> dict[str, Any]:
+    """Resolve only this term's trusted subtitle source and associated media.
+
+    This endpoint never downloads, starts a job, edits review progress, or asks
+    an LLM. The browser cannot supply arbitrary source/media paths or cue IDs.
+    """
+    if set(payload)-{'path','section','index','source'}:raise ValueError('证据定位不接受自选素材路径或时间编号')
+    path=_resolve_project_path(_required_str(payload,'path'))
+    _ensure_under_root(path);_ensure_web_readable(path)
+    text=path.read_text(encoding="utf-8");data=_load_yaml_text(text,path)
+    section=payload.get('section');index=payload.get('index')
+    if not isinstance(section,str) or section not in {'program','characters','terms'} or type(index) is not int:
+        raise ValueError('请选择当前审核表中的具体术语')
+    values=[data.get('program')] if section=='program' else data.get(section,[])
+    if not isinstance(values,list) or not 0<=index<len(values) or not isinstance(values[index],dict):
+        raise ValueError('术语已经变化，请重新加载当前审核表')
+    item=values[index]
+    if payload.get('source')!=str(item.get('source') or ''):raise ValueError('术语已经变化，未播放另一条证据')
+    source=_source_srt_from_glossary_text(text,path)
+    base={'path':str(path),'section':section,'index':index,'source':str(item.get('source') or ''),
+          'media':None,'evidence':[],'total_occurrences':0,'truncated':False,'missing_ids':[]}
+    if source is None:return {**base,'message':'这份术语表没有关联原文字幕，暂时无法定位视频片段。'}
+    source=source.resolve();_ensure_under_root(source);_ensure_web_readable(source)
+    if source.suffix.lower()!='.srt':raise ValueError('术语证据只能关联原文SRT字幕')
+    if not source.is_file():return {**base,'message':'关联的原文字幕已经不存在，暂时无法定位视频片段。'}
+    from video_translate.glossary_evidence import evidence_locations
+    locations=evidence_locations(read_srt(source),_evidence_ids_from_item(item),str(item.get('source') or ''),
+        item.get('aliases') if isinstance(item.get('aliases'),list) else [])
+    media=_glossary_evidence_media(path,source)
+    return {**base,**locations,'media':media,
+        'message':('未找到对应原句，不会猜测视频时间点。' if not locations['evidence'] else
+                   '' if media else '已定位证据原句，但未找到关联的本地视频或音频。请先在素材库补齐素材，再重试。'),
+        'notice':'定位来自原文字幕时间轴，不是词级强制对齐；可扩大上下文核对连读和识别错误。'}
+
+
+def _glossary_evidence_media(glossary_path: Path,source: Path) -> dict[str,str] | None:
+    """Read existing associations only; never bind to an unrelated/new project."""
+    contexts=[]
+    with _LOCK:
+        sessions=sorted(_AGENT_SESSIONS.values(),key=lambda s:s.updated_at,reverse=True)
+        for session in sessions:
+            if any(_same_existing_path(session.result.get(key),glossary_path) for key in ('glossary_path','translation_glossary_path')):
+                contexts.append(dict(session.result))
+    task=_find_agent_task_by_glossary_path(glossary_path)
+    if task:
+        contexts.append(task)
+        stages=task.get('stages') if isinstance(task.get('stages'),dict) else {}
+        contexts.extend(stages.get(stage,{}) for stage in ('probe','glossary','asr','ocr','translate'))
+    run=source.parent/'run.yaml'
+    if run.is_file():
+        _ensure_under_root(run.resolve());_ensure_web_readable(run.resolve())
+        try:
+            value=_load_yaml_text(run.read_text(encoding="utf-8"),run)
+            contexts.append({key:_run_metadata_path(run,value.get(key)) for key in ('input_video','input_media','project_dir')})
+        except (ValueError,OSError):pass
+    # Standalone source subtitles commonly live next to their project manifest.
+    contexts.append({'project_dir':str(source.parent)})
+    videos=[];audios=[]
+    for context in contexts:
+        if not isinstance(context,dict):continue
+        for key in ('input_video','input_media','input_audio'):
+            raw=context.get(key)
+            if not isinstance(raw,str) or not raw.strip():continue
+            candidate=Path(raw).expanduser().resolve()
+            _ensure_under_root(candidate);_ensure_web_readable(candidate)
+            if _existing_video_path(candidate):videos.append(candidate)
+            elif _existing_audio_path(candidate):audios.append(candidate)
+        if context.get('project_dir'):
+            project=Path(str(context['project_dir'])).resolve()
+            _ensure_under_root(project);_ensure_web_readable(project)
+            primary=_primary_video_for_project(project)
+            if primary:
+                primary=primary.resolve();_ensure_under_root(primary);_ensure_web_readable(primary)
+                videos.append(primary)
+    choices=videos or audios
+    if not choices:return None
+    media=choices[0]
+    return {'path':str(media),'kind':'video' if videos else 'audio','url':'/api/file?'+urlencode({'path':str(media)})}
+
+
+def _glossary_candidate_contexts(items):
+    return list(dict.fromkeys(item['context_text'] for item in items if item.get('context_text') and not item.get('suggested_zh','').strip() and not item.get('reviewed')))
+
+
+def _glossary_candidate_profile():
+    config=load_llm_task_config('title_translation')
+    return hashlib.sha256(json.dumps([getattr(config,'provider_profile',None),config.model,config.base_url],ensure_ascii=False).encode()).hexdigest()
+
+
+_GLOSSARY_CANDIDATE_JOB_LOCK=threading.Lock()
+_GLOSSARY_CANDIDATE_JOBS={}
+
+
+def prepare_glossary_candidates_job(payload):
+    path=_resolve_project_path(_required_str(payload,'path'));_ensure_under_root(path)
+    if not path.is_file():raise FileNotFoundError('Glossary文件不存在')
+    base=read_glossary_items({'path':str(path)})
+    contexts=_glossary_candidate_contexts(base['items']);profile=_glossary_candidate_profile()
+    identity=(str(path),profile)
+    with _GLOSSARY_CANDIDATE_JOB_LOCK:
+        active=get_job(_GLOSSARY_CANDIDATE_JOBS.get(identity,''))
+        if active and active.status in {'queued','running'}:return active
+        def target(job_id):
+            from video_translate.glossary_candidates import prepare
+            _append_log(job_id,'只准备相关原句的参考译文，不写入译名、不确认审核、不翻译整片。')
+            result=prepare(path,contexts,profile,_blind_translate_glossary_context,retry_failed=bool(payload.get('retry_failed',False)),
+                progress=lambda i,total:_append_log(job_id,f'glossary_candidates: {i}/{total}'))
+            return {'path':str(path),'candidates':result}
+        job=start_job('准备 Glossary 原句参考译文',target)
+        _GLOSSARY_CANDIDATE_JOBS[identity]=job.id
+        return job
+
+
+def _agent_prepare_glossary_candidates(session,path):
+    base=read_glossary_items({'path':str(path),'include_blind_candidates':True})
+    summary=base['candidates']
+    if not summary['pending']:return summary
+    _agent_set_phase(session.id,'prepare_glossary_candidates')
+    task_id=str(session.result.get('task_id') or '')
+    if task_id:_update_task_stage(task_id,'glossary','preparing_candidates',current_stage='glossary_candidates_running',
+        expected_generation=_session_run_generation(session))
+    result=_wait_for_job(prepare_glossary_candidates_job({'path':str(path)}),session_id=session.id)
+    summary=result['candidates']
+    _agent_update_result(session.id,{'glossary_candidates':summary})
+    if task_id:_update_task_stage(task_id,'glossary','waiting_review',current_stage='glossary_review',
+        expected_generation=_session_run_generation(session))
+    return summary
 
 
 def write_glossary_items(payload: dict[str, Any]) -> dict[str, Any]:
@@ -8310,13 +8521,13 @@ def _evidence_ids_from_item(item: dict[str, Any]) -> list[int]:
     else:
         note = str(item.get("note") or "")
         match = re.search(r"evidence_ids\s*:\s*([^|]+)", note)
-        values = re.findall(r"\d+", match.group(1)) if match else []
+        values = re.findall(r"(?<![\w.])-?\d+(?![\w.])", match.group(1)) if match else []
     ids: list[int] = []
     for value in values:
-        try:
-            cue_id = int(value)
-        except (TypeError, ValueError):
-            continue
+        if type(value) is int:cue_id=value
+        elif isinstance(value,str) and re.fullmatch(r'[1-9]\d*',value.strip()):cue_id=int(value.strip())
+        else:continue
+        if cue_id<=0:continue
         if cue_id not in ids:
             ids.append(cue_id)
     return ids
@@ -8367,8 +8578,10 @@ def _blind_translate_glossary_context(text: str) -> str:
             {"role": "user", "content": text},
         ],
         "temperature": 0.0,
+        "max_tokens": 900,
     }
-    return _request_translation(endpoint, key, payload).strip()
+    if selected_model.startswith('doubao-seed-2-1-'):payload['thinking']={'type':'disabled'}
+    return _request_translation(endpoint,key,payload,max_attempts=1,timeout_seconds=35).strip()
 
 
 def _glossary_items(
@@ -8439,6 +8652,7 @@ def _glossary_item(
         "type": str(item.get("type") or ""),
         "note": str(item.get("note") or ""),
         "always": bool(item.get("always", False)),
+        "evidence_ids": _evidence_ids_from_item(item),
     }
     context_text = _glossary_context_text(item, cue_texts or {})
     if context_text:
@@ -8448,13 +8662,7 @@ def _glossary_item(
         result["english_reference_text"] = english_reference_text
     if include_blind_candidates and context_text and not suggested_zh.strip() and not reviewed:
         cache = blind_candidate_cache if blind_candidate_cache is not None else {}
-        try:
-            if context_text not in cache:
-                cache[context_text] = _blind_translate_glossary_context(context_text)
-            if cache[context_text]:
-                result["blind_candidate_zh"] = cache[context_text]
-        except Exception as exc:
-            result["blind_candidate_error"] = str(exc)
+        if cache.get(context_text):result['blind_candidate_zh']=cache[context_text]
     return result
 
 
@@ -9540,6 +9748,17 @@ def _ensure_under_root(path: Path) -> None:
         raise ValueError(f"路径不在允许的工作目录下: {path}。允许目录: {allowed_text}")
 
 
+def _ensure_web_readable(path: Path) -> None:
+    """Local bootstrap/provider credentials are never downloadable artifacts."""
+    resolved=Path(path).resolve()
+    config=(ROOT/'configs').resolve();glossaries=(config/'glossaries').resolve()
+    private_config=resolved.is_relative_to(config) and not resolved.is_relative_to(glossaries)
+    private_name=any(part in {'.git','.ssh'} or part.startswith('.env') for part in resolved.parts)
+    private_suffix=resolved.suffix.lower() in {'.pem','.key','.p12','.pfx','.jks'}
+    if private_config or private_name or private_suffix:
+        raise ValueError('本机配置和密钥文件不允许通过网页读取或下载，请使用设置页面管理')
+
+
 def _allowed_path_roots() -> list[Path]:
     roots: list[Path] = []
     for path in [ROOT, DOWNLOAD_DIR, JOB_DIR, TASK_DIR, GLOSSARY_DIR]:
@@ -9739,6 +9958,10 @@ class AgentHandler(BaseHTTPRequestHandler):
             raw_path = (query.get("path") or [""])[0]
             file_path = _resolve_project_path(raw_path)
             _ensure_under_root(file_path)
+            try:_ensure_web_readable(file_path)
+            except ValueError as exc:
+                self._send_json({'error':str(exc)},status=HTTPStatus.FORBIDDEN)
+                return
             if not file_path.is_file():
                 self._send_json({"error": "file not found"}, status=HTTPStatus.NOT_FOUND)
                 return
@@ -9947,6 +10170,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send_json(write_text_file(payload))
             elif self.path == "/api/read-glossary-items":
                 self._send_json(read_glossary_items(payload))
+            elif self.path == "/api/glossary-evidence":
+                self._send_json(read_glossary_evidence(payload))
+            elif self.path == "/api/glossary-candidates/prepare":
+                self._send_json(prepare_glossary_candidates_job(payload).to_dict())
             elif self.path == "/api/write-glossary-items":
                 self._send_json(write_glossary_items(payload))
             else:
