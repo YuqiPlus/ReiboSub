@@ -1,168 +1,17 @@
 <template>
-  <section class="panel task-history" :aria-busy="loading ? 'true' : 'false'">
-    <header class="task-history-head">
-      <div class="task-history-heading">
-        <span class="task-history-eyebrow">持久化工作流</span>
-        <h2>任务历史</h2>
-        <p>按任务恢复处理进度，或从指定阶段重新运行，不依赖素材库重新识别。</p>
-      </div>
-      <button class="secondary" type="button" :disabled="loading || anyBusy" @click="emit('refresh')">
-        {{ loading ? '刷新中…' : '刷新任务' }}
-      </button>
-    </header>
-
-    <div class="task-history-tools">
-      <label class="task-history-search">
-        <span>搜索任务</span>
-        <div class="task-history-search-box">
-          <span aria-hidden="true">⌕</span>
-          <input
-            v-model.trim="query"
-            type="search"
-            autocomplete="off"
-            placeholder="标题、任务 ID、链接或阶段"
-          />
-          <button v-if="query" class="task-history-clear" type="button" aria-label="清除搜索" @click="query = ''">×</button>
-        </div>
-      </label>
-
-      <div class="task-history-summary" aria-live="polite">
-        <span><b>{{ counts.all }}</b> 个任务</span>
-        <span><b>{{ counts.attention }}</b> 个待处理</span>
-        <span><b>{{ counts.failed }}</b> 个失败</span>
-      </div>
-    </div>
-
-    <nav class="task-history-tabs" aria-label="任务筛选">
-      <button
-        v-for="item in filters"
-        :key="item.id"
-        class="task-history-tab"
-        :class="{ active: activeFilter === item.id }"
-        type="button"
-        :aria-pressed="activeFilter === item.id"
-        @click="activeFilter = item.id"
-      >
-        <span>{{ item.label }}</span>
-        <b>{{ counts[item.id] }}</b>
-      </button>
-    </nav>
-
-    <p v-if="status" class="status task-history-status" :class="statusClass">{{ status }}</p>
-
-    <div v-if="loading && !tasks.length" class="task-history-loading" aria-label="正在加载任务">
-      <span v-for="index in 3" :key="index"></span>
-    </div>
-
-    <div v-else-if="!visibleTasks.length" class="empty task-history-empty">
-      <b>{{ query ? '没有匹配的任务' : emptyTitle }}</b>
-      <span>{{ query ? '换一个标题、任务 ID 或链接试试。' : emptyDescription }}</span>
-    </div>
-
-    <div v-else class="task-history-list">
-      <article
-        v-for="task in visibleTasks"
-        :key="task.id"
-        class="task-history-card"
-        :class="[`state-${taskState(task)}`, { busy: isBusy(task) }]"
-      >
-        <header class="task-history-card-head">
-          <div class="task-history-title-wrap">
-            <span class="task-history-state-mark" aria-hidden="true"></span>
-            <div>
-              <h3>{{ task.title || task.url || task.id || '未命名任务' }}</h3>
-              <p>
-                <code>{{ task.id || '无任务 ID' }}</code>
-                <span v-if="safeSourceUrl(task.url)" aria-hidden="true">·</span>
-                <a v-if="safeSourceUrl(task.url)" :href="safeSourceUrl(task.url)" target="_blank" rel="noreferrer">查看来源</a>
-              </p>
-            </div>
-          </div>
-          <span class="task-history-state-pill" :class="taskState(task)">{{ taskStateLabel(task) }}</span>
-        </header>
-
-        <div class="task-history-facts">
-          <div>
-            <span>当前阶段</span>
-            <b>{{ currentStageLabel(task.current_stage) }}</b>
-          </div>
-          <div>
-            <span>最近更新</span>
-            <b>{{ localTime(task.updated_at || task.completed_at || task.created_at) }}</b>
-          </div>
-          <div>
-            <span>运行代次</span>
-            <b>第 {{ runGeneration(task) }} 轮</b>
-          </div>
-          <div>
-            <span>归档运行</span>
-            <b>{{ archivedRunCount(task) }} 轮</b>
-          </div>
-        </div>
-
-        <details v-if="archivedRuns(task).length" class="task-history-archives">
-          <summary>
-            <span>旧轮次与历史产物</span>
-            <b>{{ archivedRuns(task).length }} 轮</b>
-          </summary>
-          <div class="task-history-archive-list">
-            <article v-for="run in archivedRuns(task)" :key="run.generation" class="task-history-archive-run">
-              <div>
-                <b>第 {{ run.generation || '?' }} 轮</b>
-                <span>{{ currentStageLabel(run.current_stage) }} · {{ localTime(run.archived_at || run.updated_at) }}</span>
-              </div>
-              <p v-if="run.error" class="task-history-stage-error">{{ run.error }}</p>
-              <div v-if="run.artifacts?.length" class="task-history-stage-actions">
-                <button
-                  v-for="artifact in run.artifacts"
-                  :key="`${artifact.kind}:${artifact.path}`"
-                  class="ghost mini task-history-artifact"
-                  type="button"
-                  :title="artifact.path"
-                  @click="openArchivedArtifact(task, run, artifact)"
-                >
-                  {{ archiveArtifactLabel(artifact) }}
-                </button>
-              </div>
-            </article>
-          </div>
-        </details>
-
-        <div class="task-history-card-actions">
-          <button
-            v-if="!isCompleted(task)"
-            type="button"
-            :disabled="anyBusy"
-            @click="emit('continue-task', task.id)"
-          >
-            {{ isBusy(task) ? '处理中…' : (isTaskRunning(task) ? '查看运行' : '继续任务') }}
-          </button>
-          <button
-            v-else
-            class="secondary"
-            type="button"
-            :disabled="anyBusy"
-            @click="emit('reopen-task', task)"
-          >
-            恢复为活动任务
-          </button>
-          <button v-if="task.can_restart !== false" class="secondary" type="button" :disabled="anyBusy" @click="emit('restart-task', task)">
-            从头重跑
-          </button>
-          <button
-            v-if="!isCompleted(task)"
-            class="secondary"
-            type="button"
-            :disabled="anyBusy || isTaskRunning(task)"
-            @click="emit('complete-task', task)"
-          >
-            标记完成
-          </button>
-          <button class="danger secondary" type="button" :disabled="anyBusy || isTaskRunning(task)" @click="emit('delete-task', task)">
-            删除
-          </button>
-        </div>
-
+  <section class="panel task-history history-studio" :aria-busy="loading">
+    <header class="studio-page-head"><div><span class="studio-kicker">任务历史</span><h2>接着上次的工作</h2><p>任务、字幕和旧版本都保留在这里。</p></div><button class="secondary" type="button" :disabled="loading || anyBusy" @click="emit('refresh')"><AppIcon name="history" :size="16" />{{ loading ? '刷新中…' : '刷新任务' }}</button></header>
+    <div class="studio-filter-bar history-filter-bar"><label class="studio-search"><AppIcon name="search" :size="17" /><input v-model.trim="query" type="search" autocomplete="off" aria-label="搜索任务" placeholder="搜索标题、链接或任务编号" /><button v-if="query" class="icon-button" type="button" aria-label="清除搜索" @click="query = ''"><AppIcon name="close" :size="14" /></button></label><select v-model="sortBy" class="library-sort" aria-label="任务排序"><option value="recent">最近更新</option><option value="name">按标题</option></select></div>
+    <nav class="studio-tabs history-tabs" aria-label="任务筛选"><button v-for="item in filters" :key="item.id" type="button" :class="{ active: activeFilter === item.id }" :aria-pressed="activeFilter === item.id" @click="activeFilter = item.id">{{ item.label }}<span v-if="counts[item.id]">{{ counts[item.id] }}</span></button></nav>
+    <p v-if="status && statusClass !== 'ok'" class="status" :class="statusClass" role="status">{{ status }}</p>
+    <div v-if="loading && !tasks.length" class="studio-empty" role="status">正在读取任务…</div>
+    <div v-else-if="!visibleTasks.length" class="studio-empty"><AppIcon name="history" :size="30" /><h3>{{ query ? '没有匹配的任务' : emptyTitle }}</h3><p>{{ query ? '试试其他标题或链接。' : emptyDescription }}</p><button v-if="query" class="secondary" @click="query = ''">清除搜索</button></div>
+    <div v-else class="history-task-list">
+      <article v-for="task in visibleTasks" :key="task.id" class="history-task-card" :class="{ busy: isBusy(task) }">
+        <header class="history-task-heading"><div><h3>{{ task.title || task.url || task.id || '未命名任务' }}</h3><p><span v-if="!isCompleted(task)">{{ currentStageLabel(task.current_stage) }} · </span>{{ localTime(task.updated_at || task.completed_at || task.created_at) }}</p></div><span class="history-state" :class="taskState(task)"><span></span>{{ taskStateLabel(task) }}</span></header>
+        <div class="history-primary-actions"><button v-if="!isCompleted(task)" :disabled="anyBusy" @click="emit('continue-task', task.id)">{{ isBusy(task) ? '处理中…' : isTaskRunning(task) ? '查看运行' : '继续任务' }}</button><button v-else class="secondary" @click="toggleDetails(task.id)">查看记录</button><button v-for="entry in artifactShortcuts(task)" :key="entry.artifact.path" class="secondary" :title="entry.artifact.path" @click="openArtifact(task, entry.stage, entry.artifact)"><AppIcon :name="entry.artifact.kind === 'glossary' ? 'book' : 'log'" :size="15" />{{ entry.label }}</button></div>
+        <details class="history-task-details" :open="expandedIds.has(task.id)" @toggle="setDetailsOpen(task.id, $event.target.open)"><summary>阶段记录、重跑与更多</summary>
+          <div class="history-task-meta"><span>任务编号 <code>{{ task.id }}</code></span><span>第 {{ runGeneration(task) }} 轮 · {{ archivedRunCount(task) }} 轮归档</span><a v-if="safeSourceUrl(task.url)" :href="safeSourceUrl(task.url)" target="_blank" rel="noreferrer">查看原视频</a></div>
         <div class="task-history-stages">
           <section
             v-for="stage in task.stage_items || []"
@@ -206,6 +55,38 @@
             </div>
           </section>
         </div>
+
+        <details v-if="archivedRuns(task).length" class="task-history-archives">
+          <summary>
+            <span>旧轮次与历史产物</span>
+            <b>{{ archivedRuns(task).length }} 轮</b>
+          </summary>
+          <div class="task-history-archive-list">
+            <article v-for="run in archivedRuns(task)" :key="run.generation" class="task-history-archive-run">
+              <div>
+                <b>第 {{ run.generation || '?' }} 轮</b>
+                <span>{{ currentStageLabel(run.current_stage) }} · {{ localTime(run.archived_at || run.updated_at) }}</span>
+              </div>
+              <p v-if="run.error" class="task-history-stage-error">{{ run.error }}</p>
+              <div v-if="run.artifacts?.length" class="task-history-stage-actions">
+                <button
+                  v-for="artifact in run.artifacts"
+                  :key="`${artifact.kind}:${artifact.path}`"
+                  class="ghost mini task-history-artifact"
+                  type="button"
+                  :title="artifact.path"
+                  @click="openArchivedArtifact(task, run, artifact)"
+                >
+                  {{ archiveArtifactLabel(artifact) }}
+                </button>
+              </div>
+            </article>
+          </div>
+        </details>
+
+
+          <div class="history-manage-actions"><span>任务管理</span><button v-if="task.can_restart !== false" class="secondary mini" :disabled="anyBusy" @click="emit('restart-task', task)">从头重跑…</button><button v-if="!isCompleted(task)" class="secondary mini" :disabled="anyBusy || isTaskRunning(task)" @click="emit('complete-task', task)">标记完成</button><button v-else class="secondary mini" :disabled="anyBusy" @click="emit('reopen-task', task)">恢复为活动任务</button><button class="danger secondary mini" :disabled="anyBusy || isTaskRunning(task)" @click="emit('delete-task', task)">删除任务…</button></div>
+        </details>
       </article>
     </div>
   </section>
@@ -213,6 +94,7 @@
 
 <script setup>
 import { computed, ref } from 'vue'
+import AppIcon from './AppIcon.vue'
 
 const props = defineProps({
   tasks: { type: Array, default: () => [] },
@@ -236,6 +118,15 @@ const emit = defineEmits([
 
 const query = ref('')
 const activeFilter = ref('all')
+const sortBy = ref('recent')
+const expandedIds = ref(new Set())
+function setDetailsOpen(id, open) {
+  const ids = new Set(expandedIds.value)
+  if (open) ids.add(id)
+  else ids.delete(id)
+  expandedIds.value = ids
+}
+function toggleDetails(id) { setDetailsOpen(id, !expandedIds.value.has(id)) }
 const anyBusy = computed(() => Boolean(props.busyTaskId))
 
 const filters = [
@@ -265,7 +156,9 @@ const visibleTasks = computed(() => {
     return [task.title, task.id, task.url, task.current_stage, task.workflow_status, stageText]
       .filter(Boolean)
       .some((value) => String(value).toLocaleLowerCase().includes(needle))
-  })
+  }).sort((a, b) => sortBy.value === 'name'
+    ? String(a.title || '').localeCompare(String(b.title || ''))
+    : (Number(b.updated_at || b.completed_at || b.created_at) || 0) - (Number(a.updated_at || a.completed_at || a.created_at) || 0))
 })
 
 const emptyTitle = computed(() => ({
@@ -333,6 +226,9 @@ function isBusy(task) {
 }
 
 function isTaskRunning(task) {
+  if (isCompleted(task) || ['failed', 'cancelled', 'interrupted'].includes(String(task?.status || '')) || task?.workflow_status === 'failed' || String(task?.current_stage || '').endsWith('_failed')) return false
+  if (needsAttention(task)) return false
+  if (task?.status === 'running') return true
   const stages = [
     ...(task?.stage_items || []),
     ...Object.values(task?.stages || {}),
@@ -384,6 +280,11 @@ function localTime(value) {
 function currentStageLabel(stage) {
   const labels = {
     created: '刚创建',
+    autonomous_running: 'Agent 正在处理',
+    autonomous_failed: 'Agent 处理失败',
+    autonomous_waiting: '等待确认',
+    autonomous_verification_review: '字幕疑点待复核',
+    autonomous_review_required: '字幕疑点待复核',
     probe: '检测中',
     probe_done: '检测完成',
     ocr_done: 'OCR 完成',
@@ -499,6 +400,20 @@ function openArtifact(task, stage, artifact) {
   else emit('open-artifact', payload)
 }
 
+function artifactShortcuts(task) {
+  const entries = (task.stage_items || []).flatMap(stage => artifactItems(stage).map(artifact => ({ stage, artifact })))
+  const choose = kinds => entries.find(entry => kinds.includes(entry.artifact.kind))
+  const target = choose(['translated_srt']) || choose(['translated_sidecar', 'subtitle'])
+  const source = choose(['source_srt'])
+  const glossary = choose(['glossary'])
+  const seen = new Set()
+  return [[target, target?.artifact.kind === 'subtitle' ? '打开字幕' : '打开中文字幕'], [source, '打开原文字幕'], [glossary, '查看术语表']].flatMap(([entry, label]) => {
+    if (!entry || seen.has(entry.artifact.path)) return []
+    seen.add(entry.artifact.path)
+    return [{ ...entry, label }]
+  })
+}
+
 function archiveArtifactLabel(artifact) {
   return {
     source_srt: '旧版原文 SRT',
@@ -522,507 +437,3 @@ function openArchivedArtifact(task, run, artifact) {
   else emit('open-artifact', payload)
 }
 </script>
-
-<style scoped>
-.task-history {
-  display: grid;
-  gap: 16px;
-  padding: 20px;
-}
-
-.task-history-head,
-.task-history-tools,
-.task-history-card-head,
-.task-history-stage-head,
-.task-history-card-actions,
-.task-history-stage-actions {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.task-history-head,
-.task-history-card-head,
-.task-history-stage-head {
-  justify-content: space-between;
-}
-
-.task-history-heading {
-  display: grid;
-  gap: 4px;
-}
-
-.task-history-heading h2 {
-  font-size: 20px;
-}
-
-.task-history-heading p {
-  color: var(--muted);
-  font-size: 13px;
-  line-height: 1.5;
-}
-
-.task-history-eyebrow {
-  color: var(--teal);
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: .08em;
-  text-transform: uppercase;
-}
-
-.task-history-tools {
-  align-items: end;
-  justify-content: space-between;
-  padding: 14px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--soft);
-}
-
-.task-history-search {
-  width: min(560px, 100%);
-  margin: 0;
-}
-
-.task-history-search-box {
-  position: relative;
-  display: flex;
-  align-items: center;
-}
-
-.task-history-search-box > span {
-  position: absolute;
-  left: 11px;
-  color: var(--muted);
-  font-size: 18px;
-  pointer-events: none;
-}
-
-.task-history-search-box input {
-  padding-right: 38px;
-  padding-left: 36px;
-}
-
-.task-history-clear {
-  position: absolute;
-  right: 7px;
-  width: 26px;
-  min-height: 26px;
-  padding: 0;
-  border-color: transparent;
-  background: transparent;
-  color: var(--muted);
-  box-shadow: none;
-  font-size: 18px;
-}
-
-.task-history-clear:hover {
-  border-color: var(--line);
-  background: #fff;
-  color: var(--ink);
-}
-
-.task-history-summary {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 7px;
-}
-
-.task-history-summary span {
-  padding: 6px 9px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: #fff;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.task-history-summary b {
-  color: var(--ink);
-}
-
-.task-history-tabs {
-  display: flex;
-  gap: 4px;
-  overflow-x: auto;
-  padding-bottom: 1px;
-  border-bottom: 1px solid var(--line);
-}
-
-.task-history-tab {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  min-height: 38px;
-  padding: 7px 10px;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  border-radius: 0;
-  background: transparent;
-  color: var(--muted);
-  box-shadow: none;
-}
-
-.task-history-tab:hover {
-  border-bottom-color: var(--line-strong);
-  background: var(--soft);
-  color: var(--ink);
-}
-
-.task-history-tab.active {
-  border-bottom-color: var(--teal);
-  color: var(--teal-dark);
-}
-
-.task-history-tab b {
-  min-width: 21px;
-  padding: 2px 6px;
-  border-radius: 999px;
-  background: var(--soft);
-  font-size: 11px;
-  text-align: center;
-}
-
-.task-history-tab.active b {
-  background: var(--teal-soft);
-}
-
-.task-history-status {
-  margin: -4px 0 0;
-}
-
-.task-history-list {
-  display: grid;
-  gap: 13px;
-}
-
-.task-history-card {
-  position: relative;
-  display: grid;
-  gap: 14px;
-  overflow: hidden;
-  padding: 16px;
-  border: 1px solid var(--line);
-  border-radius: 13px;
-  background: #fff;
-  box-shadow: 0 8px 24px rgba(45, 94, 68, .05);
-}
-
-.task-history-card::before {
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 3px;
-  background: var(--blue);
-  content: '';
-}
-
-.task-history-card.state-attention::before { background: var(--amber); }
-.task-history-card.state-failed::before { background: var(--red); }
-.task-history-card.state-completed::before { background: var(--green); }
-.task-history-card.busy { border-color: var(--teal); }
-
-.task-history-title-wrap,
-.task-history-title-wrap > div,
-.task-history-stage-head > div {
-  display: flex;
-  align-items: center;
-  min-width: 0;
-}
-
-.task-history-title-wrap {
-  gap: 10px;
-}
-
-.task-history-title-wrap > div {
-  display: grid;
-  gap: 5px;
-}
-
-.task-history-title-wrap h3 {
-  overflow: hidden;
-  font-size: 15px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.task-history-title-wrap p {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.task-history-title-wrap code {
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.task-history-title-wrap a {
-  color: var(--teal);
-  text-decoration: none;
-}
-
-.task-history-title-wrap a:hover { text-decoration: underline; }
-
-.task-history-state-mark {
-  flex: 0 0 auto;
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: var(--blue);
-  box-shadow: 0 0 0 4px var(--blue-soft);
-}
-
-.state-attention .task-history-state-mark { background: var(--amber); box-shadow: 0 0 0 4px var(--amber-soft); }
-.state-failed .task-history-state-mark { background: var(--red); box-shadow: 0 0 0 4px var(--red-soft); }
-.state-completed .task-history-state-mark { background: var(--green); box-shadow: 0 0 0 4px var(--green-soft); }
-
-.task-history-state-pill,
-.task-history-stage-status {
-  flex: 0 0 auto;
-  padding: 4px 8px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: var(--soft);
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 750;
-}
-
-.task-history-state-pill.active { color: var(--blue); background: var(--blue-soft); border-color: #ccdeed; }
-.task-history-state-pill.attention { color: var(--amber); background: var(--amber-soft); border-color: #ead9bd; }
-.task-history-state-pill.failed { color: var(--red); background: var(--red-soft); border-color: #efcbc7; }
-.task-history-state-pill.completed { color: var(--green); background: var(--green-soft); border-color: #c6e6d1; }
-
-.task-history-facts {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.task-history-facts > div {
-  display: grid;
-  gap: 3px;
-  padding: 9px 10px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  background: var(--soft);
-}
-
-.task-history-facts span {
-  color: var(--muted);
-  font-size: 10px;
-}
-
-.task-history-facts b {
-  overflow: hidden;
-  font-size: 12px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.task-history-archives {
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: #fff;
-}
-
-.task-history-archives > summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 12px;
-  color: var(--muted);
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.task-history-archives > summary b {
-  padding: 2px 7px;
-  border-radius: 999px;
-  background: var(--soft);
-  color: var(--ink);
-  font-size: 10px;
-}
-
-.task-history-archive-list {
-  display: grid;
-  gap: 7px;
-  padding: 0 10px 10px;
-}
-
-.task-history-archive-run {
-  display: grid;
-  gap: 8px;
-  padding: 9px 10px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--soft);
-}
-
-.task-history-archive-run > div:first-child {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 6px;
-}
-
-.task-history-archive-run > div:first-child b { font-size: 12px; }
-.task-history-archive-run > div:first-child span { color: var(--muted); font-size: 10px; }
-
-.task-history-card-actions,
-.task-history-stage-actions {
-  flex-wrap: wrap;
-}
-
-.task-history-card-actions {
-  padding-bottom: 2px;
-}
-
-.task-history-card-actions .danger.secondary {
-  margin-left: auto;
-  border-color: #e8b8b3;
-  background: #fff;
-  color: var(--red);
-}
-
-.task-history-card-actions .danger.secondary:hover {
-  background: var(--red-soft);
-}
-
-.task-history-stages {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-  gap: 9px;
-}
-
-.task-history-stage {
-  display: grid;
-  align-content: start;
-  gap: 10px;
-  min-width: 0;
-  padding: 11px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--soft);
-}
-
-.task-history-stage-head > div {
-  gap: 8px;
-}
-
-.task-history-stage-head > div > div {
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-}
-
-.task-history-stage-head b {
-  font-size: 12px;
-}
-
-.task-history-stage-head small {
-  color: var(--muted);
-  font-size: 10px;
-}
-
-.task-history-stage-index {
-  display: grid;
-  flex: 0 0 auto;
-  width: 27px;
-  height: 27px;
-  place-items: center;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: #fff;
-  color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 10px;
-}
-
-.stage-done .task-history-stage-status,
-.stage-reviewed .task-history-stage-status { color: var(--green); background: var(--green-soft); border-color: #c6e6d1; }
-.stage-failed .task-history-stage-status { color: var(--red); background: var(--red-soft); border-color: #efcbc7; }
-.stage-waiting .task-history-stage-status,
-.stage-waiting_review .task-history-stage-status,
-.stage-needs_input .task-history-stage-status { color: var(--amber); background: var(--amber-soft); border-color: #ead9bd; }
-.stage-running .task-history-stage-status,
-.stage-rerunning .task-history-stage-status,
-.stage-queued .task-history-stage-status { color: var(--blue); background: var(--blue-soft); border-color: #ccdeed; }
-
-.task-history-stage-error {
-  padding: 8px;
-  border-radius: 7px;
-  background: var(--red-soft);
-  color: var(--red);
-  font-size: 11px;
-  line-height: 1.45;
-  overflow-wrap: anywhere;
-}
-
-.task-history-stage-actions {
-  margin-top: auto;
-  gap: 6px;
-}
-
-.task-history-artifact {
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.task-history-loading {
-  display: grid;
-  gap: 10px;
-}
-
-.task-history-loading span {
-  height: 154px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: linear-gradient(100deg, var(--soft) 20%, #eef6f0 38%, var(--soft) 55%);
-  background-size: 200% 100%;
-  animation: task-history-shimmer 1.25s ease-in-out infinite;
-}
-
-.task-history-empty {
-  display: grid;
-  gap: 5px;
-  min-height: 130px;
-  align-content: center;
-  justify-items: center;
-  text-align: center;
-}
-
-.task-history-empty b { color: var(--ink); }
-.task-history-empty span { font-size: 12px; }
-
-@keyframes task-history-shimmer {
-  to { background-position-x: -200%; }
-}
-
-@media (max-width: 860px) {
-  .task-history-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .task-history-tools { align-items: stretch; flex-direction: column; }
-  .task-history-search { width: 100%; }
-  .task-history-summary { justify-content: flex-start; }
-}
-
-@media (max-width: 620px) {
-  .task-history { padding: 14px; }
-  .task-history-head, .task-history-card-head { align-items: stretch; flex-direction: column; }
-  .task-history-head > button { align-self: flex-start; }
-  .task-history-state-pill { align-self: flex-start; }
-  .task-history-facts { grid-template-columns: 1fr; }
-  .task-history-card-actions .danger.secondary { margin-left: 0; }
-  .task-history-stages { grid-template-columns: 1fr; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .task-history-loading span { animation: none; }
-}
-</style>

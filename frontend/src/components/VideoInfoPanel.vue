@@ -1,95 +1,21 @@
 <template>
-  <section class="panel">
-    <div class="panel-head">
-      <h2>检测结果</h2>
-      <span v-if="probe" class="badge" :class="probe.recommendation">{{ recommendationLabel }}</span>
-    </div>
-
-    <div v-if="!probe" class="empty">还没有检测结果。</div>
-    <div v-else class="stack">
-      <div class="info-block">
-        <div v-if="thumbnailPath" class="probe-cover">
-          <img :src="fileUrl(thumbnailPath)" alt="" />
-        </div>
-        <div class="video-title">{{ probe.title || '未识别标题' }}</div>
-        <div class="muted path">{{ probe.webpage_url }}</div>
-        <div v-if="probe.normalized_url && probe.normalized_url !== probe.webpage_url" class="muted path">标准链接：{{ probe.normalized_url }}</div>
-        <div class="summary-grid">
-          <div class="metric"><b>{{ probe.subtitles?.length || 0 }}</b><span>字幕轨道</span></div>
-          <div class="metric"><b>{{ manualCount }}</b><span>人工字幕</span></div>
-          <div class="metric"><b>{{ autoCount }}</b><span>自动字幕</span></div>
-        </div>
-      </div>
-
-      <div v-if="existingProject" class="agent-card">
-        <div class="agent-card-head">
-          <div>
-            <h3>已找到本地项目</h3>
-            <p>{{ existingProject.name }}</p>
-          </div>
-          <span class="badge">{{ existingProject.source_type === 'youtube' ? 'YouTube' : '本地' }}</span>
-        </div>
-        <div class="muted path">{{ existingProject.path }}</div>
-        <div class="toolbar">
-          <button class="secondary" @click="$emit('use-project', existingProject)">载入项目继续处理</button>
-        </div>
-      </div>
-
-      <div v-if="agentPlan" class="agent-card">
-        <div class="agent-card-head">
-          <div>
-            <h3>Agent 推荐</h3>
-            <p>{{ routeLabel }}</p>
-          </div>
-          <span class="badge">{{ confidenceLabel }}</span>
-        </div>
-        <div v-if="agentPlan.selected_subtitle" class="agent-selected">
-          <span>推荐字幕</span>
-          <b>{{ agentPlan.selected_subtitle.label || agentPlan.selected_subtitle.lang }}</b>
-        </div>
-        <ul v-if="agentPlan.reasons?.length" class="reason-list">
-          <li v-for="reason in agentPlan.reasons" :key="reason">{{ reason }}</li>
-        </ul>
-        <div class="toolbar">
-          <button v-if="agentPlan.selected_subtitle" @click="downloadSubtitle(agentPlan.selected_subtitle)">下载推荐字幕</button>
-          <button v-else-if="agentPlan.recommended_action === 'run_ocr'" class="warning" @click="$emit('agent-ocr-full')">按推荐跑 OCR</button>
-          <button v-else-if="agentPlan.recommended_action === 'run_asr'" class="secondary" @click="$emit('agent-download-video')">先下载视频再 ASR</button>
-          <button v-else class="secondary" @click="$emit('agent-download-video')">先下载视频再诊断</button>
-        </div>
-      </div>
-
-      <div class="title-tools">
-        <div>
-          <label for="translatedTitle">中文标题</label>
-          <input id="translatedTitle" :value="titleBox" placeholder="检测标题后自动盲翻，可复制到任务提示" @input="$emit('update:titleBox', $event.target.value)" />
-        </div>
-        <div class="toolbar">
-          <button class="secondary" @click="$emit('copy-title')">复制</button>
-          <button class="secondary" @click="$emit('append-title-hint')">填入提示</button>
-        </div>
-      </div>
-      <div class="status" :class="titleStatusClass">{{ titleStatus }}</div>
-
-      <div class="subtitle-section">
-        <div class="section-title">
-          <h3>常用字幕</h3>
-          <span class="muted">只展开中 / 英 / 日 / 韩，其它语言折叠</span>
-        </div>
-        <SubtitleTable v-if="coreSubtitles.length" :items="coreSubtitles" @download="downloadSubtitle" />
-        <div v-else class="empty">没有中 / 英 / 日 / 韩字幕。</div>
-
-        <details v-if="otherSubtitles.length" class="more-subtitles">
-          <summary><span>其它字幕</span><span class="badge">{{ otherSubtitles.length }}</span></summary>
-          <SubtitleTable :items="otherSubtitles" @download="downloadSubtitle" />
-        </details>
-      </div>
-    </div>
+  <section class="panel link-results-studio" aria-label="链接检测结果">
+    <div v-if="!probe" class="studio-empty">还没有检测结果。</div>
+    <template v-else>
+      <header class="link-result-header"><img v-if="thumbnailPath" :src="fileUrl(thumbnailPath)" alt="" /><div><span class="studio-kicker">检测结果</span><h2>{{ probe.title || '未识别标题' }}</h2><p>{{ manualCount }} 条人工字幕 · {{ autoCount }} 条自动字幕</p></div></header>
+      <div v-if="existingProject" class="link-existing-project"><AppIcon name="folder" :size="18" /><span>本地已有素材，可继续使用。</span><button class="secondary mini" @click="$emit('use-project', existingProject)">载入项目</button></div>
+      <div v-if="agentPlan" class="link-recommendation"><div><span>来源建议</span><p>{{ routeLabel }}</p></div><button v-if="agentPlan.selected_subtitle" @click="downloadSubtitle(agentPlan.selected_subtitle)">下载推荐字幕</button><button v-else-if="agentPlan.recommended_action === 'run_ocr'" class="secondary" @click="$emit('agent-ocr-full')">提取画面字幕</button><button v-else-if="agentPlan.recommended_action === 'run_asr'" class="secondary" @click="$emit('agent-download-video')">下载视频后使用 ASR</button><button v-else class="secondary" @click="$emit('agent-download-video')">先保存视频</button></div>
+      <section class="links-subtitle-tracks"><div class="studio-section-head"><h3>可用字幕</h3><span>中文 / 英文 / 日文 / 韩文</span></div><SubtitleTable v-if="coreSubtitles.length" :items="coreSubtitles" @download="downloadSubtitle" /><p v-else class="links-no-subtitles">没有这些语言的外挂字幕，可使用上方手动 OCR 或字幕助手。</p><details v-if="otherSubtitles.length" class="studio-disclosure"><summary>其他语言 · {{ otherSubtitles.length }} 条</summary><SubtitleTable :items="otherSubtitles" @download="downloadSubtitle" /></details></section>
+      <details class="studio-disclosure link-title-details"><summary>中文标题与任务提示</summary><div class="title-tools"><label for="translatedTitle">中文标题<input id="translatedTitle" :value="titleBox" placeholder="标题参考译文" @input="$emit('update:titleBox', $event.target.value)" /></label><div class="toolbar"><button class="secondary" @click="$emit('copy-title')">复制标题</button><button class="secondary" @click="$emit('append-title-hint')">填入任务提示</button></div></div><p v-if="titleStatus" class="status" :class="titleStatusClass" role="status">{{ titleStatus }}</p></details>
+      <details class="studio-disclosure link-source-details"><summary>来源与判断详情</summary><p class="path">{{ probe.webpage_url }}</p><p v-if="probe.normalized_url && probe.normalized_url !== probe.webpage_url" class="path">标准链接：{{ probe.normalized_url }}</p><p v-if="existingProject" class="path">本地项目：{{ existingProject.name }}<br />{{ existingProject.path }}</p><p v-if="agentPlan">来源建议置信度：{{ confidenceLabel }}</p><ul v-if="agentPlan?.reasons?.length"><li v-for="reason in agentPlan.reasons" :key="reason">{{ reason }}</li></ul></details>
+    </template>
   </section>
 </template>
 
 <script setup>
 import { computed } from 'vue'
 import SubtitleTable from './SubtitleTable.vue'
+import AppIcon from './AppIcon.vue'
 
 const props = defineProps({
   probe: { type: Object, default: null },

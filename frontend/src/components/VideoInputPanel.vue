@@ -1,72 +1,22 @@
 <template>
-  <section class="panel link-tool-panel">
-    <div class="link-tool-hero">
-      <div>
-        <h2>处理 YouTube 链接</h2>
-        <p>只想保存视频时可直接下载；需要字幕轨道、标题或路线建议时再检测。</p>
+  <section class="panel link-tool-panel links-studio">
+    <header class="studio-page-head"><div><span class="studio-kicker">下载与链接</span><h2>从一个链接开始</h2><p>直接保存视频，或按需查看它的字幕。</p></div><AppIcon class="links-page-icon" name="download" :size="28" /></header>
+    <form class="links-composer" @submit.prevent="downloadVideo">
+      <label class="links-url" for="url">YouTube 链接或视频 ID<input id="url" :value="url" autocomplete="off" placeholder="粘贴 YouTube 链接…" @input="$emit('update:url', $event.target.value)" /></label>
+      <div class="links-download-row">
+        <label class="links-quality" for="videoQuality"><AppIcon name="video" :size="17" /><span class="sr-only">视频画质</span><select id="videoQuality" aria-label="视频画质" :value="videoQuality" @change="$emit('update:videoQuality', $event.target.value)"><option value="1080p">兼容下载 · 最高 1080p · H.264 / MP4 优先</option><optgroup v-if="availableVideoFormats.length" label="当前视频实际可用格式"><option v-for="format in availableVideoFormats" :key="format.id" :value="videoFormatChoiceValue(format)">{{ format.label }}</option></optgroup></select></label>
+        <button class="secondary links-refresh-formats" type="button" :disabled="!hasUrl || videoFormatsLoading" @click="$emit('load-video-formats')"><AppIcon name="history" :size="15" />{{ videoFormatsLoading ? '读取中…' : '刷新画质' }}</button>
+        <button class="links-download-primary" type="submit" :disabled="!hasUrl || Boolean(actionBusy) || probing"><AppIcon name="download" :size="17" />{{ actionBusy === 'download-video' ? '正在创建任务…' : '下载视频' }}</button>
       </div>
-      <span class="link-tool-direct-badge">无需先检测</span>
-    </div>
-
-    <div class="link-tool-quick-grid">
-      <div class="link-tool-url-field">
-        <label for="url">YouTube 链接或视频 ID</label>
-        <input
-          id="url"
-          :value="url"
-          placeholder="https://www.youtube.com/watch?v=..."
-          @input="$emit('update:url', $event.target.value)"
-        />
-      </div>
-      <div class="link-tool-quality-field">
-        <label for="videoQuality">视频画质</label>
-        <select id="videoQuality" :value="videoQuality" @change="$emit('update:videoQuality', $event.target.value)">
-          <option value="1080p">快速兼容 · 最高 1080p · 优先 H.264 / MP4</option>
-          <optgroup v-if="availableVideoFormats.length" label="当前视频实际可用格式">
-            <option v-for="format in availableVideoFormats" :key="format.id" :value="videoFormatChoiceValue(format)">
-              {{ format.label }}
-            </option>
-          </optgroup>
-        </select>
-        <div class="link-tool-format-state" :class="videoFormatsStatusClass">
-          <span>{{ videoFormatsStatus || '粘贴有效链接后会自动读取真实画质，也可手动刷新。' }}</span>
-          <button
-            class="secondary mini"
-            type="button"
-            :disabled="!hasUrl || videoFormatsLoading"
-            @click="$emit('load-video-formats')"
-          >
-            {{ videoFormatsLoading ? '读取中…' : '刷新画质' }}
-          </button>
-        </div>
-      </div>
-      <button
-        class="link-tool-download-button"
-        type="button"
-        :disabled="!hasUrl || Boolean(actionBusy) || probing"
-        @click="$emit('download-video')"
-      >
-        {{ actionBusy === 'download-video' ? '正在创建任务…' : '直接下载视频' }}
-      </button>
-    </div>
-
-    <div class="link-tool-detect-row">
-      <button
-        class="secondary"
-        type="button"
-        :disabled="!hasUrl || probing || Boolean(actionBusy)"
-        @click="$emit('probe')"
-      >
-        {{ probing ? '正在检测…' : '检测字幕与信息' }}
-      </button>
-      <span>检测是可选操作，完成后会留在当前页面，不会自动跳转。</span>
-    </div>
-    <div v-if="status" class="status link-tool-status" :class="statusClass">{{ status }}</div>
-
+    </form>
+    <p v-if="videoFormatsLoading || videoFormatsStatus" class="links-format-feedback" :class="videoFormatsStatusClass" role="status">{{ videoFormatsLoading ? '正在读取这个视频可下载的画质…' : videoFormatsStatus }}</p>
+    <p v-else class="links-format-feedback">粘贴链接后自动读取可用画质。不必先检测字幕，也可以直接下载。</p>
+    <div class="links-secondary-action"><button class="secondary" type="button" :disabled="!hasUrl || probing || Boolean(actionBusy)" @click="$emit('probe')"><AppIcon name="scan" :size="16" />{{ probing ? '正在检测…' : '查看字幕与视频信息' }}</button><span>可选操作，不会自动跳转或开始翻译。</span></div>
+    <p v-if="status" class="links-operation-feedback" :class="statusClass" role="status">{{ status }}</p>
     <details class="link-tool-section">
       <summary>
         <span>
-          <b>更多下载选项</b>
+          <b>封面与下载说明</b>
           <small>下载封面，或查看画质模式说明</small>
         </span>
         <span class="link-tool-chevron" aria-hidden="true">⌄</span>
@@ -101,8 +51,8 @@
     <details class="link-tool-section link-tool-ocr-section">
       <summary>
         <span>
-          <b>字幕与 OCR</b>
-          <small>确认画面字幕语言，必要时下载视频并运行 OCR</small>
+          <b>手动提取画面字幕</b>
+          <small>按需使用 OCR；独立保留全部语言、裁框和精修设置</small>
         </span>
         <span class="link-tool-chevron" aria-hidden="true">⌄</span>
       </summary>
@@ -254,12 +204,14 @@
         </div>
       </div>
     </details>
+
   </section>
 </template>
 
 <script setup>
 import { computed } from 'vue'
 import OcrCropControls from './OcrCropControls.vue'
+import AppIcon from './AppIcon.vue'
 
 const props = defineProps({
   url: { type: String, default: '' },
@@ -296,6 +248,9 @@ const props = defineProps({
 const emit = defineEmits(['update:url', 'update:ocrTranslationMode', 'update:ocrScope', 'update:ocrExtractionMode', 'update:ocrShapeMode', 'update:ocrCropTopRatio', 'update:ocrCropBottomRatio', 'update:ocrCropLeftRatio', 'update:ocrCropRightRatio', 'update:ocrExcludeEnabled', 'update:ocrExcludeTopRatio', 'update:ocrExcludeBottomRatio', 'update:ocrExcludeLeftRatio', 'update:ocrExcludeRightRatio', 'update:ocrRefinementMode', 'update:embeddedSubtitleHint', 'update:sourceLanguage', 'update:ocrLanguage', 'update:thumbnailFormat', 'update:videoQuality', 'probe', 'load-video-formats', 'download-video', 'download-thumbnail', 'ocr-full'])
 
 const hasUrl = computed(() => Boolean(String(props.url || '').trim()))
+function downloadVideo() {
+  if (hasUrl.value && !props.actionBusy && !props.probing) emit('download-video')
+}
 
 function videoFormatChoiceValue(format) {
   return format?.id ? `format:${format.id}` : ''

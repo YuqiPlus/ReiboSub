@@ -32,6 +32,7 @@ test('defines every configurable LLM task once', () => {
   assert.deepEqual(
     SETTINGS_TASKS.map((item) => item.key),
     [
+      'video_analysis',
       'title_translation',
       'glossary',
       'subtitle_translation',
@@ -53,7 +54,7 @@ test('normalizes empty settings to Korean defaults and all task bindings', () =>
     target_language: 'zh',
     provider_profile: 'volcano',
   })
-  assert.equal(Object.keys(result.tasks).length, 8)
+  assert.equal(Object.keys(result.tasks).length, 9)
   assert.deepEqual(result.tasks.subtitle_translation, { provider_profile: '', model: '' })
 })
 

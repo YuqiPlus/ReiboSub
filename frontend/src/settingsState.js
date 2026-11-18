@@ -1,5 +1,10 @@
 export const SETTINGS_TASKS = Object.freeze([
   {
+    key: 'video_analysis',
+    label: '视频画面分析',
+    description: '自主Agent抽帧识别字幕区域和Logo，需要支持图片输入的模型；不支持时不会强行套遮罩。',
+  },
+  {
     key: 'title_translation',
     label: '标题翻译',
     description: '视频标题盲翻和 Glossary 审核里的单句候选。',

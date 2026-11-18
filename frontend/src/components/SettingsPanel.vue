@@ -1,66 +1,13 @@
 <template>
-  <section class="panel settings-panel">
-    <div class="panel-head settings-head">
-      <div>
-        <h2>默认值与模型</h2>
-        <p class="panel-subtitle">这些设置用于之后新建的任务，不会改写已经运行或等待审核的 Agent 任务。</p>
-      </div>
-      <span class="badge" :class="{ pending: dirty, done: !dirty }">{{ dirty ? '有未保存修改' : '已与保存配置同步' }}</span>
-    </div>
-
-    <div v-if="loading" class="empty loading-box">正在读取设置和服务配置…</div>
-
+  <section class="panel settings-panel settings-studio">
+    <header class="studio-page-head"><div><span class="studio-kicker">设置</span><h2>让工作台按你的习惯工作</h2><p>语言和模型用于新任务；连接信息单独保存，已有任务不受影响。</p></div></header>
+    <div v-if="loading" class="studio-empty" role="status">正在读取设置…</div>
     <template v-else>
-      <section class="settings-section settings-language-section">
-        <div class="settings-section-head">
-          <div>
-            <span class="eyebrow">01 · 新任务</span>
-            <h3>默认语言</h3>
-          </div>
-          <span class="muted">Agent 首页和字幕工具会以此作为初始值</span>
-        </div>
-
-        <div class="grid2 settings-language-grid">
-          <div>
-            <label for="settingsSourceLanguage">默认音源 / 原文语言</label>
-            <select id="settingsSourceLanguage" v-model="draft.defaults.source_language">
-              <option v-for="option in SOURCE_LANGUAGE_OPTIONS" :key="option.value" :value="option.value">{{ option.label }}</option>
-            </select>
-            <p class="muted settings-field-help">连续处理韩语或日语视频时，固定语言可以减少每次手动选择。</p>
-          </div>
-          <div>
-            <label for="settingsOcrLanguage">默认 OCR 语言</label>
-            <select id="settingsOcrLanguage" v-model="draft.defaults.ocr_language">
-              <option value="auto">跟随音源语言</option>
-              <option value="korean">韩语</option>
-              <option value="japanese">日语</option>
-              <option value="english">英语</option>
-              <option value="chinese">中文</option>
-            </select>
-            <p class="muted settings-field-help">保持“跟随”时，Agent 会把上方语言传给 OCR。</p>
-          </div>
-        </div>
-
-        <div class="settings-readonly-row">
-          <span>默认目标语言</span>
-          <b>{{ targetLanguageLabel }}</b>
-          <small>当前成品流程固定输出简体中文。</small>
-        </div>
-      </section>
-
-      <section class="settings-section settings-provider-section">
-        <div class="settings-section-head">
-          <div>
-            <span class="eyebrow">02 · 连接</span>
-            <h3>默认服务配置</h3>
-          </div>
-          <span class="muted">连接信息可保存到服务器本地私密配置；本页永远不会回显密钥</span>
-        </div>
-
-        <div v-if="providers.length" class="settings-provider-grid">
-          <div>
-            <label for="settingsDefaultProvider">默认服务商</label>
-            <select
+      <nav class="studio-tabs settings-page-tabs" aria-label="设置分类"><button type="button" :class="{ active: activeSection === 'defaults' }" :aria-pressed="activeSection === 'defaults'" @click="activeSection = 'defaults'">常用设置</button><button type="button" :class="{ active: activeSection === 'providers' }" :aria-pressed="activeSection === 'providers'" @click="activeSection = 'providers'">服务商管理<span>{{ providers.length }}</span></button></nav>
+      <div v-show="activeSection === 'defaults'" class="settings-defaults-page">
+        <section class="settings-section settings-essentials">
+          <div class="studio-section-head"><div><h3>新任务默认值</h3><p>连续处理同一种语言时，在这里设好一次。</p></div><span class="settings-output-note">输出：{{ targetLanguageLabel }}</span></div>
+          <div class="settings-essentials-grid"><label for="settingsSourceLanguage">原文语言<select id="settingsSourceLanguage" v-model="draft.defaults.source_language"><option v-for="option in SOURCE_LANGUAGE_OPTIONS" :key="option.value" :value="option.value">{{ option.label }}</option></select></label><label for="settingsDefaultProvider">默认服务商            <select
               id="settingsDefaultProvider"
               :value="draft.defaults.provider_profile"
               @change="handleDefaultProviderChange"
@@ -74,86 +21,91 @@
               <option v-for="provider in providers" :key="provider.id" :value="provider.id">
                 {{ providerDisplayName(provider) }}
               </option>
-            </select>
-          </div>
+            </select></label></div>
+          <div class="settings-default-provider-line"><span :class="credentialBadgeClass">{{ credential.label }}</span><button class="secondary mini" :disabled="!defaultProviderId || defaultProviderFetching" @click="requestModels(defaultProviderId)">{{ defaultProviderFetching ? '正在获取模型…' : '刷新默认服务商模型' }}</button><button class="ghost mini" @click="openDefaultConnection">管理默认服务商</button></div>
+          <details class="studio-disclosure settings-ocr-default"><summary>画面文字语言</summary><label for="settingsOcrLanguage">OCR 语言<select id="settingsOcrLanguage" v-model="draft.defaults.ocr_language"><option value="auto">跟随原文语言</option><option value="korean">韩语</option><option value="japanese">日语</option><option value="english">英语</option><option value="chinese">中文</option></select></label></details>
+        </section>
+        <section class="settings-section settings-bindings">
+          <div class="studio-section-head"><div><h3>各模块使用的模型</h3><p>更换服务商后会重新匹配模型；也可以留空，使用该服务商的默认模型。</p></div></div>
+          <component v-for="group in modelGroups" :key="group.id" :is="group.advanced ? 'details' : 'div'" :class="group.advanced ? 'studio-disclosure settings-extra-models' : 'settings-primary-models'"><summary v-if="group.advanced">更多模型：OCR、ASR 与兼容流程 · {{ group.tasks.length }} 项</summary><div class="settings-model-list">          <div v-for="task in group.tasks" :key="task.key" class="settings-model-row">
+            <div class="settings-model-copy">
+              <b>{{ task.label }}</b>
+              <p>{{ task.description }}</p>
 
-          <div class="settings-provider-connection">
-            <label>连接状态</label>
-            <div class="settings-connection-line">
-              <span class="badge" :class="credentialBadgeClass">{{ credential.label }}</span>
-              <span class="muted settings-provider-endpoint">连接信息在下方“管理服务商”中维护</span>
+            </div>
+
+            <div class="settings-model-provider">
+              <label :for="`settingsProvider-${task.key}`">服务商</label>
+              <select
+                :id="`settingsProvider-${task.key}`"
+                :value="draft.tasks[task.key].provider_profile"
+                @change="handleTaskProviderChange(task.key, $event)"
+              >
+                <option value="">跟随默认（{{ defaultProviderName }}）</option>
+                <option
+                  v-if="draft.tasks[task.key].provider_profile && !providerById.has(draft.tasks[task.key].provider_profile)"
+                  :value="draft.tasks[task.key].provider_profile"
+                >
+                  {{ draft.tasks[task.key].provider_profile }}（配置未加载）
+                </option>
+                <option v-for="provider in providers" :key="provider.id" :value="provider.id">
+                  {{ providerDisplayName(provider) }}
+                </option>
+              </select>
+            </div>
+
+            <div class="settings-model-input">
+              <label :for="`settingsModel-${task.key}`">模型</label>
+              <div class="settings-model-input-row">
+                <select
+                  v-if="modelsForTask(task.key).length"
+                  :id="`settingsModel-${task.key}`"
+                  v-model="draft.tasks[task.key].model"
+                  @focus="ensureTaskModelCatalog(task.key)"
+                >
+                  <option value="">使用服务商默认模型{{ defaultModelForTask(task.key) ? `（${defaultModelForTask(task.key)}）` : '' }}</option>
+                  <option
+                    v-if="taskModelAwaitingValidation(task.key)"
+                    :value="draft.tasks[task.key].model"
+                  >
+                    {{ draft.tasks[task.key].model }}（等待刷新验证）
+                  </option>
+                  <option v-for="model in modelsForTask(task.key)" :key="model" :value="model">{{ model }}</option>
+                </select>
+                <input
+                  v-else
+                  :id="`settingsModel-${task.key}`"
+                  v-model.trim="draft.tasks[task.key].model"
+                  autocomplete="off"
+                  placeholder="暂无候选，请手动填写模型 ID"
+                  :disabled="isProviderFetching(providerIdForTask(task.key))"
+                />
+                <button
+                  type="button"
+                  class="secondary mini"
+                  :disabled="!providerIdForTask(task.key) || isProviderFetching(providerIdForTask(task.key))"
+                  @click="requestModels(providerIdForTask(task.key))"
+                >
+                  {{ isProviderFetching(providerIdForTask(task.key)) ? '获取中' : '刷新' }}
+                </button>
+              </div>
+              <p v-if="modelErrorFor(providerIdForTask(task.key))" class="settings-inline-error">
+                列表获取失败；没有本地候选时可手填，或点击“刷新”重试。
+              </p>
+              <p v-else class="muted settings-field-help">
+                {{ modelsForTask(task.key).length ? `${modelsForTask(task.key).length} 个可选模型` : '无可选列表，请手动填写' }}
+              </p>
             </div>
           </div>
-
-          <div class="settings-provider-actions">
-            <label>模型列表</label>
-            <button
-              type="button"
-              class="secondary"
-              :disabled="!defaultProviderId || defaultProviderFetching"
-              @click="requestModels(defaultProviderId)"
-            >
-              {{ defaultProviderFetching ? '正在请求…' : '获取远程模型' }}
-            </button>
-            <span class="muted">{{ defaultProviderModels.length ? `已可用 ${defaultProviderModels.length} 个模型` : '暂无列表，下方仍可手动填写' }}</span>
-          </div>
-        </div>
-
-        <div v-else class="empty settings-provider-empty">
-          还没有服务商。请在下方新增一个 OpenAI-compatible 服务商。
-        </div>
-
-        <div class="settings-provider-manager">
-          <div class="settings-provider-manager-select">
-            <label for="settingsManagedProvider">管理服务商</label>
-            <select
-              id="settingsManagedProvider"
-              :value="selectedProviderId"
-              :disabled="!providers.length || providerManaging"
-              @change="handleManagedProviderChange"
-            >
-              <option v-if="!providers.length" value="">暂无服务商</option>
-              <option v-for="provider in providers" :key="provider.id" :value="provider.id">
-                {{ providerDisplayName(provider) }} · {{ provider.id }}
-              </option>
-            </select>
-            <p class="muted settings-field-help">这里只切换正在编辑的连接，不会修改默认服务商。</p>
-          </div>
-          <div class="settings-provider-manager-actions">
-            <label>服务商结构</label>
-            <div>
-              <button
-                type="button"
-                class="secondary"
-                :disabled="!providerManagementAllowed || providerManaging"
-                @click="openCreateProvider"
-              >
-                新增服务商
-              </button>
-              <button
-                type="button"
-                class="secondary"
-                :disabled="!providerManagementAllowed || providerManaging || !selectedProvider"
-                @click="openEditProvider"
-              >
-                编辑当前
-              </button>
-              <button
-                type="button"
-                class="secondary settings-delete-provider"
-                :disabled="!canDeleteSelectedProvider"
-                @click="deleteSelectedProvider"
-              >
-                删除当前
-              </button>
-            </div>
-            <p v-if="!providerManagementAllowed" class="settings-inline-warning">
-              当前服务未开放 Provider 结构管理。
-            </p>
-            <p v-else-if="providers.length === 1" class="muted settings-field-help">至少保留一个服务商；请先新增再删除。</p>
-          </div>
-        </div>
-
+</div></component>
+        </section>
+      </div>
+      <div v-show="activeSection === 'providers'" class="settings-providers-page">
+        <section class="settings-section settings-provider-section">
+          <div class="studio-section-head"><div><h3>服务商与连接</h3><p>新增服务、修改连接，或为服务商选择默认模型。密钥仅可写入，不会回显。</p></div><button class="secondary" :disabled="!providerManagementAllowed || providerManaging" @click="openCreateProvider"><AppIcon name="plus" :size="16" />新增服务商</button></div>
+          <div class="settings-managed-row"><label for="settingsManagedProvider">当前管理<select id="settingsManagedProvider" :value="selectedProviderId" :disabled="!providers.length || providerManaging" @change="handleManagedProviderChange"><option v-if="!providers.length" value="">暂无服务商</option><option v-for="provider in providers" :key="provider.id" :value="provider.id">{{ providerDisplayName(provider) }}</option></select></label><button class="secondary" :disabled="!providerManagementAllowed || providerManaging || !selectedProvider" @click="openEditProvider">名称与默认模型</button><button class="secondary" :disabled="!selectedProviderId || selectedProviderFetching" @click="requestModels(selectedProviderId)">{{ selectedProviderFetching ? '获取中…' : '获取模型列表' }}</button></div>
+          <p v-if="!providers.length" class="studio-inline-notice">尚未配置服务商。添加接口地址和密钥后，即可获取模型。</p>
+          <p v-if="!providerManagementAllowed" class="settings-inline-warning">当前服务未开放服务商结构管理，仍可使用已配置的服务。</p>
         <div v-if="showCreateProvider" class="settings-provider-create" role="region" aria-label="新增服务商">
           <div class="settings-provider-create-head">
             <div>
@@ -354,7 +306,7 @@
                 </button>
               </div>
             </div>
-            <div class="settings-provider-models-field">
+            <details class="settings-provider-models-field studio-disclosure"><summary>手工维护候选模型</summary>
               <label for="settingsEditProviderStaticModels">静态模型列表 <span class="muted">（可留空）</span></label>
               <textarea
                 id="settingsEditProviderStaticModels"
@@ -365,7 +317,7 @@
                 :disabled="providerManaging"
               />
               <p class="muted settings-field-help">这里只维护手工模型候选；远程获取到的模型不会写回 Provider YAML。</p>
-            </div>
+            </details>
           </div>
           <div class="settings-provider-create-actions">
             <button type="button" :disabled="providerManaging || !editProviderDirty" @click="submitEditProvider">
@@ -379,7 +331,8 @@
           远程模型获取失败：{{ selectedProviderModelError }}。可以继续使用已保存的模型，或在下方直接填写模型 ID。
         </div>
 
-        <div v-if="selectedProviderId" class="settings-connection-editor">
+
+        <details v-if="selectedProviderId" class="settings-connection-editor studio-disclosure" :open="!connectionLoading && !activeConnection.key_configured"><summary>密钥与接口地址</summary>
           <div class="settings-connection-editor-head">
             <div>
               <b>服务连接管理</b>
@@ -397,6 +350,7 @@
           </div>
 
           <template v-else>
+            <details class="settings-source-details studio-disclosure"><summary>配置来源与本地文件</summary>
             <div class="settings-connection-summary">
               <div>
                 <span>密钥状态</span>
@@ -415,6 +369,7 @@
               </div>
             </div>
 
+            </details>
             <div class="settings-connection-fields">
               <div>
                 <label :for="`settingsApiKey-${selectedProviderId}`">API Key</label>
@@ -492,109 +447,20 @@
             <b>安全提醒</b>
             <p>密钥会以明文保存在本机 Git 忽略文件中，请只在受信任的服务器上使用。远程打开本页时，请先通过 HTTPS 或 SSH 隧道访问，不要在明文 HTTP 连接中输入密钥。</p>
           </div>
-        </div>
-      </section>
+        </details>
 
-      <section class="settings-section settings-model-section">
-        <div class="settings-section-head">
-          <div>
-            <span class="eyebrow">03 · 模块</span>
-            <h3>模型绑定</h3>
-          </div>
-          <span class="muted">有远程候选时直接选择；列表为空时才需要手动填写</span>
-        </div>
-
-        <div class="settings-model-list">
-          <div v-for="task in SETTINGS_TASKS" :key="task.key" class="settings-model-row">
-            <div class="settings-model-copy">
-              <b>{{ task.label }}</b>
-              <p>{{ task.description }}</p>
-              <code>{{ task.key }}</code>
-            </div>
-
-            <div class="settings-model-provider">
-              <label :for="`settingsProvider-${task.key}`">服务配置</label>
-              <select
-                :id="`settingsProvider-${task.key}`"
-                :value="draft.tasks[task.key].provider_profile"
-                @change="handleTaskProviderChange(task.key, $event)"
-              >
-                <option value="">跟随默认（{{ defaultProviderName }}）</option>
-                <option
-                  v-if="draft.tasks[task.key].provider_profile && !providerById.has(draft.tasks[task.key].provider_profile)"
-                  :value="draft.tasks[task.key].provider_profile"
-                >
-                  {{ draft.tasks[task.key].provider_profile }}（配置未加载）
-                </option>
-                <option v-for="provider in providers" :key="provider.id" :value="provider.id">
-                  {{ providerDisplayName(provider) }}
-                </option>
-              </select>
-            </div>
-
-            <div class="settings-model-input">
-              <label :for="`settingsModel-${task.key}`">模型 ID</label>
-              <div class="settings-model-input-row">
-                <select
-                  v-if="modelsForTask(task.key).length"
-                  :id="`settingsModel-${task.key}`"
-                  v-model="draft.tasks[task.key].model"
-                  @focus="ensureTaskModelCatalog(task.key)"
-                >
-                  <option value="">使用服务商默认模型{{ defaultModelForTask(task.key) ? `（${defaultModelForTask(task.key)}）` : '' }}</option>
-                  <option
-                    v-if="taskModelAwaitingValidation(task.key)"
-                    :value="draft.tasks[task.key].model"
-                  >
-                    {{ draft.tasks[task.key].model }}（等待刷新验证）
-                  </option>
-                  <option v-for="model in modelsForTask(task.key)" :key="model" :value="model">{{ model }}</option>
-                </select>
-                <input
-                  v-else
-                  :id="`settingsModel-${task.key}`"
-                  v-model.trim="draft.tasks[task.key].model"
-                  autocomplete="off"
-                  placeholder="暂无候选，请手动填写模型 ID"
-                  :disabled="isProviderFetching(providerIdForTask(task.key))"
-                />
-                <button
-                  type="button"
-                  class="secondary mini"
-                  :disabled="!providerIdForTask(task.key) || isProviderFetching(providerIdForTask(task.key))"
-                  @click="requestModels(providerIdForTask(task.key))"
-                >
-                  {{ isProviderFetching(providerIdForTask(task.key)) ? '获取中' : '刷新' }}
-                </button>
-              </div>
-              <p v-if="modelErrorFor(providerIdForTask(task.key))" class="settings-inline-error">
-                列表获取失败；没有本地候选时可手填，或点击“刷新”重试。
-              </p>
-              <p v-else class="muted settings-field-help">
-                {{ modelsForTask(task.key).length ? `${modelsForTask(task.key).length} 个可选模型` : '无可选列表，请手动填写' }}
-              </p>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <div class="settings-save-bar">
-        <div>
-          <b>{{ dirty ? '修改尚未生效' : '当前配置已保存' }}</b>
-          <p class="muted">保存后，新启动的 Agent、OCR 精修和字幕翻译任务会使用新配置。</p>
-        </div>
-        <button type="button" :disabled="saving || !dirty" @click="saveSettings">
-          {{ saving ? '正在保存…' : '保存设置' }}
-        </button>
+          <details v-if="selectedProvider" class="studio-disclosure settings-provider-delete-details"><summary>删除服务商</summary><p>会迁移正在引用它的模块；不会撤销服务商后台的密钥。</p><button class="danger secondary" :disabled="!canDeleteSelectedProvider" @click="deleteSelectedProvider">删除当前服务商…</button><p v-if="providers.length === 1">至少保留一个服务商；请先新增再删除。</p></details>
+        </section>
       </div>
-
-      <div v-if="status" class="status settings-status" :class="statusClass" aria-live="polite">{{ status }}</div>
+      <p v-if="status && status !== '设置已加载。'" class="settings-action-status" :class="statusClass" role="status">{{ status }}</p>
+      <footer class="studio-save-bar settings-main-save"><div class="studio-save-copy" role="status"><span class="save-dot" :class="dirty ? 'dirty' : 'saved'"></span><span>{{ dirty ? '语言与模块模型有未保存修改' : '语言与模块模型已保存' }}</span></div><span v-if="activeSection === 'providers'" class="settings-separate-save-note">{{ connectionDirty || editProviderDirty && showEditProvider ? '连接 / 服务商资料请使用各自的保存按钮' : '连接信息在对应编辑区单独保存' }}</span><button type="button" :disabled="saving || !dirty" @click="saveSettings">{{ saving ? '正在保存…' : '保存设置' }}</button></footer>
     </template>
   </section>
 </template>
 
 <script setup>
 import { computed, ref, watch } from 'vue'
+import AppIcon from './AppIcon.vue'
 import {
   SETTINGS_TASKS,
   SOURCE_LANGUAGE_OPTIONS,
@@ -652,6 +518,12 @@ const emit = defineEmits([
   'delete-provider',
 ])
 const initialSettings = normalizeSettings(props.settings, props.providers)
+const activeSection = ref(props.providers.length ? 'defaults' : 'providers')
+const coreModelKeys = new Set(['subtitle_translation', 'glossary', 'video_analysis', 'title_translation'])
+const modelGroups = [
+  { id: 'core', tasks: ['subtitle_translation', 'glossary', 'video_analysis', 'title_translation'].map(key => SETTINGS_TASKS.find(task => task.key === key)), advanced: false },
+  { id: 'extra', tasks: SETTINGS_TASKS.filter(task => !coreModelKeys.has(task.key)), advanced: true },
+]
 const draft = ref(reconcileTaskModelBindings(initialSettings, props.providers, props.modelsByProvider))
 const savedPayload = ref(JSON.stringify(buildSettingsPayload(initialSettings)))
 const connectionDraft = ref(createProviderConnectionDraft())
@@ -876,6 +748,11 @@ function requestModels(providerId) {
   emit('fetch-models', providerId)
 }
 
+function openDefaultConnection() {
+  activeSection.value = 'providers'
+  if (defaultProviderId.value && selectedProviderId.value !== defaultProviderId.value) emit('select-provider', defaultProviderId.value)
+}
+
 function handleDefaultProviderChange(event) {
   const providerId = String(event?.target?.value || '').trim()
   draft.value = applyDefaultProviderChange(draft.value, providerId)
@@ -924,6 +801,7 @@ function clearLocalApiKey() {
 
 function openCreateProvider() {
   if (!props.providerManagementAllowed || props.providerManaging) return
+  activeSection.value = 'providers'
   showEditProvider.value = false
   pendingUpdatedProvider.value = null
   pendingCreatedProviderId.value = ''
