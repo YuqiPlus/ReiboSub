@@ -1,17 +1,50 @@
 <template>
-  <section class="video-overlay-panel">
-    <div class="overlay-head">
-      <div>
-        <h3>视频处理</h3>
-        <p class="panel-subtitle">镜像、裁剪和调整尺寸后再叠加贴图，输出新视频，不覆盖原文件。</p>
+  <section class="panel video-overlay-panel video-studio">
+    <header class="studio-page-head"><div><span class="studio-kicker">视频处理</span><h2>调整画面，保留原片</h2><p>镜像、裁剪、改尺寸或加贴图，输出为新视频。</p></div><button class="secondary" type="button" @click="$emit('open-assets')"><AppIcon name="folder" :size="16" />选择素材</button></header>
+    <details class="studio-disclosure video-source-details" :open="sourceOpen" @toggle="sourceOpen = $event.target.open"><summary>{{ inputVideo ? fileLabel(inputVideo) : '选择或填写视频路径' }}</summary><label for="overlayInputVideo">视频文件<input id="overlayInputVideo" :value="inputVideo" placeholder="填写本地视频路径" @input="$emit('update:inputVideo', $event.target.value)" /></label></details>
+    <div class="video-workbench">
+      <div class="video-preview-column">
+        <div class="studio-section-head"><div><h3>画面预览</h3><p>抽取一帧查看效果；贴图可直接拖动。</p></div><button class="secondary mini" type="button" :disabled="loading || !inputVideo" @click="loadPreview()">{{ loading ? '抽帧中…' : preview.image_data_url ? '换一帧' : '加载预览' }}</button></div>
+      <div class="overlay-preview-box">
+        <div v-if="!inputVideo" class="overlay-empty">先从素材列表选择一个视频。</div>
+        <div v-else-if="!preview.image_data_url" class="overlay-empty">抽一帧后可以预览镜像、裁剪和贴图位置。</div>
+        <div v-else class="video-overlay-preview" @pointermove="onDragMove" @pointerup="endDrag" @pointercancel="endDrag" @pointerleave="endDrag">
+          <img
+            :src="preview.image_data_url"
+            :class="{ mirrored: transformSettings.horizontal_flip }"
+            alt="video preview"
+            draggable="false"
+          />
+          <div
+            ref="cropFrameRef"
+            class="video-transform-crop-frame"
+            :class="{ cropped: cropActive }"
+            :style="cropFrameStyle"
+          >
+            <div
+              v-for="layer in visibleLayers"
+              :key="layer.kind"
+              class="overlay-preview-layer"
+              :class="{ active: activeLayerKind === layer.kind }"
+              :style="layerPreviewStyle(layer)"
+              @pointerdown.stop.prevent="startDrag(layer, $event)"
+              @click.stop="activeLayerKind = layer.kind"
+            >
+              <img :src="layer.image_data_url" :alt="layer.label" draggable="false" />
+              <span>{{ layer.label }}</span>
+            </div>
+          </div>
+        </div>
+        <div class="crop-preview-meta">
+          <span v-if="preview.image_data_url">预览帧 {{ formatTime(preview.time_seconds) }}</span>
+          <span v-if="preview.width && preview.height">{{ preview.width }} × {{ preview.height }}</span>
+        </div>
       </div>
-      <button class="secondary mini" type="button" :disabled="loading || !inputVideo" @click="loadPreview()">
-        {{ preview.image_data_url ? (loading ? '换帧中' : '换一帧') : (loading ? '抽帧中' : '抽一帧') }}
-      </button>
-    </div>
 
-    <div class="overlay-layout">
-      <div class="overlay-configs">
+        <div v-if="preview.width && preview.height && !transformInspection.error" class="video-transform-summary"><span>保留 {{ transformInspection.cropped_width }} × {{ transformInspection.cropped_height }}</span><span>输出 {{ transformInspection.output_width }} × {{ transformInspection.output_height }}</span></div>
+        <details class="studio-disclosure overlay-frame-time"><summary>按时间定位预览帧</summary><div class="overlay-time-row"><label for="overlayPreviewTime">预览秒数<input id="overlayPreviewTime" type="number" min="0" step="0.1" v-model="previewTimeInput" @keydown.enter.prevent="loadPreviewAtInput" /></label><button class="secondary mini" type="button" :disabled="loading || !inputVideo" @click="loadPreviewAtInput">跳到此秒</button></div></details>
+      </div>
+      <div class="video-controls-column">
         <div class="overlay-transform-card">
           <div class="overlay-layer-head">
             <div>
@@ -63,31 +96,26 @@
           <p v-if="transformSettings.resize_enabled" class="muted compact-note">只填一边会等比例计算；两边都填时需与裁剪后的宽高比一致。奇数会向下取偶数。</p>
 
           <div v-if="transformInspection.error" class="status bad compact-status">{{ transformInspection.error }}</div>
-          <div v-else-if="preview.width && preview.height" class="video-transform-summary">
-            <span>保留 {{ transformInspection.cropped_width }} × {{ transformInspection.cropped_height }}</span>
-            <span>输出 {{ transformInspection.output_width }} × {{ transformInspection.output_height }}</span>
-          </div>
+
         </div>
 
-        <div class="overlay-config-section-title">
-          <b>贴图（可选）</b>
-          <span>水印与遮 Logo 可单独或同时启用</span>
-        </div>
+
+        <details class="studio-disclosure overlay-stickers"><summary>水印与 Logo 遮挡<span>{{ visibleLayers.length ? `${visibleLayers.length} 层已启用` : '可选' }}</span></summary>
         <div v-for="layer in layerList" :key="layer.kind" class="overlay-layer-card" :class="{ active: activeLayerKind === layer.kind }">
           <div class="overlay-layer-head">
             <label class="check-row">
               <input type="checkbox" v-model="layer.enabled" @change="activeLayerKind = layer.kind" />
               <span>{{ layer.label }}</span>
             </label>
-            <button class="ghost mini" type="button" @click="activeLayerKind = layer.kind">调整</button>
+            <button class="ghost mini" type="button" :disabled="!layer.enabled" @click="activeLayerKind = layer.kind">选中贴图</button>
           </div>
 
-          <label class="file-picker">
+          <label v-if="layer.enabled" class="file-picker">
             <span>{{ layer.fileName || '选择贴图图片' }}</span>
             <input type="file" accept="image/*" @change="onLayerFile(layer, $event)" />
           </label>
 
-          <label class="check-row subtle">
+          <details v-if="layer.enabled" class="studio-disclosure overlay-layer-options"><summary>大小、透明度与扣背景</summary><label class="check-row subtle">
             <input type="checkbox" v-model="layer.remove_background" />
             <span>扣背景</span>
           </label>
@@ -102,67 +130,25 @@
               <input type="range" min="0" max="100" step="1" :value="percent(layer.opacity)" @input="layer.opacity = numberRatio($event.target.value)" />
             </label>
           </div>
+          </details>
         </div>
 
-        <div class="overlay-time-row">
-          <label>
-            <span>预览秒数</span>
-            <input type="number" min="0" step="0.1" v-model="previewTimeInput" @keydown.enter.prevent="loadPreviewAtInput" />
-          </label>
-          <button class="secondary mini" type="button" :disabled="loading || !inputVideo" @click="loadPreviewAtInput">跳到此秒</button>
-        </div>
 
-        <div class="toolbar overlay-actions">
-          <button class="warning" type="button" :disabled="!canRun" @click="runProcessing">生成处理后视频</button>
-          <button class="secondary" type="button" @click="resetLayers">重置贴图位置</button>
-        </div>
-      </div>
-
-      <div class="overlay-preview-box">
-        <div v-if="!inputVideo" class="overlay-empty">先从素材列表选择一个视频。</div>
-        <div v-else-if="!preview.image_data_url" class="overlay-empty">抽一帧后可以预览镜像、裁剪和贴图位置。</div>
-        <div v-else class="video-overlay-preview" @pointermove="onDragMove" @pointerup="endDrag" @pointercancel="endDrag" @pointerleave="endDrag">
-          <img
-            :src="preview.image_data_url"
-            :class="{ mirrored: transformSettings.horizontal_flip }"
-            alt="video preview"
-            draggable="false"
-          />
-          <div
-            ref="cropFrameRef"
-            class="video-transform-crop-frame"
-            :class="{ cropped: cropActive }"
-            :style="cropFrameStyle"
-          >
-            <div
-              v-for="layer in visibleLayers"
-              :key="layer.kind"
-              class="overlay-preview-layer"
-              :class="{ active: activeLayerKind === layer.kind }"
-              :style="layerPreviewStyle(layer)"
-              @pointerdown.stop.prevent="startDrag(layer, $event)"
-              @click.stop="activeLayerKind = layer.kind"
-            >
-              <img :src="layer.image_data_url" :alt="layer.label" draggable="false" />
-              <span>{{ layer.label }}</span>
-            </div>
-          </div>
-        </div>
-        <div class="crop-preview-meta">
-          <span v-if="preview.image_data_url">预览帧 {{ formatTime(preview.time_seconds) }}</span>
-          <span v-if="preview.width && preview.height">{{ preview.width }} × {{ preview.height }}</span>
-        </div>
+          <button class="secondary mini" type="button" @click="resetLayers">重置贴图位置</button>
+        </details>
       </div>
     </div>
-
-    <div v-if="error" class="status bad">{{ error }}</div>
-    <div v-else class="muted overlay-note">裁剪方向以当前预览为准；开启镜像后，左/右也按镜像后的画面计算。扣背景适合白底或纯色底贴图。</div>
+    <p v-if="error" class="operation-status bad" role="alert">{{ error }}</p>
+    <details class="studio-disclosure video-processing-notes"><summary>处理顺序与注意事项</summary><p>按“镜像 → 裁剪 → 尺寸 → 贴图”处理。左右裁剪以镜像后的画面为准；贴图不跟随镜像翻转。扣背景适合纯色底图片。</p></details>
+    <footer class="studio-save-bar operation-run-bar"><span>原视频不会被覆盖。</span><button type="button" :disabled="!canRun" @click="runProcessing">{{ loading ? '正在加载预览…' : '生成处理后视频' }}</button></footer>
   </section>
 </template>
 
 <script setup>
 import { computed, reactive, ref, watch } from 'vue'
 import { api } from '../api'
+import AppIcon from './AppIcon.vue'
+import { fileLabel } from '../studioTools.js'
 import {
   buildVideoTransformPayload,
   createDefaultVideoTransform,
@@ -174,7 +160,8 @@ import {
 const props = defineProps({
   inputVideo: { type: String, default: '' },
 })
-const emit = defineEmits(['run'])
+const emit = defineEmits(['run', 'update:inputVideo', 'open-assets'])
+const sourceOpen = ref(!props.inputVideo)
 
 const preview = reactive({ image_data_url: '', time_seconds: 0, duration_seconds: 0, width: 0, height: 0 })
 const cropFrameRef = ref(null)

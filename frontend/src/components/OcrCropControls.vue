@@ -15,7 +15,8 @@
       </div>
     </div>
 
-    <div class="crop-tune-panel">
+    <component :is="compact ? 'details' : 'div'" class="crop-tune-panel" :class="{ 'crop-tune-compact': compact }">
+      <summary v-if="compact">精调字幕框与 Logo 排除框</summary>
       <div class="crop-controls grid-crop">
         <div class="crop-field">
           <span>上</span>
@@ -94,7 +95,7 @@
           <button type="button" aria-label="扩大亮区" @click="resizeWindow(nudgeStep)">＋</button>
         </div>
       </div>
-    </div>
+    </component>
 
     <div v-if="!inputVideo" class="muted crop-note">下载或选择视频后才能抽帧预览。</div>
     <div v-else-if="preview.image_data_url" class="crop-preview-wrap">
@@ -155,6 +156,7 @@ import { computed, onUnmounted, reactive, ref, watch } from 'vue'
 import { api } from '../api'
 
 const props = defineProps({
+  compact: { type: Boolean, default: false },
   title: { type: String, default: 'OCR 裁剪区域' },
   inputVideo: { type: String, default: '' },
   ocrScope: { type: String, default: 'bottom' },

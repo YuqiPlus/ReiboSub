@@ -1,25 +1,43 @@
 <template>
-  <section class="panel ocr-dev-panel">
-    <div class="panel-heading">
-      <div>
-        <h2>OCR 开发测试</h2>
-        <p class="panel-subtitle">只运行 OCR 提取：2.0 保留原区域逻辑；3.0 保存文字框四边形和文字行角度，横向优先只做软标记，严格近水平才会硬过滤。</p>
-      </div>
-    </div>
+  <section class="panel ocr-dev-panel ocr-studio">
+    <header class="studio-page-head"><div><span class="studio-kicker">OCR Lab</span><h2>把画面里的字提取出来</h2><p>选择版本、框定字幕区域，再开始测试。2.0 与 3.0 的结果独立保留。</p></div></header>
+    <nav class="studio-tabs operation-tabs" aria-label="OCR 测试方式"><button :class="{ active: labTab === 'extract' }" :aria-pressed="labTab === 'extract'" @click="labTab = 'extract'">新建识别测试</button><button :class="{ active: labTab === 'reuse' }" :aria-pressed="labTab === 'reuse'" @click="labTab = 'reuse'">复用已有结果<span>{{ debugFolders.length }}</span></button></nav>
+    <div v-show="labTab === 'extract'">
+      <div class="lab-version-grid ocr-version-grid" role="group" aria-label="OCR 版本"><button v-for="version in OCR_LAB_VERSIONS" :key="version.id" class="lab-version-card" :class="{ selected: ocrExtractionMode === version.id }" :aria-pressed="ocrExtractionMode === version.id" :disabled="running" @click="$emit('update:ocrExtractionMode', version.id)"><span><b>{{ version.label }}</b><small>{{ version.badge }}</small></span><p>{{ version.description }}</p></button></div>
+      <p class="lab-version-detail">{{ currentVersion?.detail }}</p>
+      <div class="studio-source-picker"><label for="ocrLabInput">视频文件<input id="ocrLabInput" :value="inputVideo" :disabled="running" placeholder="选择或填写本地视频路径" @input="$emit('update:inputVideo', $event.target.value)" /></label><button class="secondary" :disabled="running" @click="$emit('open-assets')"><AppIcon name="folder" :size="16" />从素材库选择</button></div>
+      <div class="lab-basic-row"><label for="ocrLabLanguage">字幕语言<select id="ocrLabLanguage" :value="sourceLanguage" :disabled="running" @change="$emit('update:sourceLanguage', $event.target.value)"><option value="korean">韩语</option><option value="japanese">日语</option><option value="chinese">中文</option><option value="english">英语</option></select></label><p><template v-if="ocrExtractionMode === 'region_v3'">{{ shapeSummary }} · </template>{{ sampleFps }} 帧 / 秒 · {{ refineTimingBoundaries ? '边界复扫开启' : '边界复扫关闭' }} · {{ llmCleanup ? '成品精修开启' : '仅机器识别' }}</p></div>
+    <OcrCropControls compact
+      title="区域 OCR 与 Logo 排除"
+      :input-video="inputVideo"
+      :ocr-scope="ocrScope"
+      :ocr-extraction-mode="ocrExtractionMode"
+      :ocr-shape-mode="ocrShapeMode"
+      :source-language="sourceLanguage"
+      :ocr-language="sourceLanguage"
+      :ocr-min-confidence="minConfidence / 100"
+      :ocr-crop-top-ratio="ocrCropTopRatio"
+      :ocr-crop-bottom-ratio="ocrCropBottomRatio"
+      :ocr-crop-left-ratio="ocrCropLeftRatio"
+      :ocr-crop-right-ratio="ocrCropRightRatio"
+      :ocr-exclude-enabled="ocrExcludeEnabled"
+      :ocr-exclude-top-ratio="ocrExcludeTopRatio"
+      :ocr-exclude-bottom-ratio="ocrExcludeBottomRatio"
+      :ocr-exclude-left-ratio="ocrExcludeLeftRatio"
+      :ocr-exclude-right-ratio="ocrExcludeRightRatio"
+      @update:ocr-crop-top-ratio="$emit('update:ocrCropTopRatio', $event)"
+      @update:ocr-crop-bottom-ratio="$emit('update:ocrCropBottomRatio', $event)"
+      @update:ocr-crop-left-ratio="$emit('update:ocrCropLeftRatio', $event)"
+      @update:ocr-crop-right-ratio="$emit('update:ocrCropRightRatio', $event)"
+      @update:ocr-exclude-enabled="$emit('update:ocrExcludeEnabled', $event)"
+      @update:ocr-exclude-top-ratio="$emit('update:ocrExcludeTopRatio', $event)"
+      @update:ocr-exclude-bottom-ratio="$emit('update:ocrExcludeBottomRatio', $event)"
+      @update:ocr-exclude-left-ratio="$emit('update:ocrExcludeLeftRatio', $event)"
+      @update:ocr-exclude-right-ratio="$emit('update:ocrExcludeRightRatio', $event)"
+    />
 
-    <div class="ocr-dev-path-row">
-      <input :value="inputVideo" placeholder="选择或填写本地视频路径" @input="$emit('update:inputVideo', $event.target.value)" />
-      <button class="secondary mini" type="button" @click="$emit('open-assets')">从素材库选</button>
-    </div>
 
-    <div class="ocr-dev-settings">
-      <label>
-        <span>OCR 提取方式</span>
-        <select :value="ocrExtractionMode" @change="$emit('update:ocrExtractionMode', $event.target.value)">
-          <option value="region">OCR 2.0（区域增强）</option>
-          <option value="region_v3">OCR 3.0（稳定版）</option>
-        </select>
-      </label>
+      <details class="studio-disclosure lab-advanced"><summary>采样、时间轴与精修参数</summary><fieldset :disabled="running" class="lab-advanced-grid">
       <label v-if="ocrExtractionMode === 'region_v3'">
         <span>文字形态策略</span>
         <select :value="ocrShapeMode" @change="$emit('update:ocrShapeMode', $event.target.value)">
@@ -29,15 +47,7 @@
         </select>
         <small class="muted">横向优先会保留倾斜文字行并交给几何 LLM；严格近水平会在生成轨迹前直接排除超出角度限制的候选。</small>
       </label>
-      <label>
-        <span>原始字幕语言</span>
-        <select :value="sourceLanguage" @change="$emit('update:sourceLanguage', $event.target.value)">
-          <option value="korean">韩语</option>
-          <option value="japanese">日语</option>
-          <option value="chinese">中文</option>
-          <option value="english">英语</option>
-        </select>
-      </label>
+
       <label>
         <span>采样帧率（FPS）</span>
         <input type="number" min="0.2" max="30" step="0.5" :value="sampleFps" @input="$emit('update:sampleFps', toNumber($event.target.value, 6))" />
@@ -74,26 +84,29 @@
           {{ llmCleanup ? '已开启' : '已关闭' }}
         </button>
       </div>
-    </div>
 
-    <div class="ocr-dev-debug-assets">
-      <div class="section-title">
-        <h3>调试素材库</h3>
-        <span class="badge">{{ debugFolders.length }}</span>
-        <button class="secondary mini" type="button" @click="$emit('refresh-debug-assets')">刷新</button>
-      </div>
-      <p class="panel-subtitle">2.0 与 3.0 使用独立调试目录和精修按钮；运行 3.0 不会覆盖已有 2.0 素材。</p>
-      <div v-if="!debugFolders.length" class="asset-list empty">暂无调试文件夹。</div>
+      </fieldset></details>
+      <details class="studio-disclosure lab-artifact-notes"><summary>产物与保存说明</summary>
+      <p v-if="ocrExtractionMode === 'region_v3'">输出：`source.srt`、`ocr_boxes.json`、`ocr_sample_frames.json`、`ocr_rejected_boxes.json`；`source.geometry_refined.srt` 和 `ocr_geometry.json` 仅供几何诊断，成品精修另生成 `source.v3.refined.srt`、`source.v3.layered.srt` 和 `ocr_v3_layers.json`。</p>
+      <p v-else>输出：`source.srt`、`source.machine.srt`、`source.refined.srt`、`ocr_boxes.json`、`ocr_sample_frames.json`。</p>
+
+      </details>
+      <footer class="studio-save-bar operation-run-bar"><span>{{ llmCleanup ? '开启精修会调用模型服务；机器识别结果仍会保留。' : '只运行本机 OCR，保留原始识别结果。' }}</span><button :disabled="running || !inputVideo.trim()" @click="$emit('run')">{{ running ? 'OCR 测试运行中…' : `运行 ${currentVersion?.label || 'OCR'} 测试` }}</button></footer>
+    </div>
+    <div v-show="labTab === 'reuse'" class="lab-reuse-results">
+      <div class="studio-filter-bar"><div class="studio-tabs" aria-label="调试结果版本"><button v-for="option in folderFilters" :key="option.id" :class="{ active: folderVersion === option.id }" :aria-pressed="folderVersion === option.id" @click="folderVersion = option.id">{{ option.label }}</button></div><label class="studio-search"><AppIcon name="search" :size="17" /><input v-model="folderQuery" type="search" aria-label="搜索 OCR 调试结果" placeholder="搜索素材或目录" /></label><button class="secondary mini" @click="$emit('refresh-debug-assets')">刷新结果</button></div>
+      <p class="operation-notice">按目录所属版本使用对应精修工具。复用轨迹和原始框时，不必重新运行 OCR。</p>
+      <div v-if="!filteredFolders.length" class="asset-list empty">暂无调试文件夹。</div>
       <div v-else class="ocr-dev-debug-list">
-        <details v-for="folder in debugFolders" :key="folder.path" class="ocr-dev-debug-folder">
+        <details v-for="folder in filteredFolders" :key="folder.path" class="ocr-dev-debug-folder">
           <summary>
             <div>
               <b>{{ folder.name }}</b>
-              <div class="muted path">{{ folder.path }}</div>
+
             </div>
-            <span><b class="badge">{{ folder.ocr_version_label || 'OCR 2.0' }}</b> <span class="muted">{{ folder.modified_label }}</span></span>
+            <span><b class="badge">{{ folder.ocr_version_label || 'OCR 2.0' }}</b> <span class="muted">{{ localModifiedLabel(folder) }}</span></span>
           </summary>
-          <div class="ocr-dev-debug-actions">
+          <div class="ocr-dev-debug-actions"><p class="path">{{ folder.path }}</p>
             <button class="secondary mini" type="button" :disabled="!folder.source_srt" @click="$emit('update:sourceSrt', folder.source_srt)">选择原始字幕</button>
             <button v-if="folder.ocr_lab_version !== 'v3'" class="warning mini" type="button" :disabled="running || !folder.has_ocr_boxes || !folder.has_tracks" @click="$emit('rebuild-track-refine', folder.path)">2.0 从 JSON 重建 + 轨迹精修</button>
             <button v-if="folder.ocr_lab_version === 'v3'" class="warning mini" type="button" :disabled="running || !folder.has_ocr_boxes || !folder.has_tracks" title="复用已有 tracks.json 和 ocr_boxes.json，不重新运行 OCR" @click="$emit('geometry-refine', folder.path)">3.0 几何精修（不重跑 OCR）</button>
@@ -109,42 +122,8 @@
           </div>
         </details>
       </div>
-    </div>
 
-    <OcrCropControls
-      title="区域 OCR 与 Logo 排除"
-      :input-video="inputVideo"
-      :ocr-scope="ocrScope"
-      :ocr-extraction-mode="ocrExtractionMode"
-      :ocr-shape-mode="ocrShapeMode"
-      :source-language="sourceLanguage"
-      :ocr-language="sourceLanguage"
-      :ocr-min-confidence="minConfidence / 100"
-      :ocr-crop-top-ratio="ocrCropTopRatio"
-      :ocr-crop-bottom-ratio="ocrCropBottomRatio"
-      :ocr-crop-left-ratio="ocrCropLeftRatio"
-      :ocr-crop-right-ratio="ocrCropRightRatio"
-      :ocr-exclude-enabled="ocrExcludeEnabled"
-      :ocr-exclude-top-ratio="ocrExcludeTopRatio"
-      :ocr-exclude-bottom-ratio="ocrExcludeBottomRatio"
-      :ocr-exclude-left-ratio="ocrExcludeLeftRatio"
-      :ocr-exclude-right-ratio="ocrExcludeRightRatio"
-      @update:ocr-crop-top-ratio="$emit('update:ocrCropTopRatio', $event)"
-      @update:ocr-crop-bottom-ratio="$emit('update:ocrCropBottomRatio', $event)"
-      @update:ocr-crop-left-ratio="$emit('update:ocrCropLeftRatio', $event)"
-      @update:ocr-crop-right-ratio="$emit('update:ocrCropRightRatio', $event)"
-      @update:ocr-exclude-enabled="$emit('update:ocrExcludeEnabled', $event)"
-      @update:ocr-exclude-top-ratio="$emit('update:ocrExcludeTopRatio', $event)"
-      @update:ocr-exclude-bottom-ratio="$emit('update:ocrExcludeBottomRatio', $event)"
-      @update:ocr-exclude-left-ratio="$emit('update:ocrExcludeLeftRatio', $event)"
-      @update:ocr-exclude-right-ratio="$emit('update:ocrExcludeRightRatio', $event)"
-    />
-
-    <div class="ocr-dev-actions">
-      <button :disabled="running || !inputVideo" @click="$emit('run')">{{ running ? 'OCR 测试运行中…' : '运行 OCR 开发测试' }}</button>
-      <p v-if="ocrExtractionMode === 'region_v3'">输出：`source.srt`、`ocr_boxes.json`、`ocr_sample_frames.json`、`ocr_rejected_boxes.json`；`source.geometry_refined.srt` 和 `ocr_geometry.json` 仅供几何诊断，成品精修另生成 `source.v3.refined.srt`、`source.v3.layered.srt` 和 `ocr_v3_layers.json`。</p>
-      <p v-else>输出：`source.srt`、`source.machine.srt`、`source.refined.srt`、`ocr_boxes.json`、`ocr_sample_frames.json`。</p>
-    </div>
+      <details class="studio-disclosure lab-legacy-cleanup"><summary>兼容工具：仅清理已有字幕</summary>
     <div class="ocr-dev-existing-cleanup">
       <div>
         <b>已有字幕直接去噪</b>
@@ -153,14 +132,21 @@
       <input :value="sourceSrt" placeholder="填写已有 source.srt 路径" @input="$emit('update:sourceSrt', $event.target.value)" />
       <button class="secondary" :disabled="running || !sourceSrt" type="button" @click="$emit('run-cleanup')">直接 LLM 去噪</button>
     </div>
-    <div v-if="status" class="status" :class="statusClass">{{ status }}</div>
+
+      </details>
+    </div>
+    <p v-if="status" class="operation-status" :class="statusClass" role="status">{{ status }}</p>
   </section>
 </template>
 
 <script setup>
+import { computed, ref } from 'vue'
 import OcrCropControls from './OcrCropControls.vue'
+import AppIcon from './AppIcon.vue'
+import { OCR_LAB_VERSIONS } from '../labVersions.js'
+import { localModifiedLabel } from '../studioTools.js'
 
-defineProps({
+const props = defineProps({
   inputVideo: { type: String, default: '' },
   sourceLanguage: { type: String, default: 'korean' },
   sampleFps: { type: Number, default: 6 },
@@ -186,6 +172,15 @@ defineProps({
   status: { type: String, default: '' },
   statusClass: { type: String, default: '' },
 })
+
+const labTab = ref('extract'), folderVersion = ref('all'), folderQuery = ref('')
+const currentVersion = computed(() => OCR_LAB_VERSIONS.find(version => version.id === props.ocrExtractionMode))
+const shapeSummary = computed(() => ({ unrestricted: '不限形态', horizontal_preferred: '横向优先 · 软提示', horizontal_strict: '严格近水平 · 硬过滤' }[props.ocrShapeMode] || props.ocrShapeMode))
+const folderFilters = [{ id: 'all', label: '全部版本' }, { id: 'v3', label: 'OCR 3.0' }, { id: 'v2', label: 'OCR 2.0' }]
+const filteredFolders = computed(() => props.debugFolders.filter(folder => {
+  const version = folder.ocr_lab_version === 'v3' ? 'v3' : 'v2'
+  return (folderVersion.value === 'all' || folderVersion.value === version) && (!folderQuery.value.trim() || `${folder.name} ${folder.path}`.toLocaleLowerCase().includes(folderQuery.value.trim().toLocaleLowerCase()))
+}))
 
 defineEmits([
   'update:inputVideo',

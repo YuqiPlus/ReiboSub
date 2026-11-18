@@ -1,52 +1,11 @@
 <template>
-  <section class="panel asr-lab-panel">
-    <div class="panel-heading">
-      <div>
-        <h2>ASR 开发测试</h2>
-        <p class="panel-subtitle">
-          {{ asrVersion === 'agent-experimental' ? '两套本地识别 → Agent按需复核 → 中文翻译 → 时间轴校准。单独保存实验结果，不覆盖原来的2.2或素材字幕。' : asrVersion === '2.0'
-            ? 'ASR 2.2 会先做双遍高召回识别，再对可疑缺口做局部增益重听；仍不确定的片段可直接试听复核。'
-            : 'ASR 1.0 是原有兼容流程，直接使用模型原始分段，仅建议用于历史对照和回退。' }}
-        </p>
-      </div>
-    </div>
-
-    <div class="ocr-dev-path-row">
-      <input
-        :value="inputVideo"
-        placeholder="选择或填写本地视频、音频路径"
-        @input="$emit('update:inputVideo', $event.target.value)"
-      />
-      <button class="secondary mini" type="button" @click="$emit('open-assets')">从素材库选</button>
-    </div>
-
-    <div class="ocr-dev-settings asr-lab-settings">
-      <label>
-        <span>ASR 版本</span>
-        <select :value="asrVersion" :disabled="running" @change="$emit('update:asrVersion', $event.target.value)">
-          <option value="1.0">ASR 1.0（原始兼容模式）</option>
-          <option value="2.0">ASR 2.2（定向补漏，推荐）</option>
-          <option value="agent-experimental">多模型 Agent（实验版 · 韩语）</option>
-        </select>
-      </label>
-      <label v-if="asrVersion !== 'agent-experimental'">
-        <span>音频语言</span>
-        <select :value="sourceLanguage" @change="$emit('update:sourceLanguage', $event.target.value)">
-          <option value="auto">自动识别</option>
-          <option value="korean">韩语</option>
-          <option value="japanese">日语</option>
-          <option value="chinese">中文</option>
-          <option value="english">英语</option>
-        </select>
-      </label>
-      <label v-if="asrVersion !== 'agent-experimental'">
-        <span>ASR 模型</span>
-        <select :value="modelSize" @change="$emit('update:modelSize', $event.target.value)">
-          <option value="large-v3">large-v3（质量优先）</option>
-          <option value="medium">medium（平衡）</option>
-          <option value="small">small（速度优先）</option>
-        </select>
-      </label>
+  <section class="panel asr-lab-panel asr-studio">
+    <header class="studio-page-head"><div><span class="studio-kicker">ASR Lab</span><h2>从声音里，还原每一句</h2><p>稳定识别与 Agent 实验分开选择，已有版本和结果继续保留。</p></div></header>
+    <div class="lab-version-grid asr-version-grid" role="group" aria-label="ASR 版本"><button v-for="version in ASR_LAB_VERSIONS" :key="version.id" class="lab-version-card" :class="{ selected: asrVersion === version.id, experimental: version.experimental }" :aria-pressed="asrVersion === version.id" :disabled="running" @click="$emit('update:asrVersion', version.id)"><span><b>{{ version.label }}</b><small>{{ version.badge }}</small></span><p>{{ version.description }}</p></button></div>
+    <p class="lab-version-detail">{{ currentVersion?.detail }}</p>
+    <div class="studio-source-picker"><label for="asrLabInput">视频或音频文件<input id="asrLabInput" :value="inputVideo" :disabled="running" placeholder="选择或填写本地视频、音频路径" @input="$emit('update:inputVideo', $event.target.value)" /></label><button class="secondary" :disabled="running" @click="$emit('open-assets')"><AppIcon name="folder" :size="16" />从素材库选择</button></div>
+    <fieldset v-if="!isExperiment" :disabled="running" class="lab-basic-row"><label for="asrLabLanguage">音频语言<select id="asrLabLanguage" :value="sourceLanguage" @change="$emit('update:sourceLanguage', $event.target.value)"><option value="auto">自动识别</option><option value="korean">韩语</option><option value="japanese">日语</option><option value="chinese">中文</option><option value="english">英语</option></select></label><p>{{ modelSize }} · {{ speakerDiarization ? '区分说话人' : '不区分说话人' }}<template v-if="asrVersion === '2.0'"> · {{ highRecall ? '高召回补漏开启' : '高召回补漏关闭' }}</template></p></fieldset>
+    <fieldset v-if="asrVersion === '2.0'" :disabled="running" class="asr-hotwords">
       <label v-if="asrVersion === '2.0'" class="asr-lab-wide-field">
         <span>专名与术语提示（可选）</span>
         <input
@@ -55,6 +14,18 @@
           @input="$emit('update:hotwords', $event.target.value)"
         />
       </label>
+
+    </fieldset>
+    <details v-if="!isExperiment" class="studio-disclosure lab-advanced"><summary>识别模型、说话人与补漏参数</summary><fieldset :disabled="running" class="lab-advanced-grid">
+      <label v-if="!isExperiment">
+        <span>ASR 模型</span>
+        <select aria-label="ASR 模型" :value="modelSize" @change="$emit('update:modelSize', $event.target.value)">
+          <option value="large-v3">large-v3（质量优先）</option>
+          <option value="medium">medium（平衡）</option>
+          <option value="small">small（速度优先）</option>
+        </select>
+      </label>
+
       <div v-if="asrVersion === '2.0'" class="ocr-dev-timing">
         <div>
           <b>高召回补漏</b>
@@ -69,7 +40,7 @@
           {{ highRecall ? '已开启' : '已关闭' }}
         </button>
       </div>
-      <div v-if="asrVersion !== 'agent-experimental'" class="ocr-dev-timing">
+      <div v-if="!isExperiment" class="ocr-dev-timing">
         <div>
           <b>区分说话人（可选）</b>
           <span>只有多人音频需要开启；单人音频保持关闭即可，不影响使用 ASR 2.2。</span>
@@ -85,7 +56,7 @@
       </div>
       <label v-if="asrVersion === '2.0' && speakerDiarization">
         <span>已知说话人数</span>
-        <select :value="knownSpeakerCount" @change="$emit('update:knownSpeakerCount', $event.target.value)">
+        <select aria-label="已知说话人数" :value="knownSpeakerCount" @change="$emit('update:knownSpeakerCount', $event.target.value)">
           <option value="auto">自动判断</option>
           <option value="1">1 人</option>
           <option value="2">2 人</option>
@@ -109,9 +80,9 @@
           {{ dualGpuParallel ? '已开启' : '已关闭' }}
         </button>
       </div>
-    </div>
 
-    <div v-if="asrVersion === 'agent-experimental'" class="experiment-ranges">
+    </fieldset></details>
+    <fieldset v-if="isExperiment" :disabled="running" class="experiment-ranges">
       <h3>测试区间</h3>
       <p class="panel-subtitle">当前仅支持韩语。每段5秒到3分钟，最多3段；填写原视频的秒数或分:秒，例如 01:30。只处理选定区间。</p>
       <div v-for="(range, index) in testRanges" :key="index" class="experiment-range-row">
@@ -121,41 +92,29 @@
       </div>
       <button class="secondary mini" type="button" :disabled="running || testRanges.length >= 3" @click="$emit('update:testRanges', [...testRanges, { start: '', end: '' }])">添加测试区间</button>
       <p class="panel-subtitle">音频只在本机识别；复核和翻译会调用设置中的模型服务，消耗相应额度。测试结果仍可能有识别和时间轴误差。</p>
-    </div>
+    </fieldset>
 
-    <div class="ocr-dev-actions">
-      <button :disabled="running || !inputVideo.trim()" type="button" @click="$emit('run')">
-        {{ asrVersion === 'agent-experimental' ? (running ? '实验 Agent 处理中…' : '运行实验 Agent') : running
-          ? (speakerDiarization
-            ? `正在运行 ASR ${asrVersion === '2.0' ? '2.2' : asrVersion} 并区分说话人…`
-            : `正在运行 ASR ${asrVersion === '2.0' ? '2.2' : asrVersion}…`)
-          : `运行 ASR ${asrVersion === '2.0' ? '2.2' : asrVersion}` }}
-      </button>
-      <p v-if="asrVersion === 'agent-experimental'">完成后可直接试听中文字幕；需要确认人名时，可在实验结果页补线索，让 Agent 继续。</p>
-      <p v-else-if="asrVersion === '2.0' && speakerDiarization">2.0 会把单词对齐到说话人，并优先在 Speaker 切换点拆句；重叠说话仍可能需要人工复核。</p>
-      <p v-else-if="speakerDiarization">1.0 保持原有整条字幕匹配方式，不改变历史行为。</p>
-      <p v-else>当前实验室不翻译、不调用 LLM，也不会覆盖视频旁已有字幕。</p>
-    </div>
 
-    <div v-if="status" class="status" :class="statusClass">{{ status }}</div>
-
-    <div v-if="result?.kind === 'asr_experiment_lab'" class="asr-lab-output">
-      <h3>{{ result.pending_questions ? '字幕草稿已生成 · 有人名需要确认' : '实验字幕已生成' }}</h3>
-      <p>{{ result.cue_count }} 条字幕 · {{ result.pending_questions }} 处人名待确认 · {{ result.timing_needs_review }} 条时间边界需检查</p>
+    <footer class="studio-save-bar operation-run-bar"><span>{{ isExperiment ? '会调用模型服务；实验产物独立保存，不覆盖 2.2。' : '仅提取原文，不翻译、不调用 LLM。' }}</span><button :disabled="running || !inputVideo.trim()" @click="$emit('run')">{{ running ? '正在处理…' : `运行 ${currentVersion?.label || 'ASR'}` }}</button></footer>
+    <p v-if="status" class="operation-status" :class="statusClass" role="status">{{ status }}</p>
+    <div v-if="result?.kind === 'asr_experiment_lab'" class="asr-lab-output"><span class="lab-result-version">本次结果 · {{ resultVersionLabel }}</span>
+      <h3>{{ result.pending_questions ? '字幕草稿已生成 · 有疑点需要确认' : '实验字幕已生成' }}</h3>
+      <p>{{ result.cue_count }} 条字幕 · {{ result.pending_questions }} 处待确认 · {{ result.timing_needs_review }} 条时间边界需检查</p>
       <p class="panel-subtitle">{{ result.notice }}</p>
-      <p v-if="result.pending_questions && result.human_review_available !== false" class="panel-subtitle">这里下载的是本次初稿；确认人名后，请从审核页下载更新后的字幕。</p>
+      <p v-if="result.pending_questions && result.human_review_available !== false" class="panel-subtitle">这里下载的是本次初稿；处理疑点后，请从审核页下载更新后的字幕。</p>
       <div class="toolbar">
-        <a class="button-link" :href="result.report_url" target="_blank" rel="noopener">{{ result.pending_questions && result.human_review_available !== false ? '确认人名，让 Agent 继续' : '打开字幕试听' }}</a>
+        <a class="button-link" :href="result.report_url" target="_blank" rel="noopener">{{ result.pending_questions && result.human_review_available !== false ? (result.asr_version === 'autonomous-experimental' ? '确认疑点，让 Agent 继续' : '确认人名，让 Agent 继续') : '打开字幕试听' }}</a>
         <a class="button-link secondary" :href="fileUrl(result.translated_srt)" download>下载中文字幕</a>
         <a class="button-link secondary" :href="fileUrl(result.source_srt)" download>下载韩语字幕</a>
+        <a v-if="result.autonomous_trace_url" class="button-link secondary" :href="result.autonomous_trace_url" target="_blank" rel="noopener">查看Agent操作记录</a>
       </div>
     </div>
-    <div v-else-if="result" class="asr-lab-output">
+    <div v-else-if="result" class="asr-lab-output"><span class="lab-result-version">本次结果 · {{ resultVersionLabel }}</span>
       <div class="section-title">
         <div>
           <h3>识别文本</h3>
           <p class="panel-subtitle">
-            ASR {{ result.pipeline_version || result.asr_version || '1.0' }} · {{ result.cue_count || 0 }} 条语音片段
+            {{ result.cue_count || 0 }} 条语音片段
             <template v-if="result.speaker_diarization"> · {{ result.speaker_count || 0 }} 位说话人</template>
           </p>
         </div>
@@ -167,6 +126,7 @@
           <a v-if="result.speaker_turns_path" class="button-link secondary mini" :href="fileUrl(result.speaker_turns_path)" download>分段 JSON</a>
         </div>
       </div>
+      <details v-if="result.asr_version === '2.0'" class="studio-disclosure asr-result-metrics"><summary>识别统计与运行信息</summary>
       <div v-if="result.asr_version === '2.0'" class="asr-v2-metrics">
         <div><b>{{ result.word_count || 0 }}</b><span>识别词块</span></div>
         <div :class="{ warning: result.low_confidence_word_count }"><b>{{ result.low_confidence_word_count || 0 }}</b><span>低置信度词块</span></div>
@@ -181,6 +141,7 @@
           ? '本次已并行使用两张 GPU：ASR 使用 GPU 0，说话人分离使用 GPU 1。'
           : `本次未启用双 GPU，已自动回退顺序执行（检测到 ${result.available_gpu_count || 0} 张 GPU）。` }}
       </p>
+      </details>
       <section
         v-if="result.asr_version === '2.0' && result.suspected_missing_regions?.length"
         class="asr-review-panel"
@@ -270,7 +231,8 @@
           </article>
         </div>
       </section>
-      <textarea :value="result.transcript_text || ''" readonly placeholder="识别完成后会在这里显示纯文本"></textarea>
+      <details class="studio-disclosure asr-transcript" :open="!result.suspected_missing_regions?.length"><summary>识别全文</summary><textarea :value="result.transcript_text || ''" readonly aria-label="识别全文" placeholder="识别完成后会在这里显示纯文本"></textarea></details>
+      <details class="studio-disclosure asr-result-artifacts"><summary>全部产物、原始数据与路径</summary>
       <div class="asr-lab-paths">
         <div v-if="result.source_sidecar" class="path-row"><span>素材库字幕</span><code>{{ result.source_sidecar }}</code></div>
         <div v-if="result.text_path" class="path-row"><span>{{ result.speaker_diarization ? '标注文本' : '纯文本' }}</span><code>{{ result.text_path }}</code></div>
@@ -295,13 +257,17 @@
         <a v-if="result.focused_segments_path" class="button-link secondary mini" :href="fileUrl(result.focused_segments_path)" download>定向重听 Segments</a>
         <a v-if="result.quality_path" class="button-link secondary mini" :href="fileUrl(result.quality_path)" download>质量报告</a>
       </div>
+      </details>
     </div>
+
   </section>
 </template>
 
 <script setup>
-import { onBeforeUnmount, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, reactive, ref } from 'vue'
 import { copyText } from '../clipboard.js'
+import AppIcon from './AppIcon.vue'
+import { ASR_LAB_VERSIONS } from '../labVersions.js'
 
 const props = defineProps({
   inputVideo: { type: String, default: '' },
@@ -339,6 +305,9 @@ const emit = defineEmits([
 ])
 
 const reviewAudio = ref(null)
+const isExperiment = computed(() => ['agent-experimental', 'autonomous-experimental'].includes(props.asrVersion))
+const currentVersion = computed(() => ASR_LAB_VERSIONS.find(version => version.id === props.asrVersion))
+const resultVersionLabel = computed(() => ASR_LAB_VERSIONS.find(version => version.id === props.result?.asr_version)?.label || `ASR ${props.result?.pipeline_version || props.result?.asr_version || '1.0'}`)
 function updateRange(index, key, value) {
   emit('update:testRanges', props.testRanges.map((r, i) => i === index ? { ...r, [key]: value } : r))
 }
