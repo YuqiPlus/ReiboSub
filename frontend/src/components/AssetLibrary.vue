@@ -1,157 +1,50 @@
 <template>
-  <section class="panel">
-    <div class="panel-head">
-      <h2>本地素材库</h2>
-      <button class="secondary mini" type="button" @click="$emit('refresh')">刷新</button>
+  <section class="panel library-studio">
+    <header class="studio-page-head"><div><span class="studio-kicker">素材库</span><h2>所有素材，都在这里</h2><p>找一段视频，打开字幕，接着上次的工作。</p></div><div class="toolbar"><button class="secondary" type="button" @click="$emit('refresh')"><AppIcon name="history" :size="16" />刷新</button><button type="button" :disabled="uploadBusy" :aria-expanded="showImport" @click="showImport = !showImport"><AppIcon name="plus" :size="17" />导入素材</button></div></header>
+
+    <section v-if="showImport" class="library-import" aria-label="导入素材">
+      <div class="studio-section-head"><div><h3>从本机上传</h3><p>仅保存素材，不会自动开始识别或翻译。</p></div><button class="icon-button" type="button" aria-label="收起导入" :disabled="uploadBusy" @click="showImport = false"><AppIcon name="close" :size="18" /></button></div>
+      <div class="upload-grid"><label class="file-picker"><span>{{ uploadFileName || '选择视频或音频' }}</span><input type="file" accept="video/*,audio/*,.mkv,.m4v,.avi,.ts,.m2ts,.flac,.m4a,.aac,.ogg,.opus,.wma" :disabled="uploadBusy" @change="selectUploadFile" /></label><input v-model="uploadTitle" aria-label="素材名称" placeholder="素材名称（可选）" :disabled="uploadBusy" /><button type="button" :disabled="uploadBusy || !uploadFile" @click="submitUpload">{{ uploadBusy ? '正在上传…' : '上传素材' }}</button></div>
+      <details class="studio-disclosure library-manual"><summary>素材已在服务器上？按路径导入</summary><label for="localVideo">媒体路径<input id="localVideo" :value="localVideo" placeholder="填写视频或音频的完整路径" @input="$emit('update:localVideo', $event.target.value)" /></label><div class="toolbar"><button class="secondary" :disabled="!localVideo" @click="$emit('register-local-project')">登记为素材项目</button><button class="secondary" :disabled="!localVideo" @click="$emit('open-asr-lab')">语音识别</button><button class="secondary" :disabled="!localVideo || selectedIsAudio" @click="$emit('local-ocr')">画面字幕识别</button></div></details>
+    </section>
+
+    <div class="studio-filter-bar"><label class="studio-search library-search"><AppIcon name="search" :size="18" /><input v-model="query" type="search" aria-label="搜索素材" placeholder="搜索标题或文件名" /></label><div class="studio-tabs" aria-label="素材类型"><button v-for="option in typeFilters" :key="option.id" type="button" :class="{ active: mediaFilter === option.id }" :aria-pressed="mediaFilter === option.id" @click="mediaFilter = option.id">{{ option.label }}</button></div><select v-model="sortBy" class="library-sort" aria-label="素材排序"><option value="recent">最近更新</option><option value="name">按名称</option></select></div>
+    <p v-if="status && statusClass === 'bad'" class="status bad" role="alert">{{ status }}</p>
+    <p v-else-if="actionFeedback" class="library-action-feedback" role="status">{{ actionFeedback }}</p>
+    <p v-if="localVideo" class="library-current-media" :title="localVideo"><AppIcon name="check" :size="14" /><span>当前媒体：{{ fileLabel(localVideo) }}</span></p>
+    <div v-if="!visibleProjects.length" class="studio-empty"><AppIcon :name="query ? 'search' : 'folder'" :size="34" /><h3>{{ query || mediaFilter !== 'all' ? '没有找到对应素材' : '从你的第一段素材开始' }}</h3><p>{{ query || mediaFilter !== 'all' ? '试试其他关键词，或切换素材类型。' : '上传本地文件，或到“下载与链接”保存视频。' }}</p><button v-if="query || mediaFilter !== 'all'" class="secondary" @click="query = ''; mediaFilter = 'all'">清除筛选</button><button v-else @click="showImport = true">导入素材</button></div>
+
+    <div class="library-browser" :class="{ 'has-selection': selectedProject }">
+      <div class="library-grid">
+        <article v-for="project in visibleProjects" :key="project.path" class="library-card" :class="{ selected: selectedProjectPath === project.path }">
+          <button class="library-card-open" type="button" :aria-label="`打开素材：${project.name}`" :aria-pressed="selectedProjectPath === project.path" @click="selectProject(project)">
+            <div class="library-card-cover"><img v-if="projectCover(project)" :src="fileUrl(projectCover(project))" loading="lazy" alt="" /><AppIcon v-else :name="project.audios?.length && !project.videos?.length ? 'audio' : 'video'" :size="30" /><span class="library-source">{{ sourceLabel(project.source_type) }}</span></div>
+            <div class="library-card-copy"><h3>{{ project.name }}</h3><p>{{ projectSummary(project) }}</p><span>{{ modifiedLabel(project) }}</span></div>
+          </button>
+        </article>
+      </div>
+      <aside v-if="selectedProject" ref="projectDetail" class="library-detail" tabindex="-1" aria-label="所选素材详情">
+        <header class="studio-section-head"><div><span class="studio-kicker">所选素材</span><h3>{{ selectedProject.name }}</h3></div><button class="icon-button" type="button" aria-label="关闭素材详情" @click="selectedProjectPath = ''"><AppIcon name="close" :size="18" /></button></header>
+        <div class="toolbar library-primary-actions"><button type="button" @click="$emit('use-project', selectedProject)">载入项目</button><button v-if="previewMedia" class="secondary" type="button" :aria-expanded="showPreview" @click="showPreview = !showPreview"><AppIcon name="play" :size="14" />{{ showPreview ? '收起预览' : '预览素材' }}</button></div>
+        <component v-if="showPreview && previewMedia" :is="previewMedia.kind" :key="previewMedia.path" class="library-media-preview" controls playsinline preload="metadata" :src="fileUrl(previewMedia.path)" :aria-label="selectedProject.name" />
+        <section v-if="selectedProject.videos?.length" class="library-file-section"><h4>视频</h4><AssetList :items="selectedProject.videos"><template #actions="{ item }"><button class="secondary mini" :disabled="localVideo === item.path" @click="$emit('use-video', item.path)">{{ localVideo === item.path ? '当前媒体' : '设为当前' }}</button><button class="secondary mini" @click="$emit('use-media-asr', item.path)">语音识别</button><button class="secondary mini" @click="$emit('use-video-ocr', item.path)">提取画面字幕</button></template></AssetList></section>
+        <section v-if="selectedProject.audios?.length" class="library-file-section"><h4>音频</h4><AssetList :items="selectedProject.audios"><template #actions="{ item }"><button class="secondary mini" :disabled="localVideo === item.path" @click="$emit('use-audio', item.path)">{{ localVideo === item.path ? '当前媒体' : '设为当前' }}</button><button class="secondary mini" @click="$emit('use-media-asr', item.path)">语音识别</button><button class="ghost mini" @click="copyPath(item.path)">复制路径</button></template></AssetList></section>
+        <section v-if="selectedProject.subtitles?.length" class="library-file-section"><h4>字幕</h4><AssetList :items="selectedProject.subtitles"><template #actions="{ item }"><button class="mini" @click="$emit('edit-subtitle', { path: item.path, videoPath: selectedProject.primary_video || selectedProject.videos?.[0]?.path || '' })">精修字幕</button><button class="secondary mini" @click="$emit('use-subtitle', item.path)">用于翻译</button><a class="button-link" :href="fileUrl(item.path)" download>下载</a></template></AssetList></section>
+        <details class="studio-disclosure library-project-info"><summary>文件位置与项目管理</summary><p class="path">{{ selectedProject.path }}</p><div class="toolbar"><button class="ghost mini" @click="copyPath(selectedProject.path)">复制目录</button><button v-if="selectedProject.source_url" class="ghost mini" @click="copyPath(selectedProject.source_url)">复制来源链接</button><button v-if="selectedProject.manifest_path" class="ghost mini" @click="copyPath(selectedProject.manifest_path)">复制配置路径</button><label class="ghost-file">更换封面<input type="file" accept="image/*" @change="selectProjectCover(selectedProject, $event)" /></label><button v-if="projectCover(selectedProject)" class="ghost mini" @click="copyPath(projectCover(selectedProject))">复制封面路径</button></div><p v-if="selectedProject.source_url" class="path">{{ selectedProject.normalized_url || selectedProject.source_url }}</p><AssetList v-if="selectedProject.others?.length" :items="selectedProject.others"><template #actions="{ item }"><button class="ghost mini" @click="copyPath(item.path)">复制路径</button></template></AssetList><button class="danger secondary mini library-delete" @click="$emit('delete-project', selectedProject)">删除素材目录…</button></details>
+      </aside>
     </div>
 
-    <div class="upload-card">
-      <div>
-        <div class="eyebrow">Local Media</div>
-        <h3>上传视频或音频素材</h3>
-        <p class="panel-subtitle">这里只负责保存素材，不会自动运行 ASR、OCR 或翻译。上传完成后再选择需要的处理工具。</p>
-      </div>
-      <div class="upload-grid">
-        <label class="file-picker">
-          <span>{{ uploadFileName || '选择视频或音频' }}</span>
-          <input
-            type="file"
-            accept="video/*,audio/*,.mkv,.m4v,.avi,.ts,.m2ts,.flac,.m4a,.aac,.ogg,.opus,.wma"
-            @change="selectUploadFile"
-          />
-        </label>
-        <input v-model="uploadTitle" placeholder="素材项目名，可不填" />
-        <button class="warning" type="button" :disabled="uploadBusy || !uploadFile" @click="submitUpload">
-          {{ uploadBusy ? '正在上传…' : '仅上传素材' }}
-        </button>
-      </div>
-    </div>
-
-    <div class="grid2">
-      <div>
-        <label for="localVideo">当前媒体路径</label>
-        <input
-          id="localVideo"
-          :value="localVideo"
-          placeholder="从下方选择视频或音频，也可以手动填写路径"
-          @input="$emit('update:localVideo', $event.target.value)"
-        />
-      </div>
-      <div>
-        <label>素材处理</label>
-        <div class="toolbar">
-          <button class="warning" type="button" :disabled="!localVideo || selectedIsAudio" @click="$emit('local-ocr')">视频 OCR</button>
-          <button class="secondary" type="button" :disabled="!localVideo" @click="$emit('open-asr-lab')">打开 ASR Lab</button>
-          <button class="secondary" type="button" :disabled="!localVideo" @click="$emit('register-local-project')">登记为素材项目</button>
-        </div>
-      </div>
-    </div>
-
-    <div style="margin-top:12px">
-      <div class="section-title">
-        <h3>素材项目</h3>
-        <span class="badge">{{ projects.length }}</span>
-      </div>
-      <div v-if="!projects.length" class="asset-list empty">暂无文件。</div>
-      <div v-else class="project-list">
-        <details v-for="project in projects" :key="project.path" class="project-card">
-          <summary>
-            <div>
-              <div class="project-title">{{ project.name }}</div>
-              <div class="project-meta">
-                <span class="badge">{{ sourceLabel(project.source_type) }}</span>
-                <button v-if="project.source_url" class="ghost mini" type="button" @click.prevent="copyPath(project.source_url)">复制链接</button>
-                <button v-if="project.manifest_path" class="ghost mini" type="button" @click.prevent="copyPath(project.manifest_path)">复制配置</button>
-                <label class="ghost-file mini" @click.stop>上传封面<input type="file" accept="image/*" @change="selectProjectCover(project, $event)" /></label>
-              </div>
-              <div v-if="project.source_url" class="muted path">{{ project.normalized_url || project.source_url }}</div>
-              <div class="muted path">{{ project.path }}</div>
-            </div>
-            <div class="project-counts">
-              <span>{{ project.counts?.videos || 0 }} 视频</span>
-              <span v-if="project.counts?.audios">{{ project.counts.audios }} 音频</span>
-              <span>{{ project.counts?.subtitles || 0 }} 字幕</span>
-              <span v-if="project.counts?.images">{{ project.counts.images }} 封面</span>
-              <button class="secondary mini" type="button" @click.prevent="$emit('use-project', project)">载入项目</button>
-              <button class="danger secondary mini" type="button" @click.prevent="$emit('delete-project', project)">删除目录</button>
-            </div>
-          </summary>
-
-          <div class="project-body">
-            <div v-if="projectCover(project)" class="project-cover">
-              <img :src="fileUrl(projectCover(project))" alt="" />
-              <button class="ghost mini" type="button" @click="copyPath(projectCover(project))">复制封面路径</button>
-            </div>
-
-            <div v-if="project.videos?.length" class="project-column">
-              <div class="asset-subtitle">视频</div>
-              <AssetList :items="project.videos || []" empty-text="无视频。">
-                <template #actions="{ item }">
-                  <button class="secondary mini" type="button" @click="$emit('use-video', item.path)">设为当前</button>
-                  <button class="secondary mini" type="button" @click="$emit('use-media-asr', item.path)">ASR Lab</button>
-                  <button class="warning mini" type="button" @click="$emit('use-video-ocr', item.path)">OCR</button>
-                </template>
-              </AssetList>
-            </div>
-
-            <div v-if="project.audios?.length" class="project-column">
-              <div class="asset-subtitle">音频</div>
-              <AssetList :items="project.audios || []" empty-text="无音频。">
-                <template #actions="{ item }">
-                  <button class="secondary mini" type="button" @click="$emit('use-audio', item.path)">设为当前</button>
-                  <button class="warning mini" type="button" @click="$emit('use-media-asr', item.path)">ASR Lab</button>
-                  <button class="ghost mini" type="button" @click="copyPath(item.path)">复制路径</button>
-                </template>
-              </AssetList>
-            </div>
-
-            <div v-if="project.subtitles?.length" class="project-column">
-              <div class="asset-subtitle">字幕</div>
-              <AssetList :items="project.subtitles || []" empty-text="无字幕。">
-                <template #actions="{ item }">
-                  <button class="secondary mini" type="button" @click="$emit('use-subtitle', item.path)">设为源字幕</button>
-                  <button class="warning mini" type="button" @click="$emit('edit-subtitle', { path: item.path, videoPath: project.primary_video || project.videos?.[0]?.path || '' })">精修</button>
-                  <button class="ghost mini" type="button" @click="copyPath(item.path)">复制路径</button>
-                </template>
-              </AssetList>
-            </div>
-
-            <div v-if="project.others?.length" class="project-column">
-              <div class="asset-subtitle">其他文件</div>
-              <AssetList :items="project.others" empty-text="无其他文件。">
-                <template #actions="{ item }">
-                  <button class="ghost mini" type="button" @click="copyPath(item.path)">复制路径</button>
-                </template>
-              </AssetList>
-            </div>
-          </div>
-        </details>
-      </div>
-    </div>
-
-    <div style="margin-top:12px">
-      <div class="section-title"><h3>处理任务输出</h3><span class="badge">{{ assets.ocr_jobs.length }}</span></div>
-      <AssetList :items="assets.ocr_jobs" empty-text="暂无文件。">
-        <template #actions="{ item }">
-          <button v-if="item.source_srt" class="secondary mini" type="button" @click="$emit('use-subtitle', item.source_srt)">使用 source.srt</button>
-          <button v-if="item.source_srt" class="warning mini" type="button" @click="$emit('edit-subtitle', { path: item.source_srt, videoPath: item.input_video || '' })">精修 source</button>
-          <button v-if="item.translated_srt" class="warning mini" type="button" @click="$emit('edit-subtitle', { path: item.translated_srt, videoPath: item.input_video || '' })">精修 zh</button>
-          <button v-if="item.translated_srt" class="ghost mini" type="button" @click="copyPath(item.translated_srt)">复制 zh.srt</button>
-        </template>
-      </AssetList>
-    </div>
-
-    <Teleport to="body">
-      <div v-if="copyStatus" class="copy-toast" :class="copyStatusClass">{{ copyStatus }}</div>
-    </Teleport>
-    <div class="status" :class="statusClass">{{ status }}</div>
+    <details v-if="assets.ocr_jobs?.length" class="studio-disclosure library-outputs"><summary>独立处理结果 <span>{{ assets.ocr_jobs.length }}</span></summary><p class="muted">未归入项目的识别与翻译产物。</p><AssetList :items="assets.ocr_jobs"><template #actions="{ item }"><button v-if="item.source_srt" class="secondary mini" @click="$emit('use-subtitle', item.source_srt)">使用原文</button><button v-if="item.source_srt" class="secondary mini" @click="$emit('edit-subtitle', { path: item.source_srt, videoPath: item.input_video || '' })">精修原文</button><button v-if="item.translated_srt" class="mini" @click="$emit('edit-subtitle', { path: item.translated_srt, videoPath: item.input_video || '' })">精修中文</button><button v-if="item.translated_srt" class="ghost mini" @click="copyPath(item.translated_srt)">复制中文路径</button></template></AssetList></details>
+    <Teleport to="body"><div v-if="copyStatus" class="copy-toast" :class="copyStatusClass" role="status">{{ copyStatus }}</div></Teleport>
   </section>
 </template>
 
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import AssetList from './AssetList.vue'
 import { copyText } from '../clipboard.js'
+import AppIcon from './AppIcon.vue'
+import { fileLabel, filterLibraryProjects, projectMediaSummary, localModifiedLabel } from '../studioTools.js'
 
 const props = defineProps({
   localVideo: { type: String, default: '' },
@@ -185,6 +78,32 @@ const uploadFile = ref(null)
 const uploadTitle = ref('')
 const uploadFileName = computed(() => uploadFile.value?.name || '')
 const projects = computed(() => props.assets.projects || [])
+const query = ref(''), mediaFilter = ref('all'), sortBy = ref('recent'), selectedProjectPath = ref('')
+const showImport = ref(false), showPreview = ref(false)
+const projectDetail = ref(null)
+const typeFilters = [{ id: 'all', label: '全部' }, { id: 'video', label: '视频' }, { id: 'audio', label: '音频' }, { id: 'subtitle', label: '字幕' }]
+const visibleProjects = computed(() => filterLibraryProjects(projects.value, { query: query.value, kind: mediaFilter.value, sort: sortBy.value }))
+const selectedProject = computed(() => visibleProjects.value.find(project => project.path === selectedProjectPath.value) || null)
+const previewMedia = computed(() => {
+  const project = selectedProject.value
+  if (project?.primary_video || project?.videos?.[0]?.path) return { kind: 'video', path: project.primary_video || project.videos[0].path }
+  if (project?.primary_audio || project?.audios?.[0]?.path) return { kind: 'audio', path: project.primary_audio || project.audios[0].path }
+  return null
+})
+const projectSummary = projectMediaSummary
+const actionFeedback = computed(() => {
+  if (props.statusClass !== 'ok' || /^(已扫描|已选择当前)/.test(props.status)) return ''
+  if (props.status.startsWith('封面已更新')) return '封面已更新。'
+  return props.status
+})
+const modifiedLabel = localModifiedLabel
+watch(() => selectedProject.value?.path, () => { showPreview.value = false })
+async function selectProject(project) {
+  selectedProjectPath.value = project.path
+  await nextTick()
+  projectDetail.value?.focus({ preventScroll: true })
+  if (window.innerWidth <= 760) projectDetail.value?.scrollIntoView({ block: 'start' })
+}
 const selectedIsAudio = computed(() => /\.(mp3|wav|flac|m4a|aac|ogg|opus|wma)$/i.test(props.localVideo || ''))
 
 function selectProjectCover(project, event) {
