@@ -1,7 +1,15 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 
-import { createAgentSessionPoller } from "./agentSessionPolling.js"
+import { canPresentAgentSession, createAgentSessionPoller } from "./agentSessionPolling.js"
+
+test('a new local composer is not replaced by background session polling', () => {
+  assert.equal(canPresentAgentSession('running-one', 'running-one', true), false)
+  assert.equal(canPresentAgentSession('', 'running-one', true), false)
+  assert.equal(canPresentAgentSession('selected-one', 'other-one'), false)
+  assert.equal(canPresentAgentSession('selected-one', 'selected-one'), true)
+  assert.equal(canPresentAgentSession('', 'running-one'), true)
+})
 
 test("schedules independent timers for multiple agent sessions", () => {
   let nextTimerId = 1

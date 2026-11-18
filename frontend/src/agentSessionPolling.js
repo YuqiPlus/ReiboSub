@@ -1,3 +1,7 @@
+export function canPresentAgentSession(selectedId, incomingId, drafting = false) {
+  return !drafting && (!selectedId || selectedId === incomingId)
+}
+
 export function createAgentSessionPoller({ setTimeout, clearTimeout, poll }) {
   const timers = new Map()
 

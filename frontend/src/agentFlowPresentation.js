@@ -50,6 +50,7 @@ export const AGENT_PHASE_PRESENTATIONS = freezeEntries({
   asr_ocr_refine: { stageId: 'source', label: '使用 OCR 校准 ASR 原文' },
 
   generate_glossary: { stageId: 'glossary', label: '生成 Glossary' },
+  prepare_glossary_candidates: { stageId: 'glossary', label: '准备审核用原句参考译文' },
   review_glossary: { stageId: 'glossary', label: '等待 Glossary 审核' },
   download_video_for_translation: { stageId: 'translate', label: '下载视频用于字幕交付' },
   translate: { stageId: 'translate', label: '翻译字幕' },
@@ -82,6 +83,7 @@ const OCR_WORKBENCH_QUESTION_KINDS = new Set([
 
 const RUNNING_OPERATION_PRESENTATIONS = freezeEntries({
   created: { title: 'Agent 正在启动', message: '正在准备任务环境。' },
+  autonomous_download: { title: '正在保存工程视频', message: '视频保存后继续处理；已有字幕会保留，不会因此重新翻译。', download: true },
   probe: { title: '正在检测素材', message: '正在读取视频信息和可用字幕。' },
   download_video_for_project: { title: '正在下载工程视频', message: '路线已确定，视频保存后会继续当前处理。', download: true },
   download_video_for_audio_probe: { title: '正在下载视频', message: '下载完成后将继续检测音源语言。', download: true },

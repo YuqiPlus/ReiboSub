@@ -1,18 +1,20 @@
 <template>
-  <div class="app-frame">
-    <SideNav :active-view="activeView" :items="navItems" @select="activeView = $event" />
+  <div class="app-frame" :class="{ 'sidebar-open': sidebarOpen }" @keydown.esc="closeMobileNavigation">
+    <button v-if="sidebarOpen" class="sidebar-backdrop" type="button" aria-label="关闭导航" @click="sidebarOpen = false"></button>
+    <SideNav :active-view="activeView" :items="navItems" :sessions="agentSessions" :selected-session-id="newAgentDraft ? '' : agentSession?.id || ''" @select="navigateTo" @new-task="openNewAgentDraft" @select-session="openSidebarSession" @close="sidebarOpen = false" />
 
     <div class="app-content">
       <HeaderBar
         :title="activePage.title"
-        :description="activePage.description"
-        :metrics="topbarMetrics"
+        :sidebar-open="sidebarOpen"
+        @toggle-sidebar="sidebarOpen = !sidebarOpen"
       />
 
       <main class="workspace" :class="{ 'workspace-single': activeView !== 'jobs' }">
         <section class="workspace-main">
           <div v-if="activeView === 'agent'" class="page-stack">
             <AgentSessionPanel
+              v-model:agent-mode="agentMode"
               v-model:url="url"
               v-model:embedded-subtitle-hint="embeddedSubtitleHint"
               v-model:embedded-subtitle-goal="embeddedSubtitleGoal"
@@ -29,9 +31,9 @@
               v-model:ocr-exclude-bottom-ratio="ocrExcludeBottomRatio"
               v-model:ocr-exclude-left-ratio="ocrExcludeLeftRatio"
               v-model:ocr-exclude-right-ratio="ocrExcludeRightRatio"
-              :input-video="agentPreviewVideo"
+              :input-video="newAgentDraft ? '' : agentPreviewVideo"
               v-model:extra-hint="extraHint"
-              :session="agentSession"
+              :session="newAgentDraft ? null : agentSession"
               :sessions="agentSessions"
               :starting="agentStarting"
               :status="agentStatus.text"
@@ -43,6 +45,8 @@
               @select-agent="selectAgentSession"
               @open-task-history="activeView = 'task-history'"
               @open-glossary="openGlossaryFromAgent"
+              @new-task="openNewAgentDraft"
+              @open-view="navigateTo"
             />
           </div>
 
@@ -125,7 +129,7 @@
               :status="assetStatus.text"
               :status-class="assetStatus.class"
               :upload-busy="materialUploadBusy"
-              @refresh="loadAssets"
+              @refresh="loadAssets(true)"
               @local-ocr="runLocalOcr"
               @open-asr-lab="openAsrLab"
               @upload-media="uploadLocalMedia"
@@ -143,17 +147,7 @@
           </div>
 
           <div v-else-if="activeView === 'video-overlay'" class="page-stack">
-            <section class="panel overlay-page-intro">
-              <div>
-                <h2>处理视频</h2>
-                <p class="panel-subtitle">镜像、裁剪、调整输出尺寸或添加水印；原视频不会被覆盖。</p>
-              </div>
-              <div class="path-row">
-                <input v-model="localVideo" placeholder="选择或填写要处理的视频路径" />
-                <button class="secondary" type="button" @click="activeView = 'assets'">回素材库</button>
-              </div>
-            </section>
-            <VideoOverlayPanel :input-video="localVideo" @run="runVideoOverlay" />
+            <VideoOverlayPanel v-model:input-video="localVideo" @open-assets="navigateTo('assets')" @run="runVideoOverlay" />
           </div>
 
           <div v-else-if="activeView === 'ocr-dev'" class="page-stack">
@@ -189,7 +183,7 @@
               @geometry-refine="runOcrGeometryRefine"
               @v3-refine="runOcrV3Refine"
               @layered-refine="runOcrLayeredRefine"
-              @refresh-debug-assets="loadAssets"
+              @refresh-debug-assets="loadAssets(true)"
             />
           </div>
 
@@ -232,11 +226,13 @@
               @load-glossary="loadGlossary"
               @translate-subtitle="translateSubtitle"
               @convert-subtitle="convertSubtitle"
+              @open-assets="navigateTo('assets')"
             />
           </div>
 
           <div v-else-if="activeView === 'subtitle-edit'" class="page-stack">
             <SubtitleEditorPanel
+              ref="subtitleEditorPanel"
               v-model:subtitle-path="subtitleEditorPath"
               v-model:video-path="subtitleEditorVideoPath"
               :cues="subtitleEditorCues"
@@ -279,6 +275,7 @@
               @remove-empty="removeEmptySubtitleEditorCues"
               @strip-prefixes="stripSubtitleEditorPrefixes"
               @undo="undoSubtitleEditorChange"
+              @open-assets="navigateTo('assets')"
             />
           </div>
 
@@ -288,6 +285,7 @@
               :glossary-editor="glossaryEditor"
               :glossary-items="glossaryItems"
               :loading="glossaryLoading"
+              :candidate-status="glossaryCandidateStatus"
               :agent-review="agentGlossaryReviewActive"
               :review-ready="glossaryReviewReady"
               :save-state="glossarySaveState"
@@ -304,6 +302,7 @@
               @set-glossary-reviewed="setGlossaryReviewed"
               @use-suggestion="useSuggestion"
               @retry-glossary-save="retryGlossaryAutosave"
+              @retry-candidates="prepareGlossaryCandidates(loadedGlossaryPath, glossaryLoadGeneration, true)"
             />
           </div>
 
@@ -383,13 +382,14 @@ import AsrLabPanel from './components/AsrLabPanel.vue'
 import JobSidebar from './components/JobSidebar.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import { copyText } from './clipboard.js'
-import { createAgentSessionPoller } from './agentSessionPolling.js'
+import { canPresentAgentSession, createAgentSessionPoller } from './agentSessionPolling.js'
 import {
   DEFAULT_AGENT_OCR_PIPELINE_VERSION,
   buildAgentOcrPipelinePayload,
   inferAgentOcrPipelineVersion,
 } from './agentOcrPipeline.js'
 import { createGlossaryReviewAutosave } from './glossaryReviewAutosave.js'
+import { mergeGlossaryCandidates } from './glossaryCandidates.js'
 import {
   isProbeResponseCurrent,
   looksLikeYoutubeInput,
@@ -453,6 +453,7 @@ const extraHint = ref('')
 const glossaryEditor = ref('')
 const glossaryItems = ref([])
 const glossaryLoading = ref(false)
+const glossaryCandidateStatus = ref({ state: 'ready', total: 0, ready: 0, pending: 0, failed: 0 })
 const loadedGlossaryPath = ref('')
 const glossaryTextDirty = ref(false)
 const glossarySaveState = ref('idle')
@@ -486,8 +487,10 @@ const ocrDevFlickerSmoothingMaxDurationSeconds = ref(0.55)
 const ocrDevLlmCleanup = ref(true)
 const ocrDevRunning = ref(false)
 const asrLabSourceLanguage = ref('auto')
+const agentMode = ref('autonomous')
 const asrLabModelSize = ref('large-v3')
 const asrLabVersion = ref('2.0')
+const asrLabExperimental = computed(() => ['agent-experimental', 'autonomous-experimental'].includes(asrLabVersion.value))
 const asrLabTestRanges = ref([{ start: '00:00', end: '01:30' }])
 const asrLabSpeakerDiarization = ref(false)
 const asrLabKnownSpeakerCount = ref('auto')
@@ -513,6 +516,8 @@ const ocrLanguage = ref('auto')
 const localVideo = ref('')
 const activeJobId = ref('')
 const activeView = ref('agent')
+const sidebarOpen = ref(window.innerWidth > 760)
+const newAgentDraft = ref(false)
 const agentSession = ref(null)
 const agentSessions = ref([])
 const agentTasks = ref([])
@@ -523,6 +528,7 @@ const openedGlossaryReviewKey = ref('')
 const openingGlossaryReviewKey = ref('')
 const materialUploadBusy = ref(false)
 const settingsEditor = ref(null)
+const subtitleEditorPanel = ref(null)
 const settingsProviders = ref([])
 const settingsModelsByProvider = ref({})
 const settingsModelErrors = ref({})
@@ -568,7 +574,7 @@ const glossaryAutosave = createGlossaryReviewAutosave({
 
 const pages = {
   agent: {
-    title: 'Agent 字幕流程',
+    title: '字幕助手',
     description: '自动判断字幕来源，提取原文，审核术语并完成翻译。',
   },
   'task-history': {
@@ -576,7 +582,7 @@ const pages = {
     description: '持久保存 Agent 流程、阶段结果和旧轮次，可继续处理或按阶段重新运行。',
   },
   'new-task': {
-    title: '链接处理',
+    title: '下载与链接',
     description: '粘贴链接即可直接下载；需要字幕信息时再检测，也可进入 OCR 全流程。',
   },
   assets: {
@@ -588,7 +594,7 @@ const pages = {
     description: '镜像、裁剪、调整尺寸，或给当前视频叠加水印与遮挡。',
   },
   subtitles: {
-    title: '字幕处理',
+    title: '翻译与转换',
     description: '选择源字幕，生成 glossary，翻译为中文外挂字幕。',
   },
   'subtitle-edit': {
@@ -644,11 +650,6 @@ const taskAttentionCount = computed(() => agentTasks.value.filter((task) => {
   if (/(review|confirm|waiting|interrupted|attention)/.test(current)) return true
   return stages.some((stage) => ['waiting', 'waiting_review', 'needs_input', 'interrupted'].includes(stage.status))
 }).length)
-const topbarMetrics = computed(() => ({
-  media: assets.videos.length + assets.audios.length,
-  subtitles: assets.subtitles.length,
-  jobs: activeView.value === 'task-history' ? agentTasks.value.length : jobList.value.length,
-}))
 const agentPreviewVideo = computed(() => (
   agentSession.value
     ? (agentSession.value.result?.input_video || '')
@@ -688,7 +689,8 @@ watch(url, (nextUrl, previousUrl) => {
   }
 })
 
-watch(activeView, (view) => {
+watch(activeView, (view, previousView) => {
+  if (view !== previousView) window.scrollTo(0, 0)
   if (view === 'new-task' && !availableVideoFormats.value.length) scheduleVideoFormats(url.value, 150)
   if (view === 'task-history') refreshAgentTasks()
 })
@@ -707,19 +709,49 @@ watch(ocrScope, (scope) => {
 })
 
 const navItems = computed(() => [
-  { id: 'agent', group: '日常流程', label: 'Agent 路线', hint: '自动完成字幕', icon: 'A', badge: waitingAgentCount.value ? `${waitingAgentCount.value} 待确认` : runningAgentCount.value || '' },
-  { id: 'task-history', group: '日常流程', label: '任务历史', hint: '继续、重跑与归档', icon: 'H', badge: taskAttentionCount.value ? `${taskAttentionCount.value} 待处理` : agentTasks.value.length || '' },
-  { id: 'assets', group: '日常流程', label: '素材库', hint: '视频、音频与字幕', icon: 'M', badge: assets.videos.length + assets.audios.length + assets.subtitles.length || '' },
-  { id: 'subtitle-edit', group: '字幕制作', label: '字幕精修', hint: '新增与微调 SRT', icon: 'E', badge: subtitleEditorCues.value.length || '' },
-  { id: 'glossary', group: '字幕制作', label: '术语审核', hint: '人名与固定译法', icon: 'G', badge: glossaryItems.value.length || '' },
-  { id: 'subtitles', group: '字幕制作', label: '翻译与转换', hint: '字幕后续处理', icon: 'S', badge: sourceSrt.value ? '已选' : '' },
+  { id: 'agent', group: '日常流程', label: '字幕助手', badge: waitingAgentCount.value ? `${waitingAgentCount.value} 待确认` : runningAgentCount.value || '' },
+  { id: 'task-history', group: '日常流程', label: '所有任务', badge: '' },
+  { id: 'assets', group: '日常流程', label: '素材库', badge: '' },
+  { id: 'new-task', group: '日常流程', label: '下载与链接', badge: '' },
+  { id: 'subtitle-edit', group: '字幕工具', label: '字幕精修', badge: '' },
+  { id: 'glossary', group: '字幕工具', label: '术语审核', badge: '' },
+  { id: 'subtitles', group: '字幕工具', label: '翻译与转换', badge: '' },
+  { id: 'video-overlay', group: '字幕工具', label: '视频处理', badge: '' },
   { id: 'ocr-dev', group: '实验室', label: 'OCR Lab', hint: 'V2 / V3 独立测试', icon: 'O', badge: '' },
   { id: 'asr-dev', group: '实验室', label: 'ASR Lab', hint: '提取音频文本', icon: 'R', badge: asrLabRunning.value ? '运行中' : '' },
-  { id: 'new-task', group: '日常流程', label: '链接处理', hint: '直接下载、字幕检测', icon: 'L', badge: probe.value?.subtitles?.length || '' },
-  { id: 'video-overlay', group: '其他工具', label: '视频处理', hint: '镜像、裁剪与水印', icon: 'V', badge: localVideo.value ? '已选' : '' },
   { id: 'settings', group: '系统', label: '设置', hint: '语言、服务与模型', icon: '⚙', badge: '' },
   { id: 'jobs', group: '系统', label: '任务日志', hint: '进度、错误与输出', icon: 'J', badge: runningJobCount.value || failedJobCount.value || '' },
 ])
+
+function navigateTo(view) {
+  activeView.value = view
+  if (window.innerWidth <= 760) sidebarOpen.value = false
+}
+
+function closeMobileNavigation() {
+  if (window.innerWidth <= 760 && sidebarOpen.value) {
+    sidebarOpen.value = false
+    nextTick(() => document.querySelector('[aria-controls="main-sidebar"]')?.focus())
+  }
+}
+
+function openNewAgentDraft() {
+  // Opening a composer is local navigation; existing tasks keep running.
+  newAgentDraft.value = true
+  url.value = ''
+  extraHint.value = ''
+  if (settingsEditor.value) applyAppSettingDefaults(settingsEditor.value)
+  setStatus(agentStatus, '', '')
+  navigateTo('agent')
+  nextTick(() => document.getElementById('agentUrl')?.focus())
+}
+
+async function openSidebarSession(sessionId) {
+  navigateTo('agent')
+  await selectAgentSession(sessionId)
+}
+
+watch(() => agentSession.value?.id, () => { newAgentDraft.value = false })
 
 onMounted(async () => {
   window.addEventListener('keydown', onSubtitleEditorUndoShortcut)
@@ -987,9 +1019,10 @@ async function startAgent() {
   try {
     const agentOcrPipeline = buildAgentOcrPipelinePayload(agentOcrPipelineVersion.value, { ocrScope: ocrScope.value })
     const session = await api('/api/agent/start', {
+      agent_mode: agentMode.value,
       url: url.value.trim(),
       embedded_subtitle_hint: embeddedSubtitleHint.value,
-      embedded_subtitle_goal: embeddedSubtitleGoal.value,
+      embedded_subtitle_goal: agentMode.value === 'autonomous' ? 'auto' : embeddedSubtitleGoal.value,
       source_language: sourceLanguage.value,
       ocr_language: ocrLanguage.value,
       target_language: 'zh',
@@ -1006,6 +1039,7 @@ async function startAgent() {
       ocr_exclude_right_ratio: ocrExcludeRightRatio.value,
     })
     agentSession.value = session
+    newAgentDraft.value = false
     // The new task must become the sole source of restored OCR settings.
     // Otherwise a previously selected V1/V2 task can leak its shape/refinement
     // settings into the first answer sent to this new V3 session.
@@ -1023,6 +1057,7 @@ async function startAgent() {
 
 async function answerAgent(action) {
   if (!agentSession.value?.id) return
+  const structured = action && typeof action === 'object' ? action : { action }
   setStatus(
     agentStatus,
     action === 'download_video_for_preview'
@@ -1037,7 +1072,7 @@ async function answerAgent(action) {
       restoredSettings: agentRestoredOcrSettings.value,
     })
     const session = await api(`/api/agent/${agentSession.value.id}/answer`, {
-      action,
+      ...structured,
       ...agentOcrPipeline,
       ocr_crop_top_ratio: ocrCropTopRatio.value,
       ocr_crop_bottom_ratio: ocrCropBottomRatio.value,
@@ -1111,7 +1146,7 @@ function syncAgentSessionPolls() {
 }
 
 function isSelectedAgentSession(sessionId) {
-  return !agentSession.value?.id || agentSession.value.id === sessionId
+  return canPresentAgentSession(agentSession.value?.id, sessionId, newAgentDraft.value)
 }
 
 async function pollAgent(sessionId) {
@@ -1160,7 +1195,7 @@ async function loadAgentSessions() {
     agentSessions.value = result.sessions || []
     syncAgentSessionPolls()
     await openWaitingGlossaryReviewFromSessions()
-    if (!agentSession.value?.id && agentSessions.value.length) {
+    if (!newAgentDraft.value && !agentSession.value?.id && agentSessions.value.length) {
       const preferred = agentSessions.value.find((session) => ['waiting', 'running'].includes(session.status))
         || agentSessions.value[0]
       agentSession.value = preferred
@@ -1172,6 +1207,7 @@ async function loadAgentSessions() {
 }
 
 async function openWaitingGlossaryReviewFromSessions() {
+  if (newAgentDraft.value) return false
   const currentSession = agentSession.value
   const reviewSession = findGlossaryReviewSession(agentSessions.value, currentSession?.id || '')
   if (!reviewSession) return false
@@ -1213,6 +1249,7 @@ async function selectAgentSession(sessionId) {
   try {
     const session = await getJson(`/api/agent/${sessionId}`)
     agentSession.value = session
+    newAgentDraft.value = false
     restoreAgentOcrPipeline(session)
     setStatus(agentStatus, `已切换到 Agent 任务：${session.id}`, '')
     const openedGlossaryReview = await openGlossaryReviewForSession(session)
@@ -1505,6 +1542,9 @@ async function openGlossaryReviewForSession(session) {
   }
   openingGlossaryReviewKey.value = reviewKey
   try {
+    // Enter the review page immediately; loading/candidate generation is visible
+    // there and does not require a separate "open review" click.
+    activeView.value = 'glossary'
     const loaded = await loadGlossary(reviewPath)
     if (!loaded) return false
     openedGlossaryReviewKey.value = reviewKey
@@ -1941,7 +1981,7 @@ async function runAsrLab() {
   asrLabResult.value = null
   setStatus(
     asrLabStatus,
-    asrLabVersion.value === 'agent-experimental' ? '正在启动多模型 Agent 实验…' : asrLabSpeakerDiarization.value
+    asrLabExperimental.value ? '正在启动独立 Agent 实验…' : asrLabSpeakerDiarization.value
       ? `正在启动 ASR ${asrLabVersion.value === '2.0' ? '2.2' : asrLabVersion.value} 与说话人分离…`
       : `正在启动 ASR ${asrLabVersion.value === '2.0' ? '2.2' : asrLabVersion.value}…`,
     '',
@@ -1950,8 +1990,8 @@ async function runAsrLab() {
     const job = await api('/api/jobs/asr-lab', {
       input_video: localVideo.value.trim(),
       asr_version: asrLabVersion.value,
-      test_ranges: asrLabVersion.value === 'agent-experimental' ? asrLabTestRanges.value : undefined,
-      source_language: asrLabVersion.value === 'agent-experimental' ? 'korean' : asrLabSourceLanguage.value,
+      test_ranges: asrLabExperimental.value ? asrLabTestRanges.value : undefined,
+      source_language: asrLabExperimental.value ? 'korean' : asrLabSourceLanguage.value,
       model_size: asrLabModelSize.value,
       speaker_diarization: asrLabSpeakerDiarization.value,
       known_speaker_count: asrLabKnownSpeakerCount.value,
@@ -1965,13 +2005,13 @@ async function runAsrLab() {
       compute_type: 'float16',
     })
     asrLabJobId.value = job.id
-    if (asrLabVersion.value === 'agent-experimental') {
-      try { localStorage.setItem('reibosub-asr-experiment-job', JSON.stringify({ id: job.id, input_video: localVideo.value, test_ranges: asrLabTestRanges.value })) } catch {}
+    if (asrLabExperimental.value) {
+      try { localStorage.setItem('reibosub-asr-experiment-job', JSON.stringify({ id: job.id, version: asrLabVersion.value, input_video: localVideo.value, test_ranges: asrLabTestRanges.value })) } catch {}
     }
     watchJob(job)
     setStatus(
       asrLabStatus,
-      asrLabVersion.value === 'agent-experimental' ? '实验任务已启动，正在截取所选音频…' : asrLabSpeakerDiarization.value
+      asrLabExperimental.value ? '实验任务已启动，正在截取所选音频…' : asrLabSpeakerDiarization.value
         ? `ASR ${asrLabVersion.value === '2.0' ? '2.2' : asrLabVersion.value} 与说话人分离任务运行中；完成后会显示 Speaker 标签。`
         : `ASR ${asrLabVersion.value === '2.0' ? '2.2' : asrLabVersion.value} 任务运行中；识别完成后文本会显示在本页。`,
       '',
@@ -2144,8 +2184,10 @@ async function loadGlossary(pathOverride) {
   }
   const loadGeneration = ++glossaryLoadGeneration
   if (!hasPathOverride) activeView.value = 'glossary'
+  glossaryPath.value = requestedPath
   glossaryLoading.value = true
-  setStatus(flowStatus, '正在加载 glossary，并生成盲翻候选...', '')
+  glossaryCandidateStatus.value = { state: 'ready', total: 0, ready: 0, pending: 0, failed: 0 }
+  setStatus(flowStatus, '正在读取术语表...', '')
   try {
     await glossaryAutosave.flush()
     if (loadGeneration !== glossaryLoadGeneration) return false
@@ -2158,11 +2200,15 @@ async function loadGlossary(pathOverride) {
     glossaryPath.value = requestedPath
     glossaryEditor.value = text.content || ''
     glossaryItems.value = review.items || []
+    glossaryCandidateStatus.value = review.candidates || { state: 'ready', total: 0, ready: 0, pending: 0, failed: 0 }
     loadedGlossaryPath.value = requestedPath
     glossaryTextDirty.value = false
     glossaryAutosave.reset('idle')
     setStatus(flowStatus, `已加载 ${glossaryItems.value.length} 条 glossary。`, 'ok')
     activeView.value = 'glossary'
+    if (review.candidates?.pending > 0) {
+      void prepareGlossaryCandidates(requestedPath, loadGeneration)
+    }
     return true
   } catch (error) {
     if (loadGeneration === glossaryLoadGeneration) {
@@ -2172,6 +2218,28 @@ async function loadGlossary(pathOverride) {
     return false
   } finally {
     if (loadGeneration === glossaryLoadGeneration) glossaryLoading.value = false
+  }
+}
+
+async function prepareGlossaryCandidates(path, generation, retryFailed = false) {
+  const isCurrent = () => generation === glossaryLoadGeneration && path === loadedGlossaryPath.value && path === glossaryPath.value.trim()
+  if (!path || !isCurrent() || glossaryCandidateStatus.value.state === 'running') return
+  glossaryCandidateStatus.value = { ...glossaryCandidateStatus.value, state: 'running' }
+  try {
+    let job = await api('/api/glossary-candidates/prepare', { path, retry_failed: retryFailed })
+    while (['queued', 'running', 'cancel_requested'].includes(job.status)) {
+      await new Promise(resolve => window.setTimeout(resolve, 1200))
+      if (!isCurrent()) return
+      job = await getJson(`/api/jobs/${job.id}`)
+    }
+    if (!isCurrent()) return
+    if (job.status !== 'done') throw new Error('原句参考译文暂未准备成功，仍可直接填写译名。')
+    const review = await api('/api/read-glossary-items', { path, include_blind_candidates: true })
+    if (!isCurrent()) return
+    if (!glossaryTextDirty.value) glossaryItems.value = mergeGlossaryCandidates(glossaryItems.value, review.items)
+    glossaryCandidateStatus.value = review.candidates || { state: 'ready' }
+  } catch {
+    if (isCurrent()) glossaryCandidateStatus.value = { ...glossaryCandidateStatus.value, state: 'partial', failed: Math.max(1, glossaryCandidateStatus.value.failed || 0) }
   }
 }
 
@@ -2350,8 +2418,8 @@ async function convertSubtitle() {
   }
 }
 
-async function loadAssets() {
-  setStatus(assetStatus, '正在扫描本地素材...', '')
+async function loadAssets(refresh = false) {
+  setStatus(assetStatus, refresh ? '正在更新素材列表...' : '正在读取素材列表...', '')
   try {
     const result = await getJson('/api/assets')
     assets.videos = result.videos || []
@@ -2400,7 +2468,7 @@ async function loadJobs() {
       const saved = JSON.parse(localStorage.getItem('reibosub-asr-experiment-job') || 'null')
       const experiment = saved && loadedJobs.find(job => job.id === saved.id)
       if (experiment) {
-        asrLabVersion.value = 'agent-experimental'
+        asrLabVersion.value = saved.version === 'autonomous-experimental' ? saved.version : 'agent-experimental'
         localVideo.value = saved.input_video || localVideo.value
         if (Array.isArray(saved.test_ranges)) asrLabTestRanges.value = saved.test_ranges
         asrLabJobId.value = experiment.id
@@ -2428,7 +2496,7 @@ async function cancelJob(jobId) {
     const job = await api(`/api/jobs/${jobId}/cancel`, {})
     jobs[job.id] = job
     if (['running', 'cancel_requested'].includes(job.status)) {
-      if (job.id === asrLabJobId.value && asrLabVersion.value === 'agent-experimental') {
+      if (job.id === asrLabJobId.value && asrLabExperimental.value) {
         const stage = [...(job.logs || [])].reverse().find(line => line.includes('experiment_stage: '))
         if (stage) setStatus(asrLabStatus, stage.slice(stage.indexOf('experiment_stage: ') + 18), '')
       }
@@ -2458,7 +2526,7 @@ async function pollJob(jobId) {
     const job = await getJson(`/api/jobs/${jobId}`)
     jobs[job.id] = job
     if (['running', 'cancel_requested'].includes(job.status)) {
-      if (job.id === asrLabJobId.value && asrLabVersion.value === 'agent-experimental') {
+      if (job.id === asrLabJobId.value && asrLabExperimental.value) {
         const stage = [...(job.logs || [])].reverse().find(line => line.includes('experiment_stage: '))
         if (stage) setStatus(asrLabStatus, stage.split('experiment_stage: ').pop(), '')
       }
@@ -2497,7 +2565,7 @@ function applyJobResult(job) {
     asrLabJobId.value = ''
     asrLabResult.value = result
     setStatus(asrLabStatus, result.pending_questions
-      ? `字幕草稿已生成：${result.cue_count} 条，还有 ${result.pending_questions} 处人名需要你确认。`
+      ? `字幕草稿已生成：${result.cue_count} 条，还有 ${result.pending_questions} 处${result.asr_version === 'autonomous-experimental' ? '字幕疑点' : '人名'}需要你确认。`
       : `实验字幕已生成：${result.cue_count} 条，可试听或下载；请留意标记的时间边界。`, 'ok')
     return
   }
@@ -2998,6 +3066,7 @@ function stripDetectedSubtitleSpeakerPrefixes() {
 
 async function focusSubtitleEditorCue(uid) {
   subtitleFocusedCueUid.value = uid
+  await subtitleEditorPanel.value?.revealCue(uid)
   await nextTick()
   const selector = `[data-subtitle-textarea="${cssEscape(uid)}"]`
   const textarea = document.querySelector(selector)

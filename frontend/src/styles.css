@@ -308,6 +308,7 @@ select { min-height: 36px; border: 1px solid var(--line); border-radius: 7px; ba
 }
 .agent-current-panel {
   display: grid;
+  min-width: 0;
   gap: 14px;
   padding: 20px;
   border: 1px solid rgba(45,143,112,.24);
@@ -411,8 +412,12 @@ select { min-height: 36px; border: 1px solid var(--line); border-radius: 7px; ba
   background: transparent;
   box-shadow: none;
 }
-.agent-hero-copy h2 { font-size: 26px; line-height: 1.08; letter-spacing: 0; }
+.agent-hero-copy { min-width: 0; max-width: 100%; }
+.agent-hero-copy h2 { font-size: 26px; line-height: 1.08; letter-spacing: 0; overflow-wrap: anywhere; }
 .agent-hero-copy p { margin-top: 8px; color: var(--muted); font-size: 13px; line-height: 1.5; max-width: 720px; }
+.autonomous-question { display: grid; gap: 10px; min-width: 0; }
+.autonomous-question button { text-align: left; white-space: normal; overflow-wrap: anywhere; }
+.autonomous-question audio { max-width: 100%; }
 .agent-live-chip {
   display: inline-flex;
   align-items: center;
@@ -1126,6 +1131,32 @@ details.more-subtitles summary { display: flex; justify-content: space-between; 
 .roman-hint { display: inline-flex; margin-left: 8px; color: var(--teal); font-weight: 650; }
 .review-edit { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; }
 .review-toolbar { margin-bottom: 12px; }
+.glossary-evidence-toolbar { margin-top: 10px; }
+.glossary-evidence-toolbar small { color: var(--muted); }
+.glossary-evidence-player { margin-top: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.glossary-evidence-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.glossary-evidence-choices { margin: 10px 0; }
+.glossary-evidence-choices .active { border-color: var(--teal); background: var(--teal-soft); color: var(--teal); }
+.glossary-evidence-body { display: grid; grid-template-columns: minmax(0, 2fr) minmax(220px, 1fr); gap: 12px; align-items: start; }
+.glossary-evidence-body.text-only { grid-template-columns: 1fr; }
+.glossary-evidence-media { min-width: 0; }
+.glossary-evidence-stage { position: relative; max-width: 720px; background: #101815; border-radius: 8px; overflow: hidden; }
+.glossary-evidence-stage video { display: block; width: 100%; max-height: 405px; }
+.glossary-evidence-stage.audio-only { background: var(--soft); }
+.glossary-evidence-stage audio { display: block; width: 100%; }
+.glossary-evidence-overlay { position: absolute; left: 5%; right: 5%; bottom: 54px; display: grid; justify-items: center; pointer-events: none; }
+.glossary-evidence-overlay span { max-width: 100%; background: #000b; color: #fff; font-size: clamp(14px, 2vw, 21px); line-height: 1.5; padding: 2px 8px; border-radius: 4px; white-space: pre-line; text-align: center; }
+.glossary-evidence-overlay.audio-caption { position: static; padding: 6px; }
+.glossary-evidence-controls { margin-top: 10px; align-items: center; }
+.glossary-evidence-controls label { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-size: 12px; }
+.glossary-evidence-controls input[type="checkbox"] { width: auto; }
+.glossary-evidence-controls select { width: auto; padding: 5px; }
+.glossary-evidence-context { min-width: 0; display: grid; gap: 4px; }
+.glossary-evidence-context > div { padding: 6px 8px; border-left: 3px solid transparent; }
+.glossary-evidence-context > div.focused { border-left-color: var(--teal); background: var(--teal-soft); }
+.glossary-evidence-context span { color: var(--muted); font-size: 11px; }
+.glossary-evidence-context p { margin: 3px 0; line-height: 1.5; white-space: pre-line; }
+@media (max-width: 1050px) { .glossary-evidence-body { grid-template-columns: 1fr; } }
 .context-box {
   display: grid;
   gap: 8px;

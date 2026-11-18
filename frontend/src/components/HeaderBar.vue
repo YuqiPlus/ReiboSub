@@ -1,23 +1,15 @@
 <template>
   <header class="topbar">
-    <div>
-      <div v-if="eyebrow" class="eyebrow">{{ eyebrow }}</div>
+    <div class="topbar-leading">
+      <button class="icon-button" type="button" aria-label="切换侧边栏" aria-controls="main-sidebar" :aria-expanded="sidebarOpen" @click="$emit('toggle-sidebar')"><AppIcon name="panel" /></button>
       <h1>{{ title }}</h1>
-      <p>{{ description }}</p>
     </div>
-    <div class="topbar-metrics">
-      <span class="metric-chip"><b>{{ metrics.media ?? metrics.videos ?? 0 }}</b>素材</span>
-      <span class="metric-chip"><b>{{ metrics.subtitles }}</b>字幕</span>
-      <span class="metric-chip"><b>{{ metrics.jobs }}</b>任务</span>
-    </div>
+    <span class="topbar-signature">ReiboSub <span>字幕工作空间</span></span>
   </header>
 </template>
 
 <script setup>
-defineProps({
-  eyebrow: { type: String, default: '' },
-  title: { type: String, default: 'ReiboSub Agent' },
-  description: { type: String, default: '下载、提取、纠错、术语审核和字幕翻译工作台。' },
-  metrics: { type: Object, default: () => ({ media: 0, subtitles: 0, jobs: 0 }) },
-})
+import AppIcon from './AppIcon.vue'
+defineProps({ title: { type: String, default: 'ReiboSub' }, sidebarOpen: Boolean })
+defineEmits(['toggle-sidebar'])
 </script>

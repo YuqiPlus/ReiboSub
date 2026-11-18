@@ -27,6 +27,14 @@ test('uses six stable user-facing Agent stages', () => {
   )
 })
 
+test('autonomous video saving shows download progress without exposing logs', () => {
+  const state=agentOperationPresentation({status:'running',phase:'autonomous_download',
+    result:{current_job_status:'running',current_job_logs:['[download] 35.4% of 100MiB']}})
+  assert.equal(state.title,'正在保存工程视频')
+  assert.match(state.message,/35.4%/)
+  assert.match(state.message,/不会因此重新翻译/)
+})
+
 test('maps every current backend phase to a stable stage', () => {
   const expected = {
     created: 'analyze',
@@ -54,6 +62,7 @@ test('maps every current backend phase to a stable stage', () => {
     ocr_reference: 'source',
     asr_ocr_refine: 'source',
     generate_glossary: 'glossary',
+    prepare_glossary_candidates: 'glossary',
     review_glossary: 'glossary',
     download_video_for_translation: 'translate',
     translate: 'translate',
