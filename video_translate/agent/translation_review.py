@@ -19,7 +19,7 @@ PROMPT = '''你是字幕局部复核Agent。用户只授权复核target_ids：�
 如果提供reviewed_glossary，则它是用户已审核的固定译法，优先级高于保留原文原则；不能擅自更名、删去已确认的译名或拿自己的猜测替换。
 user_guidance是用户对具体译文疑点提供的意思线索或偏好，不是原文识别证据；仍须结合原文和上下文检查，不可据此改原文、时间或无关条目。
 先read_context；不够再扩大或search_context取证。propose中每条必须引用本条和必要上下文。不能只拿旧问题说明当证据。
-propose格式 {decisions:[{id:整数,action:"keep|revise|uncertain",replacement:null或最小修改后的整条中文,reason_zh:"判断理由",evidence:[{id:整数,quote:"源字幕原样片段"}]}]}。
+propose格式 {decisions:[{id:整数,action:"keep|revise|uncertain",replacement:null或最小修改后的整条目标语言译文,reason_zh:"判断理由",evidence:[{id:整数,quote:"源字幕原样片段"}]}]}。zh只是历史字段名，实际语言以target_language为准。
 keep/uncertain的replacement必须null。每个id最多提案两次；checker拒绝后不要硬改，可补证据或改为keep/uncertain。
 只重提被拒绝的id，已批准的id不能再次提案。被拒绝的keep不意味着必须改稿，要检查旧批评是否仅为风格偏好或引用了不存在的文字。
 check独立复核所有待审提案，不会修改字幕。finish只导出已获准的局部修正，uncertain原样保留。只用available_tools提供的参数。
@@ -76,7 +76,9 @@ def replace_only_cue_text(data: bytes, replacements: dict[int, str]) -> bytes:
 
 
 class TranslationReview:
-    def __init__(self,source,translated,issues,target_ids,output_dir,llm_json,glossary_path=None,user_guidance=None):
+    def __init__(self,source,translated,issues,target_ids,output_dir,llm_json,glossary_path=None,user_guidance=None,target_language='zh'):
+        from video_translate.translation_languages import target_language_code
+        self.target_language=target_language_code(target_language)
         self.source=Path(source).resolve();self.translated=Path(translated).resolve()
         self.root=Path(output_dir).resolve()
         if self.root.exists():raise FileExistsError('局部复核必须使用新目录，不能覆盖已有结果')
@@ -109,7 +111,7 @@ class TranslationReview:
 
     def save(self):
         write_json_atomic(self.root/'audit.json',{'source':str(self.source),'original_translation':str(self.translated),
-            **self.hashes,'target_ids':self.targets,'prior_hypotheses':self.issues,'views':self.views,'proposals':self.proposals,
+            **self.hashes,'target_language':self.target_language,'target_ids':self.targets,'prior_hypotheses':self.issues,'views':self.views,'proposals':self.proposals,
             'reviewed_glossary':self.glossary_context,'glossary_sha256':self.glossary_sha256,'user_guidance':self.user_guidance,
             'reviews':self.reviews,'review_history':self.review_history,'events':self.events,'policy':{'full_translation':False,'source_or_timing_edits':False,'max_steps':16}})
 
@@ -190,7 +192,8 @@ class TranslationReview:
             pending={k:p for k,p in self.proposals.items() if k not in self.reviews}
             data={'proposals':[{'target':self.by_id[int(k)],'proposal':p,'context':self.views[k]} for k,p in pending.items()],
                   'searched_evidence':list(self.observed.values()),'disputed_previous_reviews':{k:self.review_history.get(k,[]) for k in pending},
-                  'reviewed_glossary':self.glossary_context,'user_guidance':self.user_guidance}
+                  'reviewed_glossary':self.glossary_context,'user_guidance':self.user_guidance,'target_language':self.target_language,
+                  'field_note':'zh为历史字段名，存放指定目标语言译文，不意味着中文。'}
             feedback=None
             for retry in range(2):
                 result=self.llm(self.root,f'proposal-check-{self.counts.get("check",0)}-{retry}','asr_correction',CHECK_PROMPT,
@@ -238,12 +241,12 @@ class TranslationReview:
                 'after':changes.get(cue_id,self.by_id[cue_id]['zh']),'action':action if accepted else 'uncertain',
                 'reason_zh':p['reason_zh'],'evidence':p['evidence'],'independent_review':review,
                 **({'suppressed_in_delivery':True,'covered_by':covered[cue_id]['covered_by']} if cue_id in covered else {})})
-        output=self.root/'zh.local_review.v1.srt'
+        output=self.root/f'{self.target_language}.local_review.v1.srt'
         with output.open('xb') as f:f.write(replace_only_cue_text(self.original,changes))
         actual=read_srt(output)
         if len(actual)!=len(self.rows) or any((c.index,c.start,c.end,c.text)!=(r['id'],r['start'],r['end'],changes.get(r['id'],r['zh'])) for c,r in zip(actual,self.rows)):
             raise RuntimeError('导出校验失败：编号、时间或非目标文字发生了变化')
-        result={'translated_srt':str(output),'audit':str(self.root/'audit.json'),'decisions':records,'changed_ids':sorted(changes),
+        result={'translated_srt':str(output),'target_language':self.target_language,'audit':str(self.root/'audit.json'),'decisions':records,'changed_ids':sorted(changes),
             'unresolved_ids':unresolved,'approved_suppressions':coverage,'target_ids':self.targets,'cue_count':len(actual),'all_timing_unchanged':True,
             'all_other_text_unchanged':True,'original_inputs_unchanged':True,**self.hashes,'output_sha256':sha(output)}
         self.assert_inputs();write_json_atomic(self.root/'result.json',result);return result
@@ -251,7 +254,7 @@ class TranslationReview:
     def run(self):
         for step in range(1,17):
             call=self.llm(self.root,f'local-decision-{step}','asr_correction',PROMPT,{
-                'target_ids':self.targets,'targets':[self.by_id[i] for i in self.targets],'prior_hypotheses':self.issues,
+                'target_language':self.target_language,'target_ids':self.targets,'targets':[self.by_id[i] for i in self.targets],'prior_hypotheses':self.issues,
                 'context_views':self.views,
                 'reviewed_glossary':self.glossary_context,'user_guidance':self.user_guidance,
                 'available_tools':self.available(),'proposals':self.proposals,'reviews':self.reviews,
@@ -269,7 +272,7 @@ class TranslationReview:
         raise RuntimeError('局部复核已达到工具调用上限；未重翻整片，输入与复核记录已保存')
 
 
-def review_translation_cues(source,translated,issues,target_ids,output_dir,llm_json=None,glossary_path=None,user_guidance=None):
+def review_translation_cues(source,translated,issues,target_ids,output_dir,llm_json=None,glossary_path=None,user_guidance=None,target_language='zh'):
     if llm_json is None:
         from scripts.asr_review_agent import llm_json
-    return TranslationReview(source,translated,issues,target_ids,output_dir,llm_json,glossary_path,user_guidance).run()
+    return TranslationReview(source,translated,issues,target_ids,output_dir,llm_json,glossary_path,user_guidance,target_language).run()

@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+from video_translate.translation_languages import target_language_code
 
 from video_translate.translate.volcengine import translate_srt_with_volcengine
 
@@ -49,7 +50,7 @@ TRANSLATION_MODES = {
 
 
 def default_output_path(source_srt: Path, target_language: str = DEFAULT_TARGET_LANGUAGE) -> Path:
-    suffix = ".zh" if "中文" in target_language or "Chinese" in target_language else ".translated"
+    suffix = '.' + target_language_code(target_language)
     return source_srt.with_name(source_srt.stem + suffix + ".srt")
 
 

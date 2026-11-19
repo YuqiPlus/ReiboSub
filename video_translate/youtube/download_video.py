@@ -13,8 +13,8 @@ from PIL import Image
 from yt_dlp.utils import DownloadError, MaxDownloadsReached
 
 from video_translate.env import load_dotenv
-from video_translate.youtube.filenames import normalize_download_format_tag, youtube_output_template
-from video_translate.youtube_url import normalize_youtube_url
+from video_translate.youtube.filenames import filesystem_safe_title, normalize_download_format_tag, youtube_output_template
+from video_translate.video_source import normalize_video_url, video_title, video_platform, platform_options, validate_video_info
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -59,7 +59,7 @@ FORMAT_SELECTOR_KEYWORDS = {
 
 
 def normalize_url(url):
-    return normalize_youtube_url(url)
+    return normalize_video_url(url)
 
 
 def parse_quality(quality):
@@ -348,11 +348,13 @@ def download_video(
                 format_tag=exact_format_tag,
                 container=exact_container,
             )
+            ydl_opts.update(platform_options(video_url, youtube_proxy=DEFAULT_PROXY))
             print(f"download_attempt: {attempt_name}")
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(video_url, download=False) if hasattr(ydl, "extract_info") else {}
-                    title = str(info.get("title") or "")
+                    validate_video_info(info, video_url)
+                    title = video_title(str(info.get("title") or ""), video_url)
                     output_title = str(project_title or title)
                     if output_title:
                         update_yt_dlp_outtmpl(
@@ -388,6 +390,9 @@ def download_video(
                         videos = [path for path in videos if path.stem.endswith(marker)]
                     if not videos:
                         videos = matcher(output_path, output_title)
+                if video_platform(video_url) == "bilibili":
+                    project_dir = output_path / filesystem_safe_title(output_title)
+                    videos = [path for path in matcher(output_path, output_title) if path.parent == project_dir]
                 if archive:
                     videos = [archive_video_path(path) for path in videos]
                 thumbnail = thumbnail_url_from_info(info)
@@ -490,8 +495,8 @@ def convert_thumbnail_bytes(content: bytes, *, image_format=DEFAULT_THUMBNAIL_FO
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Download one YouTube video.")
-    parser.add_argument("url", nargs="?", default=DEFAULT_VIDEO_URL, help="YouTube URL or video ID")
+    parser = argparse.ArgumentParser(description="Download one YouTube or Bilibili video/part.")
+    parser.add_argument("url", nargs="?", default=DEFAULT_VIDEO_URL, help="YouTube/Bilibili URL or ID; use ?p=2 for a Bilibili part")
     parser.add_argument("--quality", default=DEFAULT_QUALITY, help="Video quality: best, 2160p, 1440p, 1080p, 720p, etc.")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--thumbnail-format", default=DEFAULT_THUMBNAIL_FORMAT, choices=sorted(THUMBNAIL_FORMATS), help="Thumbnail format: jpg, png, webp, or source")

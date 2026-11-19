@@ -2,7 +2,7 @@
   <section class="panel link-tool-panel links-studio">
     <header class="studio-page-head"><div><span class="studio-kicker">下载与链接</span><h2>从一个链接开始</h2><p>直接保存视频，或按需查看它的字幕。</p></div><AppIcon class="links-page-icon" name="download" :size="28" /></header>
     <form class="links-composer" @submit.prevent="downloadVideo">
-      <label class="links-url" for="url">YouTube 链接或视频 ID<input id="url" :value="url" autocomplete="off" placeholder="粘贴 YouTube 链接…" @input="$emit('update:url', $event.target.value)" /></label>
+      <label class="links-url" for="url">YouTube / B 站链接或视频 ID<input id="url" :value="url" autocomplete="off" placeholder="粘贴视频链接，B 站分 P 可带 ?p=2…" @input="$emit('update:url', $event.target.value)" /></label>
       <div class="links-download-row">
         <label class="links-quality" for="videoQuality"><AppIcon name="video" :size="17" /><span class="sr-only">视频画质</span><select id="videoQuality" aria-label="视频画质" :value="videoQuality" @change="$emit('update:videoQuality', $event.target.value)"><option value="1080p">兼容下载 · 最高 1080p · H.264 / MP4 优先</option><optgroup v-if="availableVideoFormats.length" label="当前视频实际可用格式"><option v-for="format in availableVideoFormats" :key="format.id" :value="videoFormatChoiceValue(format)">{{ format.label }}</option></optgroup></select></label>
         <button class="secondary links-refresh-formats" type="button" :disabled="!hasUrl || videoFormatsLoading" @click="$emit('load-video-formats')"><AppIcon name="history" :size="15" />{{ videoFormatsLoading ? '读取中…' : '刷新画质' }}</button>
@@ -10,7 +10,7 @@
       </div>
     </form>
     <p v-if="videoFormatsLoading || videoFormatsStatus" class="links-format-feedback" :class="videoFormatsStatusClass" role="status">{{ videoFormatsLoading ? '正在读取这个视频可下载的画质…' : videoFormatsStatus }}</p>
-    <p v-else class="links-format-feedback">粘贴链接后自动读取可用画质。不必先检测字幕，也可以直接下载。</p>
+    <p v-else class="links-format-feedback">粘贴链接后自动读取可用画质，也可以直接下载。B 站默认只下载当前分 P；未指定时为 P1。</p>
     <div class="links-secondary-action"><button class="secondary" type="button" :disabled="!hasUrl || probing || Boolean(actionBusy)" @click="$emit('probe')"><AppIcon name="scan" :size="16" />{{ probing ? '正在检测…' : '查看字幕与视频信息' }}</button><span>可选操作，不会自动跳转或开始翻译。</span></div>
     <p v-if="status" class="links-operation-feedback" :class="statusClass" role="status">{{ status }}</p>
     <details class="link-tool-section">
@@ -30,7 +30,7 @@
             <option value="webp">WebP</option>
             <option value="source">原始格式</option>
           </select>
-          <small>默认 JPG；原始格式会保留 YouTube 返回的 WebP/JPG/PNG。</small>
+          <small>默认 JPG；原始格式会保留视频平台返回的 WebP/JPG/PNG。</small>
         </div>
         <div class="link-tool-option-action">
           <button
@@ -43,7 +43,7 @@
           </button>
         </div>
         <p class="link-tool-help">
-          “快速兼容”无需预先读取格式，会优先选择 H.264 / MP4，适合播放器与 OCR；真实格式会按当前视频列出分辨率、容器和编码，并使用 YouTube 的具体格式 ID 精确下载，不会把 4K 悄悄回落成 1080p。
+          “快速兼容”无需预先读取格式，会优先选择 H.264 / MP4，适合播放器与 OCR；真实格式按当前视频列出分辨率、容器和编码，并使用平台的具体格式 ID 精确下载。B 站部分画质和 CC 字幕需要登录 Cookie 或相应账号权限；弹幕不会作为字幕。
         </p>
       </div>
     </details>

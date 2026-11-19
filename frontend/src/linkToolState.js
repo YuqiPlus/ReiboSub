@@ -21,6 +21,13 @@ export function looksLikeYoutubeInput(value) {
   return /(?:youtube\.com|youtu\.be)\//i.test(input)
 }
 
+export function looksLikeVideoInput(value) {
+  const input = normalizeLinkInput(value)
+  if (/^(?:BV[0-9A-Za-z]{10}|av[1-9][0-9]*)$/.test(input)) return true
+  if (/^(?:(?:https?:\/\/)?(?:www\.|m\.)?bilibili\.com\/video\/(?:BV[0-9A-Za-z]{10}|av[1-9][0-9]*)(?:[/?#]|$)|(?:https?:\/\/)?(?:www\.)?b23\.tv\/[A-Za-z0-9]+(?:[/?#]|$))/i.test(input)) return true
+  return looksLikeYoutubeInput(input)
+}
+
 export function videoFormatChoiceValue(format) {
   const id = normalizeLinkInput(format?.id)
   return id ? `format:${id}` : ''

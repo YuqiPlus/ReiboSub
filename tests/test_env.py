@@ -8,6 +8,19 @@ import pytest
 from video_translate.env import load_dotenv
 
 
+def test_bilibili_startup_settings_are_optional_and_separate(tmp_path, monkeypatch):
+    config = tmp_path / 'configs' / 'reibosub.yaml'
+    config.parent.mkdir()
+    config.write_text('youtube_proxy: http://youtube-proxy\nbilibili_proxy: ""\nbilibili_cookie_file: /private/bilibili.cookies.txt\n')
+    monkeypatch.chdir(tmp_path)
+    for key in ('YTDLP_PROXY', 'BILIBILI_PROXY', 'BILIBILI_COOKIE_FILE'):
+        monkeypatch.delenv(key, raising=False)
+    load_dotenv(tmp_path)
+    assert os.environ['YTDLP_PROXY'] == 'http://youtube-proxy'
+    assert os.environ['BILIBILI_PROXY'] == ''
+    assert os.environ['BILIBILI_COOKIE_FILE'] == '/private/bilibili.cookies.txt'
+
+
 def test_loads_simple_reibosub_yaml_and_unifies_media_directory(tmp_path: Path, monkeypatch) -> None:
     config = tmp_path / "configs" / "reibosub.yaml"
     config.parent.mkdir(parents=True)

@@ -8,9 +8,11 @@ import yaml
 
 
 REBOSUB_CONFIG_PATH = Path("configs") / "reibosub.yaml"
-REBOSUB_CONFIG_KEYS = frozenset({"media_dir", "youtube_proxy", "host", "port"})
+REBOSUB_CONFIG_KEYS = frozenset({"media_dir", "youtube_proxy", "bilibili_proxy", "bilibili_cookie_file", "host", "port"})
 REBOSUB_ENV_MAP = {
     "youtube_proxy": ("YTDLP_PROXY",),
+    "bilibili_proxy": ("BILIBILI_PROXY",),
+    "bilibili_cookie_file": ("BILIBILI_COOKIE_FILE",),
     "host": ("VIDEO_TRANSLATE_HOST",),
     "port": ("VIDEO_TRANSLATE_PORT",),
     # Keep the Agent asset library and the standalone YouTube commands on the

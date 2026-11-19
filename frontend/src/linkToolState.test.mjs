@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import {
   isProbeResponseCurrent,
   looksLikeYoutubeInput,
+  looksLikeVideoInput,
   normalizeLinkInput,
   resolveLinkActionUrl,
   selectedVideoFormat,
@@ -59,4 +60,13 @@ test('maps a format choice back to its sanitized probe entry', () => {
   assert.equal(selectedVideoFormat(formats, 'format:401+140'), formats[0])
   assert.equal(selectedVideoFormat(formats, '1080p'), null)
   assert.equal(selectedVideoFormat(formats, 'format:missing'), null)
+})
+
+test('detects Bilibili ordinary links and parts without changing YouTube detection', () => {
+  for (const input of ['BV1GJ411x7h7', 'av170001', 'https://www.bilibili.com/video/BV1GJ411x7h7?p=2', 'https://b23.tv/aBc12', 'b23.tv/aBc12', 'https://youtu.be/AbCdEf12345', 'AbCdEf12345']) {
+    assert.equal(looksLikeVideoInput(input), true, input)
+  }
+  for (const input of ['typing', 'https://example.com/video/BV1GJ411x7h7', 'https://bilibili.com.evil.test/video/BV1GJ411x7h7', 'https://www.bilibili.com/bangumi/play/ep123']) {
+    assert.equal(looksLikeVideoInput(input), false, input)
+  }
 })

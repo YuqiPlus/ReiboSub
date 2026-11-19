@@ -582,7 +582,7 @@ def _build_cleanup_payload(
                     {
                         "target_language": target_language,
                         "context": glossary_context,
-                        "rules": rules,
+                        "rules": [r.replace('中文字幕', f'{target_language}字幕') for r in rules] + ['zh是历史兼容字段名，内容必须使用target_language指定语言。'],
                         "subtitles": items,
                     },
                     ensure_ascii=False,
@@ -874,7 +874,7 @@ def _build_payload(
         for cue in cues
     ]
     system = (
-        f"你是专业影视字幕翻译。把韩语/日语等原文字幕翻译成自然、简洁、口语化的{target_language}。"
+        f"你是专业影视字幕翻译。把输入原文（包括中文、韩语、日语、英语等）翻译成自然、简洁、口语化的{target_language}。"
         "必须保持 id 不变，不要增删字幕条目，不要解释。只输出 JSON 数组。"
     )
     rules = [
@@ -885,9 +885,9 @@ def _build_payload(
         '如果相邻字幕明显是同一句话的 OCR 变体，请尽量使用一致译法，避免只改一个小词造成闪烁感。',
         'ignored_texts 中的内容是 logo、水印、固定角标或不应进入字幕正文的噪声；如果输入中残留这些内容，请删除而不是翻译。',
         '不要翻译 logo、水印或节目固定标题，输入里若出现也保持克制处理。',
-        '保留原文语气；源文是疑问、反问、确认提问或请求确认时，中文应使用问句表达并以“？”结尾，不要翻成陈述句。',
+        '保留原文语气；源文是疑问、反问或请求确认时，译文使用目标语言的问句和标点（中文“？”，英语“?”），不要翻成陈述句。',
         '括号、引号、书名号等成对符号必须成对出现；如果无法确认另一半，删除装饰性符号，不要输出半边括号或半边引号。',
-        '输出格式为 [{"id": 1, "zh": "中文字幕"}]。',
+        '输出格式为 [{"id": 1, "zh": "目标语言译文"}]。zh是兼容字段名，不代表中文；context中的zh同样是用户审核的目标语言译名。',
     ]
     if extra_prompt.strip():
         rules.append(f"额外要求：{extra_prompt.strip()}")
@@ -1093,7 +1093,7 @@ def _build_json_repair_payload(payload: dict[str, Any], bad_content: str, error:
                     f"{error}\n"
                     "请只修复 JSON 格式，不要改写、增删或解释翻译内容。"
                     "输出必须是合法 JSON 数组，格式严格为 "
-                    '[{"id": 1, "zh": "中文字幕"}]。'
+                    '[{"id": 1, "zh": "原有目标语言译文"}]。zh是兼容字段名，不得把非中文译文改成中文。'
                 ),
             },
         ],

@@ -7,6 +7,7 @@
 
     <div v-if="agentReview" class="review-agent-note"><AppIcon name="spark" :size="17" /><span>确认完成后，保存并返回 Agent 继续翻译。</span></div>
 
+
     <details class="glossary-file-details studio-disclosure" :open="!reviewReady || loading">
       <summary>术语文件与高级编辑</summary>
       <div class="glossary-file-row"><label for="glossaryPathReview">术语文件<input id="glossaryPathReview" :value="glossaryPath" :disabled="loading || continueBusy" placeholder="选择或填写术语文件路径" @input="$emit('update:glossaryPath', $event.target.value)" /></label><button class="secondary" :disabled="loading || continueBusy" @click="$emit('load-glossary')">{{ loading ? '加载中…' : '加载文件' }}</button></div>
@@ -46,7 +47,7 @@
               <details v-if="item.note || item.aliases?.length || item.english_reference_text || item.blind_candidate_zh" class="term-note-details"><summary>更多参考与识别说明</summary><p v-if="item.note">{{ item.note }}</p><p v-if="item.aliases?.length">别名：{{ item.aliases.join(', ') }}</p><p v-if="item.english_reference_text">英文参考：{{ item.english_reference_text }}</p><div v-if="item.blind_candidate_zh" class="term-full-reference"><p>下方操作会把整句参考填入译名，不会自动确认；人名通常只应填写名字。</p><button class="ghost mini" :disabled="continueBusy" @click="$emit('update-glossary-zh', { index, zh: item.blind_candidate_zh })">将整句填入译名</button></div></details>
             </div>
             <div class="term-answer">
-              <label :for="`term-answer-${index}`">中文译名</label>
+              <label :for="`term-answer-${index}`">{{ targetLanguageLabel }}译名</label>
               <div class="term-answer-row"><input :id="`term-answer-${index}`" :ref="(el) => setReviewInputRef(el, index)" :value="item.zh" :disabled="continueBusy" :placeholder="item.suggested_zh || '填写译名或音译'" @input="$emit('update-glossary-zh', { index, zh: $event.target.value })" @compositionstart="isComposing = true" @compositionend="isComposing = false" @keydown.enter="handleReviewEnter($event, index)" /><button v-if="item.reviewed" class="secondary" :disabled="continueBusy" @click="$emit('set-glossary-reviewed', { index, reviewed: false })">撤回确认</button><button v-else :disabled="continueBusy" @click="$emit('set-glossary-reviewed', { index, reviewed: true })">确认</button></div>
               <button v-if="item.suggested_zh" class="term-suggestion" :disabled="continueBusy" @click="$emit('use-suggestion', index)">采用推荐：{{ item.suggested_zh }}</button>
             </div>
@@ -70,8 +71,10 @@ import { nextPendingReviewIndex, shouldConfirmReviewEnter } from '../glossaryRev
 import { evidenceKey } from '../glossaryEvidence.js'
 import GlossaryEvidencePlayer from './GlossaryEvidencePlayer.vue'
 import AppIcon from './AppIcon.vue'
+import { targetLanguages } from '../translationLanguages.js'
 
 const props = defineProps({
+  targetLanguage: { type: String, default: 'zh' },
   glossaryPath: { type: String, default: '' },
   glossaryEditor: { type: String, default: '' },
   glossaryItems: { type: Array, default: () => [] },
@@ -94,6 +97,7 @@ const emit = defineEmits([
 ])
 
 const tab = ref('review')
+const targetLanguageLabel = computed(() => targetLanguages.find((item) => item.id === props.targetLanguage)?.label || '目标语言')
 const filter = ref('pending')
 const query = ref('')
 const reviewFilters = [{ id: 'pending', label: '待确认' }, { id: 'confirmed', label: '已确认' }, { id: 'all', label: '全部' }]

@@ -16,7 +16,7 @@ def candidate_indexes(state):
     wanted=state.get('target_language','zh').lower().replace('_','-')
     def matches(language):
         language=language.lower().replace('_','-')
-        return language.split('-')[0]=='zh' if wanted in {'zh','zho','chi','cn'} else language==wanted
+        return language.split('-')[0]=='zh' if wanted in {'zh','zho','chi','cn'} else language.split('-')[0]==wanted.split('-')[0]
     indexes=[i for i,c in enumerate(state.get('captions',[])) if c.get('kind')=='manual' and matches(c.get('lang',''))]
     # Prefer simplified/generic Chinese over traditional when the requested goal is zh.
     rank={'zh-hans':0,'zh-cn':1,'zh':2,'zh-sg':3,'zh-hant':4,'zh-tw':5,'zh-hk':6}
@@ -34,7 +34,9 @@ def route(state):
     return None
 
 
-def assess(path,duration=None):
+def assess(path,duration=None,target_language='zh'):
+    from video_translate.translation_languages import target_language_code
+    target_language=target_language_code(target_language)
     path=Path(path)
     report={'path':str(path),'sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'status':'rejected','issues':[]}
     try:rows=read_srt(path)
@@ -52,9 +54,19 @@ def assess(path,duration=None):
     ratio=chinese/max(1,letters)
     report.update(chinese_characters=chinese,chinese_letter_ratio=round(ratio,3),
         first_start=min(c.start for c in rows),last_end=max(c.end for c in rows),samples=[c.text for c in rows[:4]])
-    if letters>40 and chinese==0:return {**report,'issues':['标为中文，但正文未见汉字，不能直接当作中文字幕交付']}
+    report['target_language']=target_language
+    script_counts={
+        'zh':chinese,
+        'en':sum(('a'<=c.lower()<='z') for c in text),
+        'ko':sum('\uac00'<=c<='\ud7a3' or '\u1100'<=c<='\u11ff' for c in text),
+        'ja':sum('\u3040'<=c<='\u30ff' for c in text),
+    }
+    target_chars=script_counts[target_language]
+    report['target_script_characters']=target_chars
+    if letters>40 and target_chars==0 and target_language!='ja':
+        return {**report,'issues':['字幕正文未见所选目标语言的基本文字特征，不能直接交付']}
     warnings=[]
-    if chinese==0 or ratio<.2:warnings.append('中文字符比例偏低，语言或双语格式需确认')
+    if target_chars==0 or target_chars/max(1,letters)<.2:warnings.append('目标语言字符特征偏少，语言或双语格式需确认')
     if isinstance(duration,(float,int)) and math.isfinite(duration) and duration>0:
         report['video_duration']=duration
         report['subtitle_end_ratio']=round(report['last_end']/duration,3)

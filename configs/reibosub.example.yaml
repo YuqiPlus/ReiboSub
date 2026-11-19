@@ -7,6 +7,11 @@ media_dir: YoutubeDownloads
 # Only used for YouTube requests. Leave empty when no proxy is needed.
 youtube_proxy: ""
 
+# Optional Bilibili settings. Direct connection by default, independent of YouTube.
+# Export your own Netscape-format cookies only when login is needed. Never commit them.
+# bilibili_proxy: ""
+# bilibili_cookie_file: /path/outside/the/repository/bilibili.cookies.txt
+
 # The UI has no login. Keep loopback unless you are on a trusted network.
 host: 127.0.0.1
 port: 7860

@@ -13,6 +13,7 @@ from video_translate.subtitle.srt import read_srt
 from video_translate.llm_config import load_llm_task_config
 from video_translate.translate.volcengine import DEFAULT_BASE_URL, _chat_completions_url, _load_dotenv, _parse_json_content
 from video_translate.utils.text import comparable_text
+from video_translate.translation_languages import target_language_code, target_language_name
 
 
 DEFAULT_TARGET_LANGUAGE = "简体中文"
@@ -121,6 +122,16 @@ def build_extraction_payload(
         "extra_hint": extra_hint,
         "subtitles": cues,
     }
+    code = target_language_code(target_language)
+    user['target_language'] = target_language_name(code)
+    user['rules'] = [*EXTRACTION_RULES,
+        'source、aliases保留原文；suggested_zh是历史字段名，内容必须是目标语言的推荐译名，不代表必须翻成中文。',
+        '原文也可能是中文；中文人名翻成英语时优先可靠的官方英文名或规范拼音，不猜英文身份，不确定时留空让用户确认。']
+    if code != 'zh':
+        user['rules'] = [r for r in user['rules'] if '韩语人名对应的中文汉字' not in r]
+    for section in ('program', 'characters', 'terms'):
+        schema = user['output_schema'][section]
+        (schema[0] if isinstance(schema, list) else schema)['suggested_zh'] = f'建议{target_language_name(code)}译名，可为空'
     return {
         "model": model,
         "messages": [
@@ -182,6 +193,8 @@ def generate_glossary_draft(
 
     draft = filter_low_value_candidates(draft, extra_hint=extra_hint)
     normalized = normalize_draft_for_yaml(draft, fill_suggestions=fill_suggestions)
+    normalized['target_language'] = target_language_code(target_language)
+    normalized['source_language'] = source_language
     write_glossary_yaml(normalized, out_yaml, source_srt=source_srt, fill_suggestions=fill_suggestions)
     return out_yaml
 

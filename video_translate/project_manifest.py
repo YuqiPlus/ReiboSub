@@ -8,7 +8,7 @@ from urllib.parse import parse_qs, urlparse
 
 import yaml
 
-from video_translate.youtube_url import normalize_youtube_url
+from video_translate.video_source import normalize_video_url, video_platform, video_part, video_id
 
 PROJECT_MANIFEST_NAME = 'project.yaml'
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.webm', '.mov', '.m4v', '.avi', '.ts', '.m2ts'}
@@ -67,16 +67,18 @@ def update_youtube_project_metadata(
 ) -> dict[str, Any]:
     project_dir = Path(project_dir).resolve()
     manifest = load_project_manifest(project_dir)
-    normalized = normalize_youtube_url(source_url)
+    normalized = normalize_video_url(source_url)
     manifest.update(
         {
-            'source_type': 'youtube',
+            'source_type': video_platform(normalized),
             'source_url': source_url,
             'normalized_url': normalized,
-            'video_id': youtube_video_id(normalized),
+            'video_id': video_id(normalized),
             'title': title or manifest.get('title') or project_dir.name,
         }
     )
+    if video_platform(normalized) == 'bilibili':
+        manifest['part'] = video_part(normalized)
     if primary_video:
         manifest['primary_video'] = str(Path(primary_video).resolve())
     if thumbnail_path:
@@ -138,10 +140,13 @@ def infer_project_manifest(project_dir: Path) -> dict[str, Any]:
     data.setdefault('schema_version', 1)
     data.setdefault('project_id', safe_project_id(data.get('title') or project_dir.name))
     data.setdefault('title', project_dir.name)
-    data.setdefault('source_type', 'youtube' if data.get('source_url') else 'unknown')
     data.setdefault('source_url', '')
-    data.setdefault('normalized_url', normalize_youtube_url(str(data.get('source_url') or '')) if data.get('source_url') else '')
-    data.setdefault('video_id', youtube_video_id(str(data.get('normalized_url') or '')))
+    if 'normalized_url' not in data:
+        data['normalized_url'] = normalize_video_url(str(data['source_url'])) if data.get('source_url') else ''
+    data.setdefault('source_type', video_platform(str(data['normalized_url'])) if data.get('normalized_url') else 'unknown')
+    data.setdefault('video_id', video_id(str(data.get('normalized_url') or '')))
+    if data.get('source_type') == 'bilibili':
+        data.setdefault('part', video_part(str(data.get('normalized_url') or '')))
     data.setdefault('project_dir', str(project_dir))
     if not data.get('primary_video') and videos:
         data['primary_video'] = str(videos[0].resolve())

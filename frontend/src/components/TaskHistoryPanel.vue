@@ -39,9 +39,9 @@
 
             <p v-if="stage.error" class="task-history-stage-error">{{ stage.error }}</p>
 
-            <div v-if="artifactItems(stage).length || canRerun(stage)" class="task-history-stage-actions">
+            <div v-if="artifactItems(stage, task).length || canRerun(stage)" class="task-history-stage-actions">
               <button
-                v-for="artifact in artifactItems(stage)"
+                v-for="artifact in artifactItems(stage, task)"
                 :key="`${artifact.kind}:${artifact.path}`"
                 class="ghost mini task-history-artifact"
                 type="button"
@@ -102,6 +102,7 @@
 <script setup>
 import { computed, ref } from 'vue'
 import AppIcon from './AppIcon.vue'
+import { targetSubtitleLabel } from '../translationLanguages.js'
 
 const props = defineProps({
   tasks: { type: Array, default: () => [] },
@@ -318,7 +319,7 @@ function currentStageLabel(stage) {
   if (labels[stage]) return labels[stage]
   const match = String(stage || '').match(/^(probe|ocr|asr|glossary|translate)_(running|waiting|interrupted)$/)
   if (match) {
-    const stageLabels = { probe: '来源检测', ocr: '原文字幕', asr: '语音识别', glossary: '术语表', translate: '中文字幕' }
+    const stageLabels = { probe: '来源检测', ocr: '原文字幕', asr: '语音识别', glossary: '术语表', translate: '译文字幕' }
     const stateLabels = { running: '运行中', waiting: '等待确认', interrupted: '已中断' }
     return `${stageLabels[match[1]]}${stateLabels[match[2]]}`
   }
@@ -333,7 +334,7 @@ function stageDisplayLabel(stage) {
     ocr: '原文字幕',
     asr: '语音识别',
     glossary: '术语表',
-    translate: '中文字幕',
+    translate: '译文字幕',
   }
   return labels[stage?.id] || stage?.label || stage?.id || '未命名阶段'
 }
@@ -383,12 +384,12 @@ function canRerun(stage) {
     && ['done', 'reviewed', 'waiting_review', 'failed', 'invalidated', 'interrupted', 'cancelled'].includes(String(stage?.status || ''))
 }
 
-function artifactItems(stage) {
+function artifactItems(stage, task = {}) {
   const nested = stage?.job_result && typeof stage.job_result === 'object' ? stage.job_result : {}
   const candidates = [
     { kind: 'glossary', label: '打开术语表', path: stage?.glossary_path || nested.glossary_path },
     { kind: 'source_srt', label: '查看原文 SRT', path: stage?.source_srt || nested.source_srt },
-    { kind: 'translated_srt', label: '查看中文字幕', path: stage?.translated_srt || nested.translated_srt },
+    { kind: 'translated_srt', label: `查看${targetSubtitleLabel(task.payload?.target_language || task.target_language)}`, path: stage?.translated_srt || nested.translated_srt },
     { kind: 'translated_sidecar', label: '查看字幕副本', path: stage?.translated_sidecar || nested.translated_sidecar },
     { kind: 'subtitle', label: '查看字幕', path: stage?.subtitle_path || nested.subtitle_path },
   ]
@@ -414,13 +415,13 @@ function openArtifact(task, stage, artifact) {
 }
 
 function artifactShortcuts(task) {
-  const entries = (task.stage_items || []).flatMap(stage => artifactItems(stage).map(artifact => ({ stage, artifact })))
+  const entries = (task.stage_items || []).flatMap(stage => artifactItems(stage, task).map(artifact => ({ stage, artifact })))
   const choose = kinds => entries.find(entry => kinds.includes(entry.artifact.kind))
   const target = choose(['translated_srt']) || choose(['translated_sidecar', 'subtitle'])
   const source = choose(['source_srt'])
   const glossary = choose(['glossary'])
   const seen = new Set()
-  return [[target, target?.artifact.kind === 'subtitle' ? '打开字幕' : '打开中文字幕'], [source, '打开原文字幕'], [glossary, '查看术语表']].flatMap(([entry, label]) => {
+  return [[target, target?.artifact.kind === 'subtitle' ? '打开字幕' : `打开${targetSubtitleLabel(task.payload?.target_language || task.target_language)}`], [source, '打开原文字幕'], [glossary, '查看术语表']].flatMap(([entry, label]) => {
     if (!entry || seen.has(entry.artifact.path)) return []
     seen.add(entry.artifact.path)
     return [{ ...entry, label }]
@@ -428,11 +429,12 @@ function artifactShortcuts(task) {
 }
 
 function archiveArtifactLabel(artifact) {
+  const language = String(artifact?.path || '').match(/(?:^|[/.])(en|ja|ko)(?:[._]|$)/)?.[1] || 'zh'
   return {
     source_srt: '旧版原文 SRT',
     reference_srt: '旧版参考 SRT',
     glossary_path: '旧版术语表',
-    translated_srt: '旧版中文字幕',
+    translated_srt: `旧版${targetSubtitleLabel(language)}`,
     translated_sidecar: '旧版字幕副本',
     subtitle_path: '旧版字幕',
   }[artifact?.kind] || '打开历史产物'

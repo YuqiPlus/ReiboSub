@@ -2,7 +2,7 @@
 
 [中文说明](README.zh-CN.md)
 
-ReiboSub is a YouTube/video subtitle production assistant. It can download YouTube videos, subtitles, and thumbnails; extract embedded hard subtitles with OCR; transcribe speech with ASR; generate and review glossary drafts; translate subtitles with an OpenAI-compatible LLM; edit and convert subtitle files; and copy playable sidecar subtitles next to the video.
+ReiboSub is a subtitle production assistant for YouTube, ordinary Bilibili uploads, and local videos. It can download videos, subtitles, and thumbnails; extract embedded hard subtitles with OCR; transcribe speech with ASR; generate and review glossary drafts; translate subtitles with an OpenAI-compatible LLM; edit and convert subtitle files; and copy playable sidecar subtitles next to the video.
 
 The project is designed for a human-in-the-loop workflow: the Agent can run multiple video flows at the same time, pause when it needs your decision, and continue after you review glossary terms.
 
@@ -30,6 +30,10 @@ For Agent routing design notes, see [docs/youtube_agent_workflows.md](docs/youtu
 Choose the experimental autonomous mode in the Agent cockpit and provide a YouTube link. New sessions use an evidence-linked controller: the model chooses each next tool, revises a short plan after observations or failures, and selects delivery when artifact checks allow it. There is no mandatory run-through of every tool. The legacy workflow and saved older experimental sessions retain their existing protocols.
 
 Tools include caption discovery and reuse, subtitle-context queries, frame sampling at model-selected times, vision/OCR trials, ASR, bounded 4–30 second audio checks, source comparison, and local translation review. Vision requires a configured image-capable model; local recognition requires its optional dependencies. The model cannot run arbitrary commands, select arbitrary files, change providers, bypass human glossary review for translation, or overwrite existing translated results. Reusing existing Chinese captions does not require glossary generation or retranslation.
+
+New autonomous tasks prioritize authored, burned-in subtitles. Before choosing a source, the Agent must analyze at least four frames spanning 60% of the video. If content subtitles are visible, OCR 3.0 supplies the primary text; external captions and localized audio checks are references, not substitutes. Whole-video ASR is available only after diverse sampled observations have not found burned-in subtitles, and this is not a claim about every frame. Conservative OCR crops preserve the full width and bottom edge rather than tightly cropping a few centered single-line samples. Saved experiments and explicitly scoped continuations keep their original protocols.
+
+This experiment saves raw OCR separately, then performs bounded grouped review of candidate HUD/player-ID/object-text noise. Native-script text and adjacent name/number fragments are protected; uncertain groups remain evidence rather than being discarded solely for containing Latin letters or numbers. Native dialogue anchors the per-frame machine seed, so uncertain footer IDs cannot replace it. Raw tracks, quarantine audits and final subtitles remain separate. A dedicated subprocess reuses the existing V3 final refiners with bounded requests/timeouts/output and non-thinking Doubao 2.1 generation; OCR Lab and its stable defaults are unchanged.
 
 Normal new tasks must save both the video and Chinese subtitles. The Agent may inspect captions and decide its approach before scheduling the download, and reuses an existing project video when available. Missing video prevents completion even when Chinese captions are ready. The UI shows saved-video status and a download link. Explicit verification-only, local-review and source-reuse continuations retain their original narrower scope.
 
@@ -131,6 +135,25 @@ youtube_proxy: http://127.0.0.1:7890
 Local OCR/ASR/LLM child processes do not use generic `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` by default; this keeps a YouTube proxy from slowing down local processing.
 
 Existing installations can keep their old `configs/local_runtime.yaml`, `.env`, and `configs/llm.yaml` files. They remain compatibility inputs and do not need to be migrated or deleted.
+
+### Bilibili uploads and multipart videos
+
+New Bilibili Agent tasks default to **Chinese → English**. YouTube keeps the configured source-language default and a Chinese target. Source and target can be changed independently; supported targets are Chinese, English, Japanese, and Korean. Saved tasks keep their original target rather than adopting new platform defaults.
+
+Glossary names, reference translations, verification, and delivered filename suffixes follow the selected target (`.zh.srt`, `.en.srt`, `.ja.srt`, `.ko.srt`; experimental copies retain review markers). A glossary without `target_language` is treated as a legacy Chinese glossary and cannot silently be reused for another target. The historical `zh` / `suggested_zh` JSON/YAML keys remain compatible, but contain the selected target-language text, not necessarily Chinese.
+
+Both **Downloads & Links** and **Agent** accept ordinary `https://www.bilibili.com/video/BV…` links, BV/av IDs, and `https://b23.tv/…` short links. Each task handles one part: P1 by default, or a specified part such as `https://www.bilibili.com/video/BV…?p=2`. Part-specific task keys and download directories prevent overwriting or incorrectly reusing another part's OCR results.
+
+Downloads include available quality choices, thumbnails, and accessible CC captions. The Agent reuses its existing visual inspection, OCR/ASR, glossary review, and translation tools. Bilibili `ai-*` captions are marked as automatic, not human-authored; danmaku is excluded. Bangumi, live streams, whole collections, and automatic all-part batches are not supported by this integration.
+
+Bilibili connects directly by default, independently of `youtube_proxy`. Some captions, qualities, and videos require login or account entitlements. If needed, add these optional fields to your local `configs/reibosub.yaml`, then restart. Use your own exported Netscape-format cookies, stored outside the repository; never share or commit them:
+
+```yaml
+bilibili_proxy: ""
+bilibili_cookie_file: /private/path/bilibili.cookies.txt
+```
+
+The integration only accesses content available to your session; it does not bypass paid, membership, or regional restrictions. Existing `video_translate.youtube.*` helper command names are retained for compatibility and now also accept ordinary Bilibili video/part links.
 
 ### 5. Start the UI
 

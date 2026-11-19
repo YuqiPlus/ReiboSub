@@ -50,7 +50,7 @@
           </details>
         </div>
         <div v-if="session.question.kind === 'autonomous_question'" class="autonomous-question">
-          <p v-if="session.question.question_type === 'translation'">这是中文含义/译法的求证，不是重新识别原文。选择后只对这条继续复核，不会重翻整片。</p>
+          <p v-if="session.question.question_type === 'translation'">这是译文含义/译法的求证，不是重新识别原文。选择后只对这条继续复核，不会重翻整片。</p>
           <audio v-if="session.question.audio_path" controls preload="none" :src="`/api/file?path=${encodeURIComponent(session.question.audio_path)}`" aria-label="疑句原音" />
           <button v-for="candidate in session.question.candidate_details || []" :key="candidate.text" class="secondary" type="button"
             @click="$emit('answer-agent', { action: 'autonomous_reply', confirmed_text: candidate.text })">
@@ -162,11 +162,11 @@
       <div v-if="isAutonomous && session.result.translated_srt" class="agent-decision-card agent-delivery-card">
         <div class="delivery-file-icon"><AppIcon name="log" :size="21" /></div>
         <div class="delivery-heading">
-          <h3>{{ session.status === 'done' ? (session.result.delivery_mode === 'existing_target_subtitle' ? '中文字幕已就绪' : '中文字幕已生成') : '已有字幕草稿' }}</h3>
+          <h3>{{ session.status === 'done' ? `${deliverySubtitleLabel}${session.result.delivery_mode === 'existing_target_subtitle' ? '已就绪' : '已生成'}` : '已有字幕草稿' }}</h3>
           <span v-if="deliveryCount" class="delivery-count">{{ deliveryCount }} 条 · SRT</span>
         </div>
         <div class="delivery-actions">
-          <a class="button-link delivery-primary" :href="`/api/file?path=${encodeURIComponent(session.result.translated_srt)}`" download><AppIcon name="download" :size="15" />下载中文字幕</a>
+          <a class="button-link delivery-primary" :href="`/api/file?path=${encodeURIComponent(session.result.translated_srt)}`" download><AppIcon name="download" :size="15" />下载{{ deliverySubtitleLabel }}</a>
           <a v-if="session.result.source_srt" class="delivery-secondary" :href="`/api/file?path=${encodeURIComponent(session.result.source_srt)}`" download>原文字幕</a>
           <a v-if="session.result.input_video" class="delivery-secondary" :href="`/api/file?path=${encodeURIComponent(session.result.input_video)}`" download>视频</a>
         </div>
@@ -217,12 +217,12 @@
       </details>
       <details v-if="session?.question?.kind !== 'autonomous_verification_review' && session?.result?.autonomous_verification?.status === 'complete' && session.result.autonomous_verification.issues?.length" class="agent-decision-card agent-review-details">
         <summary>检查结果 · {{ session.result.autonomous_verification.issues.length }} 处待复核</summary>
-        <p v-if="session.result.autonomous_verification.structure">原文 {{ session.result.autonomous_verification.structure.source_count }} 条 · 中文 {{ session.result.autonomous_verification.structure.target_count }} 条</p>
+        <p v-if="session.result.autonomous_verification.structure">原文 {{ session.result.autonomous_verification.structure.source_count }} 条 · 译文 {{ session.result.autonomous_verification.structure.target_count }} 条</p>
         <details v-for="(issue, i) in session.result.autonomous_verification.issues.slice(0, 12)" :key="i">
           <summary>{{ issue.id ? `第 ${issue.id} 条：` : '' }}{{ issue.reason_zh }}</summary>
           <p v-if="issue.source_quote">原文：{{ issue.source_quote }}</p>
-          <p v-if="issue.kind === 'empty_translation'">中文：当前为空，需要局部复核，不会因此重翻整片或重新对齐。</p>
-          <p v-else-if="issue.translation_quote">中文：{{ issue.translation_quote }}</p>
+          <p v-if="issue.kind === 'empty_translation'">译文：当前为空，需要局部复核，不会因此重翻整片或重新对齐。</p>
+          <p v-else-if="issue.translation_quote">译文：{{ issue.translation_quote }}</p>
         </details>
       </details>
 
@@ -260,12 +260,13 @@
     <section v-if="!session" class="agent-launchpad agent-new-task" aria-label="新建字幕任务">
       <form class="agent-command" @submit.prevent="submitTask">
         <div class="agent-url-field">
-          <label class="sr-only" for="agentUrl">YouTube 链接或视频 ID</label>
-          <input id="agentUrl" :value="url" autocomplete="off" placeholder="粘贴 YouTube 链接，开始制作中文字幕…" @input="$emit('update:url', $event.target.value)" />
+          <label class="sr-only" for="agentUrl">YouTube / B 站链接或视频 ID，分 P 可带 ?p=2</label>
+          <input id="agentUrl" :value="url" autocomplete="off" placeholder="粘贴 YouTube / B 站视频链接，分 P 可带 ?p=2…" @input="$emit('update:url', $event.target.value)" />
         </div>
         <div class="composer-controls">
           <label class="composer-select"><AppIcon name="spark" :size="16" /><span class="sr-only">处理模式</span><select aria-label="处理模式" :value="agentMode" @change="$emit('update:agentMode', $event.target.value)"><option value="autonomous">自主 Agent · 实验</option><option value="workflow">经典工作流</option></select></label>
           <label class="composer-select"><AppIcon name="language" :size="16" /><span class="sr-only">音源语言</span><select aria-label="音源语言" :value="sourceLanguage" @change="$emit('update:sourceLanguage', $event.target.value)"><option value="auto">自动识别语言</option><option value="korean">韩语</option><option value="japanese">日语</option><option value="english">英语</option><option value="chinese">中文</option></select></label>
+          <label class="composer-select"><span>译成</span><select aria-label="目标字幕语言" :value="targetLanguage" @change="$emit('update:targetLanguage', $event.target.value)"><option v-for="language in targetLanguages" :key="language.id" :value="language.id">{{ language.label }}</option></select></label>
         </div>
         <div class="agent-submit">
           <button type="submit" :disabled="starting || !url.trim()" :aria-label="starting ? '正在启动任务' : '开始制作字幕'" :title="starting ? '正在启动' : '开始制作字幕'">
@@ -298,7 +299,7 @@
         <summary>补充要求与能力说明 <span v-if="extraHint.trim()" class="composer-hint-set">已填写</span></summary>
         <label>补充要求<input :value="extraHint" placeholder="例如：对白和画面配字都保留，不要节目水印" @input="$emit('update:extraHint', $event.target.value)" /></label>
         <p>无需选择测试区间；按整片处理。首版视频下载与重识别工具限1小时以内，较长素材可先尝试已有外挂字幕。</p>
-        <p>Agent 会先检查现成中文字幕，按需使用 OCR 或 ASR。翻译前仍由你确认术语；视觉分析需要支持图片的模型。</p>
+        <p>B 站默认中文→英语，YouTube 保持原默认；上方可手动修改。Agent 按目标语言检查现成字幕，按需使用 OCR 或 ASR。翻译前仍由你确认术语；视觉分析需要支持图片的模型。</p>
       </details>
       <details v-else class="agent-advanced-settings">
         <summary>高级设置：语言、内嵌字幕、任务提示与 OCR 裁框</summary>
@@ -328,7 +329,7 @@
               <option value="korean">韩语</option>
               <option value="japanese">日语</option>
               <option value="english">英语</option>
-              <option value="chinese">中文：只提取</option>
+              <option value="chinese">中文</option>
             </select>
           </div>
           <div v-if="ocrPipelineVersion === 'v1'" class="agent-setting">
@@ -422,6 +423,7 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
+import { targetLanguages, targetSubtitleLabel, sessionTargetLanguage } from '../translationLanguages.js'
 import { currentLocalReview, autonomousDraftMessage, publicAgentDecision, friendlyAgentText, evidenceRefLabel, subtitleSourceLabel } from '../autonomousPresentation.js'
 import OcrCropControls from './OcrCropControls.vue'
 import { getAgentOcrPipeline, inferAgentOcrPipelineVersion } from '../agentOcrPipeline.js'
@@ -440,6 +442,7 @@ const props = defineProps({
   embeddedSubtitleHint: { type: String, default: 'unknown' },
   embeddedSubtitleGoal: { type: String, default: 'screen_subtitle' },
   sourceLanguage: { type: String, default: 'auto' },
+  targetLanguage: { type: String, default: 'zh' },
   ocrLanguage: { type: String, default: 'auto' },
   ocrScope: { type: String, default: 'bottom' },
   ocrPipelineVersion: { type: String, default: 'v3' },
@@ -467,6 +470,7 @@ const emit = defineEmits([
   'update:embeddedSubtitleHint',
   'update:embeddedSubtitleGoal',
   'update:sourceLanguage',
+  'update:targetLanguage',
   'update:ocrLanguage',
   'update:ocrScope',
   'update:ocrPipelineVersion',
@@ -551,9 +555,9 @@ const autonomousToolLabels = { decide: '判断下一步', planner: '检查下一
   analyze_frames: '分析画面', ocr_trial: '试跑OCR与遮罩', ocr: '提取画面字幕', asr: '听取音频', detect_language: '判断音源语言',
   select_source: '选择原文', inspect: '检查原文', review_audio: '局部重听', patch: '修正原文', translate: '翻译字幕',
   verify: '检查译文', align: '校准时间', question: '需要一点线索', finish: '交付字幕',
-  inspect_target: '检查现成中文字幕', deliver_target: '直接交付现成中文', ask_target: '确认现成字幕疑点', read_subtitles: '查看字幕上下文', review_target: '对照原文抽查现成中文', transcribe_clip: '局部音频取证', target_review: '确认现成字幕覆盖', target_caption_choice: '选择现成字幕处理方式',
+  inspect_target: '检查现成目标字幕', deliver_target: '直接交付现成目标字幕', ask_target: '确认现成字幕疑点', read_subtitles: '查看字幕上下文', review_target: '对照原文抽查现成目标字幕', transcribe_clip: '局部音频取证', target_review: '确认现成字幕覆盖', target_caption_choice: '选择现成字幕处理方式',
   internal_recovery: '恢复验收状态', format_recovery: '恢复已确认的格式清理', review_scope: '暂停于局部复核边界', internal_error: '内部错误（字幕已保留）', verification_review: '已有具体疑点，未改稿',
-  review_translation: '局部复核译文（不重翻整片）', ask_user: '询问具体字幕疑点', reuse_source: '复用既有原字幕', reuse_translation: '复用既有中文字幕',
+  review_translation: '局部复核译文（不重翻整片）', ask_user: '询问具体字幕疑点', reuse_source: '复用既有原字幕', reuse_translation: '复用既有译文字幕',
   glossary: '准备Glossary，等待人工审核', human_glossary_review: '用户已审核Glossary' }
 
 const primaryActions = ['use_recommended', 'start_hybrid_anchor_ocr', 'use_cached_ocr', 'download_video_for_preview', 'run_ocr', 'run_asr', 'run_asr_with_ocr', 'probe_audio_language']
@@ -604,12 +608,13 @@ const routeLabel = computed(() => {
 
 const steps = computed(() => buildAgentFlowSteps(props.session?.phase || 'created', props.session?.status || ''))
 
+const deliverySubtitleLabel = computed(() => targetSubtitleLabel(sessionTargetLanguage(props.session)))
 const resultItems = computed(() => {
   const result = props.session?.result || {}
   return [
     ['源字幕', result.source_srt],
     ['Glossary', result.glossary_path],
-    ['中文字幕', result.translated_srt],
+    [deliverySubtitleLabel.value, result.translated_srt],
     ['视频', result.input_video],
     ['标准链接', result.normalized_url],
   ]

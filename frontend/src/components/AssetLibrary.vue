@@ -148,6 +148,7 @@ async function copyPath(path) {
 
 function sourceLabel(sourceType) {
   if (sourceType === 'youtube') return 'YouTube'
+  if (sourceType === 'bilibili') return 'Bilibili'
   if (sourceType === 'local') return '本地素材'
   return '未登记来源'
 }

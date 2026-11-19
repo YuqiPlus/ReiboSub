@@ -1,3 +1,5 @@
+import { targetSubtitleLabel, sessionTargetLanguage } from './translationLanguages.js'
+
 export function currentLocalReview(result) {
   const review = result?.local_translation_review
   if (!review || result.local_translation_review_current === false) return null
@@ -6,7 +8,7 @@ export function currentLocalReview(result) {
 }
 
 export function subtitleSourceLabel(result) {
-  if (result?.delivery_mode === 'existing_target_subtitle') return '字幕来源：现成中文字幕，未重新翻译'
+  if (result?.delivery_mode === 'existing_target_subtitle') return `字幕来源：现成${targetSubtitleLabel(result.target_language)}，未重新翻译`
   if (result?.source_kind === 'ocr') return '原文来源：画面内嵌字幕 · OCR 3.0'
   if (result?.source_kind === 'asr') return '原文来源：语音识别 · ASR 2.2'
   if (result?.source_kind === 'captions') return '原文来源：外挂字幕'
@@ -17,7 +19,7 @@ export function subtitleSourceLabel(result) {
 }
 
 const publicToolNames = {
-  inspect_target: '检查现成中文字幕', deliver_target: '交付现成中文字幕', review_target: '对照原文抽查中文',
+  inspect_target: '检查现成目标字幕', deliver_target: '交付现成目标字幕', review_target: '对照原文抽查目标字幕',
   read_subtitles: '查看字幕上下文', transcribe_clip: '局部音频核查', sample_frames: '抽帧观察',
   analyze_frames: '分析画面', ocr_trial: 'OCR 试跑', review_translation: '局部译文复核',
   review_audio: '局部重听', compare_sources: '对照字幕来源', select_source: '选择原文',
@@ -63,8 +65,8 @@ export function publicAgentDecision(result) {
 
 export function autonomousDraftMessage(session) {
   if (session?.status === 'waiting' && session?.phase === 'autonomous_verification_review') return '结构检查已完成，尚有译文疑点需要局部复核；当前为草稿，未标记完成。'
-  if (session?.status === 'running' && session?.phase === 'autonomous_download') return '中文字幕已保留，正在保存视频素材，不会重新翻译。'
-  if (session?.status === 'failed') return '中文字幕已保留，但最终检查尚未完成。工具失败详情见操作记录，不是等待检测。'
+  if (session?.status === 'running' && session?.phase === 'autonomous_download') return `${targetSubtitleLabel(sessionTargetLanguage(session))}已保留，正在保存视频素材，不会重新翻译。`
+  if (session?.status === 'failed') return `${targetSubtitleLabel(sessionTargetLanguage(session))}已保留，但最终检查尚未完成。工具失败详情见操作记录，不是等待检测。`
   if (session?.status === 'done') return session.result?.quality_warning || '已完成自动检查；语义检查为抽查，不代表人工逐字核准。'
   if (session?.status === 'waiting') return '字幕已保留，正在等待你补充具体疑点的线索。'
   return '正在检查当前译稿；只对具体疑点做局部复核，不重翻整片。'

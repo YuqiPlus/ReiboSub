@@ -76,9 +76,12 @@ def validate_review(result, subtitles):
     return {'checks': checks, 'issues': issues, 'context_findings':findings}
 
 
-def review_semantics(root, attempt, subtitles, llm_json, reviewed_glossary=None):
+def review_semantics(root, attempt, subtitles, llm_json, reviewed_glossary=None, target_language='zh'):
     """One schema repair, on the same pairs/provider; never change subtitle text."""
-    data = {'subtitles': subtitles,'reviewed_glossary':reviewed_glossary or {}}
+    from video_translate.translation_languages import target_language_code, target_language_name
+    language = {'target_language': target_language_code(target_language), 'target_language_name': target_language_name(target_language),
+                'field_note': 'zh是历史兼容字段名，存放目标语言译文或固定译名，不意味着中文。应检查译文是否使用指定目标语言。'}
+    data = {'subtitles': subtitles,'reviewed_glossary':reviewed_glossary or {}, **language}
     audit = []
     for retry in range(2):
         name = f'{attempt}-schema-repair' if retry else attempt
@@ -91,6 +94,7 @@ def review_semantics(root, attempt, subtitles, llm_json, reviewed_glossary=None)
         except ValueError as exc:
             audit.append({'attempt': name, 'status': 'protocol_error', 'code': str(exc)})
             data = {'subtitles': subtitles, 'previous_response': result, 'format_error': str(exc),
+                    **language,
                     'reviewed_glossary':reviewed_glossary or {},
                     'repair_instruction': '上一轮结构无效，请按checks协议重新逐条判断。不得沿用正常说明作为错误，不得修改输入字幕。'}
         else:

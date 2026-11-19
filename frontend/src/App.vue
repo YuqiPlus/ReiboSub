@@ -18,7 +18,8 @@
               v-model:url="url"
               v-model:embedded-subtitle-hint="embeddedSubtitleHint"
               v-model:embedded-subtitle-goal="embeddedSubtitleGoal"
-              v-model:source-language="sourceLanguage"
+              v-model:source-language="agentSourceLanguage"
+              v-model:target-language="agentTargetLanguage"
               v-model:ocr-language="ocrLanguage"
               v-model:ocr-scope="ocrScope"
               v-model:ocr-pipeline-version="agentOcrPipelineVersion"
@@ -213,6 +214,7 @@
 
           <div v-else-if="activeView === 'subtitles'" class="page-stack">
             <TranslationFlow
+              v-model:target-language="subtitleTargetLanguage"
               v-model:source-srt="sourceSrt"
               v-model:glossary-path="glossaryPath"
               v-model:extra-hint="extraHint"
@@ -281,6 +283,7 @@
 
           <div v-else-if="activeView === 'glossary'" class="page-stack">
             <GlossaryReviewPanel
+              :target-language="glossaryTargetLanguage"
               v-model:glossary-path="glossaryPath"
               :glossary-editor="glossaryEditor"
               :glossary-items="glossaryItems"
@@ -392,11 +395,12 @@ import { createGlossaryReviewAutosave } from './glossaryReviewAutosave.js'
 import { mergeGlossaryCandidates } from './glossaryCandidates.js'
 import {
   isProbeResponseCurrent,
-  looksLikeYoutubeInput,
+  looksLikeVideoInput,
   resolveLinkActionUrl,
   selectedVideoFormat,
   shouldClearLinkProbe,
 } from './linkToolState.js'
+import { translationDefaults } from './translationLanguages.js'
 import {
   canReuseOpenedGlossaryReview,
   findGlossaryReviewSession,
@@ -452,6 +456,8 @@ const glossaryPath = ref('')
 const extraHint = ref('')
 const glossaryEditor = ref('')
 const glossaryItems = ref([])
+const glossaryTargetLanguage = ref('zh')
+const subtitleTargetLanguage = ref('zh')
 const glossaryLoading = ref(false)
 const glossaryCandidateStatus = ref({ state: 'ready', total: 0, ready: 0, pending: 0, failed: 0 })
 const loadedGlossaryPath = ref('')
@@ -512,6 +518,16 @@ let videoFormatsTimer = null
 const embeddedSubtitleHint = ref('unknown')
 const embeddedSubtitleGoal = ref('screen_subtitle')
 const sourceLanguage = ref('korean')
+const agentSourceOverride = ref(null)
+const agentTargetOverride = ref(null)
+const agentSourceLanguage = computed({
+  get: () => agentSourceOverride.value ?? translationDefaults(url.value, sourceLanguage.value).source,
+  set: (value) => { agentSourceOverride.value = value },
+})
+const agentTargetLanguage = computed({
+  get: () => agentTargetOverride.value ?? translationDefaults(url.value).target,
+  set: (value) => { agentTargetOverride.value = value },
+})
 const ocrLanguage = ref('auto')
 const localVideo = ref('')
 const activeJobId = ref('')
@@ -739,6 +755,8 @@ function openNewAgentDraft() {
   // Opening a composer is local navigation; existing tasks keep running.
   newAgentDraft.value = true
   url.value = ''
+  agentSourceOverride.value = null
+  agentTargetOverride.value = null
   extraHint.value = ''
   if (settingsEditor.value) applyAppSettingDefaults(settingsEditor.value)
   setStatus(agentStatus, '', '')
@@ -1023,9 +1041,9 @@ async function startAgent() {
       url: url.value.trim(),
       embedded_subtitle_hint: embeddedSubtitleHint.value,
       embedded_subtitle_goal: agentMode.value === 'autonomous' ? 'auto' : embeddedSubtitleGoal.value,
-      source_language: sourceLanguage.value,
+      source_language: agentSourceLanguage.value,
       ocr_language: ocrLanguage.value,
-      target_language: 'zh',
+      target_language: agentTargetLanguage.value,
       extra_hint: extraHint.value,
       ...agentOcrPipeline,
       ocr_crop_top_ratio: ocrCropTopRatio.value,
@@ -1327,7 +1345,8 @@ function restoreAgentOcrPipeline(session) {
     if (Number.isFinite(value)) target.value = value
   }
   if (typeof payload.ocr_exclude_enabled === 'boolean') ocrExcludeEnabled.value = payload.ocr_exclude_enabled
-  if (payload.source_language) sourceLanguage.value = payload.source_language
+  if (payload.source_language) { sourceLanguage.value = payload.source_language; agentSourceOverride.value = payload.source_language }
+  agentTargetOverride.value = payload.target_language || 'zh'
   if (payload.ocr_language) ocrLanguage.value = payload.ocr_language
   if (payload.embedded_subtitle_goal) embeddedSubtitleGoal.value = payload.embedded_subtitle_goal
 }
@@ -1560,7 +1579,7 @@ async function openGlossaryReviewForSession(session) {
 function scheduleVideoFormats(value, delay = 650) {
   if (videoFormatsTimer) window.clearTimeout(videoFormatsTimer)
   videoFormatsTimer = null
-  if (!looksLikeYoutubeInput(value)) return
+  if (!looksLikeVideoInput(value)) return
   const requestedUrl = String(value || '').trim()
   videoFormatsTimer = window.setTimeout(() => {
     videoFormatsTimer = null
@@ -1629,7 +1648,7 @@ async function probeVideo() {
       url: requestedUrl,
       embedded_subtitle_hint: embeddedSubtitleHint.value,
       source_language: sourceLanguage.value,
-      target_language: 'zh',
+      target_language: agentTargetLanguage.value,
     })
     if (requestSequence !== linkProbeSequence || !isProbeResponseCurrent(requestedUrl, url.value)) {
       setStatus(probeStatus, '链接已更改，已忽略上一条链接的检测结果。', '')
@@ -2140,6 +2159,7 @@ async function generateGlossary() {
   try {
     const job = await api('/api/jobs/generate-glossary', {
       source_srt: sourceSrt.value.trim(),
+      target_language: subtitleTargetLanguage.value,
       source_language: sourceLanguage.value,
       extra_hint: extraHint.value,
     })
@@ -2200,6 +2220,8 @@ async function loadGlossary(pathOverride) {
     glossaryPath.value = requestedPath
     glossaryEditor.value = text.content || ''
     glossaryItems.value = review.items || []
+    glossaryTargetLanguage.value = review.target_language || 'zh'
+    subtitleTargetLanguage.value = review.target_language || 'zh'
     glossaryCandidateStatus.value = review.candidates || { state: 'ready', total: 0, ready: 0, pending: 0, failed: 0 }
     loadedGlossaryPath.value = requestedPath
     glossaryTextDirty.value = false
@@ -2392,6 +2414,7 @@ async function translateSubtitle() {
       glossary: glossaryPath.value.trim(),
       translation_mode: subtitleTranslationMode.value,
       source_language: sourceLanguage.value,
+      target_language: subtitleTargetLanguage.value,
     }
     const job = await api('/api/jobs/translate-subtitle', payload)
     watchJob(job)

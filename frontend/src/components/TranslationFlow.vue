@@ -1,9 +1,9 @@
 <template>
   <section class="panel translation-studio">
-    <header class="studio-page-head"><div><span class="studio-kicker">翻译与转换</span><h2>让字幕更进一步</h2><p>翻译成中文、纠正原文，或换一种字幕格式。</p></div></header>
+    <header class="studio-page-head"><div><span class="studio-kicker">翻译与转换</span><h2>让字幕更进一步</h2><p>选择目标语言翻译、纠正原文，或换一种字幕格式。</p></div></header>
     <div class="studio-source-picker"><label for="sourceSrt">字幕文件<input id="sourceSrt" :value="sourceSrt" placeholder="选择或填写字幕文件路径" @input="$emit('update:sourceSrt', $event.target.value)" /></label><button class="secondary" @click="$emit('open-assets')"><AppIcon name="folder" :size="16" />从素材库选择</button></div>
     <nav class="studio-tabs operation-tabs" aria-label="字幕操作"><button v-for="operation in operations" :key="operation.id" type="button" :class="{ active: activeOperation === operation.id }" :aria-pressed="activeOperation === operation.id" @click="activeOperation = operation.id">{{ operation.label }}</button></nav>
-    <div v-show="activeOperation !== 'convert'" class="translation-language-row"><label for="subtitleSourceLanguage">原文语言<select id="subtitleSourceLanguage" :value="sourceLanguage" @change="$emit('update:sourceLanguage', $event.target.value)"><option value="auto">自动识别</option><option value="korean">韩语</option><option value="japanese">日语</option><option value="english">英语</option><option value="chinese">中文</option></select></label><span>{{ activeOperation === 'correct' ? '纠正识别文本，保留原语言。' : '输出中文字幕。' }}</span></div>
+    <div v-show="activeOperation !== 'convert'" class="translation-language-row"><label for="subtitleSourceLanguage">原文语言<select id="subtitleSourceLanguage" :value="sourceLanguage" @change="$emit('update:sourceLanguage', $event.target.value)"><option value="auto">自动识别</option><option value="korean">韩语</option><option value="japanese">日语</option><option value="english">英语</option><option value="chinese">中文</option></select></label><label v-if="activeOperation !== 'correct'" for="subtitleTargetLanguage">译成<select id="subtitleTargetLanguage" :value="targetLanguage" @change="$emit('update:targetLanguage', $event.target.value)"><option v-for="language in targetLanguages" :key="language.id" :value="language.id">{{ language.label }}</option></select></label><span v-else>纠正识别文本，保留原语言。</span></div>
     <div v-show="activeOperation === 'translate'" class="translation-operation-body">
       <div class="operation-intro"><AppIcon name="language" :size="24" /><div><h3>翻译为中文</h3><p>可先确认人名和固定译法，再开始翻译。</p></div></div>
       <details class="studio-disclosure translation-glossary"><summary>术语表（可选）<span>{{ glossaryPath.trim() ? '已选择文件' : '未选择' }}</span></summary><label for="glossaryPath">术语表文件<input id="glossaryPath" :value="glossaryPath" placeholder="填写已有术语表路径，或先生成草稿" @input="$emit('update:glossaryPath', $event.target.value)" /></label><div class="toolbar"><button class="secondary" :disabled="!sourceSrt.trim()" @click="$emit('generate-glossary')">从字幕生成术语表</button><button class="secondary" :disabled="!glossaryPath.trim()" @click="$emit('load-glossary')">打开术语审核</button></div></details>
@@ -20,23 +20,26 @@
 <script setup>
 import { computed, ref } from 'vue'
 import AppIcon from './AppIcon.vue'
+import { targetLanguages } from '../translationLanguages.js'
 const props = defineProps({
   sourceSrt: { type: String, default: '' },
   glossaryPath: { type: String, default: '' },
   extraHint: { type: String, default: '' },
   subtitleTranslationMode: { type: String, default: 'translate_only' },
   sourceLanguage: { type: String, default: 'auto' },
+  targetLanguage: { type: String, default: 'zh' },
   subtitleConvertFormat: { type: String, default: 'vtt' },
   status: { type: String, default: '' },
   statusClass: { type: String, default: '' },
 })
 
 const emit = defineEmits([
+  'update:targetLanguage',
   'update:sourceSrt', 'update:glossaryPath', 'update:extraHint', 'update:subtitleTranslationMode', 'update:subtitleConvertFormat', 'update:sourceLanguage',
   'correct-asr', 'generate-glossary', 'load-glossary', 'translate-subtitle', 'convert-subtitle', 'open-assets',
 ])
 const activeOperation = ref('translate')
-const operations = [{ id: 'translate', label: '翻译为中文' }, { id: 'correct', label: '原文纠错' }, { id: 'convert', label: '格式转换' }]
+const operations = [{ id: 'translate', label: '翻译字幕' }, { id: 'correct', label: '原文纠错' }, { id: 'convert', label: '格式转换' }]
 const timingLabel = computed(() => ({ translate_only: '锁定时间轴', standard_cleanup: '标准清理', readability_retime: '优化阅读时长' }[props.subtitleTranslationMode] || props.subtitleTranslationMode))
 function runOperation() {
   if (!props.sourceSrt.trim()) return

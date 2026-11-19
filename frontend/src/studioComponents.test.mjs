@@ -17,6 +17,23 @@ async function render(name, props) {
   return renderToString(createSSRApp({ render: () => h(component, props) }))
 }
 
+test('Agent language selector and English delivery never claim a Chinese artifact', async () => {
+  const composer = await render('AgentSessionPanel', { url: 'https://www.bilibili.com/video/BV1GJ411x7h7', sourceLanguage: 'chinese', targetLanguage: 'en' })
+  assert.match(composer, /目标字幕语言/)
+  assert.match(composer, /<select[^>]*value="en"[^>]*>/)
+  const delivery = await render('AgentSessionPanel', { session: { id: 'sample', status: 'done', phase: 'done', payload: { target_language: 'en', agent_mode: 'autonomous' }, result: { translated_srt: '/sample/en.srt' } } })
+  assert.match(delivery, /英文字幕已生成/)
+  assert.match(delivery, /下载英文字幕/)
+  assert.doesNotMatch(delivery, /下载中文字幕/)
+})
+
+test('glossary review labels confirmed names in the task target language', async () => {
+  const html = await render('GlossaryReviewPanel', { targetLanguage: 'en', reviewReady: true,
+    glossaryItems: [{ section: 'characters', index: 0, source: '小王', zh: 'Xiao Wang', reviewed: false }] })
+  assert.match(html, /英语译名/)
+  assert.doesNotMatch(html, /中文译名/)
+})
+
 test('quiet header retains an accessible sidebar toggle without global counters', async () => {
   const html = await render('HeaderBar', { title: '字幕助手', sidebarOpen: true })
   assert.match(html, /字幕助手/)

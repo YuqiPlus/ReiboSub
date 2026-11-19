@@ -4284,7 +4284,7 @@ def test_download_video_job_builds_video_download_command(monkeypatch, tmp_path:
 
     assert job.status == "done"
     assert calls[0][:3] == ["/python", "-m", "video_translate.youtube.download_video"]
-    assert calls[0][3] == "abc123"
+    assert calls[0][3] == "https://www.youtube.com/watch?v=abc123"
     assert "--output-dir" in calls[0]
     assert calls[0][calls[0].index("--output-dir") + 1] == str(tmp_path)
     assert "--quality" in calls[0]
@@ -4414,7 +4414,7 @@ def test_download_thumbnail_job_builds_thumbnail_download_command(monkeypatch, t
     snapshot = _wait_job_status(job.id, "done")
 
     assert calls[0][:3] == ["/python", "-m", "video_translate.youtube.download_thumbnail"]
-    assert calls[0][3] == "abc123"
+    assert calls[0][3] == "https://www.youtube.com/watch?v=abc123"
     assert "--output-dir" in calls[0]
     assert calls[0][calls[0].index("--output-dir") + 1] == str(tmp_path)
     assert "--format" in calls[0]

@@ -124,6 +124,11 @@ from video_translate.youtube.download_video import (
 )
 from video_translate.youtube.filenames import filesystem_safe_title, normalize_download_format_tag
 from video_translate.youtube_url import normalize_youtube_url
+from video_translate.video_source import (
+    normalize_video_url, explicit_video_url, video_platform, video_part, video_id,
+    video_task_key, video_title, platform_options, validate_video_info, bilibili_caption_tracks,
+)
+from video_translate.translation_languages import target_language_code, target_language_name, default_translation_target
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT)
@@ -296,11 +301,12 @@ def probe_video(
     url: str,
     *,
     proxy: str | None = DEFAULT_PROXY,
-    target_language: str = "zh",
+    target_language: str | None = None,
     detected_source_language: str = "",
     embedded_subtitle_hint: str = "unknown",
 ) -> dict[str, Any]:
-    normalized_url = normalize_youtube_url(url)
+    normalized_url = normalize_video_url(url)
+    target_language = target_language_code(target_language or default_translation_target(normalized_url))
     opts: dict[str, Any] = {
         "skip_download": True,
         "quiet": True,
@@ -311,11 +317,17 @@ def probe_video(
         opts["proxy"] = proxy
     if shutil.which("node"):
         opts["js_runtimes"] = {"node": {}}
+    opts.update(platform_options(normalized_url, youtube_proxy=proxy))
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(normalized_url, download=False)
+    validate_video_info(info, normalized_url)
 
     manual = _caption_entries(info.get("subtitles") or {}, kind="manual")
     auto = _caption_entries(info.get("automatic_captions") or {}, kind="auto")
+    if video_platform(normalized_url) == "bilibili":
+        tracks = bilibili_caption_tracks(info)
+        manual = [{k: v for k, v in item.items() if k != "storage"} for item in tracks if item["kind"] == "manual"]
+        auto = [{k: v for k, v in item.items() if k != "storage"} for item in tracks if item["kind"] == "auto"]
     subtitles = manual + auto
     recommendation = "ocr"
     if manual:
@@ -329,9 +341,9 @@ def probe_video(
         detected_source_language=planner_source_language,
         embedded_subtitle_hint=embedded_subtitle_hint,
     )
-    title = str(info.get("title") or "")
+    title = video_title(str(info.get("title") or ""), normalized_url)
     existing_project = _find_or_bind_youtube_project(normalized_url, title)
-    thumbnail_path = _ensure_probe_thumbnail(normalized_url, title, info, proxy=proxy)
+    thumbnail_path = _ensure_probe_thumbnail(normalized_url, title, info, proxy=opts.get("proxy"))
     if thumbnail_path:
         existing_project = _find_or_bind_youtube_project(normalized_url, title)
     return {
@@ -340,6 +352,9 @@ def probe_video(
         "duration": info.get("duration"),
         "webpage_url": normalized_url,
         "normalized_url": normalized_url,
+        "source_type": video_platform(normalized_url),
+        "video_id": video_id(normalized_url),
+        "part": video_part(normalized_url),
         "subtitles": subtitles,
         "recommendation": recommendation,
         "agent_plan": agent_plan,
@@ -351,7 +366,7 @@ def probe_video(
 def download_formats(url: str, *, proxy: str | None = DEFAULT_PROXY) -> dict[str, Any]:
     """Return safe, exact video/audio selections without exposing signed media URLs."""
 
-    normalized_url = normalize_youtube_url(url)
+    normalized_url = normalize_video_url(url)
     opts: dict[str, Any] = {
         "skip_download": True,
         "quiet": True,
@@ -362,16 +377,19 @@ def download_formats(url: str, *, proxy: str | None = DEFAULT_PROXY) -> dict[str
         opts["proxy"] = proxy
     if shutil.which("node"):
         opts["js_runtimes"] = {"node": {}}
+    opts.update(platform_options(normalized_url, youtube_proxy=proxy))
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(normalized_url, download=False)
-    if not isinstance(info, dict):
-        raise RuntimeError("没有获取到视频格式信息")
+    validate_video_info(info, normalized_url)
     formats = _download_format_choices(info.get("formats") or [])
     if not formats:
         raise RuntimeError("没有发现可下载的视频格式")
     return {
         "id": str(info.get("id") or ""),
-        "title": str(info.get("title") or ""),
+        "title": video_title(str(info.get("title") or ""), normalized_url),
+        "normalized_url": normalized_url,
+        "source_type": video_platform(normalized_url),
+        "part": video_part(normalized_url),
         "duration": info.get("duration"),
         "formats": formats,
         "recommended_format_id": formats[0]["id"],
@@ -841,6 +859,12 @@ def start_agent_session(payload: dict[str, Any], *, prepared_task: dict[str, Any
     if payload.get('agent_mode') not in {None,'','autonomous','workflow'}:
         raise ValueError('不支持的Agent模式')
     normalized_payload = dict(payload)
+    # Saved/prepared tasks without this field predate multilingual delivery.
+    # Only genuinely new tasks receive platform defaults.
+    origin = normalize_video_url(str(payload.get('url') or '')) if payload.get('url') else ''
+    normalized_payload['target_language'] = target_language_code(payload.get('target_language') or ('zh' if prepared_task else default_translation_target(origin)))
+    if not payload.get('source_language') and not prepared_task and video_platform(origin) == 'bilibili':
+        normalized_payload['source_language'] = 'chinese'
     normalized_payload["source_language"] = normalize_source_language(normalized_payload.get("source_language") or "auto")
     normalized_payload["ocr_language"] = normalize_source_language(normalized_payload.get("ocr_language") or "auto")
     requested_pipeline_version = normalized_payload.get("ocr_pipeline_version")
@@ -1380,7 +1404,7 @@ def save_uploaded_project_cover(*, project_path: str, filename: str, content: by
     manifest = infer_project_manifest(project_dir)
     source_type = str(manifest.get("source_type") or "")
     title = str(manifest.get("title") or project_dir.name)
-    if source_type == "youtube":
+    if source_type in {"youtube", "bilibili"}:
         manifest = update_youtube_project_metadata(
             project_dir,
             source_url=str(manifest.get("source_url") or ""),
@@ -1516,13 +1540,14 @@ def _agent_start(session: AgentSession) -> None:
         detected_source_language=detected_source_language,
         embedded_subtitle_hint=str(payload.get("embedded_subtitle_hint") or "unknown"),
     )
+    session.payload["url"] = str(probe.get("normalized_url") or url)
     existing_project = probe.get("existing_project") if isinstance(probe.get("existing_project"), dict) else {}
     project_dir = str(existing_project.get("path") or "")
     input_video = _project_video_path(project_dir, existing_project.get("primary_video"))
     probe_result: dict[str, Any] = {
         "probe": probe,
         "normalized_url": probe.get("normalized_url"),
-        "source_type": "youtube",
+        "source_type": probe.get("source_type") or video_platform(str(probe.get("normalized_url") or "")),
     }
     if project_dir:
         probe_result["project_dir"] = project_dir
@@ -1542,7 +1567,7 @@ def _agent_start(session: AgentSession) -> None:
             prepared_task_id,
             {
                 "url": str(probe.get("normalized_url") or task.get("url") or ""),
-                "source_type": "youtube",
+                "source_type": probe.get("source_type") or video_platform(str(probe.get("normalized_url") or "")),
                 "title": title or task.get("title") or "",
                 "payload": persisted_payload,
             },
@@ -1627,14 +1652,14 @@ def _agent_ensure_project_video(
         _agent_persist_project_video(current, context)
         return context
 
-    url = _explicit_youtube_url(
+    url = explicit_video_url(
         probe.get("normalized_url")
         or current.result.get("normalized_url")
         or current.payload.get("url")
         or ""
     )
     if not url:
-        raise RuntimeError("当前 Agent 任务没有可用于下载的 YouTube 地址")
+        raise RuntimeError("当前 Agent 任务没有可用于下载的 YouTube / B 站视频地址")
 
     _agent_set_phase(session.id, phase)
     video_result = _wait_for_job(
@@ -1899,8 +1924,8 @@ def _agent_confirm_hybrid_ocr_settings(session: AgentSession) -> None:
 
 def _agent_retry_current_phase(session: AgentSession) -> None:
     if session.payload.get('agent_mode') == 'autonomous':
-        from video_translate.agent.autonomous import run
-        run(session,sys.modules[__name__])
+        from video_translate.agent.autonomous import retry
+        retry(session,sys.modules[__name__])
         return
     phase = session.phase
     if phase in {"created", "probe"}:
@@ -2010,6 +2035,9 @@ def _agent_use_recommended_subtitle(session: AgentSession) -> None:
     )
     if not plan.get("requires_translation", True):
         current = get_agent_session(session.id) or session
+        code = target_language_code(current.payload.get('target_language'))
+        target_srt = (_materialize_task_artifact(current, source_srt, f"{code}.srt") or source_srt) if code != 'zh' else source_srt
+        copied = _copy_agent_translated_sidecar(current, source_srt, target_srt) if code != 'zh' else {}
         task_id = str(current.result.get("task_id") or "")
         input_video = _agent_input_video_path(current)
         if task_id and not _update_task_stage(
@@ -2017,8 +2045,8 @@ def _agent_use_recommended_subtitle(session: AgentSession) -> None:
             "translate",
             "done",
             current_stage="done",
-            translated_srt=source_srt,
-            subtitle_path=source_srt,
+            translated_srt=target_srt,
+            subtitle_path=target_srt,
             source_kind="target_subtitle",
             input_video=str(input_video) if input_video else "",
             project_dir=str(current.result.get("project_dir") or ""),
@@ -2026,7 +2054,8 @@ def _agent_use_recommended_subtitle(session: AgentSession) -> None:
             expected_generation=_session_run_generation(current),
         ):
             raise RuntimeError("任务已被新一轮处理替代，停止保存目标语言字幕")
-        _agent_done(session.id, {"subtitle_path": source_srt, "message": "已下载目标语言字幕。"})
+        _agent_done(session.id, {"subtitle_path": target_srt, "translated_srt": target_srt,
+            **{key:str(value) for key,value in copied.items()}, "message": "已下载目标语言字幕。"})
         return
     if plan.get("needs_source_correction"):
         _agent_log(session.id, "source_correction_suggested")
@@ -2050,6 +2079,7 @@ def _agent_generate_glossary_review(session: AgentSession, source_srt: str, *, d
             "source_srt": source_srt,
             "extra_hint": str(session.payload.get("extra_hint") or ""),
             "source_language": _agent_source_language_for_glossary(session, is_hybrid or is_dual_reference or is_ocr or is_asr),
+            "target_language": session.payload.get('target_language', 'zh'),
             "out": str(_agent_workspace(session)/glossary_filename if autonomous else _agent_glossary_path(session)),
         }
     )
@@ -2170,7 +2200,7 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
     run_generation = _session_run_generation(session)
     attempt_id = str(session.result.get("translation_attempt_id") or "")
     input_video = _agent_input_video_path(session)
-    normalized_url = _explicit_youtube_url(
+    normalized_url = explicit_video_url(
         session.result.get("normalized_url") or session.payload.get("url") or ""
     )
     if not input_video and normalized_url:
@@ -2248,6 +2278,7 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
         {
             "source_srt": source_srt,
             "glossary": translation_glossary_path,
+            "target_language": session.payload.get('target_language', 'zh'),
             "translation_mode": translation_mode,
             "extra_prompt": extra_prompt,
             "out": str(_agent_workspace(session) / f"translated.{attempt_id or session.id}.srt"),
@@ -2256,7 +2287,7 @@ def _agent_translate_after_glossary(session: AgentSession, *, use_glossary: bool
     )
     translated = _wait_for_job(job, session_id=session.id)
     if translated.get("translated_srt"):
-        materialized = _materialize_task_artifact(session, str(translated.get("translated_srt")), "zh.srt")
+        materialized = _materialize_task_artifact(session, str(translated.get("translated_srt")), f"{target_language_code(session.payload.get('target_language'))}.srt")
         if materialized:
             translated["translated_srt"] = materialized
     translated.update(
@@ -2597,7 +2628,7 @@ def _agent_use_cached_ocr(session: AgentSession, cached: dict[str, Any]) -> None
 
 
 def _agent_should_finish_ocr_without_translation(session: AgentSession) -> bool:
-    return _session_ocr_language(session) == "chinese"
+    return _session_ocr_language(session) == "chinese" and target_language_code(session.payload.get('target_language')) == 'zh'
 
 
 def _agent_finish_ocr_without_translation(session: AgentSession, source_srt: str) -> None:
@@ -3072,7 +3103,7 @@ def _ensure_agent_task(
     task_id: str | None = None,
 ) -> dict[str, Any]:
     TASK_DIR.mkdir(parents=True, exist_ok=True)
-    normalized = normalize_youtube_url(normalized_url)
+    normalized = normalize_video_url(normalized_url)
     video_key = _youtube_task_key(normalized)
     if task_id:
         task_dir = _task_yaml_path(task_id).parent
@@ -3134,7 +3165,7 @@ def _ensure_agent_task(
                 "id": task_dir.name,
                 "video_key": video_key,
                 "url": normalized,
-                "source_type": "youtube",
+                "source_type": video_platform(normalized),
                 "title": title or data.get("title") or "",
                 "task_dir": str(task_dir),
                 "payload": {**(data.get("payload") if isinstance(data.get("payload"), dict) else {}), **dict(payload)},
@@ -3251,7 +3282,7 @@ def _import_legacy_agent_jobs() -> None:
                 if input_video:
                     title = Path(input_video).stem
                 agent_cache = run_config.get("agent_cache") if isinstance(run_config.get("agent_cache"), dict) else {}
-                normalized_url = _explicit_youtube_url(
+                normalized_url = explicit_video_url(
                     agent_cache.get("normalized_url")
                     or run_config.get("normalized_url")
                     or run_config.get("url")
@@ -3266,7 +3297,7 @@ def _import_legacy_agent_jobs() -> None:
             "id": task_dir.name,
             "video_key": task_dir.name,
             "url": normalized_url,
-            "source_type": "youtube" if normalized_url else "legacy",
+            "source_type": video_platform(normalized_url) if normalized_url else "legacy",
             "title": title,
             "task_dir": str(task_dir),
             "payload": {},
@@ -3332,7 +3363,7 @@ def _agent_session_from_task(task: dict[str, Any]) -> AgentSession:
         "task_dir": task.get("task_dir"),
         "run_generation": int(task.get("run_generation") or 0),
         "normalized_url": task.get("url"),
-        "source_type": task.get("source_type") or ("youtube" if _explicit_youtube_url(task.get("url")) else "legacy"),
+        "source_type": task.get("source_type") or (video_platform(task["url"]) if explicit_video_url(task.get("url")) else "legacy"),
         "probe": {
             "title": task.get("title") or "",
             "normalized_url": task.get("url") or "",
@@ -3842,7 +3873,7 @@ def _copy_agent_translated_sidecar(session: AgentSession, source_srt: str, trans
             input_video,
             source_srt=source if source.exists() else None,
             translated_srt=translated,
-            config=SidecarConfig(enabled=True, copy_source=False, copy_translated=True, source_suffix=".source", translated_suffix=".zh"),
+            config=SidecarConfig(enabled=True, copy_source=False, copy_translated=True, source_suffix=".source", translated_suffix="." + target_language_code(session.payload.get('target_language'))),
         )
 
 
@@ -4145,13 +4176,8 @@ def _task_serializable(value: Any) -> Any:
 
 
 def _youtube_task_key(normalized_url: str) -> str:
-    parsed = urlparse(normalized_url)
-    video_id = ""
-    if parsed.netloc.endswith("youtu.be"):
-        video_id = parsed.path.strip("/").split("/")[0]
-    else:
-        video_id = (parse_qs(parsed.query).get("v") or [""])[0]
-    return _safe_slug(video_id or normalized_url)[:80]
+    # Preserve YouTube's existing keys; Bilibili additionally namespaces each P.
+    return _safe_slug(video_task_key(normalize_video_url(normalized_url)) or normalized_url)[:80]
 
 
 def _find_task_dir(video_key: str) -> Path | None:
@@ -4184,7 +4210,7 @@ def _find_reusable_ocr_result(
     source_language: str = "auto",
     exclude_session_id: str = "",
 ) -> dict[str, Any] | None:
-    normalized_url = normalize_youtube_url(url) if str(url or "").strip() else ""
+    normalized_url = normalize_video_url(url) if str(url or "").strip() else ""
     title_key = _filename_match_key(title)
     requested_pipeline_version = str(ocr_pipeline_version or "").strip()
     if requested_pipeline_version:
@@ -4285,6 +4311,8 @@ def _find_reusable_ocr_result(
             continue
         input_video = Path(str(config.get("input_video") or ""))
         exact_url_match = bool(normalized_url and cached_url == normalized_url)
+        if not exact_url_match and (video_platform(normalized_url) == "bilibili" or video_platform(cached_url) == "bilibili"):
+            continue  # Similar titles must never reuse a different Bilibili P.
         title_match = _cached_ocr_title_matches(input_video, title_key)
         if pipeline_version and cached_pipeline_version != pipeline_version:
             continue
@@ -4367,6 +4395,8 @@ def _reusable_ocr_from_tasks(*, normalized_url: str, title_key: str, mode: str, 
         task_url = str(task.get("url") or "")
         task_title_key = _filename_match_key(str(task.get("title") or ""))
         exact_url_match = bool(normalized_url and task_url == normalized_url)
+        if not exact_url_match and (video_platform(normalized_url) == "bilibili" or video_platform(task_url) == "bilibili"):
+            continue
         title_match = bool(title_key and task_title_key and (title_key in task_title_key or task_title_key in title_key or SequenceMatcher(None, title_key, task_title_key).ratio() >= 0.86))
         if not exact_url_match and not title_match:
             continue
@@ -4557,6 +4587,7 @@ def _agent_done(session_id: str, values: dict[str, Any]) -> None:
             return
         session.result.update(values)
         session.result["translation_pending"] = False
+        session.result['target_language'] = target_language_code(session.payload.get('target_language'))
         session.status = "done"
         session.phase = "done"
         session.question = {}
@@ -4676,15 +4707,18 @@ def _job_service() -> JobService:
 
 
 def download_subtitle_job(payload: dict[str, Any]) -> Job:
-    url = _required_str(payload, "url")
+    url = normalize_video_url(_required_str(payload, "url"))
     lang = _required_str(payload, "lang")
     kind = str(payload.get("kind") or "manual")
-    title = str(payload.get("title") or "").strip()
+    title = video_title(str(payload.get("title") or "").strip(), url) if payload.get("title") else ""
     output_dir=_resolve_project_path(payload['output_dir']) if payload.get('output_dir') else DOWNLOAD_DIR
     _ensure_under_root(output_dir)
     before = _snapshot_files(output_dir, "*.srt")
 
     def target(job_id: str) -> dict[str, Any]:
+        nonlocal title
+        if not title and video_platform(url) == "bilibili":
+            title = str(probe_video(url)["title"])
         args = _module_command("video_translate.youtube.download_subtitles", url, "--output-dir", output_dir, "--sub-langs", lang)
         if kind == "manual":
             args.append("--no-auto")
@@ -4692,8 +4726,12 @@ def download_subtitle_job(payload: dict[str, Any]) -> Job:
             args.append("--auto-only")
         _run_command(job_id, args)
         changed = _changed_files(output_dir, "*.srt", before)
+        subtitle_dir = output_dir
+        if video_platform(url) == "bilibili":
+            subtitle_dir = output_dir / _filesystem_safe_title(title)
+            changed = [path for path in changed if path.parent == subtitle_dir]
         if not changed:
-            changed = _matching_subtitle_files(output_dir, title, lang)
+            changed = _matching_subtitle_files(subtitle_dir, title, lang)
         if not changed and not title:
             changed = _newest_files(output_dir, "*.srt", limit=3)
         if not changed:
@@ -4715,12 +4753,14 @@ def generate_glossary_job(payload: dict[str, Any]) -> Job:
     if source_language == "auto":
         source_language = _guess_language_from_path(source_srt)
     extra_hint = str(payload.get("extra_hint") or "")
+    target_code = target_language_code(payload.get('target_language'))
     out = _resolve_project_path(payload.get("out") or str(GLOSSARY_DIR / f"{_safe_slug(source_srt.stem)}.draft.yaml"))
     _ensure_under_root(out)
 
     def target(job_id: str) -> dict[str, Any]:
         out.parent.mkdir(parents=True, exist_ok=True)
         args = _module_command("video_translate.tools.generate_glossary", source_srt, "--out", out, "--source-language", source_language)
+        args.extend(['--target-language', target_language_name(target_code)])
         if extra_hint.strip():
             args.extend(["--extra-hint", extra_hint.strip()])
         _run_command(job_id, args)
@@ -4736,7 +4776,12 @@ def translate_subtitle_job(payload: dict[str, Any]) -> Job:
     translation_mode = _normalize_subtitle_translation_mode(payload.get("translation_mode"))
     extra_prompt = str(payload.get("extra_prompt") or "")
     copy_sidecar = bool(payload.get("copy_sidecar", True))
-    out = _resolve_project_path(payload.get("out") or str(source_srt.with_name(source_srt.stem + ".zh.srt")))
+    target_code = target_language_code(payload.get('target_language'))
+    out = _resolve_project_path(payload.get("out") or str(source_srt.with_name(source_srt.stem + f".{target_code}.srt")))
+    if glossary and glossary.is_file():
+        glossary_data = _load_yaml_text(glossary.read_text(encoding="utf-8"), glossary)
+        if target_language_code(glossary_data.get('target_language')) != target_code:
+            raise ValueError('术语表的目标语言与本次翻译不同，请生成或审核对应目标语言的术语表')
     _ensure_under_root(out)
 
     def target(job_id: str) -> dict[str, Any]:
@@ -4752,12 +4797,13 @@ def translate_subtitle_job(payload: dict[str, Any]) -> Job:
         ]
         if glossary:
             args.extend(["--glossary", str(glossary)])
+        args.extend(['--target-language', target_language_name(target_code)])
         if extra_prompt.strip():
             args.extend(["--extra-prompt", extra_prompt.strip()])
         _run_command(job_id, args)
-        result = {"translated_srt": str(out), "translation_mode": translation_mode}
+        result = {"translated_srt": str(out), "translation_mode": translation_mode, "target_language": target_code}
         if copy_sidecar:
-            result.update({name: str(path) for name, path in _copy_translated_sidecar_for_source(source_srt, out).items()})
+            result.update({name: str(path) for name, path in _copy_translated_sidecar_for_source(source_srt, out, target_language=target_code).items()})
         result.update(subtitle_pair_issues(out))
         return result
 
@@ -4830,7 +4876,7 @@ def convert_subtitle_job(payload: dict[str, Any]) -> Job:
 
 
 
-def _copy_translated_sidecar_for_source(source_srt: Path, translated_srt: Path) -> dict[str, Path]:
+def _copy_translated_sidecar_for_source(source_srt: Path, translated_srt: Path, *, target_language: str = 'zh') -> dict[str, Path]:
     run_config = source_srt.parent / "run.yaml"
     if not run_config.exists() or not translated_srt.exists():
         return {}
@@ -4847,7 +4893,7 @@ def _copy_translated_sidecar_for_source(source_srt: Path, translated_srt: Path) 
         copy_source=False,
         copy_translated=bool(raw_sidecar.get("copy_translated", True)),
         source_suffix=str(raw_sidecar.get("source_suffix", ".source")),
-        translated_suffix=str(raw_sidecar.get("translated_suffix", ".zh")),
+        translated_suffix=(str(raw_sidecar.get("translated_suffix", ".zh")) if target_language_code(target_language) == 'zh' else '.' + target_language_code(target_language)),
     )
     return copy_sidecar_subtitles(input_video, translated_srt=translated_srt, config=config)
 
@@ -5112,8 +5158,8 @@ def _copy_source_sidecar_for_run_config(run_config: Path, source_srt: Path) -> d
 
 
 def download_video_job(payload: dict[str, Any]) -> Job:
-    url = _required_str(payload, "url")
-    title = str(payload.get("title") or "").strip()
+    url = normalize_video_url(_required_str(payload, "url"))
+    title = video_title(str(payload.get("title") or "").strip(), url) if payload.get("title") else ""
     thumbnail_format = str(payload.get("thumbnail_format") or "jpg").strip().lower()
     quality = str(payload.get("quality") or "1080p").strip() or "1080p"
     format_id = normalize_exact_format_id(payload.get("format_id"))
@@ -5142,6 +5188,15 @@ def download_video_job(payload: dict[str, Any]) -> Job:
             update_youtube_project_metadata(intended_project_dir, source_url=url, title=title)
 
     def target(job_id: str) -> dict[str, Any]:
+        nonlocal title, intended_project_dir
+        if intended_project_dir is None and video_platform(url) == "bilibili":
+            # Direct download does not require a UI probe. Resolve its own
+            # single-part identity before looking for cached/downloaded files.
+            title = str(probe_video(url)["title"])
+            with _YOUTUBE_PROJECT_BIND_LOCK:
+                intended_project_dir = _youtube_project_dir_for_title(title, normalized_url=url)
+                intended_project_dir.mkdir(parents=True, exist_ok=True)
+                update_youtube_project_metadata(intended_project_dir, source_url=url, title=title)
         command = _module_command(
             "video_translate.youtube.download_video",
             url,
@@ -5243,12 +5298,15 @@ def download_video_job(payload: dict[str, Any]) -> Job:
 
 
 def download_thumbnail_job(payload: dict[str, Any]) -> Job:
-    url = _required_str(payload, "url")
-    title = str(payload.get("title") or "").strip()
+    url = normalize_video_url(_required_str(payload, "url"))
+    title = video_title(str(payload.get("title") or "").strip(), url) if payload.get("title") else ""
     image_format = str(payload.get("format") or payload.get("thumbnail_format") or "jpg").strip().lower()
     before = _snapshot_image_files(DOWNLOAD_DIR)
 
     def target(job_id: str) -> dict[str, Any]:
+        nonlocal title
+        if not title and video_platform(url) == "bilibili":
+            title = str(probe_video(url)["title"])
         _run_command(
             job_id,
             _module_command(
@@ -5261,8 +5319,12 @@ def download_thumbnail_job(payload: dict[str, Any]) -> Job:
             ),
         )
         images = _changed_image_files(DOWNLOAD_DIR, before)
+        image_dir = DOWNLOAD_DIR
+        if video_platform(url) == "bilibili":
+            image_dir = DOWNLOAD_DIR / _filesystem_safe_title(title)
+            images = [path for path in images if path.parent == image_dir]
         if not images:
-            images = _matching_image_files(DOWNLOAD_DIR, title)
+            images = _matching_image_files(image_dir, title)
         if not images and not title:
             images = _newest_image_files(DOWNLOAD_DIR, limit=3)
         if not images:
@@ -5298,8 +5360,8 @@ def _materialize_chinese_ocr_output(input_video: Path, out_dir: Path) -> dict[st
 
 
 def ocr_full_job(payload: dict[str, Any]) -> Job:
-    url = _required_str(payload, "url")
-    title = str(payload.get("title") or "").strip()
+    url = normalize_video_url(_required_str(payload, "url"))
+    title = video_title(str(payload.get("title") or "").strip(), url) if payload.get("title") else ""
     extra_hint = str(payload.get("extra_hint") or "")
     pipeline = _resolve_ocr_pipeline(
         payload.get("ocr_pipeline_version"),
@@ -5330,12 +5392,16 @@ def ocr_full_job(payload: dict[str, Any]) -> Job:
     job_slug = _safe_slug(payload.get("title") or "ocr_task")[:80]
 
     def target(job_id: str) -> dict[str, Any]:
+        nonlocal title
+        if not title and video_platform(url) == "bilibili":
+            title = str(probe_video(url)["title"])
         out_dir = JOB_DIR / job_id
         out_dir.mkdir(parents=True, exist_ok=True)
         before_videos = _snapshot_video_files(DOWNLOAD_DIR)
         _append_log(job_id, "download_video_start")
         _run_command(job_id, _module_command("video_translate.youtube.download_video", url, "--output-dir", DOWNLOAD_DIR, "--quality", "1080p"))
-        videos = _downloaded_video_candidates(DOWNLOAD_DIR, before_videos, title, newest_limit=1)
+        videos = (_project_video_files(DOWNLOAD_DIR / _filesystem_safe_title(title), archive_quality=False)
+                  if video_platform(url) == "bilibili" else _downloaded_video_candidates(DOWNLOAD_DIR, before_videos, title, newest_limit=1))
         if not videos:
             missing_title = title or "<unknown>"
             raise RuntimeError(f"视频下载完成后没有找到匹配文件: title={missing_title}")
@@ -5350,7 +5416,7 @@ def ocr_full_job(payload: dict[str, Any]) -> Job:
             config["sidecar"]["copy_translated"] = False
         config["agent_cache"] = {
             "kind": "youtube_ocr",
-            "normalized_url": normalize_youtube_url(url),
+            "normalized_url": normalize_video_url(url),
             "ocr_pipeline_version": ocr_pipeline_version,
             "ocr_source_cleanup_mode": pipeline["source_cleanup_mode"],
             "ocr_translation_mode": translation_mode,
@@ -5403,8 +5469,8 @@ def ocr_full_job(payload: dict[str, Any]) -> Job:
 
 
 def ocr_extract_job(payload: dict[str, Any]) -> Job:
-    url = _required_str(payload, "url")
-    title = str(payload.get("title") or "").strip()
+    url = normalize_video_url(_required_str(payload, "url"))
+    title = video_title(str(payload.get("title") or "").strip(), url) if payload.get("title") else ""
     prebound_input_video: Path | None = None
     raw_input_video = str(payload.get("input_video") or "").strip()
     if raw_input_video:
@@ -5442,6 +5508,9 @@ def ocr_extract_job(payload: dict[str, Any]) -> Job:
     job_slug = _safe_slug(payload.get("title") or "ocr_task")[:80]
 
     def target(job_id: str) -> dict[str, Any]:
+        nonlocal title
+        if not title and video_platform(url) == "bilibili":
+            title = str(probe_video(url)["title"])
         out_dir = JOB_DIR / job_id
         out_dir.mkdir(parents=True, exist_ok=True)
         if prebound_input_video:
@@ -5451,7 +5520,8 @@ def ocr_extract_job(payload: dict[str, Any]) -> Job:
             before_videos = _snapshot_video_files(DOWNLOAD_DIR)
             _append_log(job_id, "download_video_start")
             _run_command(job_id, _module_command("video_translate.youtube.download_video", url, "--output-dir", DOWNLOAD_DIR, "--quality", "1080p"))
-            videos = _downloaded_video_candidates(DOWNLOAD_DIR, before_videos, title, newest_limit=1)
+            videos = (_project_video_files(DOWNLOAD_DIR / _filesystem_safe_title(title), archive_quality=False)
+                      if video_platform(url) == "bilibili" else _downloaded_video_candidates(DOWNLOAD_DIR, before_videos, title, newest_limit=1))
             if not videos:
                 missing_title = title or "<unknown>"
                 raise RuntimeError(f"视频下载完成后没有找到匹配文件: title={missing_title}")
@@ -5465,7 +5535,7 @@ def ocr_extract_job(payload: dict[str, Any]) -> Job:
         config["sidecar"]["copy_translated"] = False
         config["agent_cache"] = {
             "kind": "youtube_ocr",
-            "normalized_url": normalize_youtube_url(url),
+            "normalized_url": normalize_video_url(url),
             "ocr_pipeline_version": ocr_pipeline_version,
             "ocr_source_cleanup_mode": pipeline["source_cleanup_mode"],
             "ocr_translation_mode": translation_mode,
@@ -8123,7 +8193,8 @@ def read_glossary_items(payload: dict[str, Any]) -> dict[str, Any]:
     items=_glossary_items(data,cue_texts=cue_texts,english_reference_texts=english_reference_texts)
     from video_translate.glossary_candidates import cached
     contexts=_glossary_candidate_contexts(items)
-    existing=cached(path,contexts,_glossary_candidate_profile())
+    target_code=target_language_code(data.get('target_language'))
+    existing=cached(path,contexts,_glossary_candidate_profile(target_code))
     if payload.get('include_blind_candidates'):
         for item in items:
             context=item.get('context_text','')
@@ -8131,7 +8202,7 @@ def read_glossary_items(payload: dict[str, Any]) -> dict[str, Any]:
             if context in existing['values']:item['blind_candidate_zh']=existing['values'][context]
             elif context in existing['errors']:item['blind_candidate_error']=existing['errors'][context]
             else:item['blind_candidate_pending']=True
-    return {'path':str(path),'items':items,'candidates':existing['summary']}
+    return {'path':str(path),'items':items,'candidates':existing['summary'],'target_language':target_code}
 
 
 def read_glossary_evidence(payload: dict[str, Any]) -> dict[str, Any]:
@@ -8218,9 +8289,11 @@ def _glossary_candidate_contexts(items):
     return list(dict.fromkeys(item['context_text'] for item in items if item.get('context_text') and not item.get('suggested_zh','').strip() and not item.get('reviewed')))
 
 
-def _glossary_candidate_profile():
+def _glossary_candidate_profile(target_language='zh'):
     config=load_llm_task_config('title_translation')
-    return hashlib.sha256(json.dumps([getattr(config,'provider_profile',None),config.model,config.base_url],ensure_ascii=False).encode()).hexdigest()
+    values=[getattr(config,'provider_profile',None),config.model,config.base_url]
+    if target_language_code(target_language)!='zh':values.append(target_language_code(target_language))
+    return hashlib.sha256(json.dumps(values,ensure_ascii=False).encode()).hexdigest()
 
 
 _GLOSSARY_CANDIDATE_JOB_LOCK=threading.Lock()
@@ -8231,7 +8304,8 @@ def prepare_glossary_candidates_job(payload):
     path=_resolve_project_path(_required_str(payload,'path'));_ensure_under_root(path)
     if not path.is_file():raise FileNotFoundError('Glossary文件不存在')
     base=read_glossary_items({'path':str(path)})
-    contexts=_glossary_candidate_contexts(base['items']);profile=_glossary_candidate_profile()
+    target_code=base.get('target_language','zh')
+    contexts=_glossary_candidate_contexts(base['items']);profile=_glossary_candidate_profile(target_code)
     identity=(str(path),profile)
     with _GLOSSARY_CANDIDATE_JOB_LOCK:
         active=get_job(_GLOSSARY_CANDIDATE_JOBS.get(identity,''))
@@ -8239,7 +8313,8 @@ def prepare_glossary_candidates_job(payload):
         def target(job_id):
             from video_translate.glossary_candidates import prepare
             _append_log(job_id,'只准备相关原句的参考译文，不写入译名、不确认审核、不翻译整片。')
-            result=prepare(path,contexts,profile,_blind_translate_glossary_context,retry_failed=bool(payload.get('retry_failed',False)),
+            translator=_blind_translate_glossary_context if target_code=='zh' else lambda text:_blind_translate_glossary_context(text,target_language=target_code)
+            result=prepare(path,contexts,profile,translator,retry_failed=bool(payload.get('retry_failed',False)),
                 progress=lambda i,total:_append_log(job_id,f'glossary_candidates: {i}/{total}'))
             return {'path':str(path),'candidates':result}
         job=start_job('准备 Glossary 原句参考译文',target)
@@ -8555,7 +8630,7 @@ def _glossary_reference_text(item: dict[str, Any], cue_texts: dict[int, str]) ->
     return "\n".join(lines)
 
 
-def _blind_translate_glossary_context(text: str) -> str:
+def _blind_translate_glossary_context(text: str, *, target_language: str = 'zh') -> str:
     text = text.strip()
     if not text:
         return ""
@@ -8573,7 +8648,7 @@ def _blind_translate_glossary_context(text: str) -> str:
         "messages": [
             {
                 "role": "system",
-                "content": "你是字幕句子直译助手。不要使用任何术语表、上下文或推测，只把用户给出的单句翻译成自然简体中文。只输出译文。",
+                "content": f"你是字幕句子直译助手。不要使用任何术语表、上下文或推测，只把用户给出的单句翻译成自然的{target_language_name(target_language)}。只输出译文。",
             },
             {"role": "user", "content": text},
         ],
@@ -8901,7 +8976,8 @@ def _ensure_probe_thumbnail(normalized_url: str, title: str, info: dict[str, Any
         update_youtube_project_metadata(project_dir, source_url=normalized_url, title=title)
         return None
     try:
-        response = requests.get(thumbnail_url, timeout=30, proxies={"http": proxy, "https": proxy} if proxy else None)
+        proxies = {"http": proxy or "", "https": proxy or ""} if video_platform(normalized_url) == "bilibili" else ({"http": proxy, "https": proxy} if proxy else None)
+        response = requests.get(thumbnail_url, timeout=30, proxies=proxies)
         response.raise_for_status()
     except Exception as exc:
         print(f"thumbnail_probe_skip: {type(exc).__name__}: {exc}", flush=True)
@@ -8915,7 +8991,7 @@ def _ensure_probe_thumbnail(normalized_url: str, title: str, info: dict[str, Any
 
 
 def _youtube_project_dir_for_title(title: str, *, normalized_url: str = "") -> Path:
-    normalized_url = normalize_youtube_url(normalized_url) if normalized_url else ""
+    normalized_url = normalize_video_url(normalized_url) if normalized_url else ""
     if normalized_url and DOWNLOAD_DIR.exists():
         for project_dir in sorted(
             (path for path in DOWNLOAD_DIR.iterdir() if path.is_dir() and path.name != "debug"),
@@ -8948,7 +9024,7 @@ def _youtube_project_bound_url(project_dir: Path) -> str:
     if not raw:
         return ""
     try:
-        return normalize_youtube_url(raw)
+        return normalize_video_url(raw)
     except ValueError:
         return raw
 
@@ -8970,7 +9046,7 @@ def _filesystem_safe_title(title: str) -> str:
 def _find_or_bind_youtube_project(normalized_url: str, title: str) -> dict[str, Any]:
     if not DOWNLOAD_DIR.exists():
         return {}
-    normalized_url = normalize_youtube_url(normalized_url) if normalized_url else ""
+    normalized_url = normalize_video_url(normalized_url) if normalized_url else ""
     project_dirs = [
         path
         for path in DOWNLOAD_DIR.iterdir()
@@ -9173,6 +9249,8 @@ def _subtitle_role(path: Path) -> str:
         return "source"
     if name == "zh.srt" or ".zh" in name or "zh-hans" in name:
         return "translated"
+    if re.fullmatch(r'(en|ja|ko)(?:\.(?:review_[a-z0-9]+|caption_.+|local_review\..+|aligned_.+))?\.srt', name):
+        return 'translated'
     return "downloaded"
 
 
@@ -9785,6 +9863,8 @@ def _safe_slug(value: Any) -> str:
 
 def _guess_language_from_path(path: Path) -> str:
     name = path.name.lower()
+    if ".ai-" in name:
+        name = name.replace(".ai-", ".")
     if ".en" in name:
         return "english"
     if ".ja" in name or ".jp" in name:
@@ -10098,7 +10178,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                 data = probe_video(
                     _required_str(payload, "url"),
                     proxy=str(payload.get("proxy") or DEFAULT_PROXY) or None,
-                    target_language=str(payload.get("target_language") or "zh"),
+                    target_language=payload.get("target_language") or None,
                     detected_source_language=detected_source_language,
                     embedded_subtitle_hint=str(payload.get("embedded_subtitle_hint") or "unknown"),
                 )

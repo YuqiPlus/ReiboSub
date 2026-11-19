@@ -91,8 +91,29 @@ def runtime(tmp_path):
     # planner protocol. Goal-controller tests below explicitly create v2 state.
     result=agent.Runtime(app,session)
     result.state['controller_version']=1
+    result.state.pop('screen_source_policy_version',None)
     result.save()
     return result,session,app,calls
+
+
+def test_autonomous_tools_use_bilibili_selected_part_and_caption_provenance(runtime):
+    r, session, app, calls = runtime
+    url = 'https://www.bilibili.com/video/BV1GJ411x7h7?p=2'
+    session.payload['url'] = 'https://b23.tv/example'
+    app.probe_video = lambda *a, **k: {'normalized_url': url, 'source_type': 'bilibili',
+        'title': 'fixture [BV1GJ411x7h7 P2]', 'duration': 20,
+        'subtitles': [{'lang': 'ai-ko', 'kind': 'auto'}]}
+    r.execute('probe', {})
+    assert session.payload['url'] == url and session.result['source_type'] == 'bilibili'
+    received = []
+    source = r.root / 'captions.srt'
+    write_srt([SubtitleCue(1, 0, 2, '안녕하세요')], source)
+    app.download_subtitle_job = lambda p: (received.append(p) or SimpleNamespace(result={'subtitle_path': str(source)}))
+    r.state['language'] = 'auto'
+    r.execute('captions', {'index': 0})
+    assert received[0]['url'] == url and received[0]['kind'] == 'auto'
+    assert r.state['language'] == 'korean'
+    assert next(iter(r.state['sources'].values()))['language'] == 'ko'
 
 
 def test_main_route_with_captions_skips_video_download_ocr_and_asr(runtime,monkeypatch):
@@ -133,6 +154,47 @@ def test_main_route_with_captions_skips_video_download_ocr_and_asr(runtime,monke
     agent.resume_after_glossary(session,app)
     assert session.status=='done' and calls==['translate']
     assert Path(session.result['translated_srt']).is_file()
+
+
+def test_chinese_to_english_agent_waits_for_human_terms_then_translates_and_verifies(runtime, monkeypatch):
+    import hashlib
+    from scripts import asr_review_agent
+    from video_translate import web_agent
+    r, session, app, calls = runtime
+    session.payload.update(url='https://www.bilibili.com/video/BV1GJ411x7h7', source_language='chinese', target_language='en')
+    r.state.update(language='chinese', target_language='en'); r.save()
+    source = r.root/'chinese.srt'; write_srt([SubtitleCue(1,0,2,'小王，你好！')],source)
+    app.probe_video = lambda *a, **k: {'normalized_url':session.payload['url'],'source_type':'bilibili','title':'中文测试','duration':2,'subtitles':[{'lang':'zh-CN','kind':'manual'}]}
+    app.download_subtitle_job = lambda p: SimpleNamespace(result={'subtitle_path':str(source)})
+    glossary = r.root/'english-glossary.yaml'
+    def generate(item, path, *, defer_wait=False):
+        glossary.write_text("target_language: en\ncharacters:\n- source: 小王\n  zh: ''\n  reviewed: false\n")
+        item.result['glossary_path']=str(glossary)
+    app._agent_generate_glossary_review=generate
+    actions=iter([{'tool':'probe'},{'tool':'captions','args':{'index':0}},{'tool':'select_source','args':{'source_id':'captions_1'}},{'tool':'inspect'},{'tool':'glossary'}])
+    def model(root,name,task,instruction,data):
+        if name.startswith('verify-'):
+            assert data['target_language']=='en'
+            return {'checks':[{'id':row['id'],'verdict':'pass'} for row in data['subtitles']]}
+        return next(actions)
+    monkeypatch.setattr(asr_review_agent,'llm_json',model)
+    agent.run(session,app)
+    assert session.status=='waiting' and session.phase=='review_glossary' and 'translate' not in calls
+    glossary.write_text('target_language: en\ncharacters:\n- source: 小王\n  zh: Xiao Wang\n  reviewed: true\n')
+    session.result.update(translation_glossary_path=str(glossary),glossary_digest=hashlib.sha256(glossary.read_bytes()).hexdigest())
+    app._glossary_review_summary=web_agent._glossary_review_summary;app._glossary_items=web_agent._glossary_items;app._load_yaml_file=web_agent._load_yaml_file
+    def translate(payload):
+        assert payload['target_language']=='en' and Path(payload['out']).name.startswith('en_')
+        calls.append('translate');write_srt([SubtitleCue(1,0,2,'Hello, Xiao Wang!')],Path(payload['out']))
+        return SimpleNamespace(result={'translated_srt':payload['out']})
+    app.translate_subtitle_job=translate
+    actions=iter([{'tool':'translate'},{'tool':'verify'},{'tool':'finish'}])
+    session.status='running';session.question={}
+    agent.resume_after_glossary(session,app)
+    assert session.status=='done' and calls==['translate']
+    assert session.result['target_language']=='en' and Path(session.result['translated_srt']).name.startswith('en_')
+    latest=read_json(r.path)
+    assert latest['verification']['acceptable'] and agent.current_verification(latest)
 
 
 def test_main_patch_cannot_use_unrelated_source_evidence(runtime):
@@ -681,6 +743,59 @@ def goal_call(tool,args=None,*,refs=None,plan=None):
         'plan':plan or ['检查现有字幕是否满足交付目标'],'next_check':'核对工具实际返回的内容与当前目标'}
 
 
+def test_screen_first_agent_runs_ocr_then_waits_for_glossary_not_asr(runtime,monkeypatch):
+    import base64
+    from scripts import asr_review_agent
+    from video_translate.agent import ocr_candidates, ocr_finalize
+    r,session,app,calls=runtime
+    r.state.update(controller_version=2,screen_source_policy_version=1)
+    r.save()
+    original=r.root/'screen.srt';write_srt([SubtitleCue(1,2,3,'화면 자막')],original)
+    def preview(payload):
+        return {'time_seconds':payload['time_seconds'],'width':100,'height':100,
+                'image_data_url':'data:image/jpeg;base64,'+base64.b64encode(b'fake fixture frame').decode(),
+                'ocr_analysis':{'accepted':[{'text':'화면 자막','bbox':[10,70,90,80]}]}}
+    app.ocr_preview_frame=preview
+    monkeypatch.setattr(vision,'analyze',lambda *a:{'has_burned_subtitles':True,
+        'subtitle_regions':[[.1,.65,.9,.85]],'summary_zh':'抽样画面有内嵌字幕','exclusion_proposals':[]})
+    def ocr(payload):
+        assert payload['ocr_crop_left_ratio']==payload['ocr_crop_right_ratio']==0
+        assert payload['ocr_crop_top_ratio']<=.45 and payload['ocr_crop_bottom_ratio']==0
+        assert payload['ocr_pipeline_version']=='v3' and payload['materialize_debug_bundle'] is False
+        assert payload['llm_cleanup'] is False
+        calls.append('ocr')
+        raw=r.root/'raw';raw.mkdir()
+        for name,content in [('tracks.json','[]'),('ocr_boxes.json','[]'),('run.yaml','ocr: {}')]:
+            (raw/name).write_text(content)
+        return SimpleNamespace(result={'output_dir':str(raw)})
+    app.ocr_development_job=ocr
+    app._debug_rebuild_timing=lambda _:None
+    monkeypatch.setattr(ocr_candidates,'prepare',lambda *a,**k:{'debug_dir':str(r.root/'raw'),'kept_tracks':1})
+    def refine(payload):
+        calls.append('ocr_refine')
+        return SimpleNamespace(result={'v3_layered_srt':str(original)})
+    monkeypatch.setattr(ocr_finalize,'launch',lambda app,candidate:refine(candidate))
+    glossary=r.root/'screen.glossary.yaml'
+    def prepare_glossary(item,source,*,defer_wait=False):
+        assert source==str(original) and defer_wait
+        glossary.write_text("characters:\n- source: 이름\n  zh: ''\n  reviewed: false\n")
+        item.result['glossary_path']=str(glossary)
+    app._agent_generate_glossary_review=prepare_glossary
+    commands=iter([goal_call('probe'),goal_call('download'),
+        goal_call('sample_frames',{'times':[1,6,12,18]}),goal_call('analyze_frames'),
+        goal_call('ocr_trial',{'use_exclusion':False}),goal_call('ocr'),goal_call('refine_screen_ocr'),goal_call('finalize_screen_ocr'),
+        goal_call('select_source',{'source_id':'ocr_1'}),goal_call('inspect'),goal_call('glossary')])
+    monkeypatch.setattr(asr_review_agent,'llm_json',lambda *a:next(commands))
+    agent.run(session,app)
+    saved=read_json(r.path)
+    assert session.status=='waiting' and session.phase=='review_glossary'
+    assert session.result['source_kind']=='ocr' and saved['selected']=='ocr_1'
+    assert calls==['video_download','ocr','ocr_refine'] and not agent.glossary_approved(saved)
+    assert [e['tool'] for e in saved['events']]==['probe','download','sample_frames','analyze_frames',
+        'ocr_trial','ocr','refine_screen_ocr','finalize_screen_ocr','select_source','inspect','glossary']
+    assert 'translated_srt' not in session.result
+
+
 def test_new_sessions_use_goal_controller_but_saved_sessions_keep_their_version(runtime):
     r,session,app,_=runtime
     assert agent.Runtime(app,session).state['controller_version']==1
@@ -796,6 +911,44 @@ def test_goal_controller_selects_frame_times_and_invalidates_stale_masks(runtime
     with pytest.raises(ValueError,match='重复'):agent.validate_call(call,r.state)
     for times in ([101],[-1],[True],[float('nan')],[]):
         with pytest.raises(ValueError):agent.validate_call({'tool':'sample_frames','args':{'times':times}},r.state)
+
+
+def test_explicit_retry_preserves_video_counts_and_recovers_bad_frame_arguments(runtime,monkeypatch):
+    import base64
+    from scripts import asr_review_agent
+    class EndOfTest(Exception):pass
+    r,session,app,calls=runtime
+    video=Path(app._agent_ensure_project_video(session,{},phase='test')['input_video'])
+    before=video.read_bytes();calls.clear()
+    failures=[{'tool':'sample_frames','status':'rejected_or_failed','reason':'times必须是数组'} for _ in range(3)]
+    r.state.update(controller_version=2,probe={'duration':337.27},media=str(video),
+        counts={'probe':1,'download':1},consecutive_tool_errors=3,
+        internal_error={'code':'tool_recovery_exhausted'},events=failures)
+    r.save();seen=[];requested=[]
+    app.ocr_preview_frame=lambda payload:(requested.append(payload['time_seconds']) or {
+        'image_data_url':'data:image/jpeg;base64,'+base64.b64encode(b'frame').decode(),
+        'time_seconds':payload['time_seconds'],'width':100,'height':100})
+    def model(root,name,task,instruction,data):
+        seen.append(data)
+        assert not {'probe','download'} & {t['name'] for t in data['available_tools']}
+        if len(seen)==1:
+            assert 'times必须是数组' in data['feedback']
+            return goal_call('sample_frames',{'times':[True]})
+        if len(seen)==2:
+            assert '有限数字' in data['feedback']
+            assert data['internal_error']['argument_error']['code']=='times_number'
+            return goal_call('sample_frames',{'times':'15,100,200,310'})
+        raise EndOfTest()
+    monkeypatch.setattr(asr_review_agent,'llm_json',model)
+    with pytest.raises(EndOfTest):agent.retry(session,app)
+    saved=read_json(r.path)
+    assert saved['counts']=={'probe':1,'download':1,'sample_frames':1}
+    assert saved['consecutive_tool_errors']==0 and not saved.get('internal_error')
+    assert requested==[15,100,200,310] and video.read_bytes()==before and calls==[]
+    assert saved['events'][:3]==failures
+    event=saved['events'][-1]
+    assert event['status']=='done' and event['argument_repair']['field']=='times'
+    assert event['argument_repair']['normalized']==[15,100,200,310]
 
 
 def test_goal_controller_cannot_drop_existing_translation_by_switching_source(runtime):

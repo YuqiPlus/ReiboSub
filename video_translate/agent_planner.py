@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from video_translate.video_source import caption_language
+
 
 TARGET_CHINESE_PREFIXES = ("zh", "zh-hans", "zh-hant", "zh-cn", "zh-tw", "zh-hk")
 
@@ -171,7 +173,7 @@ def _language_matches(candidate: str, wanted: str) -> bool:
 
 
 def _language_key(language: str) -> str:
-    return str(language or "").strip().lower().replace("_", "-")
+    return caption_language(str(language or "").strip())
 
 
 def _normalize_embedded_subtitle_hint(value: str) -> str:

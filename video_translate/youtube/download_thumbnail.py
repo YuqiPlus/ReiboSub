@@ -18,6 +18,7 @@ from video_translate.youtube.download_video import (
     thumbnail_url_from_info,
 )
 from video_translate.youtube.filenames import filesystem_safe_title, youtube_project_dir
+from video_translate.video_source import platform_options, video_title, video_platform, validate_video_info
 
 
 def build_thumbnail_options(output_dir=DEFAULT_OUTPUT_DIR, *, proxy=DEFAULT_PROXY):
@@ -39,15 +40,19 @@ def download_thumbnail(url, output_dir=DEFAULT_OUTPUT_DIR, *, proxy=DEFAULT_PROX
     video_url = normalize_url(url)
     image_format = normalize_thumbnail_format(image_format)
     ydl_opts = build_thumbnail_options(output_dir, proxy=proxy)
+    ydl_opts.update(platform_options(video_url, youtube_proxy=proxy))
+    proxy = ydl_opts.get("proxy")
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
+        validate_video_info(info, video_url)
         thumbnail_url = thumbnail_url_from_info(info)
         if not thumbnail_url:
             raise RuntimeError("没有找到视频封面 URL")
-        response = requests.get(thumbnail_url, timeout=30, proxies={"http": proxy, "https": proxy} if proxy else None)
+        proxies = {"http": proxy or "", "https": proxy or ""} if video_platform(video_url) == "bilibili" else ({"http": proxy, "https": proxy} if proxy else None)
+        response = requests.get(thumbnail_url, timeout=30, proxies=proxies)
         response.raise_for_status()
         extension = thumbnail_extension(thumbnail_url, response.headers.get("Content-Type", ""), image_format=image_format)
-        title = str(info.get("title") or "youtube_video")
+        title = video_title(str(info.get("title") or "youtube_video"), video_url)
         safe_title = filesystem_safe_title(title)
         thumbnail_path = youtube_project_dir(output_dir, title) / f"{safe_title}{extension}"
         thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
@@ -57,8 +62,8 @@ def download_thumbnail(url, output_dir=DEFAULT_OUTPUT_DIR, *, proxy=DEFAULT_PROX
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Download one YouTube thumbnail.")
-    parser.add_argument("url", help="YouTube URL or video ID")
+    parser = argparse.ArgumentParser(description="Download one YouTube/Bilibili thumbnail.")
+    parser.add_argument("url", help="YouTube/Bilibili URL or video ID")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--proxy", default=DEFAULT_PROXY, help="Proxy URL; use an empty string to disable")
     parser.add_argument("--format", default=DEFAULT_THUMBNAIL_FORMAT, choices=sorted(THUMBNAIL_FORMATS), help="Thumbnail format: jpg, png, webp, or source")

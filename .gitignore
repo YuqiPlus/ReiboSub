@@ -36,6 +36,9 @@ docs/superpowers/plans/
 *.jks
 .netrc
 cookies*.txt
+*.cookies.txt
+cookies*.txt.*
+*.cookies.txt.*
 credentials*.json
 service-account*.json
 *-service-account.json

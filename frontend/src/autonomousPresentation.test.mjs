@@ -38,7 +38,7 @@ test('goal-driven decision shows evidence and revisable plan, not a fixed stage 
 })
 
 test('public decisions use readable tool and evidence names', () => {
-  assert.equal(friendlyAgentText('调用 deliver_target，并用 read_subtitles 查上下文'), '调用 交付现成中文字幕，并用 查看字幕上下文 查上下文')
+  assert.equal(friendlyAgentText('调用 deliver_target，并用 read_subtitles 查上下文'), '调用 交付现成目标字幕，并用 查看字幕上下文 查上下文')
   assert.equal(evidenceRefLabel('event:12'), '操作记录 #12')
   assert.equal(evidenceRefLabel('metadata'), '视频信息')
   assert.equal(evidenceRefLabel('source:captions_2'), '原文来源 #2')
