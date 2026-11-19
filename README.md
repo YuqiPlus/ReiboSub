@@ -6,6 +6,8 @@ ReiboSub is a YouTube/video subtitle production assistant. It can download YouTu
 
 The project is designed for a human-in-the-loop workflow: the Agent can run multiple video flows at the same time, pause when it needs your decision, and continue after you review glossary terms.
 
+[Install and start](#quick-start) · [Model settings](#llm-configuration) · [GPU and experiments](#gpu-and-model-cache) · [Troubleshooting](#troubleshooting)
+
 ## What It Can Do
 
 - **Agent cockpit**: paste a YouTube URL or video ID, let the Agent probe subtitles, choose a route, and wait for confirmation when needed.
@@ -19,7 +21,7 @@ The project is designed for a human-in-the-loop workflow: the Agent can run mult
 - **Subtitle editing**: edit text and timing, keep 50 undo steps, preview one cue with a live sidecar overlay, and add/merge/delete/clean cues.
 - **Subtitle conversion**: convert to common formats including SRT, VTT, ASS/SSA, LRC, TXT, JSON, and Bilibili BCC.
 - **Video overlay tool**: place watermark/logo masks on a video and export a new video without overwriting the original.
-- **Model provider settings**: add OpenAI-compatible services, discover their models, and bind a provider/model to each LLM task from the Web UI.
+- **Model provider settings**: manage providers and search for one shared model; optionally use a separate vision model and keep per-module overrides under advanced settings.
 
 For Agent routing design notes, see [docs/youtube_agent_workflows.md](docs/youtube_agent_workflows.md). That document includes background and future ideas, so not every item is necessarily implemented.
 
@@ -40,51 +42,59 @@ Verification identifies specific empty cues and count/timing mismatches. A narro
 
 ## Quick Start
 
-Install system tools first:
+### What cloning does and does not provide
 
-- Python 3.10 or newer, Python 3.11 recommended.
-- `ffmpeg` in `PATH` for video/audio processing and subtitle muxing.
-- Node.js 20 or newer is required for the first Web UI build from a source checkout because compiled assets are not committed.
+This is a source project, not a double-click installer. Git does not include `frontend/dist`, recognition weights, API keys, user media or machine-local settings. The UI can start without credentials; translation and Agent decisions need your own configured model service. Recognition weights are downloaded on first use.
 
-Clone and create a Python environment:
+Start with **Linux x86_64 or WSL2 and Python 3.11** for the UI, translation and CPU OCR. Package metadata allows Python 3.10+, but third-party engine wheels also depend on platform. Do not copy a maintainer's CUDA environment blindly.
+
+| Capability | Additional requirements |
+| --- | --- |
+| Downloads, conversion and subtitle editing | FFmpeg/ffprobe; YouTube also needs Node.js 22+ and network access |
+| Translation and glossary | Your own OpenAI-compatible model service and quota |
+| OCR 1.0 / 2.0 / 3.0 | CPU or GPU PaddlePaddle engine and recognition weights; LLM cleanup requires a model service |
+| Web ASR 2.2 | faster-whisper, Whisper weights and NVIDIA CUDA; the current UI submits CUDA/float16, while basic CPU transcription is available through the CLI below |
+| Agent visual inspection | An image-capable model, which may be the shared model |
+
+The standard public setup does not require MySQL, Redis or a maintainer's `.env`. Qwen/multi-model ASR experiments have separate requirements below.
+
+### 1. Install the recommended CPU starter environment
+
+Install Git and Conda/Miniforge first, then run:
 
 ```bash
 git clone https://github.com/YuqiPlus/ReiboSub.git
 cd ReiboSub
-conda create -n reibosub python=3.11 -y
-conda activate reibosub
-python -m pip install -U pip
-python -m pip install -e ".[dev,asr,ocr-cpu]"
-```
-
-If you prefer one conda command, use the provided environment file:
-
-```bash
 conda env create -f environment.yml
 conda activate reibosub
 ```
 
-For a smaller install without ASR/test dependencies:
+This installs Python 3.11, FFmpeg/ffprobe, Node.js 22+, CPU OCR and faster-whisper. Installation and initial model loading require network access; long videos may be slow on CPU. **For GPU OCR, skip this CPU environment and follow [GPU and Model Cache](#gpu-and-model-cache).**
+
+If you already have a suitable Python environment, use this alternative instead. You must separately install FFmpeg/ffprobe and Node.js 22+ in `PATH`:
 
 ```bash
-python -m pip install -e ".[ocr-cpu]"
-```
-
-For a requirements-based setup, the standard CPU OCR + ASR install is:
-
-```bash
+python -m pip install -U pip
 python -m pip install -r requirements.txt
 ```
 
-Test dependencies are managed by the `dev` extra in `pyproject.toml`:
+For downloads or existing subtitles only, `python -m pip install -e .` omits the PaddlePaddle inference engine and faster-whisper. Add `.[ocr-cpu]` or `.[asr]` when needed. The `.[dev]` extra is optional and only needed for testing.
+
+The `yt-dlp[default]` dependency includes YouTube JS challenge components. ReiboSub enables Node from `PATH`; an old Node runtime or missing challenge components can break downloads even when a browser can play the video. See the [official yt-dlp EJS guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS).
+
+### 2. Verify the active environment
 
 ```bash
-python -m pip install -e ".[dev]"
+python -c "import sys, shutil; print(sys.executable); print('ffmpeg:', shutil.which('ffmpeg')); print('ffprobe:', shutil.which('ffprobe')); print('node:', shutil.which('node'))"
+ffmpeg -version
+ffprobe -version
+node --version
+python -m pip check
 ```
 
-For GPU OCR, do not install the CPU requirements; follow the CUDA-specific steps below.
+None of the three tool paths should be `None`; Node should be version 22 or newer. Start the server from the same activated terminal. Calling a Python executable by absolute path does not automatically add its environment's `bin` directory to `PATH`. `reibosub doctor` checks some Python imports/cache paths, not every external tool, CUDA library, model download or API connection.
 
-Build the frontend once after cloning:
+### 3. Build the frontend
 
 ```bash
 cd frontend
@@ -92,6 +102,10 @@ npm ci
 npm run build
 cd ..
 ```
+
+Do not skip this step. The server reads `frontend/dist`, not the source files directly; rebuild after pulling frontend changes as well.
+
+### 4. Optional machine-local settings
 
 Optionally copy the single machine-local startup template. The defaults already start safely, so create this file only when you want to change the media directory, YouTube proxy, listen address, or port.
 
@@ -118,7 +132,7 @@ Local OCR/ASR/LLM child processes do not use generic `HTTP_PROXY` / `HTTPS_PROXY
 
 Existing installations can keep their old `configs/local_runtime.yaml`, `.env`, and `configs/llm.yaml` files. They remain compatibility inputs and do not need to be migrated or deleted.
 
-Start the Agent UI:
+### 5. Start the UI
 
 ```bash
 python run_agent_ui.py
@@ -138,16 +152,28 @@ ssh -L 7860:127.0.0.1:7860 user@server
 
 Then still open `http://127.0.0.1:7860` locally. Use `python run_agent_ui.py --host 0.0.0.0` only on a trusted LAN.
 
-### First provider setup
+### 6. Configure your model service in the UI
 
 After opening the UI for the first time:
 
-1. Open **Settings → Add provider**.
+1. Open **Settings → Provider management → Add provider**. A clean checkout has no working API key.
 2. Enter a stable provider ID, label, OpenAI-compatible API base URL, and API key.
 3. Click **Create and fetch models**; if the service has no `/models` endpoint, enter static model IDs instead.
-4. Choose a shared model for translation, glossary, OCR refinement and Agent decisions. Vision may inherit the same image-capable model or use a separate override. The picker supports search and manual model IDs.
+4. In common settings, choose the default provider and shared model, then **Save settings**. Translation, glossary, OCR cleanup and Agent decisions can use the same model.
+5. Vision needs image input support: inherit the shared model if supported, or select a separate provider/model. Search the model list, or enter an ID manually when no list is available.
+
+Model discovery only lists names: it does not prove account quota or image support. New users do not need per-module overrides. Existing installations can use the unify-text action and save to reset text bindings while retaining their vision configuration.
 
 The UI stores provider metadata in the Git-ignored `configs/provider_profiles.yaml` and connection URLs/API keys in the equally ignored `configs/provider_secrets.yaml`. Keys are write-only and are never returned by the backend. New installations do not need to copy or maintain files under `configs/providers/`.
+
+### 7. Test a short clip first
+
+1. Use **Downloads & links** for a video you are authorized to process, or import local media in **Assets**. Download-only use does not require an Agent or LLM.
+2. Test a short captioned clip with OCR Lab 3.0. With NVIDIA CUDA configured, test speech-only media using ASR Lab 2.2; CPU users should use the basic CLI below instead of assuming the Web ASR path is CPU-ready. Initial recognition downloads models.
+3. Once recognition and your API work, provide a full link in the subtitle assistant. Formal translation pauses for human glossary review: fill or confirm names and terms, then save to continue.
+4. Download the SRT or open it from Assets for editing. Task history provides stage states, artifacts and reruns. Deleting a task removes its task-directory artifacts but preserves downloaded video; download any subtitles you want to keep first.
+
+Automatic checks are not a word-for-word human audit. Test short inputs before long videos to avoid wasting processing time and API quota on setup errors.
 
 ## Frontend Development
 
@@ -165,6 +191,8 @@ npm run dev
 
 Vite defaults to `http://127.0.0.1:5173` and proxies `/api` to port `7860`. Still run `npm run build` before committing.
 
+A successful build does not imply vulnerability-free dependencies; run `npm audit` from `frontend` to inspect the lockfile. Do not expose the Vite development server publicly or apply untested major upgrades with `npm audit fix --force`.
+
 ## LLM Configuration
 
 The project uses OpenAI-compatible chat-completions APIs. The Web UI **Settings** page can persist the default language for new tasks, the default provider profile, and the model used by every LLM module.
@@ -181,9 +209,16 @@ Older `.env`, `configs/llm.yaml`, and `configs/providers/*.yml` setups remain re
 
 ## GPU and Model Cache
 
-Model caches default to the project-local `models/` directory.
+Recognition weights are not included in Git. The project configures local cache paths such as `models/`; some upstream components may also use their own caches. Initial recognition needs network access to model sources and sufficient disk space. LLM APIs do not automatically download a local LLM.
 
-For PaddleOCR GPU support, install a PaddlePaddle GPU build that matches your CUDA runtime. Example for CUDA 12.6:
+Choose this instead of the CPU starter environment. After cloning, create an environment without CPU Paddle from the repository root:
+
+```bash
+conda create -n reibosub -c conda-forge python=3.11 pip ffmpeg "nodejs>=22" -y
+conda activate reibosub
+```
+
+The following is a **Linux NVIDIA / CUDA 12.6 example**, not a universal driver/GPU recipe. Check Paddle's official compatibility guidance before choosing an index. The [PaddleOCR installation guide](https://www.paddleocr.ai/main/en/quick_start.html) distinguishes the OCR package from its inference engine.
 
 ```bash
 python -m pip uninstall -y paddlepaddle paddlepaddle-gpu
@@ -195,6 +230,8 @@ python -m pip install -e ".[dev]"
 
 The GPU requirements file installs the common project dependencies, `faster-whisper`, and its usual CUDA Python wheels, but not CPU Paddle. Install Paddle GPU itself from the CUDA-specific index in the next command.
 
+Then return to steps 2–6 above to check tools, build the frontend and configure your service. Do not install the CPU `requirements.txt` or `environment.yml` afterward: that can reintroduce CPU Paddle.
+
 Check CUDA visibility:
 
 ```bash
@@ -204,6 +241,37 @@ python -c "import paddle; print(paddle.__version__); print(paddle.device.is_comp
 When the OCR device is `auto`, ReiboSub selects an available device. Individual OCR routes can still choose CPU or a GPU explicitly. Advanced device overrides from an existing legacy local runtime file remain compatible.
 
 For ASR with `faster-whisper`, the project tries to prepend CUDA library paths from installed `nvidia-*` Python packages. If CUDA libraries are still missing, verify your environment's `nvidia-cublas-cu12` and `nvidia-cudnn-cu12` packages.
+
+The current Web ASR entry submits CUDA/float16; CPU Paddle does not make that ASR path CPU-ready. Without NVIDIA CUDA, try basic transcription through the CLI:
+
+```bash
+python -m video_translate.tools.transcribe_audio "input.mp4" \
+  --out "outputs/demo/source.srt" --language ko \
+  --model-size small --device cpu --compute-type int8
+```
+
+This is basic faster-whisper transcription, not the complete ASR Lab 2.2 recovery/review/translation pipeline. Also check the [official faster-whisper requirements](https://github.com/SYSTRAN/faster-whisper#requirements) for CUDA/cuDNN compatibility.
+
+### ASR experiments require a separate setup
+
+ASR 2.2 is the normal route. Qwen multi-model review and autonomous ASR Lab experiments additionally require a separate Qwen Python environment, weights at `models/asr3/Qwen3-ASR-1.7B` and `models/asr3/Qwen3-ForcedAligner-0.6B`, and two NVIDIA GPUs. The current experimental launcher only accepts Korean. Set `REIBOSUB_QWEN_PYTHON` to that environment's Python when needed. Standard requirements do not create it or download those weights; do not choose the experimental versions until those prerequisites are ready.
+
+### Updating an installation
+
+Wait for jobs to finish and stop the server before updating from the existing environment:
+
+```bash
+conda activate reibosub
+git pull --ff-only
+python -m pip install -e .
+cd frontend
+npm ci
+npm run build
+cd ..
+python run_agent_ui.py
+```
+
+`pip install -e .` updates base dependencies without requesting CPU Paddle over an existing GPU installation. Git normally leaves ignored settings/media alone, but back them up first. There is no automatic updater or built-in service manager; configure your own long-running service and ensure it starts in the correct environment.
 
 ### Optional speaker diarization
 
@@ -481,9 +549,14 @@ This repository does not ship user videos, subtitles, model caches, or real cred
 ## Troubleshooting
 
 - **The page says the frontend is not built**: run `cd frontend && npm ci && npm run build`, then refresh.
+- **FFmpeg is installed but the service cannot find it**: activate the project environment, verify the actual Python/ffmpeg/ffprobe paths and launch from that terminal. Installing Python packages does not install a system FFmpeg executable.
+- **YouTube reports no JS runtime or challenge solver**: ensure Node.js 22+ is in the service's `PATH`, run `python -m pip install -U "yt-dlp[default]"`, and restart. Proxies, login requirements and geographic restrictions may still affect access separately.
+- **`libGL.so.1` / `libgomp.so.1` is missing**: this is a system-library issue, not an API-key or model issue. On Ubuntu/Debian an administrator can install `libgl1 libglib2.0-0 libgomp1`; use corresponding packages on other distributions.
 - **You cannot find the Conda environment**: run `conda info --envs` and `conda config --show envs_dirs`, or choose a path explicitly with `conda env create -p /path/to/envs/reibosub -f environment.yml`.
 - **A CPU Paddle build cannot use the GPU**: select `cpu`/`auto`, or uninstall `paddlepaddle` and install a `paddlepaddle-gpu` build matching your CUDA version. Do not keep both packages.
 - **Provider model discovery fails**: many compatible APIs do not expose `/models`; maintain static model IDs in Settings and continue normally.
+- **A model list loads but translation fails**: check API base URL, key permissions, quota and model access. Listing models does not prove inference requests will succeed.
+- **ASR fails with CUDA or float16 errors on CPU**: the current UI uses CUDA/float16. Use explicit `--device cpu --compute-type int8` with the basic CLI, or configure NVIDIA CUDA before using Web ASR.
 - **YouTube cannot connect**: set `youtube_proxy` in `configs/reibosub.yaml`; it applies only to downloads and does not proxy OCR/ASR.
 - **Visible text is missing from OCR**: verify language, the green subtitle crop, the logo exclusion box, and the selected OCR version. A first run may also be downloading models. Compare 2.0 and 3.0 in their own directories.
 - **`h264 mmco: unref short failure` appears**: this is normally a decoder warning. If OCR progress keeps moving, the job has not necessarily failed.

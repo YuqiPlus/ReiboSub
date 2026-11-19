@@ -6,6 +6,8 @@ ReiboSub 是一个面向 YouTube 和本地视频的字幕制作 Agent。它可�
 
 这个项目的核心思路是“人机协作”：Agent 可以同时推进多个视频流程，遇到需要你判断的地方会暂停，等你审核 glossary 或确认路线后继续。
 
+[安装与启动](#快速开始) · [模型配置](#大模型配置) · [GPU 与实验版要求](#gpu-和模型缓存) · [常见问题](#常见问题)
+
 ## 主要功能
 
 - **Agent 工作台**：输入 YouTube 链接或视频 ID，自动检测字幕源、推荐路线、等待人工确认。
@@ -19,7 +21,7 @@ ReiboSub 是一个面向 YouTube 和本地视频的字幕制作 Agent。它可�
 - **字幕精修**：逐条改字和时间轴、50 步撤回、按单条区间播放并在画面叠加字幕，也支持新增、合并、删除和批量清理。
 - **字幕格式转换**：支持 SRT、VTT、ASS/SSA、LRC、TXT、JSON、Bilibili BCC 等格式。
 - **视频贴图处理**：上传图片作为水印或遮挡 Logo，调位置和大小后输出新视频。
-- **模型服务设置**：在网页中新增 OpenAI-compatible 服务、拉取模型，并给各个 LLM 模块分别绑定服务商和模型。
+- **模型服务设置**：在网页中管理服务商，搜索选择一个通用模型；视觉模型可单独指定，逐模块覆盖收在高级设置里。
 
 Agent 路线的设计说明见：[docs/youtube_agent_workflows.md](docs/youtube_agent_workflows.md)。其中包含设计背景和后续构想，不保证每一项都已实现。
 
@@ -42,51 +44,59 @@ Agent 路线的设计说明见：[docs/youtube_agent_workflows.md](docs/youtube_
 
 ## 快速开始
 
-先安装系统工具：
+### 先了解安装边界
 
-- Python 3.10 或更新版本，推荐 Python 3.11。
-- `ffmpeg` 需要在 `PATH` 里，用于视频/音频处理和字幕封装。
-- 从源码首次运行 Web UI 需要 Node.js 20 或更新版本，因为构建产物不提交到 Git。
+这是源码项目，不是下载后双击即用的安装包。仓库不包含 `frontend/dist`、模型权重、API Key、用户视频和本机配置。完成安装后可以先打开网页；识别模型会在首次使用时下载，翻译与 Agent 判断需要你自己的模型服务。
 
-克隆项目并创建 Python 环境：
+推荐先在 **Linux x86_64 或 WSL2 + Python 3.11** 上跑通网页、翻译与 CPU OCR，再配置 GPU。Python 元数据允许 3.10+，但 OCR/ASR 能否安装还取决于对应平台的第三方 wheel；不要直接照搬服务器的 CUDA 环境。
+
+| 使用方式 | 额外需要什么 |
+| --- | --- |
+| 下载视频、字幕转换、字幕精修 | FFmpeg/ffprobe；YouTube 还需 Node.js 22+ 和可访问的网络 |
+| 翻译现有字幕、生成术语 | 你自己的 OpenAI-compatible 模型服务与额度 |
+| OCR 1.0 / 2.0 / 3.0 | PaddlePaddle CPU 或 GPU 引擎、识别模型；LLM 精修另需模型服务 |
+| 网页 ASR 2.2 | faster-whisper、Whisper 权重和 NVIDIA CUDA 运行环境；当前网页按 CUDA/float16 提交，CPU 识别可用下文的 CLI |
+| 自主 Agent 的画面分析 | 支持图片输入的模型；可以与通用模型相同 |
+
+标准安装不需要 MySQL、Redis，也不需要复制维护者的 `.env`。Qwen/多模型 ASR 实验不是标准依赖安装后即用的能力，见下文实验版说明。
+
+### 1. 克隆并安装（推荐 CPU 入门）
+
+先安装 Git 和 Conda/Miniforge。在准备存放项目的位置执行：
 
 ```bash
 git clone https://github.com/YuqiPlus/ReiboSub.git
 cd ReiboSub
-conda create -n reibosub python=3.11 -y
-conda activate reibosub
-python -m pip install -U pip
-python -m pip install -e ".[dev,asr,ocr-cpu]"
-```
-
-也可以直接使用提供的 conda 环境文件：
-
-```bash
 conda env create -f environment.yml
 conda activate reibosub
 ```
 
-如果只想最小安装，不需要 ASR 和测试依赖：
+这一条路线安装 Python 3.11、FFmpeg/ffprobe、Node.js 22+，以及 CPU OCR 和 faster-whisper。首次安装和首次下载模型需要联网；CPU 处理长视频可能很慢。**要直接配置 GPU OCR 的用户请跳到 [GPU 和模型缓存](#gpu-和模型缓存)，不要先安装 CPU Paddle。**
+
+已有 Python 环境时，以下方式与环境文件二选一；FFmpeg/ffprobe、Node.js 22+ 仍需自行安装并加入 `PATH`：
 
 ```bash
-python -m pip install -e ".[ocr-cpu]"
-```
-
-如果希望直接使用 requirements，标准 CPU OCR + ASR 只需：
-
-```bash
+python -m pip install -U pip
 python -m pip install -r requirements.txt
 ```
 
-测试依赖统一由 `pyproject.toml` 的 `dev` extra 管理：
+只处理现有字幕或下载视频、不运行识别时，可安装 `python -m pip install -e .`；它不安装 PaddlePaddle 推理引擎和 faster-whisper。需要时再安装 `.[ocr-cpu]` 或 `.[asr]`。测试依赖是可选的 `.[dev]`，普通使用无需安装。
+
+`yt-dlp[default]` 会一并安装 YouTube JS 解题组件；项目会启用 `PATH` 中的 Node.js。只有 Node、没有解题组件，或使用过旧的 Node，都可能出现“能打开视频但下载失败”。要求依据见 [yt-dlp EJS 官方说明](https://github.com/yt-dlp/yt-dlp/wiki/EJS)。
+
+### 2. 检查是不是用了同一个环境
 
 ```bash
-python -m pip install -e ".[dev]"
+python -c "import sys, shutil; print(sys.executable); print('ffmpeg:', shutil.which('ffmpeg')); print('ffprobe:', shutil.which('ffprobe')); print('node:', shutil.which('node'))"
+ffmpeg -version
+ffprobe -version
+node --version
+python -m pip check
 ```
 
-GPU OCR 不要安装 CPU requirements，请直接使用下文的 CUDA 安装步骤。
+前三个工具路径不应是 `None`，Node 应为 22 或更新版本。必须在激活后的同一终端启动服务；只写某个环境的 Python 完整路径，并不会自动把它的 `bin` 目录加入 `PATH`。`reibosub doctor` 可以补查部分 Python 包和缓存位置，但不检查全部外部工具、CUDA、模型下载和 API 可用性。
 
-首次从源码运行必须构建前端：
+### 3. 构建网页
 
 ```bash
 cd frontend
@@ -94,6 +104,10 @@ npm ci
 npm run build
 cd ..
 ```
+
+这一步不能省略。服务读取的是构建后的 `frontend/dist`，不是直接打开 `frontend/src`；Git 更新前端后也需要重新构建。
+
+### 4. 本机配置（可选）
 
 可选：复制唯一的本机启动配置。默认值已经可以直接启动；只有需要修改素材目录、YouTube 代理、监听地址或端口时才需要这个文件。
 
@@ -120,7 +134,7 @@ youtube_proxy: http://127.0.0.1:7890
 
 已有安装可以继续保留旧的 `configs/local_runtime.yaml`、`.env` 和 `configs/llm.yaml`，后端仍会兼容读取，不需要迁移或删除。
 
-启动 Agent UI：
+### 5. 启动网页
 
 ```bash
 python run_agent_ui.py
@@ -140,16 +154,28 @@ ssh -L 7860:127.0.0.1:7860 user@server
 
 然后仍在本机打开 `http://127.0.0.1:7860`。只有在可信局域网内才建议显式运行 `python run_agent_ui.py --host 0.0.0.0`。
 
-### 首次配置模型服务
+### 6. 在网页中配置模型服务
 
 首次打开网页后：
 
-1. 进入 **设置 → 新增服务商**。
+1. 进入 **设置 → 服务商管理 → 新增服务商**。空白安装没有默认可用的密钥。
 2. 填写稳定的 Provider ID、显示名称、OpenAI-compatible API Base URL 和 API Key。
 3. 点击“创建并获取模型”；如果服务不支持 `/models`，直接填写静态模型名称即可。
-4. 在常用设置选择通用模型，让翻译、术语、OCR 整理与 Agent 判断共用；画面分析需要图片输入，可跟随通用模型或单独指定视觉模型。模型选择器支持搜索与手填 ID。
+4. 返回 **常用设置**，选择默认服务商和通用模型，点击 **保存设置**。翻译、术语、OCR 整理与 Agent 判断可以共用一个模型，不必逐项配置。
+5. 画面分析需要支持图片输入。通用模型支持图片时，视觉模型选择跟随；否则单独选择视觉服务商和模型。模型支持搜索；无候选列表时可手填 ID。
+
+获取模型列表只说明服务返回了模型名称，不代表该账号有调用额度，也不保证模型支持图片。新手无需展开逐模块高级设置。旧安装想统一文本模块，可点击“统一文本模块到通用模型”，确认保留视觉配置后保存。
 
 网页会把服务商信息保存在 Git 忽略的 `configs/provider_profiles.yaml`，把连接地址和 API Key 保存在同样被忽略的 `configs/provider_secrets.yaml`。Key 是只写字段，不会从后端回显；新安装无需复制或手工维护 `configs/providers/` 下的文件。
+
+### 7. 第一次建议先跑短素材
+
+1. 先用 **下载与链接** 下载一段你有权处理的视频，或在 **素材库 → 导入素材** 上传本地视频。只下载不需要启动 Agent，也不需要 LLM。
+2. 在 **OCR Lab** 选择 3.0 测试有内嵌字幕的短片；已配置 NVIDIA CUDA 的机器可在 **ASR Lab** 选择 2.2 测试纯人声素材。CPU 用户先使用下文的语音识别 CLI，不要把 CPU 安装等同于网页 ASR 已就绪。首次识别会下载模型，不能据此误判卡死。
+3. 验证识别和模型服务后，再到 **字幕助手** 输入完整 YouTube 链接。正式翻译前会停在术语审核：填写或确认人名和专名，再保存继续。
+4. 完成页下载 SRT，或在 **素材库** 精修字幕。**所有任务** 显示阶段、产物和重跑入口；删除任务会删除任务目录中的产物，但保留已下载视频，删除前请先下载要保留的字幕。
+
+自动检查不是人工逐字核准。先测试短片，再跑长片，避免在模型、网络或设备没有配好时反复消耗时间和 API 额度。
 
 ## 前端开发
 
@@ -167,6 +193,8 @@ npm run dev
 
 开发服务器默认是 `http://127.0.0.1:5173`，并把 `/api` 转发到 `7860`。提交前仍需运行 `npm run build`。
 
+构建成功不代表依赖没有安全告警，可在 `frontend` 中单独运行 `npm audit` 检查锁定的依赖。不要把 Vite 开发服务器暴露到公网，也不要未经测试直接用 `npm audit fix --force` 跨大版本升级。
+
 ## 大模型配置
 
 项目使用 OpenAI-compatible Chat Completions API。Web UI 的“设置”页现在可以保存新任务的默认语言、默认服务配置，以及各 LLM 模块使用的模型。
@@ -183,9 +211,16 @@ API Key 和 API 地址直接在设置页管理，不需要 `.env`。服务商名
 
 ## GPU 和模型缓存
 
-模型缓存默认在项目下的 `models/`。
+识别模型不随 Git 下载。项目会配置 `models/` 等本地缓存路径，部分上游组件也可能使用自己的缓存；首次识别需要能访问对应模型源并预留磁盘空间。通用 LLM 通常通过 API 调用，不会自动下载为本地模型。
 
-如果要用 PaddleOCR GPU，请安装匹配 CUDA 的 PaddlePaddle GPU 版本。例如 CUDA 12.6：
+GPU 安装与 CPU 入门路线二选一。新机器先克隆仓库，在仓库根目录创建不含 CPU Paddle 的环境：
+
+```bash
+conda create -n reibosub -c conda-forge python=3.11 pip ffmpeg "nodejs>=22" -y
+conda activate reibosub
+```
+
+下面只是 **Linux NVIDIA / CUDA 12.6** 的安装示例，不是适用于所有显卡和驱动的命令。先核对驱动及 Paddle 官方兼容要求，再选择对应安装源；[PaddleOCR 安装说明](https://www.paddleocr.ai/main/en/quick_start.html)也明确区分了推理引擎和 OCR 包。
 
 ```bash
 python -m pip uninstall -y paddlepaddle paddlepaddle-gpu
@@ -197,6 +232,8 @@ python -m pip install -e ".[dev]"
 
 GPU requirements 文件会安装项目通用依赖、`faster-whisper` 和常用 CUDA Python wheels，但不会安装 CPU Paddle；Paddle GPU 本体由下一条 CUDA 专用源命令安装。
 
+完成后回到上面的第 2–6 步，检查工具、构建前端并配置服务。不要再执行 CPU 的 `requirements.txt` 或 `environment.yml` 安装路线，否则可能把 CPU Paddle 装回来。
+
 检查 Paddle 是否能看到 CUDA：
 
 ```bash
@@ -207,9 +244,40 @@ python -c "import paddle; print(paddle.__version__); print(paddle.device.is_comp
 
 ASR 使用 `faster-whisper` 时，项目会尝试自动加入 `nvidia-*` Python 包里的 CUDA 库路径。如果仍报 `libcublas.so.12` 或 cuDNN 找不到，请检查环境中的 `nvidia-cublas-cu12` 和 `nvidia-cudnn-cu12`。
 
+当前网页 ASR 入口按 CUDA/float16 启动，安装了 CPU Paddle 并不意味着 ASR 也能用 CPU。无 NVIDIA GPU 时可先用基础识别 CLI：
+
+```bash
+python -m video_translate.tools.transcribe_audio "input.mp4" \
+  --out "outputs/demo/source.srt" --language ko \
+  --model-size small --device cpu --compute-type int8
+```
+
+这条命令是基础 faster-whisper 转录，不等同于自动跑完整 ASR Lab 2.2 的补漏、复核和翻译。CUDA/cuDNN 的上游要求请同时核对 [faster-whisper 官方安装说明](https://github.com/SYSTRAN/faster-whisper#requirements)。
+
+### ASR 实验版不是标准安装的一部分
+
+ASR 2.2 是常规路线。ASR Lab 的 Qwen 多模型复核和自主实验版另需独立 Qwen Python 环境、`models/asr3/Qwen3-ASR-1.7B` 与 `models/asr3/Qwen3-ForcedAligner-0.6B` 权重，以及两张 NVIDIA GPU；当前实验入口还仅接受韩语。可用 `REIBOSUB_QWEN_PYTHON` 指定该环境的 Python。标准 requirements 不会自动建立它，也不会下载这些实验权重；未准备这些资源时，请不要选择实验版。
+
+### 更新代码后
+
+先等任务完成并停止服务，再在原环境中更新：
+
+```bash
+conda activate reibosub
+git pull --ff-only
+python -m pip install -e .
+cd frontend
+npm ci
+npm run build
+cd ..
+python run_agent_ui.py
+```
+
+`pip install -e .` 更新基础依赖，不会主动安装 CPU Paddle 覆盖已有 GPU 安装。忽略的本地配置与素材通常不受 Git 更新影响，仍建议先备份。没有自动更新和常驻进程管理器；远程长期运行应自行配置进程管理，并始终从正确的环境启动。
+
 ## Agent 工作流
 
-典型流程：
+默认的“自主 Agent · 实验”只需输入链接，由模型选工具；常规 ASR、OCR、视觉 API 的依赖仍需按上文准备。Glossary 始终由人审核后才正式翻译。若希望手动决定路线，切换到“经典工作流”，其典型流程是：
 
 1. 在 **Agent** 页输入 YouTube 链接或视频 ID。
 2. 如果你知道视频是否有内嵌字幕，先选择“有/没有/不清楚”。
@@ -383,9 +451,14 @@ git diff --cached --name-only
 ## 常见问题
 
 - **页面提示前端未构建**：运行 `cd frontend && npm ci && npm run build`，然后刷新页面。
+- **`ffmpeg` 已安装但服务说找不到**：先激活项目环境，检查 `python`、`ffmpeg`、`ffprobe` 的实际路径，再从同一个终端启动；安装 Python 包不会自动安装系统 FFmpeg。
+- **YouTube 提示没有 JS runtime / challenge solver**：检查 Node.js 22+ 在服务 `PATH` 中，执行 `python -m pip install -U "yt-dlp[default]"` 后重启。代理、平台登录限制和地区限制仍可能另行影响下载。
+- **`libGL.so.1` / `libgomp.so.1` 缺失**：这是系统动态库，不是模型或 API Key 问题；在 Ubuntu/Debian 可由管理员安装 `libgl1 libglib2.0-0 libgomp1`，其他发行版使用对应软件包。
 - **不知道 Conda 环境装到哪里**：运行 `conda info --envs` 和 `conda config --show envs_dirs`；也可以用 `conda env create -p /path/to/envs/reibosub -f environment.yml` 显式指定位置。
 - **提示安装的是 CPU 版 Paddle，无法用 GPU**：把 OCR 设备改为 `cpu`/`auto`，或先卸载 `paddlepaddle`，再按 CUDA 版本安装匹配的 `paddlepaddle-gpu`；不要同时保留 CPU/GPU 两个包。
 - **服务商获取不到模型**：很多兼容接口没有 `/models`；在设置页维护静态模型 ID，仍然可以正常发起任务。
+- **有模型列表却翻译失败**：再检查 Base URL 是否为兼容接口的根地址、Key 权限、额度和模型调用权限；列表成功不等于推理请求成功。
+- **CPU 机器 ASR 报 CUDA 或 float16 错误**：网页入口目前使用 CUDA/float16。基础 CLI 显式设置 `--device cpu --compute-type int8`，或准备完整 NVIDIA CUDA 环境后再用网页 ASR。
 - **YouTube 无法连接**：在 `configs/reibosub.yaml` 设置 `youtube_proxy`；它只作用于下载，不会代理 OCR/ASR。
 - **OCR 明明有字却漏识别**：先核对语言、绿色字幕裁框、Logo 排除框和 OCR 版本；首次运行还要等待模型下载。2.0 与 3.0 应在各自目录比较。
 - **出现 `h264 mmco: unref short failure`**：通常是解码警告；只要 OCR 进度仍增长，不代表任务崩溃。
