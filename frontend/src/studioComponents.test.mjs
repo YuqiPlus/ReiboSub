@@ -24,6 +24,20 @@ test('linked task subtitles expose their language and version without a misleadi
   assert.doesNotMatch(html, /中文译文/)
 })
 
+test('glossary scratchpad offers independently selectable languages and never auto-applies a translation', async () => {
+  const html = await render('ReferenceTranslator', { targetLanguage: 'en' })
+  assert.match(html, /随手翻译/)
+  assert.match(html, /翻译器原文语言/)
+  assert.match(html, /翻译器译文语言/)
+  assert.match(html, /<option value="en"[^>]* selected>英语/)
+  assert.match(html, /自动识别/)
+  assert.match(html, /交换翻译语言与文本/)
+  assert.match(html, /不会改动术语表/)
+  assert.match(html, /readonly[^>]*aria-label="翻译器译文"/)
+  const glossary = await render('GlossaryReviewPanel', { reviewReady: true, glossaryItems: [{ section: 'terms', index: 0, source: '안녕', context_text: '안녕!', reviewed: false }] })
+  assert.match(glossary, /放入翻译器/)
+})
+
 test('Agent language selector and English delivery never claim a Chinese artifact', async () => {
   const composer = await render('AgentSessionPanel', { url: 'https://www.bilibili.com/video/BV1GJ411x7h7', sourceLanguage: 'chinese', targetLanguage: 'en' })
   assert.match(composer, /目标字幕语言/)

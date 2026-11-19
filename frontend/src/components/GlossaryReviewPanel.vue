@@ -7,6 +7,7 @@
 
     <div v-if="agentReview" class="review-agent-note"><AppIcon name="spark" :size="17" /><span>确认完成后，保存并返回 Agent 继续翻译。</span></div>
 
+    <ReferenceTranslator ref="translator" :target-language="targetLanguage" />
 
     <details class="glossary-file-details studio-disclosure" :open="!reviewReady || loading">
       <summary>术语文件与高级编辑</summary>
@@ -44,6 +45,7 @@
               <p v-else-if="item.blind_candidate_error" class="context-error">参考译文暂不可用</p>
               <p v-else-if="item.blind_candidate_pending" class="review-meta">参考译文准备中…</p>
               <p v-if="!item.context_text && !item.blind_candidate_zh" class="review-meta">可播放原片段来核对语境。</p>
+              <button class="ghost mini" type="button" @click="translator?.setText(item.context_text || item.source)">放入翻译器</button>
               <details v-if="item.note || item.aliases?.length || item.english_reference_text || item.blind_candidate_zh" class="term-note-details"><summary>更多参考与识别说明</summary><p v-if="item.note">{{ item.note }}</p><p v-if="item.aliases?.length">别名：{{ item.aliases.join(', ') }}</p><p v-if="item.english_reference_text">英文参考：{{ item.english_reference_text }}</p><div v-if="item.blind_candidate_zh" class="term-full-reference"><p>下方操作会把整句参考填入译名，不会自动确认；人名通常只应填写名字。</p><button class="ghost mini" :disabled="continueBusy" @click="$emit('update-glossary-zh', { index, zh: item.blind_candidate_zh })">将整句填入译名</button></div></details>
             </div>
             <div class="term-answer">
@@ -70,6 +72,7 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { nextPendingReviewIndex, shouldConfirmReviewEnter } from '../glossaryReviewFocus.js'
 import { evidenceKey } from '../glossaryEvidence.js'
 import GlossaryEvidencePlayer from './GlossaryEvidencePlayer.vue'
+import ReferenceTranslator from './ReferenceTranslator.vue'
 import AppIcon from './AppIcon.vue'
 import { targetLanguages } from '../translationLanguages.js'
 
@@ -97,6 +100,7 @@ const emit = defineEmits([
 ])
 
 const tab = ref('review')
+const translator = ref(null)
 const targetLanguageLabel = computed(() => targetLanguages.find((item) => item.id === props.targetLanguage)?.label || '目标语言')
 const filter = ref('pending')
 const query = ref('')
