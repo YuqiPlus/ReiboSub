@@ -117,6 +117,8 @@ cd ..
 
 这一步不能省略。服务读取的是构建后的 `frontend/dist`，不是直接打开 `frontend/src`；Git 更新前端后也需要重新构建。
 
+前端要求 Node.js **至少 22.12**；建议使用受支持 LTS 分支的最新补丁，不要固定在旧的 22.12 发行包。Vite 和 Vue 构建插件属于开发依赖，但构建网页时必须安装，因此命令显式带 `--include=dev`。网页构建完由 Python 提供静态文件，正式服务不需要运行 Vite；从 `npm ci --omit=dev` 得到的安装不能用来构建。
+
 ### 4. 本机配置（可选）
 
 可选：复制唯一的本机启动配置。默认值已经可以直接启动；需要修改素材目录、平台代理、B 站 Cookie、监听地址或端口时才需要这个文件。
@@ -291,7 +293,7 @@ npm run dev
 
 开发服务器默认是 `http://127.0.0.1:5173`，并把 `/api` 转发到 `7860`。提交前仍需运行 `npm run build`。
 
-构建成功不代表依赖没有安全告警，可在 `frontend` 中单独运行 `npm audit` 检查锁定的依赖。不要把 Vite 开发服务器暴露到公网，也不要未经测试直接用 `npm audit fix --force` 跨大版本升级。
+构建成功不代表依赖没有安全告警。在 `frontend` 中运行 `npm run audit:deps`，检查包含开发依赖的完整锁定依赖树；运行 `npm test` 做前端测试。本次使用仍受维护的 Vite 7.3 补丁线和 Vue 3.5 修复版，Node 要求与 [Vite 7 官方迁移说明](https://v7.vite.dev/guide/migration#node-js-support) 对齐。后续安全公告会变化，更新时应重新审计、测试和构建，而不是使用 `--omit=dev` 隐藏构建依赖告警。不要把 Vite 开发服务器暴露到公网，也不要未经测试直接用 `npm audit fix --force` 跨大版本升级。
 
 ## 大模型配置
 
@@ -601,6 +603,8 @@ python -m pytest -q
 cd frontend
 node --test src/*.test.mjs
 ```
+
+也可直接运行 `npm test`；依赖审计运行 `npm run audit:deps`，该命令包含开发依赖且在存在漏洞时返回非零退出码。
 
 前端构建：
 

@@ -115,6 +115,8 @@ cd ..
 
 Do not skip this step. The server reads `frontend/dist`, not the source files directly; rebuild after pulling frontend changes as well.
 
+The frontend requires Node.js **at least 22.12**; use the latest patch of a supported LTS branch rather than pinning an old 22.12 release. Vite and its Vue plugin are development dependencies but are required to build, so the command explicitly uses `--include=dev`. Python serves the resulting static files without a running Vite process; an `npm ci --omit=dev` installation cannot build the frontend.
+
 ### 4. Optional machine-local settings
 
 Optionally copy the single machine-local startup template. The defaults already start safely; create this file to change the media directory, platform proxies, Bilibili cookie path, listen address or port.
@@ -291,7 +293,7 @@ npm run dev
 
 Vite defaults to `http://127.0.0.1:5173` and proxies `/api` to port `7860`. Still run `npm run build` before committing.
 
-A successful build does not imply vulnerability-free dependencies; run `npm audit` from `frontend` to inspect the lockfile. Do not expose the Vite development server publicly or apply untested major upgrades with `npm audit fix --force`.
+A successful build does not imply vulnerability-free dependencies. Run `npm run audit:deps` from `frontend` to audit the entire locked tree, including development dependencies, and `npm test` for frontend tests. This update uses the maintained Vite 7.3 patch line and patched Vue 3.5; Node requirements align with the [official Vite 7 migration guide](https://v7.vite.dev/guide/migration#node-js-support). Advisories change over time: re-audit, test and build when updating, rather than using `--omit=dev` to hide build-tool advisories. Do not expose the Vite development server publicly or apply untested major upgrades with `npm audit fix --force`.
 
 ## LLM Configuration
 
@@ -701,6 +703,8 @@ Frontend unit tests:
 cd frontend
 node --test src/*.test.mjs
 ```
+
+Alternatively run `npm test`. Run `npm run audit:deps` for an audit including development dependencies; it exits nonzero when vulnerabilities are reported.
 
 Frontend build:
 
