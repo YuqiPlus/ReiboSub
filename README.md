@@ -55,7 +55,7 @@ Start with **Linux x86_64 or WSL2 and Python 3.11** for the UI, translation and 
 
 | Capability | Additional requirements |
 | --- | --- |
-| Downloads, conversion and subtitle editing | FFmpeg/ffprobe; YouTube also needs Node.js 22+ and network access |
+| Downloads, conversion and subtitle editing | FFmpeg/ffprobe; YouTube also needs Node.js 22.12+ and network access |
 | Translation and glossary | Your own OpenAI-compatible model service and quota |
 | OCR 1.0 / 2.0 / 3.0 | CPU or GPU PaddlePaddle engine and recognition weights; LLM cleanup requires a model service |
 | Web ASR 2.2 | faster-whisper, Whisper weights and NVIDIA CUDA; the current UI submits CUDA/float16, while basic CPU transcription is available through the CLI below |
@@ -65,18 +65,23 @@ The standard public setup stores tasks and subtitles in files; no database or ma
 
 ### 1. Install the recommended CPU starter environment
 
-Install Git and Conda/Miniforge first, then run:
+Install Git and Conda/Miniforge first, then run the following. If GitHub requires authentication or returns 404, verify repository access first; authorized SSH users can also use `git clone git@github.com:YuqiPlus/ReiboSub.git`. Installation does not change repository visibility.
 
 ```bash
 git clone https://github.com/YuqiPlus/ReiboSub.git
 cd ReiboSub
-conda env create -f environment.yml
+conda create -n reibosub --override-channels -c conda-forge python=3.11 pip ffmpeg "nodejs>=22.12" -y
 conda activate reibosub
+python -m pip install -r requirements.txt
 ```
 
-This installs Python 3.11, FFmpeg/ffprobe, Node.js 22+, CPU OCR and faster-whisper. Installation and initial model loading require network access; long videos may be slow on CPU. **For GPU OCR, skip this CPU environment and follow [GPU and Model Cache](#gpu-and-model-cache).**
+Keep `--override-channels -c conda-forge`: this command uses only conda-forge rather than appending globally configured channels. No global `.condarc` changes or Anaconda-defaults terms acceptance are needed for this project. The restriction applies to **Conda channels**: Python dependencies still install from PyPI through pip; GPU Paddle uses its official index below.
 
-If you already have a suitable Python environment, use this alternative instead. You must separately install FFmpeg/ffprobe and Node.js 22+ in `PATH`:
+An `environment.yml` containing `conda-forge` / `nodefaults` remains available for manifest-based installs. `nodefaults` prevents the solver from appending default channels, but some Anaconda terms plugins check global channels before reading the manifest. If affected, use the explicit create command above. The project never automatically accepts terms or changes global configuration. See the [official Conda environment format](https://conda.org/learn/specifications/exchange/environment-yml/) for the format semantics.
+
+This installs Python 3.11, FFmpeg/ffprobe, Node.js 22.12+, CPU OCR and faster-whisper. Installation and initial model loading require network access; long videos may be slow on CPU. **For GPU OCR, skip this CPU environment and follow [GPU and Model Cache](#gpu-and-model-cache).**
+
+If you already have a suitable Python environment, skip environment creation and install as follows. You must separately install FFmpeg/ffprobe and Node.js 22.12+ in `PATH`:
 
 ```bash
 python -m pip install -U pip
@@ -97,13 +102,13 @@ node --version
 python -m pip check
 ```
 
-None of the three tool paths should be `None`; Node should be version 22 or newer. Start the server from the same activated terminal. Calling a Python executable by absolute path does not automatically add its environment's `bin` directory to `PATH`. `reibosub doctor` checks some Python imports/cache paths, not every external tool, CUDA library, model download or API connection.
+None of the three tool paths should be `None`; Node should be version 22.12 or newer. Start the server from the same activated terminal. Calling a Python executable by absolute path does not automatically add its environment's `bin` directory to `PATH`. `reibosub doctor` checks some Python imports/cache paths, not every external tool, CUDA library, model download or API connection.
 
 ### 3. Build the frontend
 
 ```bash
 cd frontend
-npm ci
+npm ci --include=dev
 npm run build
 cd ..
 ```
@@ -272,7 +277,7 @@ The translator reuses the configured subtitle-translation model, normally inheri
 
 ## Frontend Development
 
-The Python service reads `frontend/dist`. Use `npm ci && npm run build` for a production-style local build. For development, run the backend and Vite separately:
+The Python service reads `frontend/dist`. Use `npm ci --include=dev && npm run build` for a production-style local build. For development, run the backend and Vite separately:
 
 ```bash
 # terminal 1
@@ -280,7 +285,7 @@ python run_agent_ui.py
 
 # terminal 2
 cd frontend
-npm ci
+npm ci --include=dev
 npm run dev
 ```
 
@@ -309,7 +314,7 @@ Recognition weights are not included in Git. The project configures local cache 
 Choose this instead of the CPU starter environment. After cloning, create an environment without CPU Paddle from the repository root:
 
 ```bash
-conda create -n reibosub -c conda-forge python=3.11 pip ffmpeg "nodejs>=22" -y
+conda create -n reibosub --override-channels -c conda-forge python=3.11 pip ffmpeg "nodejs>=22.12" -y
 conda activate reibosub
 ```
 
@@ -360,7 +365,7 @@ conda activate reibosub
 git pull --ff-only
 python -m pip install -e .
 cd frontend
-npm ci
+npm ci --include=dev
 npm run build
 cd ..
 python run_agent_ui.py
@@ -662,11 +667,13 @@ This repository does not ship user videos, subtitles, model caches, or real cred
 
 ## Troubleshooting
 
-- **The page says the frontend is not built**: run `cd frontend && npm ci && npm run build`, then refresh.
+- **The page says the frontend is not built**: run `cd frontend && npm ci --include=dev && npm run build`, then refresh.
 - **FFmpeg is installed but the service cannot find it**: activate the project environment, verify the actual Python/ffmpeg/ffprobe paths and launch from that terminal. Installing Python packages does not install a system FFmpeg executable.
-- **YouTube reports no JS runtime or challenge solver**: ensure Node.js 22+ is in the service's `PATH`, run `python -m pip install -U "yt-dlp[default]"`, and restart. Proxies, login requirements and geographic restrictions may still affect access separately.
+- **YouTube reports no JS runtime or challenge solver**: ensure Node.js 22.12+ is in the service's `PATH`, run `python -m pip install -U "yt-dlp[default]"`, and restart. Proxies, login requirements and geographic restrictions may still affect access separately.
 - **`libGL.so.1` / `libgomp.so.1` is missing**: this is a system-library issue, not an API-key or model issue. On Ubuntu/Debian an administrator can install `libgl1 libglib2.0-0 libgomp1`; use corresponding packages on other distributions.
-- **You cannot find the Conda environment**: run `conda info --envs` and `conda config --show envs_dirs`, or choose a path explicitly with `conda env create -p /path/to/envs/reibosub -f environment.yml`.
+- **You cannot find the Conda environment**: run `conda info --envs` and `conda config --show envs_dirs`. To choose a path, replace `-n reibosub` with `-p /path/to/envs/reibosub` in the create command, retaining `--override-channels -c conda-forge`, then activate that path.
+- **Conda asks to accept Anaconda defaults-channel terms**: use the explicit `conda create ... --override-channels -c conda-forge ...` command above, followed by pip installation. Some pre-command plugins still intercept `conda env create` even with `nodefaults`; accepting terms or changing global channels is unnecessary. Do not pass `nodefaults` as a download channel with `-c`.
+- **Vite reports unsupported Node or a crypto error during build**: check `node --version` in the activated environment; it must be at least 22.12. Node 22.0–22.11 is insufficient. After updating, rerun `npm ci --include=dev` and build; an existing `dist` does not prove dependencies are ready.
 - **A CPU Paddle build cannot use the GPU**: select `cpu`/`auto`, or uninstall `paddlepaddle` and install a `paddlepaddle-gpu` build matching your CUDA version. Do not keep both packages.
 - **Provider model discovery fails**: many compatible APIs do not expose `/models`; maintain static model IDs in Settings and continue normally.
 - **A model list loads but translation fails**: check API base URL, key permissions, quota and model access. Listing models does not prove inference requests will succeed.

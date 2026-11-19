@@ -57,7 +57,7 @@ Agent 路线的设计说明见：[docs/youtube_agent_workflows.md](docs/youtube_
 
 | 使用方式 | 额外需要什么 |
 | --- | --- |
-| 下载视频、字幕转换、字幕精修 | FFmpeg/ffprobe；YouTube 还需 Node.js 22+ 和可访问的网络 |
+| 下载视频、字幕转换、字幕精修 | FFmpeg/ffprobe；YouTube 还需 Node.js 22.12+ 和可访问的网络 |
 | 翻译现有字幕、生成术语 | 你自己的 OpenAI-compatible 模型服务与额度 |
 | OCR 1.0 / 2.0 / 3.0 | PaddlePaddle CPU 或 GPU 引擎、识别模型；LLM 精修另需模型服务 |
 | 网页 ASR 2.2 | faster-whisper、Whisper 权重和 NVIDIA CUDA 运行环境；当前网页按 CUDA/float16 提交，CPU 识别可用下文的 CLI |
@@ -67,18 +67,23 @@ Agent 路线的设计说明见：[docs/youtube_agent_workflows.md](docs/youtube_
 
 ### 1. 克隆并安装（推荐 CPU 入门）
 
-先安装 Git 和 Conda/Miniforge。在准备存放项目的位置执行：
+先安装 Git 和 Conda/Miniforge。在准备存放项目的位置执行。若 GitHub 提示认证或返回 404，需先确认仓库访问权限；已授权的 SSH 用户也可用 `git clone git@github.com:YuqiPlus/ReiboSub.git`，安装命令不会改变仓库可见性。
 
 ```bash
 git clone https://github.com/YuqiPlus/ReiboSub.git
 cd ReiboSub
-conda env create -f environment.yml
+conda create -n reibosub --override-channels -c conda-forge python=3.11 pip ffmpeg "nodejs>=22.12" -y
 conda activate reibosub
+python -m pip install -r requirements.txt
 ```
 
-这一条路线安装 Python 3.11、FFmpeg/ffprobe、Node.js 22+，以及 CPU OCR 和 faster-whisper。首次安装和首次下载模型需要联网；CPU 处理长视频可能很慢。**要直接配置 GPU OCR 的用户请跳到 [GPU 和模型缓存](#gpu-和模型缓存)，不要先安装 CPU Paddle。**
+请保留 `--override-channels -c conda-forge`：该命令只使用 conda-forge，不追加全局配置中的软件源，无需改全局 `.condarc` 或为本项目接受 Anaconda 默认源条款。这里限制的是 **Conda 软件源**；Python 依赖仍由 pip 从 PyPI 安装，GPU Paddle 按下文从官方索引安装。
 
-已有 Python 环境时，以下方式与环境文件二选一；FFmpeg/ffprobe、Node.js 22+ 仍需自行安装并加入 `PATH`：
+仓库仍提供含 `conda-forge` / `nodefaults` 的 `environment.yml`，供使用环境文件的用户选择。`nodefaults` 会阻止求解器追加默认源，但部分 Anaconda 条款插件会在读取清单前检查全局源；若遇到这种情况，请使用上面的显式创建命令。项目不会自动接受条款或修改全局配置。格式行为见 [Conda 官方环境格式说明](https://conda.org/learn/specifications/exchange/environment-yml/)。
+
+这一条路线安装 Python 3.11、FFmpeg/ffprobe、Node.js 22.12+，以及 CPU OCR 和 faster-whisper。首次安装和首次下载模型需要联网；CPU 处理长视频可能很慢。**要直接配置 GPU OCR 的用户请跳到 [GPU 和模型缓存](#gpu-和模型缓存)，不要先安装 CPU Paddle。**
+
+已有合适的 Python 环境时，可跳过创建环境，直接按以下方式安装；FFmpeg/ffprobe、Node.js 22.12+ 仍需自行安装并加入 `PATH`：
 
 ```bash
 python -m pip install -U pip
@@ -99,13 +104,13 @@ node --version
 python -m pip check
 ```
 
-前三个工具路径不应是 `None`，Node 应为 22 或更新版本。必须在激活后的同一终端启动服务；只写某个环境的 Python 完整路径，并不会自动把它的 `bin` 目录加入 `PATH`。`reibosub doctor` 可以补查部分 Python 包和缓存位置，但不检查全部外部工具、CUDA、模型下载和 API 可用性。
+前三个工具路径不应是 `None`，Node 应为 22.12 或更新版本。必须在激活后的同一终端启动服务；只写某个环境的 Python 完整路径，并不会自动把它的 `bin` 目录加入 `PATH`。`reibosub doctor` 可以补查部分 Python 包和缓存位置，但不检查全部外部工具、CUDA、模型下载和 API 可用性。
 
 ### 3. 构建网页
 
 ```bash
 cd frontend
-npm ci
+npm ci --include=dev
 npm run build
 cd ..
 ```
@@ -272,7 +277,7 @@ Agent 进入人工审核时会自动打开术语表；手动操作也可从 **�
 
 ## 前端开发
 
-Python 服务会读取 `frontend/dist`。生产式本地运行使用 `npm ci && npm run build`。开发时可以分别启动 Python 后端和 Vite：
+Python 服务会读取 `frontend/dist`。生产式本地运行使用 `npm ci --include=dev && npm run build`。开发时可以分别启动 Python 后端和 Vite：
 
 ```bash
 # 终端 1
@@ -280,7 +285,7 @@ python run_agent_ui.py
 
 # 终端 2
 cd frontend
-npm ci
+npm ci --include=dev
 npm run dev
 ```
 
@@ -309,7 +314,7 @@ API Key 和 API 地址直接在设置页管理，不需要 `.env`。服务商名
 GPU 安装与 CPU 入门路线二选一。新机器先克隆仓库，在仓库根目录创建不含 CPU Paddle 的环境：
 
 ```bash
-conda create -n reibosub -c conda-forge python=3.11 pip ffmpeg "nodejs>=22" -y
+conda create -n reibosub --override-channels -c conda-forge python=3.11 pip ffmpeg "nodejs>=22.12" -y
 conda activate reibosub
 ```
 
@@ -360,7 +365,7 @@ conda activate reibosub
 git pull --ff-only
 python -m pip install -e .
 cd frontend
-npm ci
+npm ci --include=dev
 npm run build
 cd ..
 python run_agent_ui.py
@@ -562,11 +567,13 @@ git diff --cached --name-only
 
 ## 常见问题
 
-- **页面提示前端未构建**：运行 `cd frontend && npm ci && npm run build`，然后刷新页面。
+- **页面提示前端未构建**：运行 `cd frontend && npm ci --include=dev && npm run build`，然后刷新页面。
 - **`ffmpeg` 已安装但服务说找不到**：先激活项目环境，检查 `python`、`ffmpeg`、`ffprobe` 的实际路径，再从同一个终端启动；安装 Python 包不会自动安装系统 FFmpeg。
-- **YouTube 提示没有 JS runtime / challenge solver**：检查 Node.js 22+ 在服务 `PATH` 中，执行 `python -m pip install -U "yt-dlp[default]"` 后重启。代理、平台登录限制和地区限制仍可能另行影响下载。
+- **YouTube 提示没有 JS runtime / challenge solver**：检查 Node.js 22.12+ 在服务 `PATH` 中，执行 `python -m pip install -U "yt-dlp[default]"` 后重启。代理、平台登录限制和地区限制仍可能另行影响下载。
 - **`libGL.so.1` / `libgomp.so.1` 缺失**：这是系统动态库，不是模型或 API Key 问题；在 Ubuntu/Debian 可由管理员安装 `libgl1 libglib2.0-0 libgomp1`，其他发行版使用对应软件包。
-- **不知道 Conda 环境装到哪里**：运行 `conda info --envs` 和 `conda config --show envs_dirs`；也可以用 `conda env create -p /path/to/envs/reibosub -f environment.yml` 显式指定位置。
+- **不知道 Conda 环境装到哪里**：运行 `conda info --envs` 和 `conda config --show envs_dirs`；也可以将创建命令中的 `-n reibosub` 换成 `-p /path/to/envs/reibosub`，保留 `--override-channels -c conda-forge`，随后用 `conda activate /path/to/envs/reibosub` 激活。
+- **Conda 提示需要接受 Anaconda 默认源条款**：使用上面的 `conda create ... --override-channels -c conda-forge ...`，再用 pip 安装项目。某些前置插件仍会拦截 `conda env create`，即使清单有 `nodefaults`；不必接受条款或改全局源。不要把 `nodefaults` 当作下载源传给 `-c`。
+- **Vite 提示 Node 版本不支持或构建时报 crypto 错误**：检查激活环境后的 `node --version`，至少为 22.12；旧的 Node 22.0–22.11 不满足要求。升级后重新执行 `npm ci --include=dev` 和构建，不要用已有 `dist` 推断依赖已就绪。
 - **提示安装的是 CPU 版 Paddle，无法用 GPU**：把 OCR 设备改为 `cpu`/`auto`，或先卸载 `paddlepaddle`，再按 CUDA 版本安装匹配的 `paddlepaddle-gpu`；不要同时保留 CPU/GPU 两个包。
 - **服务商获取不到模型**：很多兼容接口没有 `/models`；在设置页维护静态模型 ID，仍然可以正常发起任务。
 - **有模型列表却翻译失败**：再检查 Base URL 是否为兼容接口的根地址、Key 权限、额度和模型调用权限；列表成功不等于推理请求成功。
