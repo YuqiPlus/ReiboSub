@@ -173,7 +173,7 @@ test('probe result retains subtitles, title tools and source details without met
   assert.doesNotMatch(html, /summary-grid|class="metric"/)
 })
 
-test('task cards surface current artifacts but fold reruns, deletion and archives', async () => {
+test('task cards surface stage status, artifacts and deletion while folding reruns and archives', async () => {
   const html = await render('TaskHistoryPanel', { tasks: [{ id: 'fixture', title: '历史任务', status: 'waiting', current_stage: 'glossary_review', run_generation: 2, stage_items: [{ id: 'glossary', status: 'waiting_review', glossary_path: '/sample/glossary.yaml' }, { id: 'translate', status: 'done', translated_srt: '/sample/zh.srt', can_rerun: true }], archived_runs: [{ generation: 1, artifacts: [{ kind: 'translated_srt', path: '/sample/old.srt' }] }] }] })
   assert.match(html, /继续任务/)
   assert.match(html, /打开中文字幕/)
@@ -183,6 +183,35 @@ test('task cards surface current artifacts but fold reruns, deletion and archive
   assert.match(html, /重跑此阶段/)
   assert.match(html, /旧版中文字幕/)
   assert.match(html, /删除任务…/)
+  assert.ok(html.indexOf('删除任务…') < html.indexOf('class="history-task-details"'))
+  assert.match(html, /aria-label="各阶段状态"/)
+  assert.match(html, /第 2 轮/)
+})
+
+test('media rows expose useful actions without needing to open the detail inspector', async () => {
+  const html = await render('AssetLibrary', { assets: { projects: [
+    { name: '带字幕的视频', path: '/one', source_type: 'youtube', videos: [{ path: '/one.mp4' }], subtitles: [{ path: '/one.zh.srt', role: 'translated' }] },
+    { name: '尚未识别的视频', path: '/two', videos: [{ path: '/two.mp4' }] },
+    { name: '音频素材', path: '/three', audios: [{ path: '/three.wav' }] },
+  ] } })
+  assert.equal((html.match(/class="library-card-actions"/g) || []).length, 3)
+  assert.match(html, /载入项目/)
+  assert.match(html, /精修字幕/)
+  assert.match(html, /提取画面字幕/)
+  assert.match(html, /语音识别/)
+  assert.match(html, /文件与更多/)
+  assert.match(html, /1 视频 · 1 字幕/)
+  assert.doesNotMatch(html, /aria-label="所选素材详情"/)
+})
+
+test('running task deletion is visible but disabled, with real errors kept on failed cards', async () => {
+  const html = await render('TaskHistoryPanel', { tasks: [
+    { id: 'running', title: '正在处理', status: 'running', current_stage: 'autonomous_running', stage_items: [] },
+    { id: 'failed', title: '失败任务', status: 'failed', current_stage: 'ocr_failed', stage_items: [{ id: 'ocr', status: 'failed', error: '具体失败原因' }] },
+  ] })
+  assert.match(html, /history-delete-task"[^>]*disabled[^>]*title="请先中断正在运行的任务"/)
+  assert.match(html, /class="history-card-error"/)
+  assert.match(html, /具体失败原因/)
 })
 
 test('settings keep four main model bindings and every extra module without exposing stored keys', async () => {

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { fileLabel, localModifiedLabel, filterLibraryProjects, projectMediaSummary, visibleSubtitleRows } from './studioTools.js'
+import { fileLabel, localModifiedLabel, filterLibraryProjects, projectMediaSummary, visibleSubtitleRows, projectMedia, preferredProjectSubtitle } from './studioTools.js'
 
 test('file labels handle both path styles without changing the original', () => {
   assert.equal(fileLabel('/example/한글 中文.srt'), '한글 中文.srt')
@@ -22,6 +22,16 @@ test('invalid media timestamps use the provided label safely', () => {
   assert.equal(localModifiedLabel({ modified_at: 'NaN', modified_label: '旧记录' }), '旧记录')
   assert.equal(localModifiedLabel({ modified_at: 1e100 }), '')
   assert(localModifiedLabel({ modified_at: 1795003351 }))
+})
+test('project shortcuts use actual media and prefer labelled translations without mutating files', () => {
+  assert.equal(projectMedia(null), null)
+  assert.deepEqual(projectMedia({ audios: [{ path: '/a.wav' }] }), { kind: 'audio', path: '/a.wav' })
+  assert.deepEqual(projectMedia({ primary_video: '/main.mp4', videos: [{ path: '/other.mp4' }], primary_audio: '/a.wav' }), { kind: 'video', path: '/main.mp4' })
+  const files = [{ path: '/source.srt', role: 'source', modified_at: 9 }, { path: '/zh.srt', role: 'translated', modified_at: 1 }, { path: '/other.srt', modified_at: 10 }]
+  assert.equal(preferredProjectSubtitle({ subtitles: files }).path, '/zh.srt')
+  assert.equal(files[0].path, '/source.srt')
+  assert.equal(preferredProjectSubtitle({ subtitles: [{ name: 'missing path' }] }), null)
+  assert.equal(preferredProjectSubtitle({ subtitles: [{ path: '/older.srt', role: 'translated', modified_at: 1 }, { path: '/newer.srt', role: 'translated', modified_at: 2 }] }).path, '/newer.srt')
 })
 test('subtitle search retains original row indices and UIDs', () => {
   const cues = [{ uid: 'one', text: '你好', start_time: '00:00:01,000' }, { uid: 'two', text: 'Second line', start_time: '00:00:02,000' }]

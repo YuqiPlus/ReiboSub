@@ -15,6 +15,21 @@ export function projectMediaSummary(project) {
   }).join(' · ') || '暂无媒体文件'
 }
 
+export function projectMedia(project) {
+  const video = project?.primary_video || project?.videos?.find(file => file.path)?.path
+  if (video) return { kind: 'video', path: video }
+  const audio = project?.primary_audio || project?.audios?.find(file => file.path)?.path
+  return audio ? { kind: 'audio', path: audio } : null
+}
+
+export function preferredProjectSubtitle(project) {
+  const files = (project?.subtitles || []).filter(file => file.path)
+  // Prefer an explicitly labelled translation; never infer a language from the
+  // project title. Recent files win only within the same role.
+  const rank = file => file.role === 'translated' ? 0 : file.role === 'source' ? 1 : 2
+  return [...files].sort((a, b) => rank(a) - rank(b) || (Number(b.modified_at) || 0) - (Number(a.modified_at) || 0))[0] || null
+}
+
 export function filterLibraryProjects(projects, { query = '', kind = 'all', sort = 'recent' } = {}) {
   const key = { video: 'videos', audio: 'audios', subtitle: 'subtitles' }[kind]
   const needle = String(query).trim().toLocaleLowerCase()

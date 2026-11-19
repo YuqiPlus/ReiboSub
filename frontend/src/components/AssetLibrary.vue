@@ -1,6 +1,6 @@
 <template>
   <section class="panel library-studio">
-    <header class="studio-page-head"><div><span class="studio-kicker">素材库</span><h2>所有素材，都在这里</h2><p>找一段视频，打开字幕，接着上次的工作。</p></div><div class="toolbar"><button class="secondary" type="button" @click="$emit('refresh')"><AppIcon name="history" :size="16" />刷新</button><button type="button" :disabled="uploadBusy" :aria-expanded="showImport" @click="showImport = !showImport"><AppIcon name="plus" :size="17" />导入素材</button></div></header>
+    <header class="studio-page-head"><div><h2>素材库</h2><p>{{ projects.length }} 个素材项目 · 视频、字幕和处理工具放在一起。</p></div><div class="toolbar"><button class="secondary" type="button" @click="$emit('refresh')"><AppIcon name="history" :size="16" />刷新</button><button type="button" :disabled="uploadBusy" :aria-expanded="showImport" @click="showImport = !showImport"><AppIcon name="plus" :size="17" />导入素材</button></div></header>
 
     <section v-if="showImport" class="library-import" aria-label="导入素材">
       <div class="studio-section-head"><div><h3>从本机上传</h3><p>仅保存素材，不会自动开始识别或翻译。</p></div><button class="icon-button" type="button" aria-label="收起导入" :disabled="uploadBusy" @click="showImport = false"><AppIcon name="close" :size="18" /></button></div>
@@ -18,9 +18,20 @@
       <div class="library-grid">
         <article v-for="project in visibleProjects" :key="project.path" class="library-card" :class="{ selected: selectedProjectPath === project.path }">
           <button class="library-card-open" type="button" :aria-label="`打开素材：${project.name}`" :aria-pressed="selectedProjectPath === project.path" @click="selectProject(project)">
-            <div class="library-card-cover"><img v-if="projectCover(project)" :src="fileUrl(projectCover(project))" loading="lazy" alt="" /><AppIcon v-else :name="project.audios?.length && !project.videos?.length ? 'audio' : 'video'" :size="30" /><span class="library-source">{{ sourceLabel(project.source_type) }}</span></div>
-            <div class="library-card-copy"><h3>{{ project.name }}</h3><p>{{ projectSummary(project) }}</p><span>{{ modifiedLabel(project) }}</span></div>
+            <span class="library-card-cover"><img v-if="projectCover(project)" :src="fileUrl(projectCover(project))" loading="lazy" alt="" /><AppIcon v-else :name="project.audios?.length && !project.videos?.length ? 'audio' : 'video'" :size="28" /></span>
           </button>
+          <div class="library-card-content">
+            <button class="library-card-title" type="button" @click="selectProject(project)"><h3>{{ project.name }}</h3></button>
+            <div class="library-card-meta"><span class="library-source">{{ sourceLabel(project.source_type) }}</span><span>{{ projectSummary(project) }}</span><time>{{ modifiedLabel(project) }}</time></div>
+            <div class="library-card-actions">
+              <button type="button" @click="$emit('use-project', project)">载入项目</button>
+              <button v-if="projectMedia(project)" class="secondary" type="button" @click="previewProject(project)"><AppIcon name="play" :size="14" />预览</button>
+              <button v-if="preferredProjectSubtitle(project)" class="secondary" type="button" :title="preferredProjectSubtitle(project).path" @click="$emit('edit-subtitle', { path: preferredProjectSubtitle(project).path, videoPath: project.primary_video || project.videos?.[0]?.path || '' })"><AppIcon name="edit" :size="14" />精修字幕</button>
+              <button v-else-if="projectMedia(project)?.kind === 'video'" class="secondary" type="button" @click="$emit('use-video-ocr', projectMedia(project).path)">提取画面字幕</button>
+              <button v-else-if="projectMedia(project)?.kind === 'audio'" class="secondary" type="button" @click="$emit('use-media-asr', projectMedia(project).path)">语音识别</button>
+              <button class="secondary library-more-action" type="button" :aria-expanded="selectedProjectPath === project.path" @click="selectProject(project)">文件与更多<AppIcon name="chevron" :size="13" /></button>
+            </div>
+          </div>
         </article>
       </div>
       <aside v-if="selectedProject" ref="projectDetail" class="library-detail" tabindex="-1" aria-label="所选素材详情">
@@ -44,7 +55,7 @@ import { computed, nextTick, ref, watch } from 'vue'
 import AssetList from './AssetList.vue'
 import { copyText } from '../clipboard.js'
 import AppIcon from './AppIcon.vue'
-import { fileLabel, filterLibraryProjects, projectMediaSummary, localModifiedLabel } from '../studioTools.js'
+import { fileLabel, filterLibraryProjects, projectMediaSummary, localModifiedLabel, preferredProjectSubtitle, projectMedia } from '../studioTools.js'
 
 const props = defineProps({
   localVideo: { type: String, default: '' },
@@ -84,12 +95,7 @@ const projectDetail = ref(null)
 const typeFilters = [{ id: 'all', label: '全部' }, { id: 'video', label: '视频' }, { id: 'audio', label: '音频' }, { id: 'subtitle', label: '字幕' }]
 const visibleProjects = computed(() => filterLibraryProjects(projects.value, { query: query.value, kind: mediaFilter.value, sort: sortBy.value }))
 const selectedProject = computed(() => visibleProjects.value.find(project => project.path === selectedProjectPath.value) || null)
-const previewMedia = computed(() => {
-  const project = selectedProject.value
-  if (project?.primary_video || project?.videos?.[0]?.path) return { kind: 'video', path: project.primary_video || project.videos[0].path }
-  if (project?.primary_audio || project?.audios?.[0]?.path) return { kind: 'audio', path: project.primary_audio || project.audios[0].path }
-  return null
-})
+const previewMedia = computed(() => projectMedia(selectedProject.value))
 const projectSummary = projectMediaSummary
 const actionFeedback = computed(() => {
   if (props.statusClass !== 'ok' || /^(已扫描|已选择当前)/.test(props.status)) return ''
@@ -103,6 +109,10 @@ async function selectProject(project) {
   await nextTick()
   projectDetail.value?.focus({ preventScroll: true })
   if (window.innerWidth <= 760) projectDetail.value?.scrollIntoView({ block: 'start' })
+}
+async function previewProject(project) {
+  await selectProject(project)
+  showPreview.value = true
 }
 const selectedIsAudio = computed(() => /\.(mp3|wav|flac|m4a|aac|ogg|opus|wma)$/i.test(props.localVideo || ''))
 

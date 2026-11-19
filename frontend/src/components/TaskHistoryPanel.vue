@@ -1,15 +1,22 @@
 <template>
   <section class="panel task-history history-studio" :aria-busy="loading">
-    <header class="studio-page-head"><div><span class="studio-kicker">任务历史</span><h2>接着上次的工作</h2><p>任务、字幕和旧版本都保留在这里。</p></div><button class="secondary" type="button" :disabled="loading || anyBusy" @click="emit('refresh')"><AppIcon name="history" :size="16" />{{ loading ? '刷新中…' : '刷新任务' }}</button></header>
+    <header class="studio-page-head"><div><h2>任务历史</h2><p>{{ tasks.length }} 个任务 · 查看进展、打开字幕，或继续处理。</p></div><button class="secondary" type="button" :disabled="loading || anyBusy" @click="emit('refresh')"><AppIcon name="history" :size="16" />{{ loading ? '刷新中…' : '刷新任务' }}</button></header>
     <div class="studio-filter-bar history-filter-bar"><label class="studio-search"><AppIcon name="search" :size="17" /><input v-model.trim="query" type="search" autocomplete="off" aria-label="搜索任务" placeholder="搜索标题、链接或任务编号" /><button v-if="query" class="icon-button" type="button" aria-label="清除搜索" @click="query = ''"><AppIcon name="close" :size="14" /></button></label><select v-model="sortBy" class="library-sort" aria-label="任务排序"><option value="recent">最近更新</option><option value="name">按标题</option></select></div>
     <nav class="studio-tabs history-tabs" aria-label="任务筛选"><button v-for="item in filters" :key="item.id" type="button" :class="{ active: activeFilter === item.id }" :aria-pressed="activeFilter === item.id" @click="activeFilter = item.id">{{ item.label }}<span v-if="counts[item.id]">{{ counts[item.id] }}</span></button></nav>
     <p v-if="status && statusClass !== 'ok'" class="status" :class="statusClass" role="status">{{ status }}</p>
     <div v-if="loading && !tasks.length" class="studio-empty" role="status">正在读取任务…</div>
     <div v-else-if="!visibleTasks.length" class="studio-empty"><AppIcon name="history" :size="30" /><h3>{{ query ? '没有匹配的任务' : emptyTitle }}</h3><p>{{ query ? '试试其他标题或链接。' : emptyDescription }}</p><button v-if="query" class="secondary" @click="query = ''">清除搜索</button></div>
     <div v-else class="history-task-list">
-      <article v-for="task in visibleTasks" :key="task.id" class="history-task-card" :class="{ busy: isBusy(task) }">
-        <header class="history-task-heading"><div><h3>{{ task.title || task.url || task.id || '未命名任务' }}</h3><p><span v-if="!isCompleted(task)">{{ currentStageLabel(task.current_stage) }} · </span>{{ localTime(task.updated_at || task.completed_at || task.created_at) }}</p></div><span class="history-state" :class="taskState(task)"><span></span>{{ taskStateLabel(task) }}</span></header>
-        <div class="history-primary-actions"><button v-if="!isCompleted(task)" :disabled="anyBusy" @click="emit('continue-task', task.id)">{{ isBusy(task) ? '处理中…' : isTaskRunning(task) ? '查看运行' : '继续任务' }}</button><button v-else class="secondary" @click="toggleDetails(task.id)">查看记录</button><button v-for="entry in artifactShortcuts(task)" :key="entry.artifact.path" class="secondary" :title="entry.artifact.path" @click="openArtifact(task, entry.stage, entry.artifact)"><AppIcon :name="entry.artifact.kind === 'glossary' ? 'book' : 'log'" :size="15" />{{ entry.label }}</button></div>
+      <article v-for="task in visibleTasks" :key="task.id" class="history-task-card" :class="[taskState(task), { busy: isBusy(task) }]">
+        <header class="history-task-heading"><div><h3>{{ task.title || task.url || task.id || '未命名任务' }}</h3><div class="history-card-meta"><span>{{ currentStageLabel(task.current_stage) }}</span><span>第 {{ runGeneration(task) }} 轮<span v-if="archivedRunCount(task)"> · {{ archivedRunCount(task) }} 轮归档</span></span><time>{{ localTime(task.updated_at || task.completed_at || task.created_at) }}</time><a v-if="safeSourceUrl(task.url)" :href="safeSourceUrl(task.url)" target="_blank" rel="noreferrer">原视频<AppIcon name="link" :size="12" /></a></div></div><span class="history-state" :class="taskState(task)"><span></span>{{ taskStateLabel(task) }}</span></header>
+        <div v-if="task.stage_items?.length" class="history-stage-snapshot" aria-label="各阶段状态">
+          <span v-for="stage in task.stage_items" :key="stage.id" :class="`snapshot-${resolvedStageStatus(stage, task)}`"><i aria-hidden="true"></i>{{ stageDisplayLabel(stage) }}<b>{{ stageStatusLabel(stage, task) }}</b></span>
+        </div>
+        <p v-if="taskError(task)" class="history-card-error" :title="taskError(task)"><AppIcon name="log" :size="14" /><span>{{ taskError(task) }}</span></p>
+        <div class="history-card-footer">
+          <div class="history-primary-actions"><button v-if="!isCompleted(task)" :disabled="anyBusy" @click="emit('continue-task', task.id)">{{ isBusy(task) ? '处理中…' : isTaskRunning(task) ? '查看运行' : '继续任务' }}</button><button v-else class="secondary" @click="toggleDetails(task.id)">查看记录</button><button v-for="entry in artifactShortcuts(task)" :key="entry.artifact.path" class="secondary" :title="entry.artifact.path" @click="openArtifact(task, entry.stage, entry.artifact)"><AppIcon :name="entry.artifact.kind === 'glossary' ? 'book' : 'log'" :size="15" />{{ entry.label }}</button></div>
+          <button class="danger secondary history-delete-task" type="button" :disabled="anyBusy || isTaskRunning(task)" :title="isTaskRunning(task) ? '请先中断正在运行的任务' : '删除任务档案与任务产物，保留已下载视频'" @click="emit('delete-task', task)">删除任务…</button>
+        </div>
         <details class="history-task-details" :open="expandedIds.has(task.id)" @toggle="setDetailsOpen(task.id, $event.target.open)"><summary>阶段记录、重跑与更多</summary>
           <div class="history-task-meta"><span>任务编号 <code>{{ task.id }}</code></span><span>第 {{ runGeneration(task) }} 轮 · {{ archivedRunCount(task) }} 轮归档</span><a v-if="safeSourceUrl(task.url)" :href="safeSourceUrl(task.url)" target="_blank" rel="noreferrer">查看原视频</a></div>
         <div class="task-history-stages">
@@ -85,7 +92,7 @@
         </details>
 
 
-          <div class="history-manage-actions"><span>任务管理</span><button v-if="task.can_restart !== false" class="secondary mini" :disabled="anyBusy" @click="emit('restart-task', task)">从头重跑…</button><button v-if="!isCompleted(task)" class="secondary mini" :disabled="anyBusy || isTaskRunning(task)" @click="emit('complete-task', task)">标记完成</button><button v-else class="secondary mini" :disabled="anyBusy" @click="emit('reopen-task', task)">恢复为活动任务</button><button class="danger secondary mini" :disabled="anyBusy || isTaskRunning(task)" @click="emit('delete-task', task)">删除任务…</button></div>
+          <div class="history-manage-actions"><span>任务管理</span><button v-if="task.can_restart !== false" class="secondary mini" :disabled="anyBusy" @click="emit('restart-task', task)">从头重跑…</button><button v-if="!isCompleted(task)" class="secondary mini" :disabled="anyBusy || isTaskRunning(task)" @click="emit('complete-task', task)">标记完成</button><button v-else class="secondary mini" :disabled="anyBusy" @click="emit('reopen-task', task)">恢复为活动任务</button></div>
         </details>
       </article>
     </div>
@@ -193,6 +200,12 @@ function isFailed(task) {
   if (task?.status === 'failed' || task?.workflow_status === 'failed') return true
   if (String(task?.current_stage || '').endsWith('_failed')) return true
   return (task?.stage_items || []).some((stage) => resolvedStageStatus(stage, task) === 'failed')
+}
+
+function taskError(task) {
+  if (!isFailed(task) || isCompleted(task)) return ''
+  const stage = (task.stage_items || []).find(item => resolvedStageStatus(item, task) === 'failed' && item.error)
+  return String(stage?.error || task.error || '')
 }
 
 function needsAttention(task) {
