@@ -5,6 +5,17 @@ export function currentLocalReview(result) {
   return null
 }
 
+export function subtitleSourceLabel(result) {
+  if (result?.delivery_mode === 'existing_target_subtitle') return '字幕来源：现成中文字幕，未重新翻译'
+  if (result?.source_kind === 'ocr') return '原文来源：画面内嵌字幕 · OCR 3.0'
+  if (result?.source_kind === 'asr') return '原文来源：语音识别 · ASR 2.2'
+  if (result?.source_kind === 'captions') return '原文来源：外挂字幕'
+  if (result?.screen_source_assessment?.enabled && result.screen_source_assessment.status === 'present') {
+    return '已发现内嵌字幕，优先提取画面文字'
+  }
+  return ''
+}
+
 const publicToolNames = {
   inspect_target: '检查现成中文字幕', deliver_target: '交付现成中文字幕', review_target: '对照原文抽查中文',
   read_subtitles: '查看字幕上下文', transcribe_clip: '局部音频核查', sample_frames: '抽帧观察',
@@ -13,12 +24,17 @@ const publicToolNames = {
   detect_language: '检测音源语言', ask_target: '确认现成字幕疑点', ask_user: '询问字幕疑点',
   probe: '检查链接', download: '下载视频', captions: '获取外挂字幕', inspect: '检查原文',
   glossary: '准备术语审核', translate: '翻译字幕', align: '校准时间轴', verify: '检查译文',
-  finish: '交付字幕', patch: '局部修正原文', asr: '音频识别', ocr: '画面文字识别',
+  finish: '交付字幕', patch: '局部修正原文', asr: '音频识别', ocr: '画面文字识别', refine_screen_ocr: '核查画面文字候选', finalize_screen_ocr: '整理内嵌字幕',
 }
 
 export function friendlyAgentText(value) {
   if (typeof value !== 'string') return ''
-  return value.replace(/\b[a-z]+(?:_[a-z]+)*\b/g, word => publicToolNames[word] || word)
+  // Models sometimes return numeric HTML entities. Decode characters, never
+  // interpret markup; Vue still renders the resulting string as plain text.
+  return value.replace(/&#(x[\da-f]+|\d+);/gi, (entity, number) => {
+    const point = number[0].toLowerCase() === 'x' ? Number.parseInt(number.slice(1), 16) : Number(number)
+    return point >= 32 && point <= 0x10ffff && !(point >= 0xd800 && point <= 0xdfff) ? String.fromCodePoint(point) : entity
+  }).replace(/\b[a-z]+(?:_[a-z]+)*\b/g, word => publicToolNames[word] || word)
 }
 
 export function evidenceRefLabel(value) {

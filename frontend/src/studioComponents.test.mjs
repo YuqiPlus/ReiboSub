@@ -56,6 +56,38 @@ test('classic workflow controls remain available', async () => {
   assert.match(html, /高级设置/)
 })
 
+test('completed agent puts downloads before closed process and review disclosures', async () => {
+  const html = await render('AgentSessionPanel', { session: {
+    id: 'complete', status: 'done', phase: 'done', payload: { agent_mode: 'autonomous' },
+    result: {
+      probe: { title: '已经完成的视频' }, source_kind: 'ocr', translated_srt: '/sample/zh.srt', source_srt: '/sample/ko.srt', input_video: '/sample/video.mp4',
+      autonomous_controller_version: 2, autonomous_decision: { summary: '冗长的最终决策', reason: '&#x5C40;部复核已完成' },
+      autonomous_actions: [{ tool: 'finalize_screen_ocr', status: 'done', reason: '整理保存的原文' }],
+      autonomous_verification: { structure: { target_count: 303 } },
+      local_translation_review_current: true,
+      local_translation_review: { decisions: [{ id: 136, action: 'keep', before: '保留字幕', after: '保留字幕', reason_zh: '核查依据' }] },
+    },
+  } })
+  assert.ok(html.indexOf('下载中文字幕') < html.indexOf('处理过程'))
+  assert.match(html, /303 条 · SRT/)
+  assert.match(html, /原文字幕<\/a>/)
+  assert.match(html, /核查依据/)
+  assert.match(html, /整理内嵌字幕/)
+  assert.doesNotMatch(html, /agent-current-summary|已执行 1 项操作|<h3>文件与运行详情/)
+  assert.doesNotMatch(html, /<details[^>]*class="[^"]*(?:agent-activity-details|agent-review-details)[^"]*"[^>]*\bopen/)
+  assert.match(html, /局部复核已完成/)
+})
+
+test('running task keeps its immediate decision visible above the closed history', async () => {
+  const html = await render('AgentSessionPanel', { session: {
+    id: 'running', status: 'running', phase: 'autonomous_decide', payload: { agent_mode: 'autonomous' },
+    result: { autonomous_controller_version: 2, autonomous_decision: { summary: '正在检查画面中的字幕' } },
+  } })
+  assert.match(html, /class="agent-current-summary">正在检查画面中的字幕/)
+  assert.match(html, /处理过程/)
+  assert.doesNotMatch(html, /中文字幕已生成/)
+})
+
 test('navigation retains tools, settings and recent tasks with full accessible titles', async () => {
   const html = await render('SideNav', {
     activeView: 'glossary', items: [

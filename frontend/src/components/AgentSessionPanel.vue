@@ -6,26 +6,27 @@
       <p>从一个链接开始，得到一份看得懂的字幕。</p>
     </div>
 
-    <div v-if="session" class="agent-current-panel">
+    <div v-if="session" class="agent-current-panel" :class="{ 'agent-result-view': isAutonomous }">
       <div class="agent-hero">
         <div class="agent-hero-copy">
-          <div class="eyebrow">你的字幕任务</div>
           <h2>{{ itemLabel(session) }}</h2>
           <a v-if="sourceLink" class="agent-source-link" :href="sourceLink" target="_blank" rel="noreferrer"><AppIcon name="link" :size="14" />查看原视频</a>
         </div>
-        <div class="agent-live-chip" :class="session?.status || 'idle'">
-          <span></span>
-          <b>{{ session ? statusLabel : '无当前任务' }}</b>
+        <div class="agent-header-actions">
+          <div class="agent-live-chip" :class="session?.status || 'idle'">
+            <span></span>
+            <b>{{ statusLabel }}</b>
+          </div>
+          <div class="toolbar agent-current-actions">
+            <button class="secondary mini" type="button" @click="$emit('new-task')"><AppIcon name="compose" :size="15" />新建任务</button>
+            <button v-if="session?.retryable" class="secondary mini" type="button" @click="$emit('retry-agent')">重试当前阶段</button>
+            <button v-if="session?.cancellable" class="danger secondary mini" type="button" @click="$emit('cancel-agent')">中断</button>
+          </div>
         </div>
       </div>
 
-      <div class="toolbar agent-current-actions">
-        <button class="secondary mini" type="button" @click="$emit('new-task')"><AppIcon name="compose" :size="15" />新建任务</button>
-        <button v-if="session?.retryable" class="secondary mini" type="button" @click="$emit('retry-agent')">重试当前阶段</button>
-        <button v-if="session?.cancellable" class="danger secondary mini" type="button" @click="$emit('cancel-agent')">中断</button>
-      </div>
-
-      <div class="agent-response-heading"><span class="assistant-avatar"><AppIcon name="language" :size="20" /></span><b>ReiboSub</b><span v-if="!operationStatus">{{ phaseLabel }}</span></div>
+      <div class="agent-response-heading"><span class="assistant-avatar"><AppIcon name="language" :size="20" /></span><b>ReiboSub</b><span v-if="!operationStatus && session.status !== 'done'">{{ phaseLabel }}</span></div>
+      <p v-if="subtitleSourceLabel(session.result)" class="agent-source-note" role="status">{{ subtitleSourceLabel(session.result) }}</p>
 
       <div v-if="operationStatus" class="agent-operation-status" role="status" aria-live="polite">
         <span class="agent-operation-spinner" aria-hidden="true"></span>
@@ -158,11 +159,27 @@
         </div>
       </div>
 
-      <div v-if="agentDecision || session?.result?.autonomous_actions?.length" class="agent-decision-card">
+      <div v-if="isAutonomous && session.result.translated_srt" class="agent-decision-card agent-delivery-card">
+        <div class="delivery-file-icon"><AppIcon name="log" :size="21" /></div>
+        <div class="delivery-heading">
+          <h3>{{ session.status === 'done' ? (session.result.delivery_mode === 'existing_target_subtitle' ? '中文字幕已就绪' : '中文字幕已生成') : '已有字幕草稿' }}</h3>
+          <span v-if="deliveryCount" class="delivery-count">{{ deliveryCount }} 条 · SRT</span>
+        </div>
+        <div class="delivery-actions">
+          <a class="button-link delivery-primary" :href="`/api/file?path=${encodeURIComponent(session.result.translated_srt)}`" download><AppIcon name="download" :size="15" />下载中文字幕</a>
+          <a v-if="session.result.source_srt" class="delivery-secondary" :href="`/api/file?path=${encodeURIComponent(session.result.source_srt)}`" download>原文字幕</a>
+          <a v-if="session.result.input_video" class="delivery-secondary" :href="`/api/file?path=${encodeURIComponent(session.result.input_video)}`" download>视频</a>
+        </div>
+        <p class="delivery-quality-note">{{ autonomousDraftMessage(session) }}</p>
+        <p v-if="session.result.suppressed_cue_ids?.length" class="delivery-quality-note">交付副本已合并 {{ session.result.suppressed_cue_ids.length }} 条重复词尾；原稿与编号映射保留。</p>
+      </div>
+      <p v-if="agentDecision && session.status !== 'done'" class="agent-current-summary">{{ agentDecision.summary }}</p>
+      <details v-if="agentDecision || session?.result?.autonomous_actions?.length" class="agent-decision-card agent-activity-details">
+        <summary>处理过程<span class="agent-detail-count">{{ session.result.autonomous_actions?.length || 0 }} 项操作</span></summary>
         <template v-if="agentDecision">
-          <p>{{ agentDecision.summary }}</p>
           <details>
             <summary>计划与判断依据</summary>
+            <p>{{ agentDecision.summary }}</p>
             <p><b>{{ session.status === 'running' ? '当前行动' : '最近行动' }}：</b>{{ agentDecision.reason }}</p>
             <p v-if="agentDecision.nextCheck"><b>核对目标：</b>{{ agentDecision.nextCheck }}</p>
             <p>计划会随工具结果调整，不是固定执行流程。</p>
@@ -172,30 +189,25 @@
           </details>
         </template>
         <p v-else>{{ session.result.autonomous_actions.at(-1)?.reason }}</p>
-        <details><summary>已执行 {{ session.result.autonomous_actions?.length || 0 }} 项操作</summary>
-          <ol><li v-for="(event, i) in session.result.autonomous_actions" :key="i">{{ autonomousToolLabels[event.tool] || event.tool }} · {{ event.reason }} · {{ event.status === 'done' ? '完成' : '未采用或未完成' }}</li></ol>
+        <ol class="agent-activity-list">
+          <li v-for="(event, i) in session.result.autonomous_actions" :key="i">
+            <details>
+              <summary><span class="activity-number">{{ i + 1 }}</span><span>{{ autonomousToolLabels[event.tool] || event.tool }}</span><span class="activity-state" :class="{ 'not-done': event.status !== 'done' }">{{ event.status === 'done' ? '完成' : '未完成' }}</span></summary>
+              <p>{{ friendlyAgentText(event.reason) }}</p>
+            </details>
+          </li>
+        </ol>
+        <details v-if="session.result.autonomous_decisions?.length" class="agent-decision-archive"><summary>逐次判断依据</summary>
           <details v-for="(decision, i) in session.result.autonomous_decisions || []" :key="`decision-${i}`">
             <summary>{{ autonomousToolLabels[decision.tool] || decision.tool }} · {{ decision.status === 'done' ? '已执行' : '未完成' }}</summary>
             <p>{{ friendlyAgentText(decision.summary) }}</p>
             <p>预期核对：{{ friendlyAgentText(decision.next_check) }}</p>
-            <small>依据：{{ decision.evidence_refs.map(evidenceRefLabel).join('、') }}</small>
+            <small>依据：{{ (decision.evidence_refs || []).map(evidenceRefLabel).join('、') }}</small>
           </details>
         </details>
-      </div>
-      <div v-if="session?.payload?.agent_mode === 'autonomous' && session?.result?.translated_srt" class="agent-decision-card agent-delivery-card">
-        <div class="delivery-file-icon"><AppIcon name="log" :size="25" /></div>
-        <h3>{{ session.status === 'done' ? (session.result.delivery_mode === 'existing_target_subtitle' ? '中文字幕已就绪（沿用现成字幕）' : '中文字幕已生成') : '已有字幕草稿' }}</h3>
-        <p>{{ autonomousDraftMessage(session) }}</p>
-        <p v-if="session.result.suppressed_cue_ids?.length">当前副本 {{ session.result.delivery_cue_count }} 条；已合并 {{ session.result.suppressed_cue_ids.length }} 条经独立复核确认的重复词尾空块，原稿和编号映射保留。检查记录沿用原稿编号。</p>
-        <p v-if="session.result.input_video">视频已保存到本地素材库。</p>
-        <div class="toolbar">
-          <a class="button-link" :href="`/api/file?path=${encodeURIComponent(session.result.translated_srt)}`" download>下载中文字幕</a>
-          <a v-if="session.result.source_srt" class="button-link secondary" :href="`/api/file?path=${encodeURIComponent(session.result.source_srt)}`" download>下载原文字幕</a>
-          <a v-if="session.result.input_video" class="button-link secondary" :href="`/api/file?path=${encodeURIComponent(session.result.input_video)}`" download>下载视频</a>
-        </div>
-      </div>
+      </details>
       <details v-if="localReview" class="agent-decision-card agent-review-details">
-        <summary>局部复核记录 · {{ localReview.decisions.length }} 条</summary>
+        <summary>局部复核记录<span class="agent-detail-count">{{ localReview.decisions.length }} 条</span></summary>
         <p>只复核已授权条目，未重翻整片；未通过检查的修改不会写入。</p>
         <details v-for="row in localReview.decisions" :key="row.id">
           <summary>{{ row.suppressed_in_delivery ? '原字幕' : '字幕' }} {{ row.id }} · {{ row.suppressed_in_delivery ? '重复词尾已并入前句（仅交付副本）' : row.action === 'revise' ? '已局部修改' : row.action === 'keep' ? '保留当前译文' : '仍待确认，未修改' }}</summary>
@@ -380,9 +392,7 @@
     <p v-if="!session" class="agent-home-note">视频会保存到素材库。人名和专名，仍由你来决定。</p>
 
     <details v-if="session" class="agent-session-strip agent-technical-details">
-      <summary class="section-title">
-        <h3>文件与运行详情</h3>
-      </summary>
+      <summary>文件与运行详情</summary>
       <div class="agent-technical-stack">
         <div v-if="currentJobLabel" class="agent-monitor">
           <span>底层任务</span>
@@ -412,7 +422,7 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
-import { currentLocalReview, autonomousDraftMessage, publicAgentDecision, friendlyAgentText, evidenceRefLabel } from '../autonomousPresentation.js'
+import { currentLocalReview, autonomousDraftMessage, publicAgentDecision, friendlyAgentText, evidenceRefLabel, subtitleSourceLabel } from '../autonomousPresentation.js'
 import OcrCropControls from './OcrCropControls.vue'
 import { getAgentOcrPipeline, inferAgentOcrPipelineVersion } from '../agentOcrPipeline.js'
 import {
@@ -488,6 +498,12 @@ const sourceLink = computed(() => {
   try { const parsed = new URL(value); return ['https:', 'http:'].includes(parsed.protocol) ? parsed.href : '' } catch { return '' }
 })
 const autonomousClue = ref('')
+const isAutonomous = computed(() => props.session?.payload?.agent_mode === 'autonomous')
+const deliveryCount = computed(() => {
+  const result = props.session?.result || {}
+  const count = result.delivery_cue_count ?? result.autonomous_verification?.structure?.delivery_cue_count ?? result.autonomous_verification?.structure?.target_count
+  return Number.isInteger(count) && count > 0 ? count : null
+})
 const localReview = computed(() => currentLocalReview(props.session?.result))
 const agentDecision = computed(() => publicAgentDecision(props.session?.result))
 watch(() => [props.session?.id, props.session?.question?.message], () => { autonomousClue.value = '' })
@@ -531,6 +547,7 @@ const phaseLabel = computed(() => {
   return sessionPhaseLabel(phase)
 })
 const autonomousToolLabels = { decide: '判断下一步', planner: '检查下一步决策', probe: '检查链接', download: '下载视频', captions: '取得外挂字幕', sample_frames: '抽帧观察',
+  refine_screen_ocr: '核查画面文字候选', finalize_screen_ocr: '整理内嵌字幕',
   analyze_frames: '分析画面', ocr_trial: '试跑OCR与遮罩', ocr: '提取画面字幕', asr: '听取音频', detect_language: '判断音源语言',
   select_source: '选择原文', inspect: '检查原文', review_audio: '局部重听', patch: '修正原文', translate: '翻译字幕',
   verify: '检查译文', align: '校准时间', question: '需要一点线索', finish: '交付字幕',

@@ -1,6 +1,15 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { currentLocalReview, autonomousDraftMessage, publicAgentDecision, friendlyAgentText, evidenceRefLabel } from './autonomousPresentation.js'
+import { currentLocalReview, autonomousDraftMessage, publicAgentDecision, friendlyAgentText, evidenceRefLabel, subtitleSourceLabel } from './autonomousPresentation.js'
+
+test('source label distinguishes screen extraction from audio and external captions', () => {
+  assert.match(subtitleSourceLabel({ source_kind: 'ocr' }), /画面内嵌字幕/)
+  assert.match(subtitleSourceLabel({ source_kind: 'asr' }), /语音识别/)
+  assert.match(subtitleSourceLabel({ source_kind: 'captions' }), /外挂字幕/)
+  assert.match(subtitleSourceLabel({ screen_source_assessment: { enabled: true, status: 'present' } }), /优先提取画面文字/)
+  assert.equal(subtitleSourceLabel({ screen_source_assessment: { enabled: true, status: 'unknown' } }), '')
+  assert.match(subtitleSourceLabel({ delivery_mode: 'existing_target_subtitle', source_kind: 'ocr' }), /现成中文字幕/)
+})
 
 test('old review is not shown against a newer downloaded translation', () => {
   assert.equal(currentLocalReview({translated_srt:'zh_2.srt',local_translation_review:{translated_srt:'local_1.srt'}}), null)
@@ -33,6 +42,12 @@ test('public decisions use readable tool and evidence names', () => {
   assert.equal(evidenceRefLabel('event:12'), '操作记录 #12')
   assert.equal(evidenceRefLabel('metadata'), '视频信息')
   assert.equal(evidenceRefLabel('source:captions_2'), '原文来源 #2')
+})
+
+test('model numeric entities become readable text without interpreting HTML', () => {
+  assert.equal(friendlyAgentText('&#x5C40;部复核，&#26597;看字幕'), '局部复核，查看字幕')
+  assert.equal(friendlyAgentText('&#x110000; &#xD800; &#0;'), '&#x110000; &#xD800; &#0;')
+  assert.equal(friendlyAgentText('&#60;script&#62;'), '<script>')
 })
 
 test('video backfill does not claim to be rechecking or retranslating ready captions', () => {
