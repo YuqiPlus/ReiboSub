@@ -6,18 +6,19 @@ ReiboSub is a subtitle production assistant for YouTube, ordinary Bilibili uploa
 
 The project is designed for a human-in-the-loop workflow: the Agent can run multiple video flows at the same time, pause when it needs your decision, and continue after you review glossary terms.
 
-[Install and start](#quick-start) · [Model settings](#llm-configuration) · [GPU and experiments](#gpu-and-model-cache) · [Troubleshooting](#troubleshooting)
+[Install and start](#quick-start) · [Bilibili and languages](#bilibili-and-multilingual-subtitles) · [Assets and glossary](#assets-and-glossary-review) · [Model settings](#llm-configuration) · [GPU and experiments](#gpu-and-model-cache) · [Troubleshooting](#troubleshooting)
 
 ## What It Can Do
 
-- **Agent cockpit**: paste a YouTube URL or video ID, let the Agent probe subtitles, choose a route, and wait for confirmation when needed.
-- **Project-based downloads**: each YouTube video is stored in its own folder with video, source subtitles, translated subtitles, thumbnail, and metadata.
-- **YouTube subtitles**: detect manual and auto subtitles, download selected tracks, and prefer source-language/manual tracks for translation.
+- **Agent cockpit**: paste a YouTube or ordinary Bilibili video URL/ID, let the Agent inspect sources, and review terms before translation.
+- **Linked project assets**: each video or Bilibili part has its own media folder. Assets also lists associated task-owned source/target subtitles and archived versions without copying them beside the video.
+- **Platform captions**: detect manual and automatic captions and download selected tracks; Bilibili danmaku is not used as a caption source.
 - **OCR subtitles**: use the stabilized OCR 3.0 workflow for new Agent tasks while retaining isolated OCR 1.0 and 2.0 compatibility routes.
 - **ASR subtitles**: transcribe speech with `faster-whisper`, then optionally correct ASR text with an LLM.
 - **Video upload flow**: upload a local video from the browser and start an ASR-to-Chinese subtitle job directly.
 - **Hybrid workflows**: use a reliable uploaded subtitle timeline, such as English, while reconstructing original-language text from OCR when the embedded source subtitle is more accurate.
 - **Glossary review**: review names, nicknames and titles with romanization and context translations. Play evidence from the associated video/audio inside each term card, switch occurrences, slow down/repeat playback, and inspect adjacent source subtitles. Clips include 3 seconds on each side, expandable to 10; playback never confirms or edits a translation.
+- **Reference translator**: translate between Chinese, English, Japanese and Korean within glossary review, with automatic source detection, direction swapping, original-sentence shortcuts and copy. Results never automatically confirm glossary terms.
 - **Subtitle editing**: edit text and timing, keep 50 undo steps, preview one cue with a live sidecar overlay, and add/merge/delete/clean cues.
 - **Subtitle conversion**: convert to common formats including SRT, VTT, ASS/SSA, LRC, TXT, JSON, and Bilibili BCC.
 - **Video overlay tool**: place watermark/logo masks on a video and export a new video without overwriting the original.
@@ -27,15 +28,15 @@ For Agent routing design notes, see [docs/youtube_agent_workflows.md](docs/youtu
 
 ### Independent goal-driven Agent experiment
 
-Choose the experimental autonomous mode in the Agent cockpit and provide a YouTube link. New sessions use an evidence-linked controller: the model chooses each next tool, revises a short plan after observations or failures, and selects delivery when artifact checks allow it. There is no mandatory run-through of every tool. The legacy workflow and saved older experimental sessions retain their existing protocols.
+Choose the experimental autonomous mode in the Agent cockpit and provide a YouTube or ordinary Bilibili video link. New sessions use an evidence-linked controller: the model chooses each next tool, revises a short plan after observations or failures, and selects delivery when artifact checks allow it. There is no mandatory run-through of every tool. The legacy workflow and saved older experimental sessions retain their existing protocols.
 
-Tools include caption discovery and reuse, subtitle-context queries, frame sampling at model-selected times, vision/OCR trials, ASR, bounded 4–30 second audio checks, source comparison, and local translation review. Vision requires a configured image-capable model; local recognition requires its optional dependencies. The model cannot run arbitrary commands, select arbitrary files, change providers, bypass human glossary review for translation, or overwrite existing translated results. Reusing existing Chinese captions does not require glossary generation or retranslation.
+Tools include caption discovery and reuse, subtitle-context queries, frame sampling at model-selected times, vision/OCR trials, ASR, bounded 4–30 second audio checks, source comparison, and local translation review. Vision requires a configured image-capable model; local recognition requires its optional dependencies. The model cannot run arbitrary commands, select arbitrary files, change providers, bypass human glossary review for translation, or overwrite existing translated results. Usable existing target-language captions can be delivered after checks without glossary generation or retranslation, subject to the screen-inspection requirements below.
 
 New autonomous tasks prioritize authored, burned-in subtitles. Before choosing a source, the Agent must analyze at least four frames spanning 60% of the video. If content subtitles are visible, OCR 3.0 supplies the primary text; external captions and localized audio checks are references, not substitutes. Whole-video ASR is available only after diverse sampled observations have not found burned-in subtitles, and this is not a claim about every frame. Conservative OCR crops preserve the full width and bottom edge rather than tightly cropping a few centered single-line samples. Saved experiments and explicitly scoped continuations keep their original protocols.
 
 This experiment saves raw OCR separately, then performs bounded grouped review of candidate HUD/player-ID/object-text noise. Native-script text and adjacent name/number fragments are protected; uncertain groups remain evidence rather than being discarded solely for containing Latin letters or numbers. Native dialogue anchors the per-frame machine seed, so uncertain footer IDs cannot replace it. Raw tracks, quarantine audits and final subtitles remain separate. A dedicated subprocess reuses the existing V3 final refiners with bounded requests/timeouts/output and non-thinking Doubao 2.1 generation; OCR Lab and its stable defaults are unchanged.
 
-Normal new tasks must save both the video and Chinese subtitles. The Agent may inspect captions and decide its approach before scheduling the download, and reuses an existing project video when available. Missing video prevents completion even when Chinese captions are ready. The UI shows saved-video status and a download link. Explicit verification-only, local-review and source-reuse continuations retain their original narrower scope.
+Normal new tasks must save both the video and the selected target-language subtitles. The Agent may inspect captions and decide its approach before scheduling the download, and reuses an existing project video when available. Missing video prevents completion even when subtitles are ready. The UI shows saved-video status and a download link. Explicit verification-only, local-review and source-reuse continuations retain their original narrower scope.
 
 The UI shows concise evidence summaries, the current action, its expected observable result, and a revisable plan—not private reasoning. Recognition candidates, structural checks and sampled semantic checks are not ground truth or a full human audit. Current limits include one-hour media for whole-video download/re-recognition, 24 decisions per invocation, and per-tool budgets. Exhausted or failed runs retain their artifacts and report the actual internal failure instead of asking users to approve it as a subtitle issue.
 
@@ -60,7 +61,7 @@ Start with **Linux x86_64 or WSL2 and Python 3.11** for the UI, translation and 
 | Web ASR 2.2 | faster-whisper, Whisper weights and NVIDIA CUDA; the current UI submits CUDA/float16, while basic CPU transcription is available through the CLI below |
 | Agent visual inspection | An image-capable model, which may be the shared model |
 
-The standard public setup does not require MySQL, Redis or a maintainer's `.env`. Qwen/multi-model ASR experiments have separate requirements below.
+The standard public setup stores tasks and subtitles in files; no database or maintainer's `.env` is required. Qwen/multi-model ASR experiments have separate requirements below.
 
 ### 1. Install the recommended CPU starter environment
 
@@ -111,7 +112,7 @@ Do not skip this step. The server reads `frontend/dist`, not the source files di
 
 ### 4. Optional machine-local settings
 
-Optionally copy the single machine-local startup template. The defaults already start safely, so create this file only when you want to change the media directory, YouTube proxy, listen address, or port.
+Optionally copy the single machine-local startup template. The defaults already start safely; create this file to change the media directory, platform proxies, Bilibili cookie path, listen address or port.
 
 ```bash
 cp configs/reibosub.example.yaml configs/reibosub.yaml
@@ -135,25 +136,6 @@ youtube_proxy: http://127.0.0.1:7890
 Local OCR/ASR/LLM child processes do not use generic `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` by default; this keeps a YouTube proxy from slowing down local processing.
 
 Existing installations can keep their old `configs/local_runtime.yaml`, `.env`, and `configs/llm.yaml` files. They remain compatibility inputs and do not need to be migrated or deleted.
-
-### Bilibili uploads and multipart videos
-
-New Bilibili Agent tasks default to **Chinese → English**. YouTube keeps the configured source-language default and a Chinese target. Source and target can be changed independently; supported targets are Chinese, English, Japanese, and Korean. Saved tasks keep their original target rather than adopting new platform defaults.
-
-Glossary names, reference translations, verification, and delivered filename suffixes follow the selected target (`.zh.srt`, `.en.srt`, `.ja.srt`, `.ko.srt`; experimental copies retain review markers). A glossary without `target_language` is treated as a legacy Chinese glossary and cannot silently be reused for another target. The historical `zh` / `suggested_zh` JSON/YAML keys remain compatible, but contain the selected target-language text, not necessarily Chinese.
-
-Both **Downloads & Links** and **Agent** accept ordinary `https://www.bilibili.com/video/BV…` links, BV/av IDs, and `https://b23.tv/…` short links. Each task handles one part: P1 by default, or a specified part such as `https://www.bilibili.com/video/BV…?p=2`. Part-specific task keys and download directories prevent overwriting or incorrectly reusing another part's OCR results.
-
-Downloads include available quality choices, thumbnails, and accessible CC captions. The Agent reuses its existing visual inspection, OCR/ASR, glossary review, and translation tools. Bilibili `ai-*` captions are marked as automatic, not human-authored; danmaku is excluded. Bangumi, live streams, whole collections, and automatic all-part batches are not supported by this integration.
-
-Bilibili connects directly by default, independently of `youtube_proxy`. Some captions, qualities, and videos require login or account entitlements. If needed, add these optional fields to your local `configs/reibosub.yaml`, then restart. Use your own exported Netscape-format cookies, stored outside the repository; never share or commit them:
-
-```yaml
-bilibili_proxy: ""
-bilibili_cookie_file: /private/path/bilibili.cookies.txt
-```
-
-The integration only accesses content available to your session; it does not bypass paid, membership, or regional restrictions. Existing `video_translate.youtube.*` helper command names are retained for compatibility and now also accept ordinary Bilibili video/part links.
 
 ### 5. Start the UI
 
@@ -193,10 +175,100 @@ The UI stores provider metadata in the Git-ignored `configs/provider_profiles.ya
 
 1. Use **Downloads & links** for a video you are authorized to process, or import local media in **Assets**. Download-only use does not require an Agent or LLM.
 2. Test a short captioned clip with OCR Lab 3.0. With NVIDIA CUDA configured, test speech-only media using ASR Lab 2.2; CPU users should use the basic CLI below instead of assuming the Web ASR path is CPU-ready. Initial recognition downloads models.
-3. Once recognition and your API work, provide a full link in the subtitle assistant. Formal translation pauses for human glossary review: fill or confirm names and terms, then save to continue.
+3. Once recognition and your API work, provide a full YouTube or ordinary Bilibili link in the subtitle assistant and check source/target languages. Formal translation pauses for human glossary review: fill or confirm names and terms, then save to continue.
 4. Download the SRT or open it from Assets for editing. Task history provides stage states, artifacts and reruns. Deleting a task removes its task-directory artifacts but preserves downloaded video; download any subtitles you want to keep first.
 
 Automatic checks are not a word-for-word human audit. Test short inputs before long videos to avoid wasting processing time and API quota on setup errors.
+
+## Bilibili and Multilingual Subtitles
+
+The UI currently uses Chinese labels; the labels below are included to help you find the controls.
+
+### Supported links and parts
+
+Both **Downloads & Links (下载与链接)** and **Subtitle Assistant (字幕助手)** accept YouTube URLs/IDs, ordinary Bilibili BV/av IDs, full video links and `b23.tv` short links. Replace the placeholder `BVxxxxxxxxxx` below with a real video you are authorized to process:
+
+```text
+BVxxxxxxxxxx
+https://www.bilibili.com/video/BVxxxxxxxxxx
+https://www.bilibili.com/video/BVxxxxxxxxxx?p=2
+```
+
+One task handles one part: no `p` means P1; `?p=2` means P2. Each part has a distinct task key and media directory; similar titles do not permit cross-part OCR reuse. Create a separate task for each part. Bangumi, live streams, whole collections and automatic all-part batches are not supported. Danmaku is not CC dialogue. If a short link fails, paste the full BV URL from your browser's address bar.
+
+### Download without translation
+
+1. Open **下载与链接** and paste a link. Available video formats load automatically; **刷新画质** refreshes them.
+2. Choose an actual format, or keep the compatibility preset (up to 1080p, H.264/MP4 preferred), then click **下载视频**. A subtitle probe and LLM credentials are not required first.
+3. For CC captions, separately click **查看字幕与视频信息**, select the language/manual or automatic track, and download it. No CC tracks does not mean there are no burned-in subtitles.
+4. Find the video in **Assets (素材库)** for preview or further processing. Thumbnail download is under **封面与下载说明**.
+
+Maximum quality is limited to the formats accessible to the current session. MP4 is a container; H.264, HEVC and AV1 are codecs. The highest-quality option does not guarantee H.264; use the compatibility preset when browser/OCR playback matters.
+
+### Generate subtitles from a link
+
+1. Click **新建字幕任务** in the sidebar and paste the full URL, retaining `?p=N` for the selected Bilibili part.
+2. Check source language (**音源语言**), target (**译成**) and mode (**处理模式**). **自主 Agent · 实验** selects tools from evidence; no test range is required.
+3. Click **开始制作字幕**. The Agent saves the local video and checks sampled frames. Burned-in dialogue/captions take priority through OCR 3.0; external captions or ASR become primary only after sufficient observations find no content subtitles. Configure model services and local recognition dependencies first, as described in Quick Start.
+4. When translation is needed, **Glossary Review (术语审核)** opens. Fill and confirm names, titles and fixed terms, then click **全部已确认，保存并开始翻译**. This returns to the Agent and continues without a second confirmation. Usable existing target captions may instead be delivered after checks, without forced retranslation or glossary generation.
+5. Download source and target SRTs on completion, or edit them from **素材库**. **所有任务** contains artifacts and rerun controls; do not restart the entire translation solely because a target file has not appeared yet.
+
+Defaults for new tasks:
+
+| Platform | Source language | Target language |
+| --- | --- | --- |
+| Bilibili | Chinese | English |
+| YouTube | Saved source setting, initially Korean | Chinese |
+
+Both sides can be changed manually. Targets are Chinese, English, Japanese and Korean. Manual choices persist within the current draft even if you replace its link; click **新建字幕任务** to reset platform defaults. Saved tasks retain their saved language pair. Check the real spoken language: a Bilibili video is not necessarily Chinese.
+
+### Existing subtitles and language-specific outputs
+
+In **字幕工具 → 翻译与转换**, select/enter a subtitle path and choose **原文语言** and **译成**. Optionally generate and review a glossary first. Unlike the Agent translation route, this manual tool allows translation without a glossary. Format conversion does not call a translation model.
+
+Glossary translations, context references and verification follow the task target, with no Chinese-character requirement for non-Chinese targets. Generate/review a new target-specific glossary when changing direction. A legacy glossary without `target_language` still means Chinese; historical `zh` / `suggested_zh` field names remain compatible but hold the selected target's text.
+
+Language codes are `zh` (Chinese), `en` (English), `ja` (Japanese) and `ko` (Korean). Common outputs include `en.srt` / `<title>.en.srt`; isolated Agent versions may use `en.review_<marker>.srt` with `source.review_<marker>.srt`. Use the task download buttons or asset paths rather than searching only for `zh.srt`.
+
+### Bilibili login, proxy and access
+
+Bilibili uses a direct connection by default, not `youtube_proxy`. Some videos, qualities and CC tracks require login or account entitlements. If needed, add these optional settings to your own `configs/reibosub.yaml` and restart:
+
+```yaml
+bilibili_proxy: ""  # only if Bilibili needs its own proxy
+bilibili_cookie_file: /private/path/bilibili.cookies.txt
+```
+
+Replace the cookie path with a real, server-readable file exported from your own account in Netscape cookie format. Store it outside the repository; it is sensitive login information and must not be shared, screenshotted or committed. The integration does not bypass paid, membership or geographic restrictions. Existing `video_translate.youtube.*` command names remain compatible with ordinary Bilibili videos and selected parts.
+
+## Assets and Glossary Review
+
+### Find subtitles and archived versions
+
+1. Open **素材库**, search by title/filename, or filter by video, audio or subtitle.
+2. Click **文件与更多** on a project card. Its **字幕** section lists source/target files and available versions. Task outputs display a run number (**第 N 轮**); archived ones add **历史版本**.
+3. Download a file with **下载**, or open its **精修字幕** editor. The associated project video is passed to the editor. The card's quick-edit button prefers a current translation over an archive with a newer copy timestamp.
+4. Click **刷新** if a new result is missing. Completed OCR/ASR source text may appear before translation; target files publish once translation completes. Running or failed translation drafts are not published as final results.
+
+Association uses the exact project/video path recorded by a task, not fuzzy title matching. It neither copies nor overwrites subtitles. Media stays in the media folder; independent subtitles stay under `outputs/agent_tasks/<task-id>/` or that task's archived run. Existing tasks with correct bindings and surviving files are included too. Unbound outputs may still need to be opened from task history or independent processing results.
+
+**Visibility in Assets does not mean a player has loaded the subtitle.** Autonomous results are commonly task-owned, with no automatic sidecar copy beside the video. Manually load the downloaded SRT in your player, or place/name it beside the video as your player requires. Do not back up only the media folder if you need task subtitles. Deleting a task removes its task directory and independent subtitles; download or back them up first.
+
+### Review terms with original evidence
+
+The Agent opens its glossary automatically when human review is needed. You can also load one through **字幕工具 → 术语审核 → 术语文件与高级编辑**. Fill translations in the target language and click **确认** per term; edits autosave. **播放证据片段** shows the original audio/video and neighboring subtitles, with occurrence selection, slower playback and repeat. Recognition, romanization and reference translations are clues, not verified official names.
+
+An Agent translation waits until every pending term is confirmed and you click **全部已确认，保存并开始翻译**. A manually opened glossary uses **保存审核结果**. Playing evidence or copying a reference does not confirm a term.
+
+### Use the reference translator
+
+1. Open **随手翻译** at the top of **术语审核**; no glossary file is required. If collapsed, click **展开**.
+2. Select a source language on the left or keep **自动识别**. Choose Chinese, English, Japanese or Korean on the right. Its initial target follows the current glossary; changing it affects only this scratchpad, not the task's language pair.
+3. Enter up to 4000 characters and click **翻译**, or press `Ctrl+Enter` / `⌘+Enter` in the input. **放入翻译器** on a term card inserts its evidence sentence and resets source detection to automatic.
+4. Choose an explicit source to enable **⇄**. Swapping moves a current valid translation into the input when available; click translate again afterward. Swapping is disabled with automatic detection or while a request is active.
+5. Use **复制译文** or select text manually. Changing input/languages marks an old result as stale; late replies cannot replace the result for new input. Translate again to refresh it.
+
+The translator reuses the configured subtitle-translation model, normally inherited from the shared model unless overridden. No extra provider/key is required. Text is sent to that provider and consumes its quota. It translates only this text, not the whole video, and never fills, saves or confirms a glossary term automatically. Copy the desired name into its glossary field and confirm it yourself. Copy any result you need before leaving the page. Check model settings/access/quota after service errors; manually select/copy text if clipboard access is blocked.
 
 ## Frontend Development
 
@@ -380,7 +452,7 @@ fall back to sequential execution instead of failing.
 ## Agent Workflows
 
 The Agent page defaults to **自主 Agent · 实验** (autonomous tool selection).
-Paste a YouTube link; no test interval is required. A bounded controller chooses
+Paste a YouTube or ordinary Bilibili video link; no test interval is required. A bounded controller chooses
 among existing subtitle tracks, frame sampling, visual analysis, OCR 3.0, ASR 2.2,
 local Korean audio review, translation, and verification. It records each tool
 choice and asks for a short clue or explicit candidate confirmation when evidence
@@ -397,14 +469,14 @@ inspection. Logo exclusions must pass a sampled OCR comparison; original frames
 and OCR Lab results are retained. This first experimental mode limits video
 download and fresh recognition to one hour; longer videos may still use existing
 subtitle tracks. Semantic checks are sampled, not a guarantee of word-for-word
-accuracy. Downloadable source/Chinese SRT files remain drafts for user review.
+accuracy. Downloadable source/target-language SRT files remain drafts for user review.
 
 Select **经典工作流** to keep using the original guided route below. Its processing
 steps and the ASR 2.2 baseline are unchanged.
 
 Typical guided UI flow:
 
-1. Paste a YouTube URL or video ID in **Agent**.
+1. Paste a YouTube / ordinary Bilibili URL or video ID in **字幕助手**, and check the source/target languages.
 2. Tell the Agent whether embedded subtitles are present if you know.
 3. Let it probe metadata and subtitle tracks, then show the route choice without waiting for a full video download.
 4. Choose the recommended route or manually switch to OCR/ASR/downloaded subtitles. After the route is chosen, the Agent downloads the project video or reuses an existing one before continuing.
@@ -417,7 +489,7 @@ Multiple Agent flows can run in parallel. Running sessions are polled independen
 
 Common routes:
 
-- **Existing Chinese subtitle**: download and optionally convert/rename.
+- **Existing target-language subtitle**: inspect and reuse, optionally convert/rename.
 - **Source-language manual subtitle**: lock the uploaded timeline and translate with glossary guidance.
 - **Auto subtitle**: optionally correct source text, then glossary and translate.
 - **Embedded hard subtitle**: OCR source text, generate glossary, translate.
@@ -498,7 +570,7 @@ reibosub translate-volcengine "outputs/demo/source.srt" \
   --out "outputs/demo/zh.srt"
 ```
 
-YouTube and subtitle helper modules:
+Platform-download and subtitle helpers (replace example URLs/paths with your own):
 
 ```bash
 python -m video_translate.youtube.download_subtitles "https://www.youtube.com/watch?v=..." --sub-langs ko,en
@@ -508,19 +580,36 @@ python -m video_translate.tools.translate_subtitles "YoutubeDownloads/example.ko
 python -m video_translate.tools.convert_subtitle "YoutubeDownloads/example.zh.srt" --format bcc
 ```
 
+For example, with an existing `source.zh.srt`, generate a Chinese → English glossary and translation using the same configured model service:
+
+```bash
+python -m video_translate.tools.generate_glossary "source.zh.srt" \
+  --source-language chinese --target-language english \
+  --out "outputs/demo/glossary.en.yaml"
+# Load this glossary in the UI, fill/review and save names before continuing:
+python -m video_translate.tools.translate_subtitles "source.zh.srt" \
+  --target-language english --glossary "outputs/demo/glossary.en.yaml" \
+  --out "outputs/demo/en.srt"
+```
+
+To download Bilibili P2, use `python -m video_translate.youtube.download_video "https://www.bilibili.com/video/BVxxxxxxxxxx?p=2"`, replacing the placeholder BV ID. The `youtube` module name is retained for script compatibility, not a restriction on the source platform.
+
 Script wrappers under `scripts/` provide equivalent manual entry points.
 
 ## Output Layout
 
-Downloaded YouTube projects are stored under `YoutubeDownloads/<video-title>/` by default. Typical files:
+Downloaded YouTube/Bilibili projects are stored under `YoutubeDownloads/<video-title>/` by default. Possible files:
 
 ```text
 <video-title>.mp4
 <video-title>.jpg
 <video-title>.source.srt
 <video-title>.zh.srt
+<video-title>.en.srt
 project.yaml
 ```
+
+These are possible sidecar copies, not files guaranteed for every task. Bilibili titles/directories include a `[BV-ID Pn]` suffix to distinguish parts. `media_dir` can change the media root; its historical default name `YoutubeDownloads` is also used for Bilibili and need not be renamed.
 
 Agent task state and intermediate artifacts live under:
 
@@ -529,16 +618,18 @@ outputs/agent_tasks/<task-id>/
 outputs/agent_jobs/<job-id>/
 ```
 
+Isolated autonomous deliveries commonly use task-owned `source.review_<marker>.srt` and `en.review_<marker>.srt`. Archived generations may live under the task's `runs/generation_*/`. Assets links these records without overwriting sidecars in the video folder.
+
 Common pipeline outputs:
 
 - `source.srt`: source-language subtitle from OCR/ASR/downloaded track.
-- `zh.srt`: translated Chinese subtitle.
+- `zh.srt` / `en.srt` / `ja.srt` / `ko.srt`: subtitles in the selected target language; isolated filenames may retain review markers.
 - `tracks.json`: OCR text tracks with boxes and metadata.
 - `ignored_tracks.json`: tracks filtered as persistent overlays/noise.
 - `tracks_debug.csv`: spreadsheet-friendly OCR/debug table.
 - `*.bcc`: Bilibili subtitle JSON output.
 
-If sidecar copying is enabled, generated subtitles are copied next to the video so common players can auto-load them.
+Only workflows with sidecar copying enabled copy subtitles beside the video for player loading. Isolated autonomous results do not guarantee such a copy; use the task result or Assets to locate/download the actual final file.
 
 ## Files You Should Not Commit
 
@@ -581,6 +672,10 @@ This repository does not ship user videos, subtitles, model caches, or real cred
 - **A model list loads but translation fails**: check API base URL, key permissions, quota and model access. Listing models does not prove inference requests will succeed.
 - **ASR fails with CUDA or float16 errors on CPU**: the current UI uses CUDA/float16. Use explicit `--device cpu --compute-type int8` with the basic CLI, or configure NVIDIA CUDA before using Web ASR.
 - **YouTube cannot connect**: set `youtube_proxy` in `configs/reibosub.yaml`; it applies only to downloads and does not proxy OCR/ASR.
+- **Bilibili qualities/CC tracks are missing or require login**: check account entitlements and `bilibili_cookie_file`, then restart after changes. Bilibili does not use the YouTube proxy. Burned-in captions need OCR and speech-only material needs ASR; danmaku is not dialogue captions.
+- **Replacing a link does not reset languages**: explicit choices take priority in the current draft. Click **新建字幕任务** to restore platform defaults. Saved tasks retain their own language pair.
+- **A completed task has no subtitles beside its video**: autonomous results are often task-owned. Open **素材库 → 文件与更多 → 字幕** or download them from the task. Refresh Assets first if the list is stale instead of reprocessing the whole video.
+- **The glossary translator fails or shows stale text**: check the subtitle/shared model's configuration, access and quota. Click translate again after editing input/languages. Update and restart the backend as well as rebuilding the frontend; copying only UI build files is insufficient.
 - **Visible text is missing from OCR**: verify language, the green subtitle crop, the logo exclusion box, and the selected OCR version. A first run may also be downloading models. Compare 2.0 and 3.0 in their own directories.
 - **`h264 mmco: unref short failure` appears**: this is normally a decoder warning. If OCR progress keeps moving, the job has not necessarily failed.
 - **A running step no longer continues after restart**: active jobs, live logs, and worker processes are in memory. Agent task records and existing artifacts remain, so continue from task history, Assets, or OCR Lab and rerun the relevant stage.
