@@ -8831,16 +8831,23 @@ def _katakana_to_hiragana(text: str) -> str:
     return "".join(chars)
 
 
-def list_local_assets() -> dict[str, Any]:
+def list_local_assets(*, refresh=False) -> dict[str, Any]:
     media_files = _iter_media_files(DOWNLOAD_DIR)
     videos = _asset_entries([path for path in media_files if path.suffix.lower() in VIDEO_EXTENSIONS], kind="video")
     audios = _asset_entries([path for path in media_files if path.suffix.lower() in AUDIO_EXTENSIONS], kind="audio")
-    subtitles = _asset_entries(_iter_subtitle_files(), kind="subtitle")
+    projects = _download_project_entries(DOWNLOAD_DIR)
+    # Include linked task files in the global picker/counters as well, not just
+    # the per-project card. Explicit association metadata wins over filename guesses.
+    by_path = {item['path']: item for item in _asset_entries(_iter_subtitle_files(), kind="subtitle")}
+    for project in projects:
+        for item in project['subtitles']:
+            by_path[item['path']] = item
+    subtitles = sorted(by_path.values(), key=lambda item: item['modified_at'], reverse=True)
     return {
         "videos": videos,
         "audios": audios,
         "subtitles": subtitles,
-        "projects": _download_project_entries(DOWNLOAD_DIR),
+        "projects": projects,
         "ocr_jobs": _ocr_job_entries(),
         "ocr_debug_folders": _ocr_debug_folder_entries(),
     }
@@ -8888,15 +8895,49 @@ def _asset_entry(path: Path, *, kind: str) -> dict[str, Any]:
     }
 
 
+def _task_paths():
+    return sorted(TASK_DIR.glob('*/task.yaml'), key=lambda path: path.stat().st_mtime, reverse=True)
+
+
+def _project_subtitle_links() -> dict[str, list[dict[str, Any]]]:
+    from video_translate.project_subtitles import task_subtitle_links
+    links: dict[str, list[dict[str, Any]]] = {}
+
+    def validate(path):
+        _ensure_under_root(path)
+        _ensure_web_readable(path)
+
+    def collect(task, task_dir, archived=False):
+        project, entries = task_subtitle_links(task, task_dir=task_dir, media_root=DOWNLOAD_DIR,
+                                               validate_path=validate, archived=archived)
+        if entries:
+            links.setdefault(project, []).extend(entries)
+
+    # One pass for the asset index, not one task scan for every video card.
+    for task_path in _task_paths():
+        try:
+            task = _read_task_file(task_path)
+            collect(task, task_path.parent)
+            for run in _agent_task_run_summaries(task_path.parent):
+                run_path = Path(run['run_path']).resolve()
+                if not run_path.is_relative_to((task_path.parent / AGENT_TASK_RUNS_DIRNAME).resolve()):
+                    continue
+                collect(_read_task_file(run_path), task_path.parent, archived=True)
+        except (OSError, ValueError, UnicodeError, yaml.YAMLError):
+            continue
+    return links
+
+
 def _download_project_entries(directory: Path, limit: int = 80) -> list[dict[str, Any]]:
     if not directory.exists():
         return []
-    projects = [_download_project_entry(path) for path in directory.iterdir() if path.is_dir() and path.name != "debug"]
+    links = _project_subtitle_links()
+    projects = [_download_project_entry(path, subtitle_links=links) for path in directory.iterdir() if path.is_dir() and path.name != "debug"]
     projects = [project for project in projects if project]
     return sorted(projects, key=lambda item: item["modified_at"], reverse=True)[:limit]
 
 
-def _download_project_entry(project_dir: Path) -> dict[str, Any]:
+def _download_project_entry(project_dir: Path, *, subtitle_links=None) -> dict[str, Any]:
     project_dir = Path(project_dir).resolve()
     _backfill_project_manifest_from_tasks(project_dir)
     manifest = infer_project_manifest(project_dir)
@@ -8921,6 +8962,16 @@ def _download_project_entry(project_dir: Path) -> dict[str, Any]:
     videos = _asset_entries([path for path in files if path.suffix.lower() in VIDEO_EXTENSIONS], kind="video", limit=50)
     audios = _asset_entries([path for path in files if path.suffix.lower() in AUDIO_EXTENSIONS], kind="audio", limit=50)
     subtitles = _asset_entries([path for path in files if path.suffix.lower() in {".srt", ".vtt", ".ass", ".ssa", ".bcc"}], kind="subtitle", limit=80)
+    links = _project_subtitle_links() if subtitle_links is None else subtitle_links
+    by_path = {str(Path(item['path']).resolve()): item for item in subtitles}
+    for entry in sorted(links.get(str(project_dir), []), key=lambda item: (not item['is_archived'], item['delivered_at'])):
+        try:
+            path = Path(entry['path'])
+            if path.is_file():
+                by_path[str(path.resolve())] = {**_asset_entry(path, kind='subtitle'), **entry}
+        except OSError:
+            continue
+    subtitles = sorted(by_path.values(), key=lambda item: (item.get('is_archived', False), -float(item.get('delivered_at') or item['modified_at'])))
     images = _asset_entries([path for path in files if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}], kind="image", limit=20)
     others = _asset_entries([path for path in files if path.suffix.lower() not in {
         *VIDEO_EXTENSIONS,
@@ -8929,6 +8980,7 @@ def _download_project_entry(project_dir: Path) -> dict[str, Any]:
         ".jpg", ".jpeg", ".png", ".webp",
     }], kind="file", limit=20)
     newest = max((path.stat().st_mtime for path in files if path.exists()), default=project_dir.stat().st_mtime if project_dir.exists() else time.time())
+    newest = max([newest, *(float(item.get('delivered_at') or item['modified_at']) for item in subtitles)])
     manifest_updated = float(manifest.get("updated_at") or 0)
     newest = max(newest, manifest_updated)
     return {
@@ -10031,7 +10083,10 @@ class AgentHandler(BaseHTTPRequestHandler):
             self._send_json({"files": _list_known_files(kind)})
             return
         if parsed.path == "/api/assets":
-            self._send_json(list_local_assets())
+            try:
+                refresh=(parse_qs(parsed.query).get('refresh') or [''])[0] in {'1','true'}
+                self._send_json(list_local_assets(refresh=refresh))
+            except Exception as exc:self._send_json({'error':str(exc)},status=HTTPStatus.SERVICE_UNAVAILABLE)
             return
         if parsed.path == "/api/file":
             query = parse_qs(parsed.query)

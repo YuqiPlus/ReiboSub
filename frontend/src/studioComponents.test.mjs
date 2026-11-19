@@ -17,6 +17,13 @@ async function render(name, props) {
   return renderToString(createSSRApp({ render: () => h(component, props) }))
 }
 
+test('linked task subtitles expose their language and version without a misleading Chinese label', async () => {
+  const html = await render('AssetList', { items: [{ path: '/tasks/en.review.srt', name: 'en.review.srt', role: 'translated', language: 'en', linked: true, version_label: '第 2 轮', is_archived: true }] })
+  assert.match(html, /英文译文/)
+  assert.match(html, /任务结果 · 第 2 轮 · 历史版本/)
+  assert.doesNotMatch(html, /中文译文/)
+})
+
 test('Agent language selector and English delivery never claim a Chinese artifact', async () => {
   const composer = await render('AgentSessionPanel', { url: 'https://www.bilibili.com/video/BV1GJ411x7h7', sourceLanguage: 'chinese', targetLanguage: 'en' })
   assert.match(composer, /目标字幕语言/)

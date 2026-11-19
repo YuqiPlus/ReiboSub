@@ -1197,7 +1197,7 @@ async function pollAgent(sessionId) {
     }
     if (session.status === 'done') {
       if (selected) setStatus(agentStatus, 'Agent 已完成。', 'ok')
-      loadAssets()
+      loadAssets(true)
       await loadAgentSessions()
       await loadAgentTasks()
     }
@@ -2442,9 +2442,9 @@ async function convertSubtitle() {
 }
 
 async function loadAssets(refresh = false) {
-  setStatus(assetStatus, refresh ? '正在更新素材列表...' : '正在读取素材列表...', '')
+  setStatus(assetStatus, refresh ? '正在更新素材索引...' : '正在读取素材列表...', '')
   try {
-    const result = await getJson('/api/assets')
+    const result = await getJson(refresh === true ? '/api/assets?refresh=1' : '/api/assets')
     assets.videos = result.videos || []
     assets.audios = result.audios || []
     assets.subtitles = result.subtitles || []

@@ -27,7 +27,15 @@ export function preferredProjectSubtitle(project) {
   // Prefer an explicitly labelled translation; never infer a language from the
   // project title. Recent files win only within the same role.
   const rank = file => file.role === 'translated' ? 0 : file.role === 'source' ? 1 : 2
-  return [...files].sort((a, b) => rank(a) - rank(b) || (Number(b.modified_at) || 0) - (Number(a.modified_at) || 0))[0] || null
+  return [...files].sort((a, b) => rank(a) - rank(b) || Number(!!a.is_archived) - Number(!!b.is_archived) || (Number(b.delivered_at || b.modified_at) || 0) - (Number(a.delivered_at || a.modified_at) || 0))[0] || null
+}
+
+export function assetRoleLabel(item) {
+  const language = { zh: '中文', en: '英文', ja: '日文', ko: '韩文' }[item.language] || ''
+  if (item.role === 'translated') return `${language}译文`
+  if (item.role === 'source') return `${language}原文字幕`
+  const role = item.role || item.kind
+  return { downloaded: '外挂字幕', video: '视频', audio: '音频', subtitle: '字幕' }[role] || role || ''
 }
 
 export function filterLibraryProjects(projects, { query = '', kind = 'all', sort = 'recent' } = {}) {

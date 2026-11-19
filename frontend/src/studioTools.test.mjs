@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { fileLabel, localModifiedLabel, filterLibraryProjects, projectMediaSummary, visibleSubtitleRows, projectMedia, preferredProjectSubtitle } from './studioTools.js'
+import { assetRoleLabel, fileLabel, localModifiedLabel, filterLibraryProjects, projectMediaSummary, visibleSubtitleRows, projectMedia, preferredProjectSubtitle } from './studioTools.js'
 
 test('file labels handle both path styles without changing the original', () => {
   assert.equal(fileLabel('/example/한글 中文.srt'), '한글 中文.srt')
@@ -40,4 +40,16 @@ test('subtitle search retains original row indices and UIDs', () => {
   assert.equal(visibleSubtitleRows(cues, '00:00:01')[0].cue.uid, 'one')
   assert.equal(visibleSubtitleRows(cues, 'missing').length, 0)
   assert.equal(cues.length, 2)
+})
+
+test('current delivered translation wins over freshly copied archives', () => {
+  const files = [
+    { path: '/archive/en.srt', role: 'translated', is_archived: true, modified_at: 100 },
+    { path: '/current/en.srt', role: 'translated', delivered_at: 20, modified_at: 10 },
+    { path: '/older/en.srt', role: 'translated', delivered_at: 15, modified_at: 50 },
+  ]
+  assert.equal(preferredProjectSubtitle({ subtitles: files }).path, '/current/en.srt')
+  assert.equal(assetRoleLabel({ role: 'translated', language: 'en' }), '英文译文')
+  assert.equal(assetRoleLabel({ role: 'source', language: 'zh' }), '中文原文字幕')
+  assert.equal(assetRoleLabel({ role: 'translated' }), '译文')
 })
