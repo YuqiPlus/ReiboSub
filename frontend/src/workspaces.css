@@ -417,7 +417,7 @@
 .settings-studio .settings-model-row:last-child { border-bottom: 0; }
 .settings-studio .settings-model-copy { grid-row: auto; }
 .settings-studio .settings-model-copy b { font-size: 13px; font-weight: 550; }
-.settings-studio .settings-model-copy p { font-size: 11px; line-height: 1.8; color: #888; margin-top: 7px; }
+.settings-studio .settings-model-copy p { font-size: 12px; line-height: 1.8; color: var(--muted); margin-top: 7px; }
 .settings-studio .settings-model-row select, .settings-studio .settings-model-row input { min-width: 0; width: 100%; font-size: 12px; }
 .settings-studio .settings-model-row .settings-field-help { display: none; }
 .settings-extra-models { margin-top: 14px; border-top: 1px solid var(--line); padding: 18px 0 0; }
@@ -446,6 +446,37 @@
 .settings-separate-save-note { margin-left: auto; max-width: 280px; color: #999; font-size: 10px; line-height: 1.8; }
 .settings-action-status { color: #777; font-size: 12px; line-height: 1.8; margin-top: 20px; overflow-wrap: anywhere; }
 .settings-action-status.bad { color: var(--red); }.settings-action-status.ok { color: var(--green); }
+.settings-shared-model { margin: 18px 0 8px; padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--soft); }
+.settings-shared-model > label { display: block; font-size: 13px; color: var(--ink); margin-bottom: 10px; }
+.settings-shared-usage { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 12px; color: var(--muted); font-size: 12px; line-height: 1.8; }
+.settings-inheritance-note { display: flex; align-items: center; flex-wrap: wrap; justify-content: space-between; gap: 10px; border-top: 1px solid var(--line); padding-top: 12px; margin-top: 12px; }
+.settings-inheritance-note p { color: var(--muted); font-size: 12px; line-height: 1.8; }
+.settings-inheritance-note button { min-height: 36px; font-size: 12px; }
+.settings-studio .settings-model-input-row:has(> .model-picker:only-child) { display: block; }
+.model-picker { position: relative; min-width: 0; width: 100%; }
+.model-picker-trigger.secondary { display: flex; justify-content: space-between; align-items: center; gap: 12px; width: 100%; min-height: 44px; padding: 10px 13px; text-align: left; color: var(--ink); background: #fff; border: 1px solid var(--line-strong); border-radius: 9px; }
+.model-picker-value { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 500; }
+.model-picker-value.placeholder { color: var(--muted); font-weight: 400; }
+.model-picker-trigger > .app-icon { transform: rotate(90deg); color: var(--muted); }
+.model-picker-trigger[aria-expanded="true"] { border-color: var(--focus); box-shadow: 0 0 0 3px var(--focus-ring); }
+.model-picker-popover { position: absolute; top: calc(100% + 7px); left: 0; right: 0; z-index: 25; min-width: 0; border: 1px solid var(--line-strong); border-radius: 12px; box-shadow: 0 10px 32px #183e2826; background: #fff; overflow: hidden; }
+.model-picker-popover.above { top: auto; bottom: calc(100% + 7px); }
+.model-picker-search { display: flex; align-items: center; gap: 8px; margin: 0; padding: 9px 12px; border-bottom: 1px solid var(--line); color: var(--muted); }
+.model-picker-search input { min-width: 0; width: 100%; border: 0; background: transparent; box-shadow: none; padding: 6px 0; outline: none; font-size: 13px; }
+:root .model-picker-search input:focus { box-shadow: none; }
+.model-picker-options { margin: 0; padding: 6px; list-style: none; max-height: min(var(--model-options-height, 270px), 34vh); overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+.model-picker-options li { margin: 0; }
+.model-picker-options button { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 39px; padding: 9px 10px; border: 0; border-radius: 6px; color: var(--ink); background: transparent; text-align: left; white-space: normal; }
+.model-picker-options button > span { min-width: 0; overflow-wrap: anywhere; }
+.model-picker-options b { font-size: 12px; line-height: 1.6; font-weight: 450; }
+.model-picker-options small { display: block; font-size: 11px; color: var(--muted); margin-top: 3px; }
+.model-picker-options .focused button { background: var(--soft); }
+.model-picker-options .chosen button { color: var(--teal-dark); background: var(--selected-surface); }
+.model-picker-notice { margin: 0; padding: 9px 12px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.model-picker-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; border-top: 1px solid var(--line); padding: 5px 12px; }
+.model-picker-footer > span { font-size: 11px; color: var(--muted); }
+.model-picker-footer button { min-height: 32px; font-size: 12px; padding: 4px 6px; color: var(--teal-dark); border: 0; background: transparent; }
+.model-picker-footer button:hover { background: var(--soft); }
 @media (max-width: 1180px) {
   .settings-studio .settings-model-row { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 14px; }
   .settings-studio .settings-model-copy { grid-column: 1 / -1; }
@@ -662,6 +693,13 @@
 .asr-studio .asr-lab-paths .path-row { background: #fafafa; border-color: var(--line); padding: 12px; }
 .asr-studio .asr-lab-paths code { font-size: 10px; color: #888; }
 .asr-studio .asr-v2-downloads .button-link { font-size: 10px; }
+
+/* Keep page-specific rules from washing out real control boundaries or focus.
+   Composer/search fields use one outer focus ring rather than nested rings. */
+:root :is(input, select, textarea):focus { border-color: var(--focus); box-shadow: 0 0 0 3px var(--focus-ring); }
+:root :is(.studio-search, .agent-url-field, .composer-select, .links-url) :is(input, select):focus { box-shadow: none; }
+:root :is(button.secondary, button.ghost, .button-link):not(:disabled):hover { border-color: var(--line-hover); }
+.composer-select:focus-within { outline: 2px solid var(--focus); outline-offset: 2px; }
 @media (max-width: 1120px) {
   .video-workbench { grid-template-columns: minmax(0,1fr) minmax(260px,.8fr); gap: 22px; }
   .lab-version-card > span { flex-wrap: wrap; gap: 8px; }
@@ -693,13 +731,6 @@
   .lab-version-card > span { flex-wrap: nowrap; }
   .lab-version-card b { font-size: 14px; }
   .lab-version-card p { font-size: 11px; margin-top: 8px; }
-
-/* Keep page-specific rules from washing out real control boundaries or focus.
-   Composer/search fields use one outer focus ring rather than nested rings. */
-:root :is(input, select, textarea):focus { border-color: var(--focus); box-shadow: 0 0 0 3px var(--focus-ring); }
-:root :is(.studio-search, .agent-url-field, .composer-select, .links-url) :is(input, select):focus { box-shadow: none; }
-:root :is(button.secondary, button.ghost, .button-link):not(:disabled):hover { border-color: var(--line-hover); }
-.composer-select:focus-within { outline: 2px solid var(--focus); outline-offset: 2px; }
   .lab-version-detail { margin-bottom: 22px; font-size: 11px; }
   .lab-basic-row { display: block; }
   .lab-basic-row label { min-width: 0; }

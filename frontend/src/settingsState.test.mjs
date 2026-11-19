@@ -26,6 +26,7 @@ import {
   replacementProviderId,
   resolvedProviderId,
   shouldFetchProviderModelsOnSelection,
+  useSharedTextModel,
 } from './settingsState.js'
 
 test('defines every configurable LLM task once', () => {
@@ -53,9 +54,31 @@ test('normalizes empty settings to Korean defaults and all task bindings', () =>
     ocr_language: 'auto',
     target_language: 'zh',
     provider_profile: 'volcano',
+    model: '',
   })
   assert.equal(Object.keys(result.tasks).length, 9)
   assert.deepEqual(result.tasks.subtitle_translation, { provider_profile: '', model: '' })
+})
+
+test('shared model survives saves, clears across providers and keeps vision separate on text unification', () => {
+  const settings = normalizeSettings({ defaults: { provider_profile: 'one', model: 'main-model' }, tasks: {
+    video_analysis: { provider_profile: 'vision', model: 'image-model' }, glossary: { model: 'custom' }, subtitle_translation: { provider_profile: 'two', model: 'other' },
+  } })
+  assert.equal(buildSettingsPayload(settings).defaults.model, 'main-model')
+  const unified = useSharedTextModel(settings)
+  assert.equal(unified.defaults.model, 'main-model')
+  assert.deepEqual(unified.tasks.video_analysis, settings.tasks.video_analysis)
+  assert.deepEqual(unified.tasks.subtitle_translation, { provider_profile: '', model: '' })
+  assert.equal(settings.tasks.glossary.model, 'custom')
+  assert.equal(applyDefaultProviderChange(settings, 'two').defaults.model, '')
+  assert.equal(applyDefaultProviderChange(settings, 'one').defaults.model, 'main-model')
+})
+
+test('shared model follows fetched catalog validation without guessing model prefixes', () => {
+  const settings = { defaults: { provider_profile: 'one', model: 'previous-vendor-model' } }
+  assert.equal(reconcileTaskModelBindings(settings, [], {}).defaults.model, 'previous-vendor-model')
+  assert.equal(reconcileTaskModelBindings(settings, [], { one: [] }).defaults.model, 'previous-vendor-model')
+  assert.equal(reconcileTaskModelBindings(settings, [], { one: ['valid-model'] }).defaults.model, '')
 })
 
 test('keeps explicit provider and model bindings while dropping unknown tasks from payload', () => {

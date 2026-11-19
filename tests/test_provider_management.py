@@ -224,6 +224,7 @@ def test_delete_provider_migrates_default_tasks_and_removes_secret(tmp_path: Pat
                 "ocr_language": "auto",
                 "target_language": "zh",
                 "provider_profile": "first",
+                "model": "first-shared-model",
             },
             "tasks": {
                 "subtitle_translation": {"provider_profile": "", "model": "first-special"},
@@ -245,6 +246,8 @@ def test_delete_provider_migrates_default_tasks_and_removes_secret(tmp_path: Pat
     assert "first" not in secrets["providers"]
     assert secrets["providers"]["second"]["api_key"] == "second-secret"
     assert saved["defaults"]["provider_profile"] == "second"
+    assert saved["defaults"]["model"] == ""
+    assert saved["tasks"]["asr_correction"] == {"provider_profile": "", "model": ""}
     assert saved["tasks"]["subtitle_translation"] == {
         "provider_profile": "",
         "model": "second-model",

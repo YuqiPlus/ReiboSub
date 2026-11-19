@@ -52,6 +52,7 @@ def test_missing_settings_use_korean_defaults_volcano_and_effective_models(tmp_p
         "ocr_language": "auto",
         "target_language": "zh",
         "provider_profile": "volcano",
+        "model": "",
     }
     assert tuple(payload["settings"]["tasks"]) == LLM_TASK_KEYS
     assert all(
@@ -70,6 +71,22 @@ def test_missing_settings_fall_back_to_first_provider_or_blank(tmp_path: Path) -
 
     assert with_providers["settings"]["defaults"]["provider_profile"] == "alpha"
     assert without_providers["settings"]["defaults"]["provider_profile"] == ""
+
+
+def test_shared_model_roundtrip_inherits_missing_task_bindings(tmp_path: Path) -> None:
+    _write_provider(tmp_path, "volcano")
+    payload = {"defaults": {"provider_profile": "volcano", "model": " shared-text-model "}, "tasks": {}}
+    saved = save_app_settings(payload, tmp_path)["settings"]
+    assert saved["defaults"]["model"] == "shared-text-model"
+    assert all(row == {"provider_profile": "", "model": ""} for row in saved["tasks"].values())
+    assert get_app_settings_payload(tmp_path)["settings"] == saved
+
+
+@pytest.mark.parametrize("model", [123, "x\nbad", "x" * 257])
+def test_shared_model_validated_like_task_models(tmp_path: Path, model) -> None:
+    _write_provider(tmp_path, "volcano")
+    with pytest.raises(ValueError):
+        save_app_settings({"defaults": {"provider_profile": "volcano", "model": model}}, tmp_path)
 
 
 def test_load_normalizes_missing_fields_but_preserves_explicit_task_override(tmp_path: Path) -> None:
@@ -101,6 +118,7 @@ tasks:
         "ocr_language": "auto",
         "target_language": "zh",
         "provider_profile": "alpha",
+        "model": "",
     }
     assert payload["tasks"]["subtitle_translation"] == {
         "provider_profile": "volcano",

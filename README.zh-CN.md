@@ -147,7 +147,7 @@ ssh -L 7860:127.0.0.1:7860 user@server
 1. 进入 **设置 → 新增服务商**。
 2. 填写稳定的 Provider ID、显示名称、OpenAI-compatible API Base URL 和 API Key。
 3. 点击“创建并获取模型”；如果服务不支持 `/models`，直接填写静态模型名称即可。
-4. 选择该服务商的默认模型，再给翻译、Glossary、OCR 精修等模块选择服务商和模型。
+4. 在常用设置选择通用模型，让翻译、术语、OCR 整理与 Agent 判断共用；画面分析需要图片输入，可跟随通用模型或单独指定视觉模型。模型选择器支持搜索与手填 ID。
 
 网页会把服务商信息保存在 Git 忽略的 `configs/provider_profiles.yaml`，把连接地址和 API Key 保存在同样被忽略的 `configs/provider_secrets.yaml`。Key 是只写字段，不会从后端回显；新安装无需复制或手工维护 `configs/providers/` 下的文件。
 
@@ -171,7 +171,7 @@ npm run dev
 
 项目使用 OpenAI-compatible Chat Completions API。Web UI 的“设置”页现在可以保存新任务的默认语言、默认服务配置，以及各 LLM 模块使用的模型。
 
-服务商统一在设置页创建和管理。填写 API Base URL 与 Key 后拉取该服务支持的模型，选择默认模型，再给翻译、Glossary、OCR 精修等模块绑定模型。如果服务不支持 `/models`，也可以在同一页维护静态模型列表。
+服务商统一在设置页创建和管理。填写 API Base URL 与 Key 后拉取模型，日常只需选择一个通用模型；视觉模型必须支持图片输入。旧的逐模块配置保留在高级设置中，不会静默清空。点击“统一文本模块到通用模型”会将 8 个文本模块切换为继承，保留视觉配置，保存后生效。共用模型不等于合并处理步骤，每步仍独立调用和校验。如果服务不支持 `/models`，可手填 ID 或维护静态列表。
 
 API Key 和 API 地址直接在设置页管理，不需要 `.env`。服务商名称、模型列表和默认模型保存在 `configs/provider_profiles.yaml`；连接地址和密钥保存在 `configs/provider_secrets.yaml`。两者均被 Git 忽略，其中密钥文件权限会强制设为 `0600`。密钥输入是只写的：后端只返回是否已配置和配置来源，绝不会把现有密钥或尾号回显到浏览器。
 

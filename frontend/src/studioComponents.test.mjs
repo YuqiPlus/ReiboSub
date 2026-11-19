@@ -214,7 +214,7 @@ test('running task deletion is visible but disabled, with real errors kept on fa
   assert.match(html, /具体失败原因/)
 })
 
-test('settings keep four main model bindings and every extra module without exposing stored keys', async () => {
+test('settings show a shared model, optional vision and folded module overrides without exposing stored keys', async () => {
   const html = await render('SettingsPanel', { settings: { defaults: { provider_profile: 'sample' } }, providers: [{ id: 'sample', label: '示例服务', models: ['example-model'], key_configured: true }], selectedProviderId: 'sample', connection: { provider_id: 'sample', key_configured: true, api_key: 'must-not-be-rendered', key_write_allowed: true }, providerManagementAllowed: true })
   assert.match(html, /常用设置/)
   assert.match(html, /服务商管理/)
@@ -225,6 +225,18 @@ test('settings keep four main model bindings and every extra module without expo
   assert.match(html, /删除当前服务商…/)
   assert.match(html, /type="password"/)
   assert.doesNotMatch(html, /must-not-be-rendered/)
+  assert.match(html, /id="settingsDefaultModel"/)
+  assert.match(html, /视觉模型（可选）/)
+  assert.match(html, /按模块单独指定（高级）/)
+  assert.match(html, /8 个文本模块共用通用模型/)
+})
+
+test('model picker is a closed searchable combobox and safely escapes model IDs', async () => {
+  const html = await render('ModelPicker', { id: 'picker', label: '通用模型', modelValue: '<model-id>', models: ['<model-id>'] })
+  assert.match(html, /role="combobox"/)
+  assert.match(html, /aria-expanded="false"/)
+  assert.match(html, /&lt;model-id&gt;/)
+  assert.doesNotMatch(html, /<select|model-picker-popover/)
 })
 
 test('failed task does not offer viewing a stale running stage as its main action', async () => {

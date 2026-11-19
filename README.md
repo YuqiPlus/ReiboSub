@@ -145,7 +145,7 @@ After opening the UI for the first time:
 1. Open **Settings → Add provider**.
 2. Enter a stable provider ID, label, OpenAI-compatible API base URL, and API key.
 3. Click **Create and fetch models**; if the service has no `/models` endpoint, enter static model IDs instead.
-4. Choose the provider's default model, then bind providers/models to translation, glossary, OCR refinement, and the other LLM tasks.
+4. Choose a shared model for translation, glossary, OCR refinement and Agent decisions. Vision may inherit the same image-capable model or use a separate override. The picker supports search and manual model IDs.
 
 The UI stores provider metadata in the Git-ignored `configs/provider_profiles.yaml` and connection URLs/API keys in the equally ignored `configs/provider_secrets.yaml`. Keys are write-only and are never returned by the backend. New installations do not need to copy or maintain files under `configs/providers/`.
 
@@ -169,7 +169,7 @@ Vite defaults to `http://127.0.0.1:5173` and proxies `/api` to port `7860`. Stil
 
 The project uses OpenAI-compatible chat-completions APIs. The Web UI **Settings** page can persist the default language for new tasks, the default provider profile, and the model used by every LLM module.
 
-Create and manage providers from Settings. Enter the API base URL and key, fetch the provider's model list, choose its default model, and then bind models to translation, glossary, OCR refinement, and the other LLM tasks. When an endpoint has no `/models` support, you can maintain a static model list in the same page.
+Create and manage providers from Settings, fetch their model lists, and select one shared model for everyday use. Vision requires image input support. Existing per-module overrides remain under advanced settings and are never silently cleared. The unify-text action resets the eight text bindings to inheritance while preserving vision; changes apply after saving. Sharing a model does not merge processing steps: each still runs and validates separately. Endpoints without `/models` support can use manual IDs or a static list.
 
 API keys and endpoints are managed directly from Settings; `.env` is not required. Provider names, model lists, and default models are stored in `configs/provider_profiles.yaml`; connection URLs and keys are stored in `configs/provider_secrets.yaml`. Both files are Git-ignored, and the secrets file is forced to mode `0600`. Keys are write-only: the backend returns only configured/source status and never echoes the current key or a suffix.
 

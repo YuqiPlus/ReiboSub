@@ -20,6 +20,36 @@ def _clear_llm_env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+def test_shared_model_inheritance_respects_provider_namespace_and_overrides(tmp_path: Path, monkeypatch):
+    _clear_llm_env(monkeypatch)
+    folder = tmp_path / 'configs'
+    folder.mkdir()
+    (folder / 'app_settings.yaml').write_text('''version: 1
+defaults:
+  provider_profile: main
+  model: shared-model
+tasks:
+  glossary:
+    model: glossary-special
+  video_analysis:
+    provider_profile: vision
+  ocr_geometry_refinement:
+    provider_profile: main
+''', encoding='utf-8')
+    profiles = {
+        'main': SimpleNamespace(default_model='provider-default', base_url='https://main.example/v1', api_key='test-main'),
+        'vision': SimpleNamespace(default_model='image-model', base_url='https://vision.example/v1', api_key='test-vision'),
+    }
+    monkeypatch.setattr(llm_config, '_get_provider_profile', lambda profile_id, root: profiles.get(profile_id))
+    for task in ['subtitle_translation', 'asr_correction', 'title_translation', 'ocr_source_refinement', 'ocr_geometry_refinement']:
+        config = load_llm_task_config(task, root=tmp_path)
+        assert config.model == 'shared-model'
+        assert config.provider_profile == 'main'
+    assert load_llm_task_config('glossary', root=tmp_path).model == 'glossary-special'
+    assert load_llm_task_config('video_analysis', root=tmp_path).model == 'image-model'
+    assert load_llm_task_config('subtitle_translation', root=tmp_path, explicit_model='cli-model').model == 'cli-model'
+
+
 def test_load_llm_task_config_reads_task_specific_model(tmp_path: Path, monkeypatch):
     config = tmp_path / "configs" / "llm.yaml"
     config.parent.mkdir()

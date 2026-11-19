@@ -26,8 +26,21 @@
           <details class="studio-disclosure settings-ocr-default"><summary>画面文字语言</summary><label for="settingsOcrLanguage">OCR 语言<select id="settingsOcrLanguage" v-model="draft.defaults.ocr_language"><option value="auto">跟随原文语言</option><option value="korean">韩语</option><option value="japanese">日语</option><option value="english">英语</option><option value="chinese">中文</option></select></label></details>
         </section>
         <section class="settings-section settings-bindings">
-          <div class="studio-section-head"><div><h3>各模块使用的模型</h3><p>更换服务商后会重新匹配模型；也可以留空，使用该服务商的默认模型。</p></div></div>
-          <component v-for="group in modelGroups" :key="group.id" :is="group.advanced ? 'details' : 'div'" :class="group.advanced ? 'studio-disclosure settings-extra-models' : 'settings-primary-models'"><summary v-if="group.advanced">更多模型：OCR、ASR 与兼容流程 · {{ group.tasks.length }} 项</summary><div class="settings-model-list">          <div v-for="task in group.tasks" :key="task.key" class="settings-model-row">
+          <div class="studio-section-head"><div><h3>通用模型</h3><p>选一次，供翻译、术语、OCR 整理和 Agent 判断共用。不是把这些步骤合成一次请求。</p></div></div>
+          <div class="settings-shared-model">
+            <label for="settingsDefaultModel">{{ defaultProviderName }} · 默认模型</label>
+            <ModelPicker id="settingsDefaultModel" v-model="draft.defaults.model" label="通用模型" :models="defaultProviderModels"
+              :empty-label="`使用服务商默认${defaultProvider?.default_model ? `（${defaultProvider.default_model}）` : ''}`"
+              :disabled="!defaultProviderId" :loading="defaultProviderFetching" :error="modelErrorFor(defaultProviderId)"
+              @open="ensureDefaultModelCatalog" @refresh="requestModels(defaultProviderId)" />
+            <div class="settings-shared-usage"><span>字幕翻译</span><span>术语与标题</span><span>OCR 整理</span><span>Agent 判断与复核</span></div>
+            <div class="settings-inheritance-note">
+              <p v-if="textOverrideCount">现有 {{ textOverrideCount }} 个文本模块仍使用单独配置；修改通用模型不会覆盖它们。</p>
+              <p v-else>8 个文本模块共用通用模型，无需逐项设置。</p>
+              <button v-if="textOverrideCount" class="secondary" type="button" @click="draft = useSharedTextModel(draft)">统一文本模块到通用模型</button>
+            </div>
+          </div>
+          <component v-for="group in modelGroups" :key="group.id" :is="group.advanced ? 'details' : 'div'" :class="group.advanced ? 'studio-disclosure settings-extra-models' : 'settings-primary-models'"><summary v-if="group.advanced">按模块单独指定（高级） · {{ group.tasks.length }} 项</summary><div class="settings-model-list">          <div v-for="task in group.tasks" :key="task.key" class="settings-model-row">
             <div class="settings-model-copy">
               <b>{{ task.label }}</b>
               <p>{{ task.description }}</p>
@@ -57,37 +70,10 @@
             <div class="settings-model-input">
               <label :for="`settingsModel-${task.key}`">模型</label>
               <div class="settings-model-input-row">
-                <select
-                  v-if="modelsForTask(task.key).length"
-                  :id="`settingsModel-${task.key}`"
-                  v-model="draft.tasks[task.key].model"
-                  @focus="ensureTaskModelCatalog(task.key)"
-                >
-                  <option value="">使用服务商默认模型{{ defaultModelForTask(task.key) ? `（${defaultModelForTask(task.key)}）` : '' }}</option>
-                  <option
-                    v-if="taskModelAwaitingValidation(task.key)"
-                    :value="draft.tasks[task.key].model"
-                  >
-                    {{ draft.tasks[task.key].model }}（等待刷新验证）
-                  </option>
-                  <option v-for="model in modelsForTask(task.key)" :key="model" :value="model">{{ model }}</option>
-                </select>
-                <input
-                  v-else
-                  :id="`settingsModel-${task.key}`"
-                  v-model.trim="draft.tasks[task.key].model"
-                  autocomplete="off"
-                  placeholder="暂无候选，请手动填写模型 ID"
-                  :disabled="isProviderFetching(providerIdForTask(task.key))"
-                />
-                <button
-                  type="button"
-                  class="secondary mini"
-                  :disabled="!providerIdForTask(task.key) || isProviderFetching(providerIdForTask(task.key))"
-                  @click="requestModels(providerIdForTask(task.key))"
-                >
-                  {{ isProviderFetching(providerIdForTask(task.key)) ? '获取中' : '刷新' }}
-                </button>
+                <ModelPicker :id="`settingsModel-${task.key}`" v-model="draft.tasks[task.key].model" :label="`${task.label}模型`"
+                  :models="modelsForTask(task.key)" :empty-label="`跟随${providerIdForTask(task.key) === defaultProviderId ? '通用' : '服务商默认'}模型${defaultModelForTask(task.key) ? `（${defaultModelForTask(task.key)}）` : ''}`"
+                  :disabled="!providerIdForTask(task.key)" :loading="isProviderFetching(providerIdForTask(task.key))" :error="modelErrorFor(providerIdForTask(task.key))"
+                  @open="ensureTaskModelCatalog(task.key)" @refresh="requestModels(providerIdForTask(task.key))" />
               </div>
               <p v-if="modelErrorFor(providerIdForTask(task.key))" class="settings-inline-error">
                 列表获取失败；没有本地候选时可手填，或点击“刷新”重试。
@@ -198,24 +184,9 @@
               <span class="badge done">连接已保存</span>
             </div>
             <div class="settings-model-input-row">
-              <select
-                v-if="createdProviderModels.length"
-                id="settingsNewProviderModel"
-                v-model="newProviderDraft.default_model"
-                :disabled="providerManaging"
-              >
-                <option value="" disabled>请选择默认模型</option>
-                <option v-for="model in createdProviderModels" :key="model" :value="model">{{ model }}</option>
-              </select>
-              <input
-                v-else
-                id="settingsNewProviderModel"
-                v-model.trim="newProviderDraft.default_model"
-                autocomplete="off"
-                spellcheck="false"
-                :placeholder="createdProviderFetching ? '正在获取模型…' : '获取失败时可手动填写模型 ID'"
-                :disabled="providerManaging || createdProviderFetching"
-              />
+              <ModelPicker id="settingsNewProviderModel" v-model="newProviderDraft.default_model" label="新服务商默认模型" :models="createdProviderModels"
+                empty-label="请选择默认模型" :disabled="providerManaging" :loading="createdProviderFetching" :error="createdProviderModelError"
+                @refresh="requestModels(createdProviderId)" />
               <button
                 type="button"
                 class="secondary"
@@ -278,24 +249,9 @@
             <div>
               <label for="settingsEditProviderDefaultModel">默认模型 ID <span class="muted">（可留空）</span></label>
               <div class="settings-model-input-row">
-                <select
-                  v-if="selectedProviderModels.length"
-                  id="settingsEditProviderDefaultModel"
-                  v-model="editProviderDraft.default_model"
-                  :disabled="providerManaging"
-                >
-                  <option value="">不设置默认模型</option>
-                  <option v-for="model in selectedProviderModels" :key="model" :value="model">{{ model }}</option>
-                </select>
-                <input
-                  v-else
-                  id="settingsEditProviderDefaultModel"
-                  v-model.trim="editProviderDraft.default_model"
-                  autocomplete="off"
-                  spellcheck="false"
-                  placeholder="暂无候选，请手动填写模型 ID"
-                  :disabled="providerManaging || selectedProviderFetching"
-                />
+                <ModelPicker id="settingsEditProviderDefaultModel" v-model="editProviderDraft.default_model" label="服务商默认模型" :models="selectedProviderModels"
+                  empty-label="不设置默认模型" :disabled="providerManaging" :loading="selectedProviderFetching" :error="selectedProviderModelError"
+                  @refresh="requestModels(selectedProviderId)" />
                 <button
                   type="button"
                   class="secondary mini"
@@ -459,6 +415,7 @@
 </template>
 
 <script setup>
+import ModelPicker from './ModelPicker.vue'
 import { computed, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
 import {
@@ -468,6 +425,7 @@ import {
   applyTaskProviderChange,
   buildSettingsPayload,
   normalizeSettings,
+  useSharedTextModel,
   providerCredentialState,
   providerDisplayName,
   providerModels,
@@ -519,12 +477,12 @@ const emit = defineEmits([
 ])
 const initialSettings = normalizeSettings(props.settings, props.providers)
 const activeSection = ref(props.providers.length ? 'defaults' : 'providers')
-const coreModelKeys = new Set(['subtitle_translation', 'glossary', 'video_analysis', 'title_translation'])
 const modelGroups = [
-  { id: 'core', tasks: ['subtitle_translation', 'glossary', 'video_analysis', 'title_translation'].map(key => SETTINGS_TASKS.find(task => task.key === key)), advanced: false },
-  { id: 'extra', tasks: SETTINGS_TASKS.filter(task => !coreModelKeys.has(task.key)), advanced: true },
+  { id: 'vision', tasks: [{ ...SETTINGS_TASKS.find(task => task.key === 'video_analysis'), label: '视觉模型（可选）', description: '抽帧看字幕区域和 Logo，需要图片输入。通用模型支持图片时，可直接跟随；否则在这里单独选。' }], advanced: false },
+  { id: 'extra', tasks: SETTINGS_TASKS.filter(task => task.key !== 'video_analysis'), advanced: true },
 ]
 const draft = ref(reconcileTaskModelBindings(initialSettings, props.providers, props.modelsByProvider))
+const textOverrideCount = computed(() => SETTINGS_TASKS.filter(task => task.key !== 'video_analysis' && (draft.value.tasks[task.key].provider_profile || draft.value.tasks[task.key].model)).length)
 const savedPayload = ref(JSON.stringify(buildSettingsPayload(initialSettings)))
 const connectionDraft = ref(createProviderConnectionDraft())
 const showCreateProvider = ref(false)
@@ -708,27 +666,18 @@ function modelsForTask(taskKey) {
 
 function defaultModelForTask(taskKey) {
   const provider = providerById.value.get(providerIdForTask(taskKey))
+  if (providerIdForTask(taskKey) === defaultProviderId.value && draft.value.defaults.model) return draft.value.defaults.model
   return String(provider?.default_model || provider?.model_name || '').trim()
-}
-
-function providerCatalogLoaded(providerId) {
-  return Object.prototype.hasOwnProperty.call(props.modelsByProvider || {}, providerId)
-}
-
-function taskModelAwaitingValidation(taskKey) {
-  const model = String(draft.value.tasks[taskKey]?.model || '').trim()
-  const providerId = providerIdForTask(taskKey)
-  return Boolean(
-    model
-    && !providerCatalogLoaded(providerId)
-    && !modelsForTask(taskKey).includes(model)
-  )
 }
 
 function ensureTaskModelCatalog(taskKey) {
   const providerId = providerIdForTask(taskKey)
   if (!shouldFetchProviderModelsOnSelection(providerId, props.providers, props.modelsByProvider)) return
   requestModels(providerId)
+}
+
+function ensureDefaultModelCatalog() {
+  if (shouldFetchProviderModelsOnSelection(defaultProviderId.value, props.providers, props.modelsByProvider)) requestModels(defaultProviderId.value)
 }
 
 function isProviderFetching(providerId) {

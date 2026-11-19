@@ -83,6 +83,9 @@ def load_llm_task_config(task: str, *, root: Path | None = None, explicit_model:
     overlay_model = _clean(app_task.get("model"))
     profile_id, profile = _resolve_app_provider_profile(root, app_defaults, app_task)
     profile_default_model = _profile_value(profile, "default_model")
+    # The shared model belongs to the global provider. A per-task provider
+    # override must use its own model namespace, never another vendor's ID.
+    shared_model = _clean(app_defaults.get("model")) if not profile_id or profile_id == _clean(app_defaults.get("provider_profile")) else None
 
     if profile_id:
         # A selected provider owns its model namespace.  Falling through to a
@@ -90,9 +93,9 @@ def load_llm_task_config(task: str, *, root: Path | None = None, explicit_model:
         # invalid model name to the new endpoint.  An empty task binding uses
         # the provider default; if that is also empty, surface the missing
         # model instead of reviving the legacy value.
-        model = _clean(explicit_model) or overlay_model or profile_default_model
+        model = _clean(explicit_model) or overlay_model or shared_model or profile_default_model
     else:
-        model = _clean(explicit_model) or overlay_model or legacy_model
+        model = _clean(explicit_model) or overlay_model or shared_model or legacy_model
     base_url = _clean(explicit_base_url) or _profile_value(profile, "base_url") or legacy_base_url
     api_key = _profile_api_key(profile) or legacy_api_key
     # ``provider`` is the legacy transport/protocol field used by run config

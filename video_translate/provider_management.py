@@ -299,6 +299,7 @@ def _replace_provider_references(
     default_replaced = old_default == removed_id
     if default_replaced:
         defaults["provider_profile"] = replacement_id
+        defaults["model"] = ""
 
     affected_tasks: list[str] = []
     for task_key, raw_binding in tasks.items():
@@ -310,7 +311,7 @@ def _replace_provider_references(
             continue
         affected_tasks.append(str(task_key))
         binding["provider_profile"] = "" if default_replaced else replacement_id
-        binding["model"] = replacement_model
+        binding["model"] = "" if default_replaced and not str(binding.get("model") or "").strip() else replacement_model
         tasks[task_key] = binding
     return updated, affected_tasks, default_replaced
 

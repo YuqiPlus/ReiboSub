@@ -21,8 +21,8 @@ export const SETTINGS_TASKS = Object.freeze([
   },
   {
     key: 'asr_correction',
-    label: 'ASR 原文纠错',
-    description: '纠正语音识别结果，保留原语言文本。',
+    label: 'Agent 判断与原文复核',
+    description: 'Agent 工具选择、译文验收与语音识别原文纠错；不是 ASR 识别引擎本身。',
   },
   {
     key: 'hybrid_source_reconstruction',
@@ -83,6 +83,7 @@ export function normalizeSettings(settings = {}, providers = []) {
       ocr_language: validChoice(defaults.ocr_language, OCR_LANGUAGES, 'auto'),
       target_language: cleanText(defaults.target_language) || 'zh',
       provider_profile: cleanText(defaults.provider_profile) || firstProviderId,
+      model: cleanText(defaults.model),
     },
     tasks: normalizedTasks,
   }
@@ -118,6 +119,7 @@ export function applyDefaultProviderChange(settings = {}, providerId = '') {
   normalized.defaults.provider_profile = nextProviderId
 
   if (nextProviderId === previousProviderId) return normalized
+  normalized.defaults.model = ''
   for (const task of SETTINGS_TASKS) {
     const binding = normalized.tasks[task.key]
     if (!cleanText(binding.provider_profile)) binding.model = ''
@@ -174,6 +176,8 @@ export function providerModels(providerId, providers = [], modelsByProvider = {}
 export function reconcileTaskModelBindings(settings = {}, providers = [], modelsByProvider = {}) {
   const normalized = normalizeSettings(settings, providers)
   const defaultProviderId = cleanText(normalized.defaults.provider_profile)
+  const globalModels = uniqueModels(extractModels(asObject(modelsByProvider)[defaultProviderId]))
+  if (globalModels.length && normalized.defaults.model && !globalModels.includes(normalized.defaults.model)) normalized.defaults.model = ''
 
   for (const task of SETTINGS_TASKS) {
     const binding = normalized.tasks[task.key]
@@ -183,6 +187,14 @@ export function reconcileTaskModelBindings(settings = {}, providers = [], models
     if (!Object.prototype.hasOwnProperty.call(asObject(modelsByProvider), providerId)) continue
     const candidates = uniqueModels(extractModels(asObject(modelsByProvider)[providerId]))
     if (candidates.length && !candidates.includes(model)) binding.model = ''
+  }
+  return normalized
+}
+
+export function useSharedTextModel(settings = {}) {
+  const normalized = normalizeSettings(settings)
+  for (const task of SETTINGS_TASKS) {
+    if (task.key !== 'video_analysis') normalized.tasks[task.key] = { provider_profile: '', model: '' }
   }
   return normalized
 }

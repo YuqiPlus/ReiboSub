@@ -115,7 +115,7 @@ def _normalize_loaded_settings(
         # intentional: it means "use the selected provider's default".  Do
         # not resurrect a model from legacy llm.yaml/.env after the user
         # switches providers and clears the old model selection.
-        if not model and not binding_is_configured:
+        if not model and not binding_is_configured and "model" not in defaults:
             model = _clean_text(load_llm_task_config(task_key, root=root).model)
 
         normalized_tasks[task_key] = {
@@ -138,6 +138,7 @@ def _normalize_loaded_settings(
                 defaults.get("target_language"), TARGET_LANGUAGES, "zh"
             ),
             "provider_profile": default_provider,
+            "model": _clean_text(defaults.get("model")) if not configured_provider or configured_provider in provider_ids else "",
         },
         "tasks": normalized_tasks,
     }
@@ -174,6 +175,7 @@ def _validate_settings(
     )
 
     default_provider = _clean_text(defaults.get("provider_profile")) or _default_provider_id(providers)
+    default_model = _validate_model(defaults.get("model", ""), "defaults")
     if default_provider and default_provider not in provider_ids:
         raise ValueError(f"未知 provider: {default_provider}")
     if provider_ids and not default_provider:
@@ -205,6 +207,7 @@ def _validate_settings(
             "ocr_language": ocr_language,
             "target_language": target_language,
             "provider_profile": default_provider,
+            "model": default_model,
         },
         "tasks": normalized_tasks,
     }
