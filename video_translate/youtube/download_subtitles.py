@@ -1,5 +1,6 @@
 import argparse
 import os
+import shutil
 from pathlib import Path
 
 import yt_dlp
@@ -68,6 +69,8 @@ def build_subtitle_options(
     }
     if proxy:
         ydl_opts["proxy"] = proxy
+    if shutil.which("node"):
+        ydl_opts["js_runtimes"] = {"node": {}}
     if convert_subtitles:
         ydl_opts["convertsubtitles"] = convert_subtitles
     if list_subtitles:

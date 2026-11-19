@@ -33,6 +33,14 @@ def test_parse_subtitle_languages_from_csv():
     assert module.parse_subtitle_languages("ko, en.*, zh-Hans") == ["ko", "en.*", "zh-Hans"]
 
 
+def test_subtitle_download_enables_node_from_active_environment(tmp_path, monkeypatch):
+    import video_translate.youtube.download_subtitles as module
+    monkeypatch.setattr(module.shutil, 'which', lambda name: '/environment/bin/node' if name == 'node' else None)
+    assert module.build_subtitle_options(output_dir=tmp_path)['js_runtimes'] == {'node': {}}
+    monkeypatch.setattr(module.shutil, 'which', lambda name: None)
+    assert 'js_runtimes' not in module.build_subtitle_options(output_dir=tmp_path)
+
+
 def test_build_subtitle_options_downloads_subtitles_only(tmp_path):
     module = _load_subtitle_module()
 

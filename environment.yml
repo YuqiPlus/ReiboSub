@@ -5,6 +5,6 @@ dependencies:
   - python=3.11
   - pip
   - ffmpeg
-  - nodejs>=20
+  - nodejs>=22
   - pip:
-      - -e .[dev,asr,ocr-cpu]
+      - -e .[asr,ocr-cpu]
