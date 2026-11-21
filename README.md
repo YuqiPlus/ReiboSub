@@ -8,6 +8,8 @@ The project is designed for a human-in-the-loop workflow: the Agent can run mult
 
 [Install and start](#quick-start) · [Bilibili and languages](#bilibili-and-multilingual-subtitles) · [Assets and glossary](#assets-and-glossary-review) · [Model settings](#llm-configuration) · [GPU and experiments](#gpu-and-model-cache) · [Troubleshooting](#troubleshooting)
 
+For secondary development, the provisional [`reibosub` Python API](docs/python-api.md) provides immutable subtitle data, standalone read/write and conversion, Chinese script conversion, pluggable translation backends and custom format codecs. [Runnable examples](examples/python_api/) include offline implementations. It does not require the web service or discover its credentials. No PyPI release has been made; dependency splitting is a separate next step.
+
 ## What It Can Do
 
 - **Agent cockpit**: paste a YouTube or ordinary Bilibili video URL/ID, let the Agent inspect sources, and review terms before translation.

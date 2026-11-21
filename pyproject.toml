@@ -54,7 +54,10 @@ requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["video_translate*"]
+include = ["video_translate*", "reibosub*"]
+
+[tool.setuptools.package-data]
+reibosub = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
