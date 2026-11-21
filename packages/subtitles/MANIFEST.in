@@ -1,5 +1,5 @@
 global-exclude *
-include pyproject.toml MANIFEST.in LICENSE README.md
+include pyproject.toml MANIFEST.in LICENSE README.md CHANGELOG.md
 include docs/python-api.md
 recursive-include src/reibosub *.py py.typed
 recursive-include examples/python_api *.py

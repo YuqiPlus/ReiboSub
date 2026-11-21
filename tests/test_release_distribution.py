@@ -88,7 +88,7 @@ def test_website_dependency_cannot_leak_into_toolkit_metadata(tmp_path):
 
 def test_publish_workflow_is_tag_guarded_and_separates_oidc_from_build():
     workflow = yaml.load((ROOT / ".github/workflows/publish.yml").read_text(), Loader=yaml.BaseLoader)
-    assert "push" not in workflow["on"]
+    assert workflow['on']['push'] == {'tags': ['publish/v*']}
     assert "workflow_dispatch" in workflow["on"]
     assert workflow['on']['workflow_dispatch']['inputs']['publish']['default'] == 'false'
     jobs = workflow["jobs"]
@@ -97,6 +97,7 @@ def test_publish_workflow_is_tag_guarded_and_separates_oidc_from_build():
     assert jobs["publish"]["environment"]["name"] == "pypi"
     assert "github.event_name == 'workflow_dispatch'" in jobs["publish"]["if"]
     assert "inputs.publish" in jobs['publish']['if']
+    assert "startsWith(github.ref, 'refs/tags/publish/v')" in jobs['publish']['if']
     assert "github.ref_type == 'tag'" in jobs["publish"]["if"]
     assert jobs["publish"]["needs"] == ["build", "test"]
     assert all("run" not in step for step in jobs["publish"]["steps"])
@@ -112,6 +113,9 @@ def test_publish_workflow_is_tag_guarded_and_separates_oidc_from_build():
     ('0.1.1', 'tag', 'v0.1.0', 'true', False),
     ('0.1.0', 'tag', 'v0.1.1', 'true', False),
     ('0.1.0', 'branch', 'main', 'true', False),
+    ('0.1.0', 'tag', 'publish/v0.1.0', 'false', True),
+    ('0.1.0', 'tag', 'publish/v0.1.1', 'false', False),
+    ('0.1.0', 'tag', 'publish/v0.1.0-extra', 'false', False),
 ])
 def test_real_workflow_version_guard(tmp_path, source_version, ref_type, ref, publish, ok):
     workflow = yaml.load((ROOT / '.github/workflows/publish.yml').read_text(), Loader=yaml.BaseLoader)

@@ -37,7 +37,7 @@ def check_member(name: str, data: bytes, *, wheel: bool, version: str) -> None:
     if wheel and name == f"{dist_info}/licenses/LICENSE":
         allowed = True
     if not wheel:
-        allowed |= name in {"pyproject.toml", "MANIFEST.in", "LICENSE", "README.md", "PKG-INFO", "setup.cfg", "docs/python-api.md"}
+        allowed |= name in {"pyproject.toml", "MANIFEST.in", "LICENSE", "README.md", "CHANGELOG.md", "PKG-INFO", "setup.cfg", "docs/python-api.md"}
         info = parts[1:] if parts[:1] == ("src",) else parts
         allowed |= len(info) == 2 and info[0] == "reibosub.egg-info" and info[1] in {"PKG-INFO", "SOURCES.txt", "dependency_links.txt", "entry_points.txt", "requires.txt", "top_level.txt"}
         allowed |= len(parts) == 3 and parts[:2] == ("examples", "python_api") and path.suffix == ".py"

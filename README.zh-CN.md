@@ -36,7 +36,7 @@ python -m video_translate.dependencies setup asr --dry-run
 # 仅显式 --yes 才安装；不要修改正在运行网站使用的环境。
 ```
 
-当前目录拆分是未发布改动；PyPI 上已发布的 0.1.0 不会被覆盖，本轮不发布新版本。
+工具包从 **0.1.1** 起仅分发独立字幕能力；PyPI 上的 0.1.0 不会被覆盖，网页版本独立维护。旧识别选装组与命令的迁移见 [CHANGELOG](packages/subtitles/CHANGELOG.md)。
 网站启动入口、素材路径、配置位置及既有功能不迁移。发布维护见[发布说明](docs/publishing.md)。
 
 ## 主要功能

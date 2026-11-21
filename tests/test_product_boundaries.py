@@ -57,10 +57,12 @@ def test_website_reuses_public_chinese_conversion(monkeypatch):
 
 
 def test_source_compatibility_and_toolkit_use_same_types():
+    import reibosub
     from reibosub.models import Cue
     from reibosub import Cue as public
     assert Cue is public
     assert Path(sys.modules['reibosub.models'].__file__).is_relative_to(TOOLKIT)
+    assert reibosub.__version__ == tomllib.loads((TOOLKIT / 'pyproject.toml').read_text())['project']['version']
 
 
 def test_source_compatibility_cli_is_still_available_without_website(tmp_path):

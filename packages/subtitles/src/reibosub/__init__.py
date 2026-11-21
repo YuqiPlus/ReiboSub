@@ -11,7 +11,7 @@ from .io import convert, load, save
 from .models import Cue, Progress, Subtitle, SubtitleIssue
 from .translation import TranslationBackend, Translator, translate
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "Cue", "Subtitle", "SubtitleIssue", "Progress", "load", "save", "convert", "convert_text",

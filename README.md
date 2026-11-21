@@ -36,7 +36,7 @@ python -m video_translate.dependencies setup asr --dry-run
 # Installing requires --yes. Never modify an environment used by a running service.
 ```
 
-This product separation is unreleased; the published PyPI 0.1.0 files are unchanged and no new release is made here. Existing web entrypoints, media paths, settings and features remain in place. Maintainers: see [publishing](docs/publishing.md).
+The toolkit-only distribution starts with **0.1.1**; published PyPI 0.1.0 files are unchanged. Existing web entrypoints, media paths, settings and features remain in place, with independent application versions. See the [toolkit migration notes](packages/subtitles/CHANGELOG.md). Maintainers: see [publishing](docs/publishing.md).
 
 ## What It Can Do
 

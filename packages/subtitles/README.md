@@ -78,9 +78,11 @@ Only the `dev` extra belongs to this library. Website, download and recognition
 extras belong to the root `reibosub-web` source project. They are not public
 OCR/ASR engine APIs. See the [web guide](https://github.com/YuqiPlus/ReiboSub/blob/main/docs/web-application.md).
 
-This repository reorganization is **unreleased**. The existing PyPI 0.1.0 remains
-unchanged; a future release must use a new version. From a source checkout, use
-the editable install above to test these changes rather than assuming the
-published wheel already has this new layout.
+Version **0.1.1** is the first toolkit-only distribution. It retains the subtitle
+API while removing the bundled `video_translate` application, recognition/web
+extras and legacy video command forwarding. Install/develop the website from the
+repository root instead; see [migration notes](https://github.com/YuqiPlus/ReiboSub/blob/main/packages/subtitles/CHANGELOG.md).
+The published 0.1.0 files remain unchanged. Do not upgrade an environment used by
+a running website; test the package in its own environment first.
 
 [API and extensions](https://github.com/YuqiPlus/ReiboSub/blob/main/packages/subtitles/docs/python-api.md) · [Examples](https://github.com/YuqiPlus/ReiboSub/tree/main/packages/subtitles/examples/python_api)

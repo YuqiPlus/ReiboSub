@@ -1,4 +1,4 @@
-# ReiboSub 编程 API（独立产品，当前目录调整未发布）
+# ReiboSub 编程 API（0.1.1 独立工具包）
 
 `reibosub` 是新增的公开 Python 入口。它不要求网页运行，不创建 Agent 工程，不访问项目数据库，也不自动读取 `.env`、服务商配置或网页密钥。现有 `video_translate`、网页和旧命令行继续保持原来的调用方式，本轮没有迁移或替换它们。
 
@@ -13,7 +13,7 @@ python -m pip install reibosub
 python -c "from reibosub import Subtitle, Cue; print(Subtitle((Cue(1, 0, 1, 'Hello'),)).to_text())"
 ```
 
-默认安装只含 OpenCC 与 packaging，不安装网页、数据库或 OCR/ASR。核心代码位于本产品的 `src/reibosub`，不导入仓库根目录的网页代码。已发布的 PyPI 0.1.0 保持原样，本目录重构尚未发布。
+默认安装只含 OpenCC 与 packaging，不安装网页、数据库或 OCR/ASR。核心代码位于本产品的 `src/reibosub`，不导入仓库根目录的网页代码。0.1.1 开始仅分发独立工具包；已发布的 PyPI 0.1.0 保持原样，旧识别选装组与命令的迁移见 [CHANGELOG](../CHANGELOG.md)。
 
 源码开发从仓库根目录执行 `python -m pip install -e "./packages/subtitles[dev]"`，然后：
 
@@ -169,6 +169,6 @@ python examples/python_api/custom_format.py --out /tmp/reibosub-custom.tsv
 python -m pytest tests/test_public_api.py tests/test_public_translation_http.py -q
 ```
 
-独立工具包只构建字幕 API；网页、识别与 Agent 是另一个产品。正式发布前仍需增加版本并完成独立构建、安装与兼容性验收，本轮不发布。
+独立工具包只构建字幕 API；网页、识别与 Agent 是另一个产品。每次发布均需增加工具包版本并完成独立构建、安装与兼容性验收。
 
 安装保护只能识别当前进程已加载的模块和本工具自己的环境锁，不能证明同一环境没有其他进程正在使用。请在独立环境测试，或先停止共享该环境的服务；不要因为使用了新终端就认为修改共享环境没有影响。
