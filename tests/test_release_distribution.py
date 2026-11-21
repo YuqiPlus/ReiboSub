@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 import tarfile
 import zipfile
 
@@ -19,7 +22,8 @@ INFO = b"Name: reibosub\nVersion: 0.1.0\nLicense-Expression: Apache-2.0\n\nPubli
 
 
 def files(wheel):
-    data = {name: b"# public Python\n" for name in ("reibosub/__init__.py", "reibosub/py.typed", "reibosub/models.py", "reibosub/dependencies.py", "video_translate/cli.py")}
+    prefix = '' if wheel else 'src/'
+    data = {prefix + name: b"# public Python\n" for name in ("reibosub/__init__.py", "reibosub/py.typed", "reibosub/models.py", "reibosub/dependencies.py")}
     data[f"reibosub-{VERSION}.dist-info/METADATA" if wheel else "PKG-INFO"] = INFO
     return data
 
@@ -41,10 +45,10 @@ def archive(tmp_path, data, wheel=True):
 
 @pytest.mark.parametrize("wheel", [True, False])
 def test_public_archive_is_accepted(tmp_path, wheel):
-    assert audit.inspect_archive(archive(tmp_path, files(wheel), wheel), version=VERSION) == 6
+    assert audit.inspect_archive(archive(tmp_path, files(wheel), wheel), version=VERSION) == 5
 
 
-@pytest.mark.parametrize("name", [".env", "configs/provider_secrets.yaml", "outputs/job.json", "tests/input.srt", "video_translate/storage.py", "video_translate/storage_migration.py", "reibosub/secret.key", "../escaped.py", "reibosub/../../escaped.py", "frontend/dist/index.html"])
+@pytest.mark.parametrize("name", [".env", "configs/provider_secrets.yaml", "outputs/job.json", "tests/input.srt", "video_translate/cli.py", "video_translate/web_agent.py", "video_translate/storage.py", "video_translate/storage_migration.py", "reibosub/secret.key", "../escaped.py", "reibosub/../../escaped.py", "frontend/dist/index.html"])
 @pytest.mark.parametrize("wheel", [True, False])
 def test_unexpected_and_private_files_are_rejected(tmp_path, name, wheel):
     data = files(wheel)
@@ -75,15 +79,24 @@ def test_missing_core_files_are_rejected(tmp_path):
         audit.inspect_archive(archive(tmp_path, data), version=VERSION)
 
 
+def test_website_dependency_cannot_leak_into_toolkit_metadata(tmp_path):
+    data = files(True)
+    data[f"reibosub-{VERSION}.dist-info/METADATA"] = INFO.replace(b"\n\n", b"\nRequires-Dist: paddleocr>=3\n\n")
+    with pytest.raises(ValueError, match="Application dependency"):
+        audit.inspect_archive(archive(tmp_path, data), version=VERSION)
+
+
 def test_publish_workflow_is_tag_guarded_and_separates_oidc_from_build():
     workflow = yaml.load((ROOT / ".github/workflows/publish.yml").read_text(), Loader=yaml.BaseLoader)
-    assert workflow["on"]["push"]["tags"] == ["v*"]
+    assert "push" not in workflow["on"]
     assert "workflow_dispatch" in workflow["on"]
+    assert workflow['on']['workflow_dispatch']['inputs']['publish']['default'] == 'false'
     jobs = workflow["jobs"]
     assert "permissions" not in jobs["build"]
     assert jobs["publish"]["permissions"] == {"id-token": "write"}
     assert jobs["publish"]["environment"]["name"] == "pypi"
-    assert "github.event_name == 'push'" in jobs["publish"]["if"]
+    assert "github.event_name == 'workflow_dispatch'" in jobs["publish"]["if"]
+    assert "inputs.publish" in jobs['publish']['if']
     assert "github.ref_type == 'tag'" in jobs["publish"]["if"]
     assert jobs["publish"]["needs"] == ["build", "test"]
     assert all("run" not in step for step in jobs["publish"]["steps"])
@@ -91,3 +104,23 @@ def test_publish_workflow_is_tag_guarded_and_separates_oidc_from_build():
         for step in job["steps"]:
             if "uses" in step:
                 assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", step["uses"])
+
+
+@pytest.mark.parametrize('source_version,ref_type,ref,publish,ok', [
+    ('0.1.0', 'branch', 'main', 'false', True),
+    ('0.1.0', 'tag', 'v0.1.0', 'true', True),
+    ('0.1.1', 'tag', 'v0.1.0', 'true', False),
+    ('0.1.0', 'tag', 'v0.1.1', 'true', False),
+    ('0.1.0', 'branch', 'main', 'true', False),
+])
+def test_real_workflow_version_guard(tmp_path, source_version, ref_type, ref, publish, ok):
+    workflow = yaml.load((ROOT / '.github/workflows/publish.yml').read_text(), Loader=yaml.BaseLoader)
+    step = next(step for step in workflow['jobs']['build']['steps'] if step.get('name') == 'Validate release version')
+    script = step['run'].split("python - <<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
+    project = tmp_path / 'packages/subtitles'
+    (project / 'src/reibosub').mkdir(parents=True)
+    (project / 'pyproject.toml').write_text('[project]\nversion="0.1.0"\n')
+    (project / 'src/reibosub/__init__.py').write_text(f'__version__ = "{source_version}"\n')
+    env = {**os.environ, 'GITHUB_REF_TYPE': ref_type, 'GITHUB_REF_NAME': ref, 'PUBLISH_REQUESTED': publish}
+    result = subprocess.run([sys.executable, '-c', script], cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert (result.returncode == 0) is ok, result.stderr

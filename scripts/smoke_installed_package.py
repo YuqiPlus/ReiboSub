@@ -19,6 +19,7 @@ def main() -> None:
     for module in ("numpy", "paddleocr", "faster_whisper", "cv2"):
         assert importlib.util.find_spec(module) is None, f"Default install unexpectedly contains {module}"
     assert not any(name.startswith("video_translate") for name in sys.modules)
+    assert importlib.util.find_spec("video_translate") is None, "PyPI toolkit must not contain the web application"
     source = Subtitle((Cue(1, 0.5, 2.0, "繁體字幕"), Cue(2, 2.5, 4.0, "歡迎")), language="zh-Hant")
     with TemporaryDirectory() as folder:
         folder = Path(folder)
