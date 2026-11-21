@@ -8,46 +8,35 @@ The project is designed for a human-in-the-loop workflow: the Agent can run mult
 
 [Install and start](#quick-start) · [Bilibili and languages](#bilibili-and-multilingual-subtitles) · [Assets and glossary](#assets-and-glossary-review) · [Model settings](#llm-configuration) · [GPU and experiments](#gpu-and-model-cache) · [Troubleshooting](#troubleshooting)
 
-For secondary development, the provisional [`reibosub` Python API](docs/python-api.md) provides immutable subtitle data, standalone read/write and conversion, Chinese script conversion, pluggable translation backends and custom format codecs. [Runnable examples](examples/python_api/) include offline implementations. It does not require the web service or discover its credentials. The `0.1.0` package uses a lightweight default install, with other features optional.
+## One repository, two independent products
 
-## Install only the features you need
+| Product | Source and dependencies | Guide |
+| --- | --- | --- |
+| Python subtitle library `reibosub` | [packages/subtitles](packages/subtitles/): its own pyproject, src and tests | [Programming API](packages/subtitles/docs/python-api.md) |
+| Browser application `reibosub-web` | Root pyproject, video_translate, frontend and tests | [Web setup and development](docs/web-application.md) |
+
+For standalone subtitle I/O, conversion, Chinese script conversion and translation:
 
 ```bash
 python -m pip install reibosub
 reibosub convert input.srt output.vtt
 reibosub script input.srt simplified.srt --to simplified
-reibosub doctor core
 ```
 
-Default installation contains only OpenCC and packaging, not OCR/ASR, OpenCV, FFmpeg or Node. The public HTTP translator uses the standard library and works without an extra. Optional groups:
+Develop the library with `python -m pip install -e "./packages/subtitles[dev]"`.
+Develop the website with `python -m pip install -e ./packages/subtitles -e ".[web,dev]"`.
+The complete CPU starter remains `requirements.txt`; GPU deployments use `requirements-gpu-cu126.txt` plus a separately selected GPU Paddle engine.
+Recognition/download extras (`translate/download/video/ocr/ocr-cpu/asr/diarization/web/all-cpu`) belong to the root web project. The library has lightweight runtime dependencies and a dev extra only.
 
-| Extra | Purpose |
-| --- | --- |
-| `translate` | requests/YAML for legacy translation/configuration |
-| `download` | yt-dlp and image utilities; install FFmpeg/Node separately |
-| `video` | OpenCV/Pillow; install FFmpeg separately |
-| `ocr` | OCR framework, without choosing a Paddle engine |
-| `ocr-cpu` | OCR framework plus CPU Paddle; do not apply to a GPU environment |
-| `asr` | faster-whisper; separately prepare FFmpeg and device runtime |
-| `diarization` | Speaker separation; model access/weights are separate |
-| `web` | Website dependencies without OCR/ASR; still build the frontend from the source checkout |
-| `all-cpu` | Website/download/CPU OCR/ASR starter, without diarization |
-
-For example: `python -m pip install "reibosub[asr]"`. For development, clone this repository and run `python -m pip install -e .` (or `-e ".[web,asr]"`). `requirements.txt` / `environment.yml` remain the full CPU website starter; GPU requirements select `web,ocr,asr` and never CPU Paddle. The website still needs a source checkout and frontend build; installing the wheel alone does not deploy it. Release maintainers: see [the publishing guide](docs/publishing.md).
-
-### Runtime diagnostics and opt-in installation
+Website diagnosis and explicit setup:
 
 ```bash
-reibosub doctor asr --json
-reibosub setup asr --dry-run
-reibosub setup asr --yes
+python -m video_translate.dependencies doctor asr --json
+python -m video_translate.dependencies setup asr --dry-run
+# Installing requires --yes. Never modify an environment used by a running service.
 ```
 
-Source-based startup also supports `python run_agent_ui.py --install-missing`, explicitly installing only missing web Python dependencies before startup. Without this flag, startup never installs packages; existing complete environments keep their normal behavior.
-
-Diagnostics never install anything. `--yes` or `ensure_feature("asr", install=True)` explicitly opts into installing missing Python dependencies in the **current venv/Conda environment**, using its interpreter. Chinese conversion also accepts `subtitle.to_simplified(install_missing=True)`. Requirements come from the installed package metadata, with no second version list. Installation follows [pip's documented subprocess approach](https://pip.pypa.io/en/stable/user_guide/#using-pip-from-your-program).
-
-This does not create an environment, install OS tools/CUDA, choose a GPU engine, download models or accept model terms. Missing FFmpeg/Node must be resolved first. CPU Paddle installation is refused when GPU Paddle is present. System Python, concurrent installs and processes already loading native/model libraries or the website are protected. Install from a fresh terminal/process, not the running website; the website exposes no installer endpoint. Opt-in pip installation can still adjust versions or fail, and diagnostics do not prove model/CUDA/API readiness.
+This product separation is unreleased; the published PyPI 0.1.0 files are unchanged and no new release is made here. Existing web entrypoints, media paths, settings and features remain in place. Maintainers: see [publishing](docs/publishing.md).
 
 ## What It Can Do
 
@@ -129,7 +118,7 @@ python -m pip install -U pip
 python -m pip install -r requirements.txt
 ```
 
-For existing subtitles only, use `python -m pip install -e .`; add `.[download]` for downloads or `.[web]` for the website. The default omits PaddleOCR, OpenCV, PaddlePaddle and faster-whisper. Add `.[ocr-cpu]` / `.[asr]` for recognition or `.[dev]` for testing.
+For existing subtitles only, install the library with `python -m pip install -e ./packages/subtitles`. For the website, install both local products with `python -m pip install -e ./packages/subtitles -e ".[web]"`; root extras `.[download]`, `.[ocr-cpu]`, `.[asr]` and `.[dev]` belong to the web project. The standalone toolkit installs none of the OCR/ASR frameworks.
 
 The `yt-dlp[default]` dependency includes YouTube JS challenge components. ReiboSub enables Node from `PATH`; an old Node runtime or missing challenge components can break downloads even when a browser can play the video. See the [official yt-dlp EJS guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS).
 
@@ -143,7 +132,7 @@ node --version
 python -m pip check
 ```
 
-None of the three tool paths should be `None`; Node should be version 22.12 or newer. Start the server from the same activated terminal. Calling a Python executable by absolute path does not automatically add its environment's `bin` directory to `PATH`. `reibosub doctor` checks some Python imports/cache paths, not every external tool, CUDA library, model download or API connection.
+None of the three tool paths should be `None`; Node should be version 22.12 or newer. Start the server from the same activated terminal. Calling a Python executable by absolute path does not automatically add its environment's `bin` directory to `PATH`. `video-translate doctor` checks some Python imports/cache paths, not every external tool, CUDA library, model download or API connection.
 
 ### 3. Build the frontend
 
@@ -331,7 +320,7 @@ Shortcuts link to downloads, subtitle translation/conversion, screen-text extrac
 
 Enable **Separate speakers (区分说话人)** in the dialogue tool's main controls to set the known speaker count to automatic or 1–20. This labels speakers as Speaker 1, 2, etc.; it does not identify real names and still requires speaker-separation dependencies and weights.
 
-**Chinese ASR output**: the dialogue tool and stable ASR Lab expose Simplified (default), Traditional and original-as-recognized output when the input language is Chinese or automatic. Automatic detection applies conversion only to Chinese. Copied text, TXT, SRT and sidecars use the same script; raw recognition evidence remains intact, and subsequent gap review retains the selected script. Conversion uses local [OpenCC](https://github.com/yichen0831/opencc-python), not an LLM; it changes neither timing nor recognition mistakes. Existing tasks are not rewritten, and Korean-only experiments are unchanged. Existing installations should run `python -m pip install -e ".[asr]"` to install the new dependency, then restart the web service.
+**Chinese ASR output**: the dialogue tool and stable ASR Lab expose Simplified (default), Traditional and original-as-recognized output when the input language is Chinese or automatic. Automatic detection applies conversion only to Chinese. Copied text, TXT, SRT and sidecars use the same script; raw recognition evidence remains intact, and subsequent gap review retains the selected script. Conversion uses local [OpenCC](https://github.com/yichen0831/opencc-python), not an LLM; it changes neither timing nor recognition mistakes. Existing tasks are not rewritten, and Korean-only experiments are unchanged. Existing installations should run `python -m pip install -e ./packages/subtitles -e ".[asr]"` to install the new dependency, then restart the web service.
 
 ## Frontend Development
 
@@ -383,7 +372,7 @@ python -m pip uninstall -y paddlepaddle paddlepaddle-gpu
 python -m pip install -r requirements-gpu-cu126.txt
 python -m pip install paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
 # Optional for development and tests:
-python -m pip install -e ".[dev]"
+python -m pip install -e ./packages/subtitles -e ".[dev]"
 ```
 
 The GPU requirements file installs the common project dependencies, `faster-whisper`, and its usual CUDA Python wheels, but not CPU Paddle. Install Paddle GPU itself from the CUDA-specific index in the next command.
@@ -421,7 +410,7 @@ Wait for jobs to finish and stop the server before updating from the existing en
 ```bash
 conda activate reibosub
 git pull --ff-only
-python -m pip install -e .
+python -m pip install -e ./packages/subtitles -e .
 cd frontend
 npm ci --include=dev
 npm run build
@@ -438,7 +427,7 @@ ASR Lab can label speech segments as `Speaker 1`, `Speaker 2`, and so on. This i
 Install the optional runtime in the same Python environment that runs ReiboSub:
 
 ```bash
-python -m pip install -e ".[diarization]"
+python -m pip install -e ./packages/subtitles -e ".[diarization]"
 ```
 
 Then accept the access conditions for
@@ -602,7 +591,7 @@ python -m pip install --no-deps -e .
 Probe dependencies and cache paths:
 
 ```bash
-reibosub doctor
+video-translate doctor
 ```
 
 Run from `configs/run.yaml`:
@@ -610,25 +599,25 @@ Run from `configs/run.yaml`:
 ```bash
 python run_from_config.py
 # or
-reibosub run-config configs/run.yaml
+video-translate run-config configs/run.yaml
 ```
 
 Extract hard subtitles from a local video:
 
 ```bash
-reibosub extract "input.mp4" --lang korean --out "outputs/demo"
+video-translate extract "input.mp4" --lang korean --out "outputs/demo"
 ```
 
 Extract with full-screen assist:
 
 ```bash
-reibosub extract "input.mp4" --lang korean --out "outputs/demo" --scan-full-frame
+video-translate extract "input.mp4" --lang korean --out "outputs/demo" --scan-full-frame
 ```
 
 Translate an existing SRT with the configured OpenAI-compatible provider:
 
 ```bash
-reibosub translate-volcengine "outputs/demo/source.srt" \
+video-translate translate-volcengine "outputs/demo/source.srt" \
   --glossary "configs/glossaries/examples/glossary.example.yaml" \
   --out "outputs/demo/zh.srt"
 ```
