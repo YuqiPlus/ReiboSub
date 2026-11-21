@@ -8,4 +8,4 @@ dependencies:
   - ffmpeg
   - nodejs>=22.12
   - pip:
-      - -e .[asr,ocr-cpu]
+      - -e .[web,ocr-cpu,asr]

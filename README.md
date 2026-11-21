@@ -8,7 +8,46 @@ The project is designed for a human-in-the-loop workflow: the Agent can run mult
 
 [Install and start](#quick-start) · [Bilibili and languages](#bilibili-and-multilingual-subtitles) · [Assets and glossary](#assets-and-glossary-review) · [Model settings](#llm-configuration) · [GPU and experiments](#gpu-and-model-cache) · [Troubleshooting](#troubleshooting)
 
-For secondary development, the provisional [`reibosub` Python API](docs/python-api.md) provides immutable subtitle data, standalone read/write and conversion, Chinese script conversion, pluggable translation backends and custom format codecs. [Runnable examples](examples/python_api/) include offline implementations. It does not require the web service or discover its credentials. No PyPI release has been made; dependency splitting is a separate next step.
+For secondary development, the provisional [`reibosub` Python API](docs/python-api.md) provides immutable subtitle data, standalone read/write and conversion, Chinese script conversion, pluggable translation backends and custom format codecs. [Runnable examples](examples/python_api/) include offline implementations. It does not require the web service or discover its credentials. No PyPI release has been made; default installation is now a lightweight subtitle toolkit, with other features optional.
+
+## Install only the features you need
+
+```bash
+python -m pip install -e .
+reibosub convert input.srt output.vtt
+reibosub script input.srt simplified.srt --to simplified
+reibosub doctor core
+```
+
+Default installation contains only OpenCC and packaging, not OCR/ASR, OpenCV, FFmpeg or Node. The public HTTP translator uses the standard library and works without an extra. Optional groups:
+
+| Extra | Purpose |
+| --- | --- |
+| `translate` | requests/YAML for legacy translation/configuration |
+| `download` | yt-dlp and image utilities; install FFmpeg/Node separately |
+| `video` | OpenCV/Pillow; install FFmpeg separately |
+| `ocr` | OCR framework, without choosing a Paddle engine |
+| `ocr-cpu` | OCR framework plus CPU Paddle; do not apply to a GPU environment |
+| `asr` | faster-whisper; separately prepare FFmpeg and device runtime |
+| `diarization` | Speaker separation; model access/weights are separate |
+| `web` | Website dependencies without OCR/ASR; still build the frontend from the source checkout |
+| `all-cpu` | Website/download/CPU OCR/ASR starter, without diarization |
+
+For example: `python -m pip install -e ".[web,asr]"`. `requirements.txt` / `environment.yml` remain the full CPU website starter; GPU requirements select `web,ocr,asr` and never CPU Paddle. There is no PyPI release yet: use this checkout rather than assuming an index project with the same name belongs to this repository.
+
+### Runtime diagnostics and opt-in installation
+
+```bash
+reibosub doctor asr --json
+reibosub setup asr --dry-run
+reibosub setup asr --yes
+```
+
+Source-based startup also supports `python run_agent_ui.py --install-missing`, explicitly installing only missing web Python dependencies before startup. Without this flag, startup never installs packages; existing complete environments keep their normal behavior.
+
+Diagnostics never install anything. `--yes` or `ensure_feature("asr", install=True)` explicitly opts into installing missing Python dependencies in the **current venv/Conda environment**, using its interpreter. Chinese conversion also accepts `subtitle.to_simplified(install_missing=True)`. Requirements come from the installed package metadata, with no second version list. Installation follows [pip's documented subprocess approach](https://pip.pypa.io/en/stable/user_guide/#using-pip-from-your-program).
+
+This does not create an environment, install OS tools/CUDA, choose a GPU engine, download models or accept model terms. Missing FFmpeg/Node must be resolved first. CPU Paddle installation is refused when GPU Paddle is present. System Python, concurrent installs and processes already loading native/model libraries or the website are protected. Install from a fresh terminal/process, not the running website; the website exposes no installer endpoint. Opt-in pip installation can still adjust versions or fail, and diagnostics do not prove model/CUDA/API readiness.
 
 ## What It Can Do
 
@@ -90,7 +129,7 @@ python -m pip install -U pip
 python -m pip install -r requirements.txt
 ```
 
-For downloads or existing subtitles only, `python -m pip install -e .` omits the PaddlePaddle inference engine and faster-whisper. Add `.[ocr-cpu]` or `.[asr]` when needed. The `.[dev]` extra is optional and only needed for testing.
+For existing subtitles only, use `python -m pip install -e .`; add `.[download]` for downloads or `.[web]` for the website. The default omits PaddleOCR, OpenCV, PaddlePaddle and faster-whisper. Add `.[ocr-cpu]` / `.[asr]` for recognition or `.[dev]` for testing.
 
 The `yt-dlp[default]` dependency includes YouTube JS challenge components. ReiboSub enables Node from `PATH`; an old Node runtime or missing challenge components can break downloads even when a browser can play the video. See the [official yt-dlp EJS guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS).
 

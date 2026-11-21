@@ -8,7 +8,47 @@ ReiboSub 是一个面向 YouTube、Bilibili 普通投稿和本地视频的字幕
 
 [安装与启动](#快速开始) · [B站与多语言](#b-站与多语言) · [素材库与术语审核](#素材库与术语审核) · [模型配置](#大模型配置) · [GPU 与实验版要求](#gpu-和模型缓存) · [常见问题](#常见问题)
 
-二次开发可使用新增的 [`reibosub` 编程 API](docs/python-api.md)：不可变字幕数据、独立读写与格式转换、简繁转换、可替换翻译器和自定义格式协议，附[可运行示例](examples/python_api/)。不要求网页运行、不读取网页密钥。接口目前为首版草案，尚未发布 PyPI；安装依赖暂时仍与原应用共用，下一步再按功能拆分。
+二次开发可使用新增的 [`reibosub` 编程 API](docs/python-api.md)：不可变字幕数据、独立读写与格式转换、简繁转换、可替换翻译器和自定义格式协议，附[可运行示例](examples/python_api/)。不要求网页运行、不读取网页密钥。接口目前为首版草案，尚未发布 PyPI；默认安装已拆成轻量字幕工具，其他能力按功能选装。
+
+## 只安装需要的功能
+
+只处理字幕或使用编程 API，无需安装 OCR、ASR、FFmpeg 或 Node：
+
+```bash
+python -m pip install -e .
+reibosub convert input.srt output.vtt
+reibosub script input.srt simplified.srt --to simplified
+reibosub doctor core
+```
+
+| 选择 | 源码安装命令 | 说明 |
+| --- | --- | --- |
+| 默认字幕工具 | `python -m pip install -e .` | 仅 OpenCC、packaging；公开 API 的 HTTP 翻译器也可直接使用 |
+| 旧翻译流程 | `python -m pip install -e ".[translate]"` | 加 requests、YAML，供旧翻译命令与配置使用 |
+| 下载 | `python -m pip install -e ".[download]"` | yt-dlp 与图片工具；FFmpeg/Node 另装 |
+| 视频处理 | `python -m pip install -e ".[video]"` | OpenCV、Pillow；FFmpeg 另装 |
+| OCR 框架 | `python -m pip install -e ".[ocr]"` | 不替用户选择 Paddle CPU/GPU 引擎 |
+| CPU OCR | `python -m pip install -e ".[ocr-cpu]"` | OCR 框架及 CPU Paddle；不要在 GPU 环境执行 |
+| ASR | `python -m pip install -e ".[asr]"` | faster-whisper；FFmpeg、CUDA 或 CPU 运行设置另行准备 |
+| 说话人分离 | `python -m pip install -e ".[diarization]"` | 还需模型授权/权重，可与 asr 组合 |
+| 网页依赖 | `python -m pip install -e ".[web]"` | 不捆绑 OCR/ASR；网页仍按下文从源码构建前端 |
+| 完整 CPU 入门 | `python -m pip install -e ".[all-cpu]"` | 网页、下载、CPU OCR、ASR，不包含说话人分离 |
+
+可组合安装，例如 `python -m pip install -e ".[web,asr]"`。`requirements.txt` 和 `environment.yml` 仍是完整 CPU 网页入门路线，GPU 文件使用 `web,ocr,asr` 且不带 CPU Paddle。本项目尚未发布 PyPI，因此目前使用源码安装，不要假定包索引上同名项目就是本项目。
+
+### 运行时检测与可选自动安装
+
+```bash
+reibosub doctor asr --json
+reibosub setup asr --dry-run
+reibosub setup asr --yes
+```
+
+从源码启动网页也可显式使用 `python run_agent_ui.py --install-missing`，只补网页 Python 依赖；不加这个选项就不会安装，已有完整环境启动行为不变。
+
+默认只检查/报告缺项，不安装。`--yes` 或编程 API 的 `ensure_feature("asr", install=True)` 才明确授权为**当前虚拟环境/Conda 环境**补齐 Python 依赖；命令使用当前解释器，不调用系统里的另一份 pip。简繁转换也支持显式 `subtitle.to_simplified(install_missing=True)`。检测版本约束来自安装包元数据，与 pyproject 保持单一来源。安装机制按 [pip 官方建议](https://pip.pypa.io/en/stable/user_guide/#using-pip-from-your-program) 启动独立 pip 子进程，不调用 pip 私有 API。
+
+不会自动创建 Python/Conda 环境、安装系统工具/CUDA、选择 GPU Paddle、下载模型或同意模型授权。缺少 FFmpeg/Node 时先按提示自行准备；GPU Paddle 已安装时会拒绝补 CPU Paddle。已经加载识别库或网页模块的进程、系统 Python、并发安装都会被保护性拒绝。需要安装时请使用一个新终端/新进程，而不是在线网站进程；网页没有开放依赖安装接口。自动安装仍可能调整依赖版本或因网络/权限失败，不是无风险的环境修复器。诊断不加载模型，也不证明 CUDA、模型、API 已可用。
 
 ## 主要功能
 
@@ -92,7 +132,7 @@ python -m pip install -U pip
 python -m pip install -r requirements.txt
 ```
 
-只处理现有字幕或下载视频、不运行识别时，可安装 `python -m pip install -e .`；它不安装 PaddlePaddle 推理引擎和 faster-whisper。需要时再安装 `.[ocr-cpu]` 或 `.[asr]`。测试依赖是可选的 `.[dev]`，普通使用无需安装。
+只处理现有字幕时安装 `python -m pip install -e .`；需要下载再添加 `.[download]`，网页再添加 `.[web]`。默认安装不包含 PaddleOCR、OpenCV、PaddlePaddle 或 faster-whisper。识别按需添加 `.[ocr-cpu]` / `.[asr]`；测试依赖是可选的 `.[dev]`。
 
 `yt-dlp[default]` 会一并安装 YouTube JS 解题组件；项目会启用 `PATH` 中的 Node.js。只有 Node、没有解题组件，或使用过旧的 Node，都可能出现“能打开视频但下载失败”。要求依据见 [yt-dlp EJS 官方说明](https://github.com/yt-dlp/yt-dlp/wiki/EJS)。
 

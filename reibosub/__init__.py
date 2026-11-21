@@ -3,7 +3,8 @@
 Importing this package does not load OCR/ASR, discover credentials, connect to
 storage or start a service. Chinese conversion loads OpenCC only when requested.
 """
-from .errors import MissingDependencyError, OperationCancelled, ReiboSubError, SubtitleFormatError, TranslationError, ValidationError
+from .errors import DependencyInstallError, MissingDependencyError, OperationCancelled, ReiboSubError, SubtitleFormatError, TranslationError, ValidationError
+from .dependencies import FEATURES, FeatureStatus, check_feature, ensure_feature
 from .formats import FormatRegistry, SubtitleCodec
 from .io import convert, load, save
 from .models import Cue, Progress, Subtitle, SubtitleIssue
@@ -16,4 +17,5 @@ __all__ = [
     "FormatRegistry", "SubtitleCodec", "TranslationBackend", "Translator", "translate",
     "ReiboSubError", "ValidationError", "SubtitleFormatError", "MissingDependencyError",
     "TranslationError", "OperationCancelled",
+    "DependencyInstallError", "FeatureStatus", "FEATURES", "check_feature", "ensure_feature",
 ]

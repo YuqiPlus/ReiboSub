@@ -23,3 +23,7 @@ class TranslationError(ReiboSubError):
 
 class OperationCancelled(ReiboSubError):
     """A cooperative cancellation check stopped processing."""
+
+
+class DependencyInstallError(ReiboSubError):
+    """An explicitly requested dependency install was unsafe or unsuccessful."""

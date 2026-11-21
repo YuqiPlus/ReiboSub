@@ -12,7 +12,7 @@ def test_pyproject_exposes_reibosub_and_legacy_cli_alias() -> None:
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
     assert 'name = "reibosub"' in pyproject
-    assert 'reibosub = "video_translate.cli:main"' in pyproject
+    assert 'reibosub = "reibosub.cli:main"' in pyproject
     assert 'video-translate = "video_translate.cli:main"' in pyproject
     assert "https://github.com/YuqiPlus/ReiboSub" in pyproject
 

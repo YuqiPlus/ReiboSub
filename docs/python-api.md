@@ -13,7 +13,24 @@ python -m pip install -e .
 python -c "from reibosub import Subtitle, Cue; print(Subtitle((Cue(1, 0, 1, 'Hello'),)).to_text())"
 ```
 
-本阶段新增独立编程接口，但安装依赖暂时仍与网站共用，普通安装仍会包含原有 OCR 等依赖。API 运行时的基础字幕工具只用标准库，简繁转换延迟加载 OpenCC；模型、网页、配置与数据库不会被自动加载。按功能拆分安装依赖及诊断命令在下一批完成。
+默认安装只含轻量的 OpenCC 与 packaging，不安装 OCR/ASR。字幕读写、格式转换、检查和内置 HTTP 翻译器只使用标准库；简繁转换才延迟导入 OpenCC，功能诊断才使用 packaging。网页、下载、OCR/ASR 以 extras 选装，详见 [README 的功能安装表](../README.zh-CN.md#只安装需要的功能)。旧命令入口 `video-translate` 保留；`reibosub convert/script/text/translate/doctor/setup` 使用轻量入口，原有 OCR 命令名仍按需转交旧实现。
+
+### 检测依赖与明确授权安装
+
+```python
+from reibosub import check_feature, ensure_feature
+
+status = check_feature("asr")  # 只读，不加载模型、不安装
+print(status.ready, status.missing_requirements, status.missing_external)
+ensure_feature("asr")         # 缺项时抛出 MissingDependencyError
+ensure_feature("asr", install=True)  # 明确授权，只在当前 venv/Conda 环境补 Python 包
+```
+
+可检测 `core/translate/download/video/ocr/ocr-cpu/asr/diarization/web/all-cpu`。`FeatureStatus` 提供需求、缺失版本/模块、外部工具、CPU/GPU 冲突和手工步骤。版本要求解析安装包自己的标准元数据，未发布阶段也不会自动去包索引下载另一个同名 reibosub 包。源码更新后需重新执行 `pip install -e .`，让安装元数据与代码一致。
+
+缺失简繁依赖时，`subtitle.to_simplified(install_missing=True)` / `to_traditional(install_missing=True)` 可明确开启安装；默认仍报错，不修改环境。安装使用当前解释器的独立 pip 子进程，且有环境内锁；默认不升级、强制重装或卸载，也不代装 GPU 引擎、系统工具或模型。系统 Python、运行中网页/已加载识别库、CPU/GPU 冲突等情况会拒绝安装。缺少外部工具先自行准备，`ocr` 要求用户明确选择引擎；CPU 路线用 `ocr-cpu`。安装失败使用 `DependencyInstallError`，不会回显可能包含凭据的 pip/index 错误正文。安装不具备事务回滚能力；不要在生产进程中改环境。
+
+`check_feature` 只是检查版本和模块/工具路径，不导入识别模型、不检查 CUDA 二进制兼容、工具版本、权重或授权；`.ready` 不是整条业务成功的保证。完整系统的部署诊断仍需按 README 验证。
 
 ## 统一数据结构
 
@@ -150,4 +167,6 @@ python examples/python_api/custom_format.py --out /tmp/reibosub-custom.tsv
 python -m pytest tests/test_public_api.py tests/test_public_translation_http.py -q
 ```
 
-本轮没有新增 ASR/OCR 的公开封装、异步服务、HTTP 上传 API、数据库要求或发布流水线。正式发布前还需拆分安装依赖、验证打包范围、平台矩阵和兼容性策略。
+本轮没有新增 ASR/OCR 的公开封装、异步服务、HTTP 上传 API、数据库要求或发布流水线。默认轻量安装与 extras 已拆分；正式发布前仍需验证打包范围、平台矩阵和兼容性策略。
+
+安装保护只能识别当前进程已加载的模块和本工具自己的环境锁，不能证明同一环境没有其他进程正在使用。请在独立环境测试，或先停止共享该环境的服务；不要因为使用了新终端就认为修改共享环境没有影响。

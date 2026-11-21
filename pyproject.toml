@@ -18,16 +18,35 @@ classifiers = [
 ]
 dependencies = [
     "opencc-python-reimplemented>=0.1.7,<0.2",
-    "opencv-python>=4.8,<5",
-    "paddleocr>=3.0,<4",
-    "Pillow>=10,<13",
-    "pyyaml>=6.0,<7",
-    "requests>=2.31,<3",
-    "yt-dlp[default]>=2026.8.19",
+    "packaging>=24",
 ]
 
 [project.optional-dependencies]
+translate = [
+    "requests>=2.31,<3",
+    "pyyaml>=6.0,<7",
+]
+download = [
+    "reibosub[translate]",
+    "yt-dlp[default]>=2026.8.19",
+    "Pillow>=10,<13",
+]
+video = [
+    "opencv-python>=4.8,<5",
+    "Pillow>=10,<13",
+]
+ocr = [
+    "reibosub[video,translate]",
+    "paddleocr>=3.0,<4",
+]
+web = [
+    "reibosub[download,translate]",
+]
+all-cpu = [
+    "reibosub[web,ocr-cpu,asr]",
+]
 ocr-cpu = [
+    "reibosub[ocr]",
     "paddlepaddle>=3.0,<4",
 ]
 asr = [
@@ -38,10 +57,12 @@ diarization = [
 ]
 dev = [
     "pytest>=8.0",
+    "reibosub[translate]",
+    "tomli>=2; python_version < '3.11'",
 ]
 
 [project.scripts]
-reibosub = "video_translate.cli:main"
+reibosub = "reibosub.cli:main"
 video-translate = "video_translate.cli:main"
 
 [project.urls]

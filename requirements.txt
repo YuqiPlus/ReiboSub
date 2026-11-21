@@ -1,4 +1,4 @@
 # Standard CPU installation: PaddleOCR plus faster-whisper ASR.
 # Package versions are defined once in pyproject.toml.
 
--e .[ocr-cpu,asr]
+-e .[web,ocr-cpu,asr]

@@ -24,7 +24,7 @@ def test_starter_environment_provides_tools_and_both_cpu_engines():
     assert 'ffmpeg' in dependencies
     assert 'nodejs>=22.12' in dependencies
     pip = next(row['pip'] for row in dependencies if isinstance(row, dict) and 'pip' in row)
-    assert '-e .[asr,ocr-cpu]' in pip
+    assert '-e .[web,ocr-cpu,asr]' in pip
 
 
 def test_conda_environment_uses_only_forge_and_disables_default_channels():

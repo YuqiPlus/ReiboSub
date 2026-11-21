@@ -118,13 +118,13 @@ class Subtitle:
     def map_text(self, transform: Callable[[str], str]) -> Subtitle:
         return replace(self, cues=tuple(replace(cue, text=transform(cue.text)) for cue in self))
 
-    def to_simplified(self) -> Subtitle:
+    def to_simplified(self, *, install_missing: bool = False) -> Subtitle:
         from .chinese import convert_script
-        return convert_script(self, "simplified")
+        return convert_script(self, "simplified", install_missing=install_missing)
 
-    def to_traditional(self) -> Subtitle:
+    def to_traditional(self, *, install_missing: bool = False) -> Subtitle:
         from .chinese import convert_script
-        return convert_script(self, "traditional")
+        return convert_script(self, "traditional", install_missing=install_missing)
 
     def to_text(self, *, timestamps: bool = False) -> str:
         from .formats import format_time

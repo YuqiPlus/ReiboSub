@@ -3,15 +3,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from video_translate.cache import configure_model_cache
-from video_translate.pipeline import CueTimingConfig, extract_subtitles_from_video, merge_ocr_samples, reprocess_tracks_json
-from video_translate.run_config import run_config
-from video_translate.translate.apply import apply_translation_json
-from video_translate.translate.batch import prepare_translation_batch
-from video_translate.translate.volcengine import translate_srt_with_volcengine
-from video_translate.subtitle.retime import align_srt_timing
-
-
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="reibosub")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -84,6 +75,9 @@ def main(argv: list[str] | None = None) -> None:
 
     args = parser.parse_args(argv)
     if args.command == "extract":
+        from reibosub import ensure_feature
+        ensure_feature("ocr")
+        from video_translate.pipeline import extract_subtitles_from_video
         outputs = extract_subtitles_from_video(
             args.video,
             args.out,
@@ -103,6 +97,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         _print_outputs(outputs)
     elif args.command == "merge-ocr":
+        from video_translate.pipeline import merge_ocr_samples
         outputs = merge_ocr_samples(
             args.ocr_json,
             args.out,
@@ -114,6 +109,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         _print_outputs(outputs)
     elif args.command == "reprocess-tracks":
+        from video_translate.pipeline import reprocess_tracks_json
         outputs = reprocess_tracks_json(
             args.tracks_json,
             args.out,
@@ -125,16 +121,22 @@ def main(argv: list[str] | None = None) -> None:
         )
         _print_outputs(outputs)
     elif args.command == "prepare-translation":
+        from video_translate.translate.batch import prepare_translation_batch
         path = prepare_translation_batch(args.source_srt, args.out, args.glossary, args.batch_size)
         print(f"translation_batch: {path}")
     elif args.command == "apply-translation":
+        from video_translate.translate.apply import apply_translation_json
         path = apply_translation_json(args.source_srt, args.translation_json, args.out)
         print(f"zh_srt: {path}")
     elif args.command == "align-timing":
+        from video_translate.subtitle.retime import align_srt_timing
         out = args.out or args.target_srt
         path = align_srt_timing(args.reference_srt, args.target_srt, out)
         print(f"aligned_srt: {path}")
     elif args.command == "translate-volcengine":
+        from reibosub import ensure_feature
+        ensure_feature("translate")
+        from video_translate.translate.volcengine import translate_srt_with_volcengine
         path = translate_srt_with_volcengine(
             args.source_srt,
             args.out,
@@ -146,8 +148,10 @@ def main(argv: list[str] | None = None) -> None:
         )
         print(f"zh_srt: {path}")
     elif args.command == "run-config":
+        from video_translate.run_config import run_config
         run_config(args.config)
     elif args.command == "doctor":
+        from video_translate.cache import configure_model_cache
         cache_dir = configure_model_cache(args.cache_dir)
         print(f"cache_dir: {cache_dir}")
         _check_dependency("cv2")
@@ -177,7 +181,8 @@ def _add_timing_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--short-fragment-similarity", type=float, default=0.55)
 
 
-def _cue_timing_from_args(args: argparse.Namespace) -> CueTimingConfig:
+def _cue_timing_from_args(args: argparse.Namespace):
+    from video_translate.pipeline import CueTimingConfig
     return CueTimingConfig(
         merge_gap_seconds=args.merge_gap_seconds,
         end_padding_seconds=args.end_padding_seconds,
