@@ -1,8 +1,8 @@
 [project]
-name = "reibosub"
+name = "reibosub-web"
 version = "0.1.0"
 description = "Human-in-the-loop OCR, ASR, glossary, translation, and subtitle refinement for video."
-readme = "docs/package-readme.md"
+readme = "docs/web-application.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
@@ -17,7 +17,7 @@ classifiers = [
     "Topic :: Multimedia :: Video :: Conversion",
 ]
 dependencies = [
-    "opencc-python-reimplemented>=0.1.7,<0.2",
+    "reibosub>=0.1.0,<0.2",
     "packaging>=24",
 ]
 
@@ -27,7 +27,7 @@ translate = [
     "pyyaml>=6.0,<7",
 ]
 download = [
-    "reibosub[translate]",
+    "reibosub-web[translate]",
     "yt-dlp[default]>=2026.8.19",
     "Pillow>=10,<13",
 ]
@@ -36,17 +36,17 @@ video = [
     "Pillow>=10,<13",
 ]
 ocr = [
-    "reibosub[video,translate]",
+    "reibosub-web[video,translate]",
     "paddleocr>=3.0,<4",
 ]
 web = [
-    "reibosub[download,translate]",
+    "reibosub-web[download,translate]",
 ]
 all-cpu = [
-    "reibosub[web,ocr-cpu,asr]",
+    "reibosub-web[web,ocr-cpu,asr]",
 ]
 ocr-cpu = [
-    "reibosub[ocr]",
+    "reibosub-web[ocr]",
     "paddlepaddle>=3.0,<4",
 ]
 asr = [
@@ -57,12 +57,12 @@ diarization = [
 ]
 dev = [
     "pytest>=8.0",
-    "reibosub[translate]",
+    "reibosub-web[translate]",
     "tomli>=2; python_version < '3.11'",
 ]
 
 [project.scripts]
-reibosub = "reibosub.cli:main"
+reibosub-web = "video_translate.web_cli:main"
 video-translate = "video_translate.cli:main"
 
 [project.urls]
@@ -75,10 +75,7 @@ requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["video_translate*", "reibosub*"]
-
-[tool.setuptools.package-data]
-reibosub = ["py.typed"]
+include = ["video_translate*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

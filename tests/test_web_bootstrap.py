@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import reibosub
+from video_translate import dependencies as web_dependencies
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -24,7 +24,7 @@ def test_default_startup_never_installs_and_keeps_configured_defaults(monkeypatc
     calls = []
     fake = SimpleNamespace(DEFAULT_HOST='configured-host', DEFAULT_PORT=8000, serve=lambda *args: calls.append(args))
     monkeypatch.setitem(sys.modules, 'video_translate.web_agent', fake)
-    monkeypatch.setattr(reibosub, 'ensure_feature', lambda *a, **kw: pytest.fail('no installation without flag'))
+    monkeypatch.setattr(web_dependencies, 'ensure_feature', lambda *a, **kw: pytest.fail('no installation without flag'))
     monkeypatch.setattr(sys, 'argv', ['run_agent_ui.py', *arguments])
     bootstrap().main()
     assert calls == [expected]
@@ -33,7 +33,7 @@ def test_default_startup_never_installs_and_keeps_configured_defaults(monkeypatc
 def test_explicit_install_runs_before_serve(monkeypatch):
     calls = []
     monkeypatch.setitem(sys.modules, 'video_translate.web_agent', SimpleNamespace(DEFAULT_HOST='host', DEFAULT_PORT=8000, serve=lambda *a: calls.append('serve')))
-    monkeypatch.setattr(reibosub, 'ensure_feature', lambda feature, **kwargs: calls.append((feature, kwargs)))
+    monkeypatch.setattr(web_dependencies, 'ensure_feature', lambda feature, **kwargs: calls.append((feature, kwargs)))
     monkeypatch.setattr(sys, 'argv', ['run_agent_ui.py', '--install-missing'])
     bootstrap().main()
     assert calls == [('web', {'install': True}), 'serve']

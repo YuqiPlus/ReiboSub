@@ -11,8 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_pyproject_exposes_reibosub_and_legacy_cli_alias() -> None:
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
-    assert 'name = "reibosub"' in pyproject
-    assert 'reibosub = "reibosub.cli:main"' in pyproject
+    assert 'name = "reibosub-web"' in pyproject
+    assert 'reibosub-web = "video_translate.web_cli:main"' in pyproject
+    assert '"reibosub>=0.1.0,<0.2"' in pyproject
     assert 'video-translate = "video_translate.cli:main"' in pyproject
     assert "https://github.com/YuqiPlus/ReiboSub" in pyproject
 

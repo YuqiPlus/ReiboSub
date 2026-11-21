@@ -1,10 +1,8 @@
 # Start from an explicit allowlist, including when building from a dirty checkout.
 global-exclude *
 include pyproject.toml MANIFEST.in LICENSE README.md README.zh-CN.md
-include docs/package-readme.md docs/python-api.md
-recursive-include reibosub *.py py.typed
+include docs/web-application.md
 recursive-include video_translate *.py
-recursive-include examples/python_api *.py
 # Local persistence work must never enter this release.
 exclude video_translate/storage.py video_translate/storage_migration.py
 global-exclude *.pyc *.pyo

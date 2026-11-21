@@ -1,0 +1,45 @@
+[project]
+name = "reibosub"
+version = "0.1.0"
+description = "Independent subtitle I/O, format and Chinese script conversion, and pluggable translation."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = ["opencc-python-reimplemented>=0.1.7,<0.2", "packaging>=24"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video :: Conversion",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "tomli>=2; python_version < '3.11'"]
+
+[project.scripts]
+reibosub = "reibosub.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/YuqiPlus/ReiboSub"
+Repository = "https://github.com/YuqiPlus/ReiboSub.git"
+Documentation = "https://github.com/YuqiPlus/ReiboSub/tree/main/packages/subtitles"
+Issues = "https://github.com/YuqiPlus/ReiboSub/issues"
+
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["reibosub*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+reibosub = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

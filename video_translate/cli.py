@@ -75,7 +75,7 @@ def main(argv: list[str] | None = None) -> None:
 
     args = parser.parse_args(argv)
     if args.command == "extract":
-        from reibosub import ensure_feature
+        from video_translate.dependencies import ensure_feature
         ensure_feature("ocr")
         from video_translate.pipeline import extract_subtitles_from_video
         outputs = extract_subtitles_from_video(
@@ -134,7 +134,7 @@ def main(argv: list[str] | None = None) -> None:
         path = align_srt_timing(args.reference_srt, args.target_srt, out)
         print(f"aligned_srt: {path}")
     elif args.command == "translate-volcengine":
-        from reibosub import ensure_feature
+        from video_translate.dependencies import ensure_feature
         ensure_feature("translate")
         from video_translate.translate.volcengine import translate_srt_with_volcengine
         path = translate_srt_with_volcengine(

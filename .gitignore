@@ -12,6 +12,8 @@ outputs/
 *.candidates.json
 /build/
 /dist/
+packages/*/build/
+packages/*/dist/
 frontend/node_modules/
 frontend/dist/
 .idea/

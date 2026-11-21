@@ -1,4 +1,5 @@
 # Standard CPU installation: PaddleOCR plus faster-whisper ASR.
-# Package versions are defined once in pyproject.toml.
+# Install the independent toolkit locally, then the web application.
 
+-e ./packages/subtitles
 -e .[web,ocr-cpu,asr]

@@ -16,12 +16,15 @@ from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
 from reibosub import DependencyInstallError, MissingDependencyError, ValidationError
-from reibosub import dependencies as dependencies
-from reibosub.cli import main
+from video_translate import dependencies as dependencies
+from video_translate.dependencies import main
 
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT = tomllib.loads((ROOT / 'pyproject.toml').read_text())['project']
 VERSIONS = {'opencc-python-reimplemented': '0.1.7', 'packaging': '26.3', 'requests': '2.34.0', 'pyyaml': '6.0.3', 'yt-dlp': '2026.8.19', 'pillow': '12.0.0', 'opencv-python': '4.12.0', 'paddleocr': '3.5.0', 'paddlepaddle': '3.3.0', 'faster-whisper': '1.2.0', 'pyannote-audio': '4.0.0'}
+
+
+VERSIONS['reibosub'] = '0.1.0'
 
 
 @pytest.fixture
@@ -53,8 +56,33 @@ def names(rows):
     return {canonicalize_name(Requirement(row).name) for row in rows}
 
 
+def test_legacy_running_environment_metadata_is_read_without_reinstall(monkeypatch):
+    headers = email.message.Message()
+    headers['Provides-Extra'] = 'ocr-cpu'
+    headers['Provides-Extra'] = 'asr'
+    legacy = SimpleNamespace(metadata=headers, requires=['requests>=2.31,<3', 'paddleocr>=3,<4'])
+    def distribution(name):
+        if name == 'reibosub-web':
+            raise dependencies.metadata.PackageNotFoundError(name)
+        return legacy
+    monkeypatch.setattr(dependencies.metadata, 'distribution', distribution)
+    assert names(dependencies._requirements('ocr')) == {'requests', 'paddleocr'}
+
+
+def test_pure_toolkit_metadata_is_not_mistaken_for_web_install(monkeypatch):
+    headers = email.message.Message()
+    headers['Provides-Extra'] = 'dev'
+    def distribution(name):
+        if name == 'reibosub-web':
+            raise dependencies.metadata.PackageNotFoundError(name)
+        return SimpleNamespace(metadata=headers, requires=['packaging>=24'])
+    monkeypatch.setattr(dependencies.metadata, 'distribution', distribution)
+    with pytest.raises(MissingDependencyError, match='separate web project'):
+        dependencies._requirements('web')
+
+
 def test_minimal_base_and_recursive_feature_boundaries(feature_env):
-    assert names(dependencies.check_feature('core').requirements) == {'opencc-python-reimplemented', 'packaging'}
+    assert names(dependencies.check_feature('core').requirements) == {'reibosub', 'packaging'}
     web = names(dependencies.check_feature('web').requirements)
     assert {'yt-dlp', 'requests', 'pyyaml', 'pillow'} <= web
     assert not {'paddleocr', 'opencv-python', 'paddlepaddle', 'faster-whisper'} & web
@@ -90,7 +118,7 @@ def test_explicit_install_uses_current_python_and_only_missing_declared_requirem
     assert status.ready and status.installation_performed
     command, options = calls[0]
     assert command[:4] == (dependencies.sys.executable, '-m', 'pip', 'install')
-    assert names(command[4:]) == {'opencc-python-reimplemented', 'packaging'}
+    assert names(command[4:]) == {'reibosub', 'packaging'}
     assert '--user' not in command and '--break-system-packages' not in command
     assert options['timeout'] == 900 and options['capture_output']
     assert not (tmp_path / '.reibosub-install.lock').exists()
@@ -167,6 +195,7 @@ def test_cli_dry_run_and_missing_consent_do_not_install(feature_env, monkeypatch
 
 
 def test_cli_subtitle_commands_do_not_need_legacy_modules(tmp_path, monkeypatch, capsys):
+    from reibosub.cli import main
     source = tmp_path / 'a.srt'
     source.write_text('1\n00:00:00,000 --> 00:00:01,000\nHello\n')
     out = tmp_path / 'a.vtt'

@@ -8,4 +8,5 @@ dependencies:
   - ffmpeg
   - nodejs>=22.12
   - pip:
+      - -e ./packages/subtitles
       - -e .[web,ocr-cpu,asr]

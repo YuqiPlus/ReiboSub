@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-from functools import lru_cache
 from pathlib import Path
 
 SCRIPT_FILE = "text_presentation.json"
@@ -16,18 +15,14 @@ def normalize_chinese_script(value=None) -> str:
     return script
 
 
-@lru_cache(maxsize=2)
-def _converter(script: str):
-    try:
-        from opencc import OpenCC
-    except ImportError as exc:
-        raise RuntimeError("中文简繁转换缺少依赖，请安装 opencc-python-reimplemented，或选择保留识别原样") from exc
-    return OpenCC("t2s" if script == "simplified" else "s2t")
-
-
 def convert_chinese_text(text: str, script: str) -> str:
     script = normalize_chinese_script(script)
-    return text if script == "original" else _converter(script).convert(text)
+    if script == "original":
+        return text
+    from reibosub import Cue, Subtitle
+    value = Subtitle((Cue(1, 0, 1, text),))
+    converted = value.to_simplified() if script == "simplified" else value.to_traditional()
+    return converted[0].text
 
 
 def configure_chinese_output(output_dir: Path, script: str, language: str) -> str:
@@ -36,7 +31,7 @@ def configure_chinese_output(output_dir: Path, script: str, language: str) -> st
     is_chinese = str(language or "").strip().lower().replace("_", "-") in {"zh", "chinese", "zh-cn", "zh-tw", "zh-hans", "zh-hant"}
     resolved = script if is_chinese else "original"
     if resolved != "original":
-        _converter(resolved)  # Fail before writing any converted outputs.
+        convert_chinese_text("", resolved)  # Fail before writing any converted outputs.
     (output_dir / SCRIPT_FILE).write_text(json.dumps({"chinese_script": resolved, "language": language}, ensure_ascii=False) + "\n", encoding="utf-8")
     return resolved
 

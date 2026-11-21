@@ -1,6 +1,7 @@
 # CUDA 12.6 installation: project runtime plus faster-whisper ASR.
 # Install paddlepaddle-gpu separately from Paddle's CUDA-specific package index.
 
+-e ./packages/subtitles
 -e .[web,ocr,asr]
 nvidia-cublas-cu12==12.6.4.1
 nvidia-cudnn-cu12==9.5.1.17
