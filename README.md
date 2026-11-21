@@ -8,12 +8,12 @@ The project is designed for a human-in-the-loop workflow: the Agent can run mult
 
 [Install and start](#quick-start) · [Bilibili and languages](#bilibili-and-multilingual-subtitles) · [Assets and glossary](#assets-and-glossary-review) · [Model settings](#llm-configuration) · [GPU and experiments](#gpu-and-model-cache) · [Troubleshooting](#troubleshooting)
 
-For secondary development, the provisional [`reibosub` Python API](docs/python-api.md) provides immutable subtitle data, standalone read/write and conversion, Chinese script conversion, pluggable translation backends and custom format codecs. [Runnable examples](examples/python_api/) include offline implementations. It does not require the web service or discover its credentials. No PyPI release has been made; default installation is now a lightweight subtitle toolkit, with other features optional.
+For secondary development, the provisional [`reibosub` Python API](docs/python-api.md) provides immutable subtitle data, standalone read/write and conversion, Chinese script conversion, pluggable translation backends and custom format codecs. [Runnable examples](examples/python_api/) include offline implementations. It does not require the web service or discover its credentials. The `0.1.0` package uses a lightweight default install, with other features optional.
 
 ## Install only the features you need
 
 ```bash
-python -m pip install -e .
+python -m pip install reibosub
 reibosub convert input.srt output.vtt
 reibosub script input.srt simplified.srt --to simplified
 reibosub doctor core
@@ -33,7 +33,7 @@ Default installation contains only OpenCC and packaging, not OCR/ASR, OpenCV, FF
 | `web` | Website dependencies without OCR/ASR; still build the frontend from the source checkout |
 | `all-cpu` | Website/download/CPU OCR/ASR starter, without diarization |
 
-For example: `python -m pip install -e ".[web,asr]"`. `requirements.txt` / `environment.yml` remain the full CPU website starter; GPU requirements select `web,ocr,asr` and never CPU Paddle. There is no PyPI release yet: use this checkout rather than assuming an index project with the same name belongs to this repository.
+For example: `python -m pip install "reibosub[asr]"`. For development, clone this repository and run `python -m pip install -e .` (or `-e ".[web,asr]"`). `requirements.txt` / `environment.yml` remain the full CPU website starter; GPU requirements select `web,ocr,asr` and never CPU Paddle. The website still needs a source checkout and frontend build; installing the wheel alone does not deploy it. Release maintainers: see [the publishing guide](docs/publishing.md).
 
 ### Runtime diagnostics and opt-in installation
 

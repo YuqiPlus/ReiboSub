@@ -1,15 +1,15 @@
-# ReiboSub 编程 API（首版，尚未发布 PyPI）
+# ReiboSub 编程 API（0.1.0 首版）
 
 `reibosub` 是新增的公开 Python 入口。它不要求网页运行，不创建 Agent 工程，不访问项目数据库，也不自动读取 `.env`、服务商配置或网页密钥。现有 `video_translate`、网页和旧命令行继续保持原来的调用方式，本轮没有迁移或替换它们。
 
-这是 0.x 阶段的公开接口草案，后续变更应记录兼容性说明。现在可以在源码环境使用；没有执行任何 PyPI/TestPyPI 发布。
+这是 0.x 阶段的公开接口草案，后续变更应记录兼容性说明。可独立安装 Python 工具包，也可以从源码进行二次开发；完整网页部署仍按仓库 README 操作。
 
 ## 安装与运行
 
-在已准备好的项目环境、仓库根目录执行：
+在独立的 Python 3.10+ 虚拟环境中执行：
 
 ```bash
-python -m pip install -e .
+python -m pip install reibosub
 python -c "from reibosub import Subtitle, Cue; print(Subtitle((Cue(1, 0, 1, 'Hello'),)).to_text())"
 ```
 
@@ -26,7 +26,7 @@ ensure_feature("asr")         # 缺项时抛出 MissingDependencyError
 ensure_feature("asr", install=True)  # 明确授权，只在当前 venv/Conda 环境补 Python 包
 ```
 
-可检测 `core/translate/download/video/ocr/ocr-cpu/asr/diarization/web/all-cpu`。`FeatureStatus` 提供需求、缺失版本/模块、外部工具、CPU/GPU 冲突和手工步骤。版本要求解析安装包自己的标准元数据，未发布阶段也不会自动去包索引下载另一个同名 reibosub 包。源码更新后需重新执行 `pip install -e .`，让安装元数据与代码一致。
+可检测 `core/translate/download/video/ocr/ocr-cpu/asr/diarization/web/all-cpu`。`FeatureStatus` 提供需求、缺失版本/模块、外部工具、CPU/GPU 冲突和手工步骤。版本要求解析安装包自己的标准元数据，不会自动更换 ReiboSub 版本。源码开发时在仓库根目录执行 `python -m pip install -e .`；源码更新后需重新执行，让安装元数据与代码一致。
 
 缺失简繁依赖时，`subtitle.to_simplified(install_missing=True)` / `to_traditional(install_missing=True)` 可明确开启安装；默认仍报错，不修改环境。安装使用当前解释器的独立 pip 子进程，且有环境内锁；默认不升级、强制重装或卸载，也不代装 GPU 引擎、系统工具或模型。系统 Python、运行中网页/已加载识别库、CPU/GPU 冲突等情况会拒绝安装。缺少外部工具先自行准备，`ocr` 要求用户明确选择引擎；CPU 路线用 `ocr-cpu`。安装失败使用 `DependencyInstallError`，不会回显可能包含凭据的 pip/index 错误正文。安装不具备事务回滚能力；不要在生产进程中改环境。
 

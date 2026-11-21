@@ -2,7 +2,7 @@
 name = "reibosub"
 version = "0.1.0"
 description = "Human-in-the-loop OCR, ASR, glossary, translation, and subtitle refinement for video."
-readme = "README.md"
+readme = "docs/package-readme.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"

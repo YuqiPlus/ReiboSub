@@ -8,14 +8,14 @@ ReiboSub 是一个面向 YouTube、Bilibili 普通投稿和本地视频的字幕
 
 [安装与启动](#快速开始) · [B站与多语言](#b-站与多语言) · [素材库与术语审核](#素材库与术语审核) · [模型配置](#大模型配置) · [GPU 与实验版要求](#gpu-和模型缓存) · [常见问题](#常见问题)
 
-二次开发可使用新增的 [`reibosub` 编程 API](docs/python-api.md)：不可变字幕数据、独立读写与格式转换、简繁转换、可替换翻译器和自定义格式协议，附[可运行示例](examples/python_api/)。不要求网页运行、不读取网页密钥。接口目前为首版草案，尚未发布 PyPI；默认安装已拆成轻量字幕工具，其他能力按功能选装。
+二次开发可使用新增的 [`reibosub` 编程 API](docs/python-api.md)：不可变字幕数据、独立读写与格式转换、简繁转换、可替换翻译器和自定义格式协议，附[可运行示例](examples/python_api/)。不要求网页运行、不读取网页密钥。`0.1.0` 接口目前为首版草案；默认安装已拆成轻量字幕工具，其他能力按功能选装。
 
 ## 只安装需要的功能
 
 只处理字幕或使用编程 API，无需安装 OCR、ASR、FFmpeg 或 Node：
 
 ```bash
-python -m pip install -e .
+python -m pip install reibosub
 reibosub convert input.srt output.vtt
 reibosub script input.srt simplified.srt --to simplified
 reibosub doctor core
@@ -34,7 +34,7 @@ reibosub doctor core
 | 网页依赖 | `python -m pip install -e ".[web]"` | 不捆绑 OCR/ASR；网页仍按下文从源码构建前端 |
 | 完整 CPU 入门 | `python -m pip install -e ".[all-cpu]"` | 网页、下载、CPU OCR、ASR，不包含说话人分离 |
 
-可组合安装，例如 `python -m pip install -e ".[web,asr]"`。`requirements.txt` 和 `environment.yml` 仍是完整 CPU 网页入门路线，GPU 文件使用 `web,ocr,asr` 且不带 CPU Paddle。本项目尚未发布 PyPI，因此目前使用源码安装，不要假定包索引上同名项目就是本项目。
+PyPI 选装示例：`python -m pip install "reibosub[asr]"`。上表保留源码开发安装命令，克隆仓库后才使用 `-e .`；可组合为 `-e ".[web,asr]"`。`requirements.txt` 和 `environment.yml` 仍是完整 CPU 网页入门路线，GPU 文件使用 `web,ocr,asr` 且不带 CPU Paddle。网页仍需源码仓库和前端构建，单独安装 wheel 不会部署网站。维护者发布步骤见[发布说明](docs/publishing.md)。
 
 ### 运行时检测与可选自动安装
 
