@@ -19,6 +19,7 @@ import time
 import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from difflib import SequenceMatcher
 from email.parser import BytesParser
 from email.policy import default as email_default_policy
@@ -38,6 +39,13 @@ except ImportError:  # pragma: no cover - Windows fallback keeps the UI usable.
     fcntl = None
 
 from video_translate.agent_planner import build_agent_plan
+from video_translate import subtitle_toolbox
+from video_translate.chinese_script import (
+    configure_chinese_output,
+    convert_chinese_text,
+    normalize_chinese_script,
+    output_chinese_script,
+)
 from video_translate.agent.models import AgentSession
 from video_translate.asr_review_web import ExperimentReviewService, ReviewConflict
 from video_translate.asr_v2 import (
@@ -4913,6 +4921,39 @@ def convert_subtitle_job(payload: dict[str, Any]) -> Job:
     return start_job(f"字幕格式转换 {source.name} -> {output_format}", target)
 
 
+def subtitle_toolbox_job(payload: dict[str, Any]) -> Job:
+    info, directory = subtitle_toolbox.load_upload(JOB_DIR / "subtitle_uploads", payload.get("upload_id"))
+    operation = str(payload.get("operation") or "")
+    if operation == "translate":
+        target_code = target_language_code(payload.get("target_language"))
+        source_code = str(payload.get("source_language") or "auto")
+        if source_code != "auto":
+            source_code = target_language_code(source_code)
+        mode = _normalize_subtitle_translation_mode(payload.get("translation_mode") or "translate_only")
+        hint = str(payload.get("extra_prompt") or "")
+        if len(hint) > 6000:
+            raise ValueError("补充要求最多 6000 个字符")
+        if source_code != "auto":
+            hint = f"原文语言为{target_language_name(source_code)}。\n" + hint
+        output_dir = JOB_DIR / "subtitle_tools" / uuid.uuid4().hex
+        return translate_subtitle_job({
+            "source_srt": str(directory / "normalized.srt"),
+            "out": str(output_dir / (Path(info["name"]).stem + f".{target_code}.srt")),
+            "target_language": target_code, "translation_mode": mode,
+            "extra_prompt": hint, "copy_sidecar": False,
+        })
+    if operation not in {"convert", "script"}:
+        raise ValueError("请选择翻译、格式转换或简繁转换")
+    output_format = subtitle_toolbox.normalize_subtitle_format(str(payload.get("format") or "srt"))
+    script = normalize_chinese_script(payload.get("chinese_script"))
+
+    def target(job_id: str) -> dict[str, Any]:
+        return subtitle_toolbox.run_mechanical(info, directory, JOB_DIR / job_id,
+                                              operation=operation, output_format=output_format, script=script)
+
+    return start_job("字幕工具箱 · " + ("格式转换" if operation == "convert" else "简繁转换"), target)
+
+
 
 def _copy_translated_sidecar_for_source(source_srt: Path, translated_srt: Path, *, target_language: str = 'zh') -> dict[str, Path]:
     run_config = source_srt.parent / "run.yaml"
@@ -5037,6 +5078,9 @@ def _write_asr_reviewed_outputs(
     turns = read_turns_json(turns_path) if turns_path.is_file() else []
     aligned_words = assign_speakers_to_words(combined, turns)
     cues = build_asr_v2_cues(aligned_words)
+    script = output_chinese_script(source_srt.parent)
+    if script != "original":
+        cues = [replace(cue, text=convert_chinese_text(cue.text, script)) for cue in cues]
     write_srt(
         [
             SubtitleCue(
@@ -5063,6 +5107,7 @@ def _write_asr_reviewed_outputs(
         "cue_count": len(cues),
         "review_word_count": len(combined),
         "accepted_review_count": len(accepted),
+        "chinese_script": script,
     }
 
 
@@ -7010,6 +7055,7 @@ def asr_lab_job(payload: dict[str, Any]) -> Job:
     if not input_media.is_file():
         raise FileNotFoundError(f"媒体文件不存在: {input_media}")
     source_language = normalize_source_language(payload.get("source_language") or "auto")
+    chinese_script = normalize_chinese_script(payload.get("chinese_script"))
     language = str(payload.get("language") or asr_language_for_source(source_language)).strip()
     model_size = str(payload.get("model_size") or "large-v3").strip()
     if model_size not in {"large-v3", "medium", "small"}:
@@ -7096,6 +7142,7 @@ def asr_lab_job(payload: dict[str, Any]) -> Job:
         config = {
             "mode": "asr_lab",
             "asr_version": asr_version,
+            "chinese_script": chinese_script,
             "input_video": str(input_media),
             "source_srt": str(configured_source_srt),
             "text_path": str(text_path),
@@ -7226,6 +7273,10 @@ def asr_lab_job(payload: dict[str, Any]) -> Job:
                 turns = read_turns_json(speaker_turns_path)
                 speaker_count = len({turn.speaker for turn in turns})
             words_payload, words = read_words_json(words_path)
+            resolved_script = configure_chinese_output(
+                out_dir, chinese_script,
+                str((words_payload.get("info") or {}).get("language") or language),
+            )
             v2_outputs = write_asr_v2_outputs(out_dir, words, turns=turns)
             quality = merge_cue_quality_report(
                 quality_path,
@@ -7258,6 +7309,13 @@ def asr_lab_job(payload: dict[str, Any]) -> Job:
                     (words_payload.get("info") or {}).get("duration") or 0.0
                 ),
             )
+            if resolved_script != "original":
+                suspected_missing_regions = [
+                    {key: convert_chinese_text(value, resolved_script)
+                     if isinstance(value, str) and key in {"text", "focused_text", "focused_context_text", "context_before", "context_after"}
+                     else value for key, value in region.items()}
+                    for region in suspected_missing_regions
+                ]
             focused_recovered_word_count = int(
                 recovery.get("focused_recovered_word_count") or 0
             )
@@ -7280,6 +7338,7 @@ def asr_lab_job(payload: dict[str, Any]) -> Job:
                 "kind": "asr_lab",
                 "asr_version": asr_version,
                 "pipeline_version": str(words_payload.get("version") or asr_version),
+                "chinese_script": resolved_script,
                 "input_video": str(input_media),
                 "output_dir": str(out_dir),
                 "source_srt": str(final_source_srt),
@@ -7345,7 +7404,19 @@ def asr_lab_job(payload: dict[str, Any]) -> Job:
                 _append_log(job_id, f"source_sidecar: {copied['source_sidecar']}")
             return result
 
+        detected_language = language
+        if language in {"auto", ""}:
+            current_job = get_job(job_id)
+            for line in reversed(current_job.logs if current_job else []):
+                if "detected_language: " in line:
+                    detected_language = line.split("detected_language: ", 1)[1].strip()
+                    break
+        resolved_script = configure_chinese_output(out_dir, chinese_script, detected_language)
         cues = read_srt(source_srt)
+        if resolved_script != "original":
+            shutil.copy2(source_srt, raw_source_srt)
+            cues = [replace(cue, text=convert_chinese_text(cue.text, resolved_script)) for cue in cues]
+            write_srt(cues, source_srt)
         plain_transcript_text = "\n".join(cue.text.strip() for cue in cues if cue.text.strip())
         if plain_transcript_text:
             plain_transcript_text += "\n"
@@ -7382,6 +7453,8 @@ def asr_lab_job(payload: dict[str, Any]) -> Job:
         result = {
             "kind": "asr_lab",
             "asr_version": asr_version,
+            "chinese_script": resolved_script,
+            "raw_source_srt": str(raw_source_srt) if raw_source_srt.is_file() else "",
             "input_video": str(input_media),
             "output_dir": str(out_dir),
             "source_srt": str(source_srt),
@@ -10107,6 +10180,13 @@ class AgentHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/jobs":
             self._send_json({"jobs": list_jobs()})
             return
+        if parsed.path.startswith("/api/toolbox/subtitles/uploads/"):
+            try:
+                info, _directory = subtitle_toolbox.load_upload(JOB_DIR / "subtitle_uploads", parsed.path.rsplit("/", 1)[-1])
+                self._send_json(info)
+            except (ValueError, FileNotFoundError) as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
         if parsed.path.startswith("/api/jobs/"):
             job_id = parsed.path.rstrip("/").rsplit("/", 1)[-1]
             job = get_job(job_id)
@@ -10151,6 +10231,23 @@ class AgentHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
+            if self.path in {"/api/toolbox/upload-subtitle", "/api/toolbox/subtitles"}:
+                origin = str(self.headers.get("Origin") or "")
+                host = str(self.headers.get("Host") or "").lower()
+                if (self.headers.get("Sec-Fetch-Site") == "cross-site"
+                    or (origin and (urlparse(origin).scheme not in {"http", "https"} or urlparse(origin).netloc.lower() != host))):
+                    self._send_json({"error": "请从当前服务网页使用字幕工具箱"}, status=HTTPStatus.FORBIDDEN)
+                    return
+                if self.path == "/api/toolbox/upload-subtitle":
+                    fields = self._read_multipart_fields(max_bytes=subtitle_toolbox.MAX_UPLOAD_BYTES + 65536)
+                    file = fields.get("file") or {}
+                    self._send_json(subtitle_toolbox.save_upload(
+                        JOB_DIR / "subtitle_uploads", filename=str(file.get("filename") or ""),
+                        content=file.get("content") or b"",
+                        encoding=str((fields.get("encoding") or {}).get("text") or "utf-8-sig")))
+                else:
+                    self._send_json(subtitle_toolbox_job(self._read_json(max_bytes=65536, require_json_content_type=True)).to_dict())
+                return
             if self.path.startswith("/api/jobs/") and self.path.rstrip("/").endswith("/cancel"):
                 job_id = self.path.rstrip("/").split("/")[-2]
                 job = cancel_job(job_id)
@@ -10447,13 +10544,15 @@ class AgentHandler(BaseHTTPRequestHandler):
             raise ValueError("上传封面为空")
         return save_uploaded_project_cover(project_path=project_path, filename=filename, content=content)
 
-    def _read_multipart_fields(self) -> dict[str, dict[str, Any]]:
+    def _read_multipart_fields(self, *, max_bytes: int | None = None) -> dict[str, dict[str, Any]]:
         content_type = self.headers.get("Content-Type", "")
         if not content_type.lower().startswith("multipart/form-data"):
             raise ValueError("上传文件必须使用 multipart/form-data")
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
             raise ValueError("上传文件为空")
+        if max_bytes is not None and length > max_bytes:
+            raise ValueError("上传文件过大，字幕文件最多 10 MB")
         body = self.rfile.read(length)
         header = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
         message = BytesParser(policy=email_default_policy).parsebytes(header + body)

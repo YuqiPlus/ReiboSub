@@ -17,6 +17,7 @@ classifiers = [
     "Topic :: Multimedia :: Video :: Conversion",
 ]
 dependencies = [
+    "opencc-python-reimplemented>=0.1.7,<0.2",
     "opencv-python>=4.8,<5",
     "paddleocr>=3.0,<4",
     "Pillow>=10,<13",

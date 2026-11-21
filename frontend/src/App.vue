@@ -12,6 +12,9 @@
 
       <main class="workspace" :class="{ 'workspace-single': activeView !== 'jobs' }">
         <section class="workspace-main">
+          <div v-show="activeView === 'toolbox'" class="page-stack">
+            <ToolboxPanel :assets="assets" :jobs="jobs" @open-view="navigateTo" @refresh-assets="loadAssets(true)" @job-started="watchJob" @cancel-job="cancelJob" @edit-subtitle="openToolboxSubtitle" />
+          </div>
           <div v-if="activeView === 'agent'" class="page-stack">
             <AgentSessionPanel
               v-model:agent-mode="agentMode"
@@ -194,6 +197,7 @@
               v-model:asr-version="asrLabVersion"
               v-model:test-ranges="asrLabTestRanges"
               v-model:source-language="asrLabSourceLanguage"
+              v-model:chinese-script="asrLabChineseScript"
               v-model:model-size="asrLabModelSize"
               v-model:speaker-diarization="asrLabSpeakerDiarization"
               v-model:known-speaker-count="asrLabKnownSpeakerCount"
@@ -337,7 +341,7 @@
             />
           </div>
 
-          <div v-else class="page-stack">
+          <div v-else-if="activeView === 'jobs'" class="page-stack">
             <section class="panel hero-panel">
               <div>
                 <h2>任务日志</h2>
@@ -384,6 +388,7 @@ import OcrDevPanel from './components/OcrDevPanel.vue'
 import AsrLabPanel from './components/AsrLabPanel.vue'
 import JobSidebar from './components/JobSidebar.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
+import ToolboxPanel from './components/ToolboxPanel.vue'
 import { copyText } from './clipboard.js'
 import { canPresentAgentSession, createAgentSessionPoller } from './agentSessionPolling.js'
 import {
@@ -493,6 +498,7 @@ const ocrDevFlickerSmoothingMaxDurationSeconds = ref(0.55)
 const ocrDevLlmCleanup = ref(true)
 const ocrDevRunning = ref(false)
 const asrLabSourceLanguage = ref('auto')
+const asrLabChineseScript = ref('simplified')
 const agentMode = ref('autonomous')
 const asrLabModelSize = ref('large-v3')
 const asrLabVersion = ref('2.0')
@@ -589,6 +595,7 @@ const glossaryAutosave = createGlossaryReviewAutosave({
 })
 
 const pages = {
+  toolbox: { title: '工具箱', description: '文本翻译、对话提取和字幕纯文本，打开即用。' },
   agent: {
     title: '字幕助手',
     description: '自动判断字幕来源，提取原文，审核术语并完成翻译。',
@@ -729,6 +736,7 @@ const navItems = computed(() => [
   { id: 'task-history', group: '日常流程', label: '所有任务', badge: '' },
   { id: 'assets', group: '日常流程', label: '素材库', badge: '' },
   { id: 'new-task', group: '日常流程', label: '下载与链接', badge: '' },
+  { id: 'toolbox', group: '日常流程', label: '工具箱', badge: '' },
   { id: 'subtitle-edit', group: '字幕工具', label: '字幕精修', badge: '' },
   { id: 'glossary', group: '字幕工具', label: '术语审核', badge: '' },
   { id: 'subtitles', group: '字幕工具', label: '翻译与转换', badge: '' },
@@ -741,6 +749,11 @@ const navItems = computed(() => [
 
 function navigateTo(view) {
   activeView.value = view
+  if (window.innerWidth <= 760) sidebarOpen.value = false
+}
+
+function openToolboxSubtitle(path, video) {
+  editSubtitle({ path, videoPath: video })
   if (window.innerWidth <= 760) sidebarOpen.value = false
 }
 
@@ -2011,6 +2024,7 @@ async function runAsrLab() {
       asr_version: asrLabVersion.value,
       test_ranges: asrLabExperimental.value ? asrLabTestRanges.value : undefined,
       source_language: asrLabExperimental.value ? 'korean' : asrLabSourceLanguage.value,
+      chinese_script: asrLabExperimental.value ? undefined : asrLabChineseScript.value,
       model_size: asrLabModelSize.value,
       speaker_diarization: asrLabSpeakerDiarization.value,
       known_speaker_count: asrLabKnownSpeakerCount.value,

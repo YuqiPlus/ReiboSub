@@ -70,7 +70,7 @@ const props = defineProps({
 })
 defineEmits(['select', 'new-task', 'select-session', 'close'])
 
-const icons = { agent: 'spark', 'task-history': 'history', assets: 'folder', 'new-task': 'download', 'subtitle-edit': 'edit', glossary: 'book', subtitles: 'language', 'ocr-dev': 'scan', 'asr-dev': 'audio', 'video-overlay': 'video', settings: 'settings', jobs: 'log' }
+const icons = { agent: 'spark', toolbox: 'toolbox', 'task-history': 'history', assets: 'folder', 'new-task': 'download', 'subtitle-edit': 'edit', glossary: 'book', subtitles: 'language', 'ocr-dev': 'scan', 'asr-dev': 'audio', 'video-overlay': 'video', settings: 'settings', jobs: 'log' }
 const footerItems = computed(() => props.items.filter(item => ['settings', 'jobs'].includes(item.id)))
 function sessionTitle(item) { return String(item.result?.probe?.title || item.payload?.url || '字幕任务') }
 function statusLabel(value) { return { running: '进行中', waiting: '待你确认', failed: '需要重试', done: '已完成', cancelled: '已中断' }[value] || '已保存' }

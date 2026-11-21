@@ -1,11 +1,11 @@
 <template>
   <section class="reference-translator" aria-label="随手翻译">
-    <header class="reference-translator-head"><div><h3><AppIcon name="language" :size="17" />随手翻译</h3><span>仅供参考，不会改动术语表 · 使用已配置的翻译模型</span></div><button type="button" class="ghost mini" :aria-expanded="expanded" @click="expanded = !expanded">{{ expanded ? '收起' : '展开' }}</button></header>
+    <header class="reference-translator-head"><div><h3><AppIcon name="language" :size="17" />{{ title }}</h3><span>{{ description }}</span></div><button type="button" class="ghost mini" :aria-expanded="expanded" @click="expanded = !expanded">{{ expanded ? '收起' : '展开' }}</button></header>
     <form v-if="expanded" @submit.prevent="translate">
       <div class="reference-translator-grid">
         <div class="reference-translator-pane">
           <label>原文语言<select v-model="source" aria-label="翻译器原文语言"><option value="auto">自动识别</option><option v-for="language in targetLanguages" :key="language.id" :value="language.id">{{ language.label }}</option></select></label>
-          <textarea ref="input" v-model="text" aria-label="翻译器原文" placeholder="输入文字，或从下方术语放入原句" maxlength="4000" @keydown.ctrl.enter.prevent="translate" @keydown.meta.enter.prevent="translate" />
+          <textarea ref="input" v-model="text" aria-label="翻译器原文" :placeholder="placeholder" maxlength="4000" @keydown.ctrl.enter.prevent="translate" @keydown.meta.enter.prevent="translate" />
           <span class="reference-translator-count">{{ text.length }} / 4000</span>
         </div>
         <button class="secondary reference-translator-swap" type="button" aria-label="交换翻译语言与文本" :disabled="source === 'auto' || busy" @click="swap">⇄</button>
@@ -26,7 +26,12 @@ import { targetLanguages } from '../translationLanguages.js'
 import { copyText } from '../clipboard.js'
 import AppIcon from './AppIcon.vue'
 
-const props = defineProps({ targetLanguage: { type: String, default: 'zh' } })
+const props = defineProps({
+  targetLanguage: { type: String, default: 'zh' },
+  title: { type: String, default: '随手翻译' },
+  description: { type: String, default: '仅供参考，不会改动术语表 · 使用已配置的翻译模型' },
+  placeholder: { type: String, default: '输入文字，或从下方术语放入原句' },
+})
 const source = ref('auto'), target = ref(props.targetLanguage), text = ref(''), translation = ref('')
 const expanded = ref(true), busy = ref(false), error = ref(''), copyStatus = ref(''), input = ref(null)
 const resultKey = ref('')

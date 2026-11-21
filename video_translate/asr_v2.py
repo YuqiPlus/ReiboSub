@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from video_translate.models import SubtitleCue
+from video_translate.chinese_script import convert_chinese_text, output_chinese_script
 from video_translate.subtitle.srt import write_srt
 from video_translate.tools.diarize_speakers import SpeakerTurn, UNKNOWN_SPEAKER
 
@@ -563,6 +564,9 @@ def write_asr_v2_outputs(
     include_speaker = bool(turns)
     aligned_words = assign_speakers_to_words(words, turns or [])
     cues = build_asr_v2_cues(aligned_words)
+    script = output_chinese_script(output_dir)
+    if script != "original":
+        cues = [replace(cue, text=convert_chinese_text(cue.text, script)) for cue in cues]
     source_srt = output_dir / "source.asr2.srt"
     cues_path = output_dir / "cues.asr2.json"
     transcript_path = output_dir / "transcript.txt"
@@ -585,6 +589,7 @@ def write_asr_v2_outputs(
             {
                 "version": ASR_V2_VERSION,
                 "speaker_aligned": include_speaker,
+                "chinese_script": script,
                 "cues": [cue.to_dict() for cue in cues],
             },
             ensure_ascii=False,
@@ -611,6 +616,7 @@ def write_asr_v2_outputs(
         "transcript_text": transcript_text,
         "plain_transcript_text": plain_transcript_text,
         "cue_count": len(cues),
+        "chinese_script": script,
         "low_confidence_cue_count": sum(1 for cue in cues if cue.low_confidence),
         "words": aligned_words,
         "cues": cues,

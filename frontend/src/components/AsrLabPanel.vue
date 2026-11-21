@@ -5,6 +5,7 @@
     <p class="lab-version-detail">{{ currentVersion?.detail }}</p>
     <div class="studio-source-picker"><label for="asrLabInput">视频或音频文件<input id="asrLabInput" :value="inputVideo" :disabled="running" placeholder="选择或填写本地视频、音频路径" @input="$emit('update:inputVideo', $event.target.value)" /></label><button class="secondary" :disabled="running" @click="$emit('open-assets')"><AppIcon name="folder" :size="16" />从素材库选择</button></div>
     <fieldset v-if="!isExperiment" :disabled="running" class="lab-basic-row"><label for="asrLabLanguage">音频语言<select id="asrLabLanguage" :value="sourceLanguage" @change="$emit('update:sourceLanguage', $event.target.value)"><option value="auto">自动识别</option><option value="korean">韩语</option><option value="japanese">日语</option><option value="chinese">中文</option><option value="english">英语</option></select></label><p>{{ modelSize }} · {{ speakerDiarization ? '区分说话人' : '不区分说话人' }}<template v-if="asrVersion === '2.0'"> · {{ highRecall ? '高召回补漏开启' : '高召回补漏关闭' }}</template></p></fieldset>
+    <fieldset v-if="!isExperiment && ['auto', 'chinese'].includes(sourceLanguage)" :disabled="running" class="lab-basic-row"><label>中文输出<select aria-label="ASR 中文输出" :value="chineseScript" @change="$emit('update:chineseScript', $event.target.value)"><option value="simplified">简体中文（默认）</option><option value="traditional">繁體中文</option><option value="original">保留识别原样</option></select></label><p>仅对中文识别结果统一字形，不改变时间轴，原始识别记录保留。</p></fieldset>
     <fieldset v-if="asrVersion === '2.0'" :disabled="running" class="asr-hotwords">
       <label v-if="asrVersion === '2.0'" class="asr-lab-wide-field">
         <span>专名与术语提示（可选）</span>
@@ -109,7 +110,7 @@
         <a v-if="result.autonomous_trace_url" class="button-link secondary" :href="result.autonomous_trace_url" target="_blank" rel="noopener">查看Agent操作记录</a>
       </div>
     </div>
-    <div v-else-if="result" class="asr-lab-output"><span class="lab-result-version">本次结果 · {{ resultVersionLabel }}</span>
+    <div v-else-if="result" class="asr-lab-output"><span class="lab-result-version">本次结果 · {{ resultVersionLabel }}<template v-if="result.chinese_script && result.chinese_script !== 'original'"> · {{ result.chinese_script === 'traditional' ? '繁體中文' : '简体中文' }}</template></span>
       <div class="section-title">
         <div>
           <h3>识别文本</h3>
@@ -274,6 +275,7 @@ const props = defineProps({
   asrVersion: { type: String, default: '1.0' },
   testRanges: { type: Array, default: () => [{ start: '00:00', end: '01:30' }] },
   sourceLanguage: { type: String, default: 'auto' },
+  chineseScript: { type: String, default: 'simplified' },
   modelSize: { type: String, default: 'large-v3' },
   speakerDiarization: { type: Boolean, default: false },
   knownSpeakerCount: { type: String, default: 'auto' },
@@ -292,6 +294,7 @@ const emit = defineEmits([
   'update:asrVersion',
   'update:testRanges',
   'update:sourceLanguage',
+  'update:chineseScript',
   'update:modelSize',
   'update:speakerDiarization',
   'update:knownSpeakerCount',

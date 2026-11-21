@@ -36,14 +36,19 @@ export async function uploadMediaFile(file, { title = '' } = {}) {
   return uploadFile('/api/upload-media', file, { title })
 }
 
+export async function uploadSubtitleFile(file, { encoding = 'utf-8-sig' } = {}) {
+  return uploadFile('/api/toolbox/upload-subtitle', file, { encoding })
+}
+
 export async function uploadVideoFile(file, { title = '' } = {}) {
   return uploadFile('/api/upload-video', file, { title })
 }
 
-async function uploadFile(path, file, { title = '' } = {}) {
+async function uploadFile(path, file, { title = '', encoding = '' } = {}) {
   const form = new FormData()
   form.append('file', file)
   if (title) form.append('title', title)
+  if (encoding) form.append('encoding', encoding)
   const response = await fetch(path, {
     method: 'POST',
     body: form,

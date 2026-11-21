@@ -17,6 +17,35 @@ async function render(name, props) {
   return renderToString(createSSRApp({ render: () => h(component, props) }))
 }
 
+test('subtitle toolbox directly uploads files and retains all three independent operations', async () => {
+  const html = await render('SubtitleToolbox', {})
+  for (const text of ['上传字幕', '字幕翻译', '格式转换', '简繁转换', 'Big5', '不需要视频', '不强制生成或审核术语表']) assert(html.includes(text), text)
+  assert.match(html, /accept=".srt,.vtt,.ass,.ssa,.bcc,.json,.lrc,.txt"/)
+  assert.match(html, /翻译字幕<\/button>/)
+  assert.match(html, /disabled[^>]*>翻译字幕/)
+})
+
+test('toolbox offers standalone translation, dialogue and local subtitle text tools', async () => {
+  const html = await render('ToolboxPanel', { assets: { videos: [{ path: '/safe/video.mp4', name: '示例视频' }], audios: [{ path: '/safe/audio.wav', name: '示例音频' }] } })
+  for (const label of ['工具箱', '文本翻译', '提取对话', '字幕转纯文本', '示例视频', '示例音频', '上传音视频', 'ASR 2.2', 'CPU · 较慢', '字幕翻译与转换']) assert(html.includes(label), label)
+  assert.match(html, /role="tablist"/)
+  assert.match(html, /role="tabpanel"/)
+  assert.match(html, /只在浏览器里处理/)
+  assert.match(html, /不翻译，不进入术语审核/)
+  assert.match(html, /对话提取中文输出/)
+  assert.match(html, /繁體中文/)
+  assert.doesNotMatch(html, /不会改动术语表/)
+})
+
+test('stable ASR Lab exposes script choices but Korean-only experiments do not', async () => {
+  const stable = await render('AsrLabPanel', { asrVersion: '2.0', sourceLanguage: 'chinese', chineseScript: 'traditional' })
+  assert.match(stable, /ASR 中文输出/)
+  assert.match(stable, /aria-label="ASR 中文输出" value="traditional"/)
+  assert.match(stable, /保留识别原样/)
+  const experiment = await render('AsrLabPanel', { asrVersion: 'agent-experimental' })
+  assert.doesNotMatch(experiment, /ASR 中文输出/)
+})
+
 test('linked task subtitles expose their language and version without a misleading Chinese label', async () => {
   const html = await render('AssetList', { items: [{ path: '/tasks/en.review.srt', name: 'en.review.srt', role: 'translated', language: 'en', linked: true, version_label: '第 2 轮', is_archived: true }] })
   assert.match(html, /英文译文/)

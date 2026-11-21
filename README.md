@@ -277,6 +277,21 @@ An Agent translation waits until every pending term is confirmed and you click *
 
 The translator reuses the configured subtitle-translation model, normally inherited from the shared model unless overridden. No extra provider/key is required. Text is sent to that provider and consumes its quota. It translates only this text, not the whole video, and never fills, saves or confirms a glossary term automatically. Copy the desired name into its glossary field and confirm it yourself. Copy any result you need before leaving the page. Check model settings/access/quota after service errors; manually select/copy text if clipboard access is blocked.
 
+### Toolbox: use individual tools without a full Agent task
+
+Open **Toolbox (工具箱)** in the workspace sidebar:
+
+- **Text translation**: choose source and target languages and translate up to 4,000 characters with the configured translation model. This uses the provider's quota and does not change the glossary.
+- **Subtitle tools**: upload/drop a subtitle directly, then switch between translation, format conversion and Simplified/Traditional conversion with the same file. No video project or Agent task is required. SRT/VTT/ASS/SSA/BCC/JSON/LRC/TXT are supported, up to 10 MB and 20,000 cues. Select UTF-8, UTF-16, GB18030/GBK or Big5 under the encoding disclosure and re-upload if needed. Translation uses the configured model, defaults to locked timing, supports Chinese/English/Japanese/Korean targets and extra fixed-name instructions, and outputs SRT without mandatory glossary review. Mechanical conversions do not call a model. Script conversion retains the native format, timecodes and ASS/SSA style definitions; cross-format conversion can lose styles/effects, and timing synthesized for TXT input is not actual synchronization. Each run saves a separate result: download it, open SRT in the editor, or reuse the result for the next operation. Navigation does not interrupt work; refresh attempts to restore the latest file/job. Original pages and their full glossary-review features remain available.
+- **Extract dialogue**: choose library media or upload audio/video. Stable ASR 2.2 produces original-language text, TXT and SRT, with an entry to subtitle editing/playback. It does not translate or require glossary approval. Advanced options include the model, CPU/GPU, hotwords and optional speaker separation. ASR/FFmpeg and device dependencies are still required; speaker separation needs additional dependencies and weights. Extraction continues when navigating away, and a refresh attempts to restore the latest extraction. Each run retains its own job outputs, while the source subtitle sidecar beside the media may be updated.
+- **Subtitle to plain text**: open or paste SRT/WebVTT, optionally retain time ranges, and copy/download TXT. This runs entirely in the browser without an upload or model request.
+
+Shortcuts link to downloads, subtitle translation/conversion, screen-text extraction and video processing. Existing pages and experimental versions remain available.
+
+Enable **Separate speakers (区分说话人)** in the dialogue tool's main controls to set the known speaker count to automatic or 1–20. This labels speakers as Speaker 1, 2, etc.; it does not identify real names and still requires speaker-separation dependencies and weights.
+
+**Chinese ASR output**: the dialogue tool and stable ASR Lab expose Simplified (default), Traditional and original-as-recognized output when the input language is Chinese or automatic. Automatic detection applies conversion only to Chinese. Copied text, TXT, SRT and sidecars use the same script; raw recognition evidence remains intact, and subsequent gap review retains the selected script. Conversion uses local [OpenCC](https://github.com/yichen0831/opencc-python), not an LLM; it changes neither timing nor recognition mistakes. Existing tasks are not rewritten, and Korean-only experiments are unchanged. Existing installations should run `python -m pip install -e ".[asr]"` to install the new dependency, then restart the web service.
+
 ## Frontend Development
 
 The Python service reads `frontend/dist`. Use `npm ci --include=dev && npm run build` for a production-style local build. For development, run the backend and Vite separately:

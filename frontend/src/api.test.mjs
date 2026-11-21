@@ -1,6 +1,20 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { deleteJson, patchJson, uploadMediaFile, uploadProjectCover, uploadVideoFile } from "./api.js"
+import { deleteJson, patchJson, uploadMediaFile, uploadProjectCover, uploadVideoFile, uploadSubtitleFile } from "./api.js"
+
+test('subtitle upload uses its own endpoint, multipart encoding and no media project title', async () => {
+  const previousFetch = globalThis.fetch
+  const file = new File(['subtitle'], '字幕.srt')
+  globalThis.fetch = async (path, options) => {
+    assert.equal(path, '/api/toolbox/upload-subtitle')
+    assert.equal(options.body.get('file'), file)
+    assert.equal(options.body.get('encoding'), 'big5')
+    assert.equal(options.body.get('title'), null)
+    return new Response(JSON.stringify({ upload_id: 'test' }))
+  }
+  try { assert.equal((await uploadSubtitleFile(file, { encoding: 'big5' })).upload_id, 'test') }
+  finally { globalThis.fetch = previousFetch }
+})
 
 test("deleteJson sends a JSON DELETE request and surfaces API errors", async () => {
   const previousFetch = globalThis.fetch

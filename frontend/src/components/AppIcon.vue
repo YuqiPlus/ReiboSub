@@ -7,6 +7,7 @@
 <script setup>
 defineProps({ name: { type: String, default: 'spark' }, size: { type: [Number, String], default: 20 } })
 const paths = {
+  toolbox: ['M8 7V4h8v3', 'M3 7h18v14H3V7Z', 'M3 12h18M10 11v3h4v-3'],
   search: ['M10.5 3a7.5 7.5 0 1 0 0 15 7.5 7.5 0 0 0 0-15Z', 'm16 16 5 5'],
   play: ['m8 4 12 8-12 8V4Z'],
   check: ['m5 12 4 4L19 6'],
