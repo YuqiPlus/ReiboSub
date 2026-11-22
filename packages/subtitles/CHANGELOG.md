@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- Add optional, lazily initialized `ASR`/`FasterWhisperBackend` and
+  `OCR`/`PaddleOCRBackend` Python interfaces, plus `ASRBackend`/`OCRBackend`
+  extension contracts. No recognition framework is imported by default.
+- Add independent `asr`, `ocr`, `ocr-cpu` and `video` extras. Models are not
+  packaged; first use delegates download/cache to the upstream runtime.
+- Add local/offline loading, explicit warmup, per-instance model reuse, image
+  regions, basic crop/mask video OCR, progress and cooperative cancellation.
+- Add optional per-instance OCR `cache_dir`, matching ASR's cache selection:
+  default Hub user cache, lazy first download, cached-first reuse, explicit local
+  model precedence and offline rejection. Do not mutate Paddle/global settings.
+  Anchor relative OCR/ASR cache paths when constructing clients.
+- Separate ordinary package installs, regular source installs and editable
+  developer installs in the guides; document CPU and CUDA setup independently.
+- Keep web OCR 3.0, ASR 2.2 and experimental Agents independent and unchanged.
+  Runtime recognition never invokes pip or silently selects fallback models.
+- These are source-only changes, not part of the already published 0.1.1 files.
+
 ## 0.1.1
 
 - Publish only the independent `reibosub` subtitle toolkit, using its own source,

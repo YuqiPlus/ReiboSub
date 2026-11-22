@@ -1,4 +1,4 @@
-# ReiboSub 编程 API（0.1.1 独立工具包）
+# ReiboSub 编程 API（独立工具包，含未发布识别接口）
 
 `reibosub` 是新增的公开 Python 入口。它不要求网页运行，不创建 Agent 工程，不访问项目数据库，也不自动读取 `.env`、服务商配置或网页密钥。现有 `video_translate`、网页和旧命令行继续保持原来的调用方式，本轮没有迁移或替换它们。
 
@@ -32,7 +32,171 @@ ensure_feature("core")
 # ensure_feature("core", install=True)  # 仅在独立环境中明确授权补齐轻量依赖
 ```
 
-独立工具包只诊断 `core`。网页、下载、OCR/ASR 的依赖配置与安全安装机制属于[网页应用](../../../docs/web-application.md)，不再由工具包提供。简繁转换仍支持显式 `install_missing=True`；默认不改环境。安装只使用当前解释器的 pip 子进程，要求虚拟环境、环境内锁，拒绝已加载识别库的进程；错误不回显私有索引凭据。不要修改运行中网站使用的环境。源码更新后需重新安装，让元数据与代码一致。
+已发布 0.1.1 只诊断 `core`；当前未发布源码新增 `asr/ocr/ocr-cpu/video` 诊断，不导入识别库、不下载模型。识别依赖必须提前显式选装，`ensure_feature(..., install=True)` 不会为这些功能运行 pip；只有 `core` 支持上述轻量修复。网页和下载的依赖管理仍属于[网页应用](../../../docs/web-application.md)。简繁转换仍支持显式 `install_missing=True`；默认不改环境。安装只使用当前解释器的 pip 子进程，要求虚拟环境、环境内锁，拒绝已加载识别库的进程；错误不回显私有索引凭据。不要修改运行中网站使用的环境。源码更新后需重新安装，让元数据与代码一致。
+
+## OCR 与 ASR：可选识别接口（尚未发布）
+
+以下新增接口只在当前源码中提供，**已发布的 0.1.1 没有这些接口或选装组**。不要在运行网站的环境中重新安装；先建独立虚拟环境。
+
+普通用户在后续识别功能正式发布后，不需要克隆仓库，也不需要填写源码路径，安装方式将是：
+
+```bash
+# 以下选装命令要等后续版本发布，不能用于目前的 PyPI 0.1.1。
+python -m pip install "reibosub[asr]"
+python -m pip install "reibosub[ocr-cpu,video]"  # CPU
+python -m pip install "reibosub[ocr,video]"      # CUDA 引擎需要另装
+```
+
+现在要测试未发布源码，从仓库根目录安装；一般使用者不用 `-e`，二次开发者才需要可编辑安装：
+
+```bash
+python -m pip install "./packages/subtitles[ocr-cpu,video]"
+# 修改源码后希望立即生效的开发安装：
+python -m pip install -e "./packages/subtitles[asr,ocr-cpu,video,dev]"
+# CUDA 则把 ocr-cpu 改成 ocr，并另装匹配的 GPU Paddle 引擎。
+```
+
+安装命令里的 `./packages/subtitles` 是源码产品位置，`[ocr,video]` 是功能依赖选择；二者都不是模型保存路径。安装包由当前 Python 环境管理，模型位置由下述 `cache_dir` 或本地模型目录参数管理，不需要新建网页配置文件。
+
+| 选装组 | 用途 | 不会安装什么 |
+| --- | --- | --- |
+| `asr` | faster-whisper 语音识别，自带 PyAV 解码依赖 | Paddle、网页、独立 FFmpeg 可执行程序 |
+| `ocr` | PaddleOCR 3.x 接口，由你选择 Paddle 引擎 | CPU/GPU Paddle 引擎、网页 |
+| `ocr-cpu` | PaddleOCR + CPU Paddle 引擎 | GPU Paddle、网页 |
+| `video` | PyAV 视频解码与 NumPy 图像数组，不额外安装另一份 OpenCV | OCR/ASR 引擎与模型 |
+
+不要同时安装 CPU 和 GPU Paddle。依赖的 Python/系统/架构支持取决于第三方 wheel；推荐在 Python 3.11 独立环境先跑通 CPU。GPU/CUDA 不会自动安装，也不会因 GPU 不可用悄悄退到 CPU。`ocr-cpu` 与网页上的同名选装组是两个产品各自的元数据，不会安装网页。
+
+### 模型生命周期
+
+1. `import reibosub`、创建 `ASR()`/`OCR()`、`check_feature()`：不导入模型运行库、不下载权重。
+2. 首次 `transcribe()` / `read_image()` / `extract_subtitles()`：导入对应库，检查模型目录/缓存，必要时由上游加载器下载。依赖缺失则报安装提示，**不调用 pip**。
+3. 同一后端实例重复调用：复用内存中的模型；后续进程复用磁盘缓存，不把模型塞进安装包。
+4. `backend.prepare()`：显式预热，适合部署时提前准备；`backend.close()`：释放该实例的引用（显存何时归还由运行库的分配器决定）。
+
+### 缓存目录与路径优先级
+
+OCR 与 ASR 都支持 `cache_dir`，默认 `None`，不填也可以直接调用。默认使用 Hugging Face 标准用户缓存，通常为 `~/.cache/huggingface/hub`，遵循上游 `HF_HOME/HF_HUB_CACHE` 等设置；不是仓库目录，也不是安装包目录。OCR 模型来自 `PaddlePaddle` 官方模型仓库，只下载推理资产，不执行远程仓库代码。
+
+```python
+from reibosub import OCR
+
+automatic = OCR(language="korean")  # 无需配置路径
+custom = OCR(language="korean", cache_dir="./models/ocr")
+cuda = OCR(language="korean", device="gpu:0", cache_dir="./models/ocr")
+```
+
+优先级为：**显式本地模型目录 > `cache_dir` > 上游默认用户缓存**。OCR 检测、识别两套模型分别应用此规则，因此可以一套本地、一套缓存；显式目录错误不会改用缓存或在线下载。相对路径在创建对象时按当前工作目录固定为绝对路径，支持 `~`，之后即使切换工作目录也不改变位置。
+
+创建对象不会创建缓存目录。首次调用先检查完整缓存，只有缺失时才下载；同一实例复用内存，跨实例/进程复用磁盘快照。可在线恢复不完整的缓存下载；离线缺文件则报错。下载/并发文件锁由 Hugging Face 管理，目录是版本化快照结构，不要把缓存根目录误当作一个可直接填入 `recognition_model_dir` 的模型目录。权限/网络错误不会静默换到其他缓存或模型。
+
+每个实例只传自己的缓存参数，不全局改写 `HOME`、`PADDLE_PDX_CACHE_HOME`、代理或网页配置。Paddle 运行库可能另存辅助缓存，但模型权重由所选 Hub 缓存或显式目录提供；原网页仍沿用自己的路径。此前未发布工具包版本使用的 `~/.paddlex/official_models` 不会自动搬动，需要复用时可显式传入其模型子目录。
+
+下载可能使用上游的用户缓存、网络/代理环境；不会读取网页配置或网页密钥。首次下载需要网络和磁盘空间，模型许可证也需要调用方遵守。缺少 Python 依赖只提示安装，不会在推理途中自动调用 pip。
+
+### ASR：音视频转字幕
+
+```python
+from reibosub import ASR
+
+recognizer = ASR(
+    model="small", device="cpu", compute_type="int8",
+    cache_dir="./models/asr",
+)
+subtitle = recognizer.transcribe(
+    "input.mp4", language="ko",  # None 自动判断；也支持 zh/ja/en 等
+    on_progress=lambda event: print(event.stage, event.completed, event.total),
+)
+subtitle.save("speech.ko.srt")
+subtitle.to_simplified().save("speech.hans.srt")  # 仅中文文本有实际简繁变化
+```
+
+支持本地音频/视频文件，不接受 URL 下载；路径错误在加载模型前报告。ASR 进度单位是已处理音频毫秒，不是“字幕条数”；字幕按原始音频的绝对秒数返回。`vad_filter=True`、`beam_size=5` 可在构造时调整。零时长/空文本片段不会编造结束时间，会跳过并记录在 `subtitle.notices`；其他非法时间会报错。基础 ASR 不做说话人分离、LLM 纠错或精确强制对齐，准确性仍需验收。
+
+离线/预下载示例：
+
+```python
+from pathlib import Path
+from reibosub import ASR
+
+offline = ASR(model="small", cache_dir="./models/asr", local_files_only=True)
+# 或 model=Path("./converted-whisper-model")，指向完整 CTranslate2 模型目录。
+offline.transcribe("speech.wav", language="zh").to_simplified().save("speech.zh.srt")
+```
+
+`local_files_only=True` 交给 faster-whisper/Hub 禁止模型下载，缓存缺失立即报 `ModelUnavailableError`，不会切换模型或供应商。需要严格离线部署时也应由部署环境禁用外网，并提前准备完整权重、分词器和配置。
+
+### OCR：图片与视频字幕
+
+```python
+from reibosub import OCR
+
+reader = OCR(language="korean", device="cpu", cache_dir="./models/ocr")
+# cache_dir 可完全省略；CUDA 使用 device="gpu:0"，前提是装好了匹配的 GPU Paddle。
+regions = reader.read_image("frame.png")
+for region in regions:
+    print(region.text, region.confidence, region.polygon)
+
+reader.extract_subtitles(
+    "input.mp4", sample_fps=3,
+    crop=(0, 0.65, 1, 1),
+    exclude=((0.8, 0, 1, 0.15),),  # 可传多个 Logo 遮罩
+    start=0, end=60, min_confidence=0.5, language="ko",
+).save("screen.ko.srt")
+```
+
+OCR 引擎语言码用 `korean/japan/ch/chinese_cht/en`，不是 ASR 的 `ko/ja/zh/en`。`extract_subtitles(language=...)` 只是结果元数据，不会重建引擎；识别语言在 `OCR(language=...)` 时选择。`read_image` 接受本地图片路径或 OpenCV 的 BGR ndarray，返回不可变 `TextRegion(text, confidence, polygon)`，坐标是输入图片上的像素。置信度来自引擎，不代表真值。
+
+视频裁剪与遮罩用相对**完整画面**的 `(左, 上, 右, 下)` 比例，范围 0–1；遮罩先涂黑再送 OCR。PyAV 顺序解码，使用实际帧时间戳，区间外帧跳过识别；SRT 使用整片的绝对时间。相邻采样文字完全一致才合并，空白采样会切断；时间误差约为采样间隔，末帧结束仍参考容器平均 FPS。默认全幅识别，字幕区域已知时请传 `crop`，否则物品文字/Logo 可能进入结果。解码提前失败不会假装整片成功；回调可用于进度展示，`cancelled=lambda: ...` 在帧间协作取消，但不能打断正在执行的原生单次推理/下载。
+
+这是**基础抽帧 OCR**，不等同网页稳定 OCR 3.0 的轨迹精修、LLM 去噪、逐字字幕恢复、边界校准，更不会自动调用 LLM。网页 OCR/ASR 及实验 Agent 代码不迁入工具包，本轮不改变它们。CPU 默认 `enable_mkldnn=False`，避免部分 Paddle/oneDNN 组合的推理兼容问题；你验证过环境后可显式打开优化。
+
+离线 OCR 可以复用先前下载到 `cache_dir` 的两套模型，也可以指定已有的本地模型目录。为兼容上游版本，在启动 Python 前禁用 Paddle 的联网探测：
+
+```bash
+# 启动 Python 前设置；工具包不会悄悄修改进程的全局环境。
+export PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
+```
+
+```python
+from reibosub import OCR
+
+reader = OCR(
+    language="korean", cache_dir="./models/ocr", local_files_only=True,
+)
+reader.read_image("frame.png")  # 缓存缺失直接报错，不下载
+
+# 或者使用已有的完整模型目录，优先级高于缓存：
+local = OCR(
+    language="korean", device="cpu", local_files_only=True,
+    detection_model_dir="./models/detection",
+    recognition_model_dir="./models/korean-recognition",
+    # 自训练模型还可传 detection_model_name / recognition_model_name。
+)
+local.read_image("frame.png")
+```
+
+每个显式目录至少需要 `inference.pdiparams` 和 `inference.json` 或 `inference.pdmodel`；还应保留原下载中的配置文件，模型名称/配置必须与上游 PaddleOCR 匹配。显式目录缺文件、未关闭上游联网探测时，会在导入运行库前拒绝启动；缓存模式要先解析语言/模型名称，再查本地快照，缺失时报 `ModelUnavailableError`，不会下载。工具包不会自行寻找网页模型或把不完整的显式目录降级为在线下载。
+
+### 自定义识别后端
+
+```python
+from reibosub import ASR, OCR, Cue, Subtitle, TextRegion
+
+class MySpeechBackend:
+    def transcribe(self, source, *, language, on_progress, cancelled):
+        # 对接你自己的模型/API；协作处理取消和进度，不读取网页密钥。
+        return Subtitle((Cue(1, 0.1, 1.8, "Hello"),), language=language)
+
+class MyImageBackend:
+    def recognize(self, image):
+        return (TextRegion("Hello", 0.9, ((0, 0), (80, 0), (80, 24), (0, 24))),)
+
+speech = ASR(backend=MySpeechBackend())
+images = OCR(backend=MyImageBackend())
+```
+
+对应结构化协议为 `ASRBackend` 和 `OCRBackend`。自定义后端无需安装默认引擎；视频解码仍需 `video`。远程识别的上传、收费、认证、缓存与隐私由后端自己明确实现，不自动切服务商。错误类型：缺依赖 `MissingDependencyError`，模型加载失败 `ModelUnavailableError`，推理/结果格式异常 `RecognitionError`，取消 `OperationCancelled`。内置错误不回显上游异常正文，避免泄露下载凭据；需要排查时检查引擎自身日志。
 
 ## 统一数据结构
 

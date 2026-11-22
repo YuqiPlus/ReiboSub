@@ -26,7 +26,8 @@ reibosub script input.srt simplified.srt --to simplified
 开发仓库内的工具包：`python -m pip install -e "./packages/subtitles[dev]"`。
 开发网页：`python -m pip install -e ./packages/subtitles -e ".[web,dev]"`。
 完整 CPU 安装仍用 `requirements.txt`；GPU 仍用 `requirements-gpu-cu126.txt` 并单独安装 GPU Paddle。
-`translate/download/video/ocr/ocr-cpu/asr/diarization/web/all-cpu` 选装组属于根目录网页项目；独立工具包只保留轻量依赖和开发测试依赖。
+根目录的 `translate/download/video/ocr/ocr-cpu/asr/diarization/web/all-cpu` 选装组配置网页项目；独立工具包默认仍只有轻量依赖。当前**未发布源码**另有 `asr/ocr/ocr-cpu/video` 可选 Python 接口，首次识别才加载或下载模型，尚不在 PyPI 0.1.1 中，见[工具包说明](packages/subtitles/README.md#optional-ocr-and-asr-unreleased-source)。它们不是网页 OCR 3.0、ASR 2.2 或实验 Agent 的完整移植。
+安装路径与模型路径是两回事：OCR/ASR 均支持可选 `cache_dir`，不填时使用标准用户缓存，首次下载、之后复用；CPU 和 CUDA 安装说明已分开。源码用户/开发者才需要安装源码目录，后续正式包用户直接按包名选功能即可。网页缓存与运行环境不随工具包改动。
 
 网页的依赖检测命令：
 
@@ -121,7 +122,7 @@ python -m pip install -U pip
 python -m pip install -r requirements.txt
 ```
 
-只处理现有字幕时安装工具包：`python -m pip install -e ./packages/subtitles`。网页开发同时安装两个本地产品：`python -m pip install -e ./packages/subtitles -e ".[web]"`；根目录的 `.[download]`、`.[ocr-cpu]`、`.[asr]` 和 `.[dev]` 都归网页项目。独立工具包不安装 OCR/ASR 框架。
+只处理现有字幕时安装工具包：`python -m pip install -e ./packages/subtitles`。网页开发同时安装两个本地产品：`python -m pip install -e ./packages/subtitles -e ".[web]"`；根目录的 `.[download]`、`.[ocr-cpu]`、`.[asr]` 和 `.[dev]` 都归网页项目。独立工具包默认不安装 OCR/ASR 框架，需要时从工具包目录显式选装。
 
 `yt-dlp[default]` 会一并安装 YouTube JS 解题组件；项目会启用 `PATH` 中的 Node.js。只有 Node、没有解题组件，或使用过旧的 Node，都可能出现“能打开视频但下载失败”。要求依据见 [yt-dlp EJS 官方说明](https://github.com/yt-dlp/yt-dlp/wiki/EJS)。
 

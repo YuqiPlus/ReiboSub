@@ -26,7 +26,8 @@ reibosub script input.srt simplified.srt --to simplified
 Develop the library with `python -m pip install -e "./packages/subtitles[dev]"`.
 Develop the website with `python -m pip install -e ./packages/subtitles -e ".[web,dev]"`.
 The complete CPU starter remains `requirements.txt`; GPU deployments use `requirements-gpu-cu126.txt` plus a separately selected GPU Paddle engine.
-Recognition/download extras (`translate/download/video/ocr/ocr-cpu/asr/diarization/web/all-cpu`) belong to the root web project. The library has lightweight runtime dependencies and a dev extra only.
+Root extras (`translate/download/video/ocr/ocr-cpu/asr/diarization/web/all-cpu`) configure the web application. The library's default dependencies stay lightweight; current **unreleased source** additionally offers independent `asr/ocr/ocr-cpu/video` Python interfaces with lazy model loading. These are not in PyPI 0.1.1 yet; see [the toolkit guide](packages/subtitles/README.md#optional-ocr-and-asr-unreleased-source). Web recognition/Agent versions remain separate.
+OCR/ASR model storage is separate from package installation: both accept optional `cache_dir`, default to the standard user cache and reuse downloaded weights. Source paths in `pip install` are for source users/developers; future package users will select extras by package name. CPU and CUDA instructions are separated in the toolkit guide; the website's cache and environment are unchanged.
 
 Website diagnosis and explicit setup:
 
@@ -118,7 +119,7 @@ python -m pip install -U pip
 python -m pip install -r requirements.txt
 ```
 
-For existing subtitles only, install the library with `python -m pip install -e ./packages/subtitles`. For the website, install both local products with `python -m pip install -e ./packages/subtitles -e ".[web]"`; root extras `.[download]`, `.[ocr-cpu]`, `.[asr]` and `.[dev]` belong to the web project. The standalone toolkit installs none of the OCR/ASR frameworks.
+For existing subtitles only, install the library with `python -m pip install -e ./packages/subtitles`. For the website, install both local products with `python -m pip install -e ./packages/subtitles -e ".[web]"`; root extras `.[download]`, `.[ocr-cpu]`, `.[asr]` and `.[dev]` belong to the web project. The standalone toolkit's default install includes no OCR/ASR frameworks; its separate recognition extras are opt-in.
 
 The `yt-dlp[default]` dependency includes YouTube JS challenge components. ReiboSub enables Node from `PATH`; an old Node runtime or missing challenge components can break downloads even when a browser can play the video. See the [official yt-dlp EJS guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS).
 
