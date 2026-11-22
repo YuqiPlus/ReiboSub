@@ -27,3 +27,11 @@ class OperationCancelled(ReiboSubError):
 
 class DependencyInstallError(ReiboSubError):
     """An explicitly requested dependency install was unsafe or unsuccessful."""
+
+
+class RecognitionError(ReiboSubError):
+    """A recognition backend failed or returned malformed results."""
+
+
+class ModelUnavailableError(RecognitionError):
+    """Model initialization failed; local files, network or hardware need attention."""

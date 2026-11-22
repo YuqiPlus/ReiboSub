@@ -8,15 +8,16 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 
-from reibosub import Cue, Subtitle, check_feature, convert, translate
+from reibosub import ASR, OCR, Cue, Subtitle, check_feature, convert, translate
 
 
 def main() -> None:
     import reibosub
     assert "site-packages" in str(Path(reibosub.__file__).resolve())
     assert check_feature("core").ready
-    assert not {"numpy", "paddle", "paddleocr", "faster_whisper", "torch", "cv2"} & sys.modules.keys()
-    for module in ("numpy", "paddleocr", "faster_whisper", "cv2"):
+    ASR(); OCR()  # Constructing optional clients must remain lightweight.
+    assert not {"numpy", "paddle", "paddleocr", "faster_whisper", "torch", "cv2", "huggingface_hub"} & sys.modules.keys()
+    for module in ("numpy", "paddleocr", "faster_whisper", "cv2", "huggingface_hub"):
         assert importlib.util.find_spec(module) is None, f"Default install unexpectedly contains {module}"
     assert not any(name.startswith("video_translate") for name in sys.modules)
     assert importlib.util.find_spec("video_translate") is None, "PyPI toolkit must not contain the web application"

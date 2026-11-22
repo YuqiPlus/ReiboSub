@@ -82,7 +82,22 @@ def test_missing_core_files_are_rejected(tmp_path):
 def test_website_dependency_cannot_leak_into_toolkit_metadata(tmp_path):
     data = files(True)
     data[f"reibosub-{VERSION}.dist-info/METADATA"] = INFO.replace(b"\n\n", b"\nRequires-Dist: paddleocr>=3\n\n")
-    with pytest.raises(ValueError, match="Application dependency"):
+    with pytest.raises(ValueError, match="approved optional extra"):
+        audit.inspect_archive(archive(tmp_path, data), version=VERSION)
+
+
+@pytest.mark.parametrize('name,extra', [('faster-whisper', 'asr'), ('paddleocr', 'ocr'), ('paddleocr', 'ocr-cpu'), ('paddlepaddle', 'ocr-cpu'), ('av', 'video'), ('numpy', 'video')])
+def test_recognition_dependencies_must_be_explicit_extras(tmp_path, name, extra):
+    data = files(True)
+    data[f"reibosub-{VERSION}.dist-info/METADATA"] = INFO.replace(b'\n\n', f'\nProvides-Extra: {extra}\nRequires-Dist: {name}; extra == "{extra}"\n\n'.encode())
+    assert audit.inspect_archive(archive(tmp_path, data), version=VERSION) == 5
+
+
+@pytest.mark.parametrize('marker', ['', '; extra == "dev"', '; extra == "asr" or python_version > "3.0"'])
+def test_recognition_cannot_become_a_default_dependency(tmp_path, marker):
+    data = files(True)
+    data[f"reibosub-{VERSION}.dist-info/METADATA"] = INFO.replace(b'\n\n', f'\nRequires-Dist: faster-whisper{marker}\n\n'.encode())
+    with pytest.raises(ValueError, match='approved optional extra'):
         audit.inspect_archive(archive(tmp_path, data), version=VERSION)
 
 

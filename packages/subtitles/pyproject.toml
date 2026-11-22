@@ -18,6 +18,10 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+asr = ["faster-whisper>=1.1,<2"]
+ocr = ["paddleocr>=3.1,<4"]
+ocr-cpu = ["paddleocr>=3.1,<4", "paddlepaddle>=3.1,<4"]
+video = ["av>=12,<19", "numpy>=1.26,<3"]
 dev = ["pytest>=8,<10", "tomli>=2; python_version < '3.11'"]
 
 [project.scripts]

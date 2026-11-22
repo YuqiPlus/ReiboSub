@@ -26,11 +26,22 @@ def env(monkeypatch, tmp_path):
     return versions
 
 
-def test_only_toolkit_feature_is_public(env):
-    assert deps.FEATURES == ('core',)
-    for feature in ('web', 'ocr', 'asr', 'download'):
+def test_only_toolkit_features_are_public(env):
+    assert deps.FEATURES == ('core', 'asr', 'ocr', 'ocr-cpu', 'video')
+    for feature in ('web', 'download', 'database'):
         with pytest.raises(ValidationError):
             deps.check_feature(feature)
+
+
+def test_optional_framework_install_is_never_implicit(env, monkeypatch):
+    def status(feature):
+        return deps.FeatureStatus(feature, ('faster-whisper>=1.1,<2',), ('faster-whisper>=1.1,<2',), ('faster_whisper',), ())
+    monkeypatch.setattr(deps, 'check_feature', status)
+    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: pytest.fail('unexpected install'))
+    with pytest.raises(MissingDependencyError, match='reibosub\\[asr\\]'):
+        deps.ensure_feature('asr')
+    with pytest.raises(DependencyInstallError, match='explicitly before runtime'):
+        deps.ensure_feature('asr', install=True)
 
 
 def test_diagnostics_never_install(env, monkeypatch):

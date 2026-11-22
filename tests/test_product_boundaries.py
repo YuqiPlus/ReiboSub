@@ -24,7 +24,7 @@ def test_two_independent_products_and_one_way_dependency():
     assert 'reibosub>=0.1.0,<0.2' in web['project']['dependencies']
     assert web['tool']['setuptools']['packages']['find']['include'] == ['video_translate*']
     assert lib['tool']['setuptools']['packages']['find']['where'] == ['src']
-    assert set(lib['project']['optional-dependencies']) == {'dev'}
+    assert set(lib['project']['optional-dependencies']) == {'dev', 'asr', 'ocr', 'ocr-cpu', 'video'}
     assert set(lib['project']['scripts']) == {'reibosub'}
     assert lib['tool']['pytest']['ini_options']['testpaths'] == ['tests']
     assert (TOOLKIT / 'README.md').exists() and (TOOLKIT / 'tests').is_dir()

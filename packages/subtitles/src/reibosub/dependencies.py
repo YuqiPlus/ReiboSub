@@ -26,7 +26,13 @@ class _Feature:
     tools: tuple[str, ...] = ()
 
 
-_FEATURES = {"core": _Feature(None, ("opencc", "packaging"))}
+_FEATURES = {
+    "core": _Feature(None, ("opencc", "packaging")),
+    "asr": _Feature("asr", ("faster_whisper",)),
+    "ocr": _Feature("ocr", ("paddleocr", "paddle")),
+    "ocr-cpu": _Feature("ocr-cpu", ("paddleocr", "paddle")),
+    "video": _Feature("video", ("av", "numpy")),
+}
 FEATURES = tuple(_FEATURES)
 _INSTALL_LOCK = threading.Lock()
 
@@ -125,7 +131,12 @@ def check_feature(feature: str = "core") -> FeatureStatus:
     modules = tuple(name for name in descriptor.modules if not _module_available(name))
     tools = ()
     manual, conflicts = [], []
-    notes = ("Toolkit diagnostics only; OCR/ASR and website setup belong to the separate web application.",)
+    notes = ("Toolkit diagnostics never load/download models or change the environment. Website setup remains separate.",)
+    if feature in {"ocr", "ocr-cpu"}:
+        if feature == "ocr" and not _module_available("paddle"):
+            manual.append('Select a Paddle engine explicitly: CPU via reibosub[ocr-cpu], or a GPU wheel matching your CUDA runtime')
+        if _installed("paddlepaddle") and _installed("paddlepaddle-gpu"):
+            conflicts.append("Both CPU and GPU Paddle distributions are installed; repair in a separate environment")
     return FeatureStatus(feature, requirements, tuple(missing), modules, tools, tuple(manual), tuple(conflicts), notes)
 
 
@@ -144,7 +155,10 @@ def _failure_message(status: FeatureStatus) -> str:
     if status.missing_modules:
         parts.append("Unavailable imports: " + ", ".join(status.missing_modules))
     parts.extend(status.conflicts + status.manual_steps)
-    parts.append(f"Inspect with: reibosub doctor {status.feature}; opt in with: reibosub setup {status.feature} --yes")
+    if status.feature == "core":
+        parts.append("Inspect with: reibosub doctor core; opt in with: reibosub setup core --yes")
+    else:
+        parts.append(f'Install explicitly in an independent environment: python -m pip install "reibosub[{status.feature}]"')
     return " ".join(parts)
 
 
@@ -159,6 +173,8 @@ def ensure_feature(feature: str = "core", *, install: bool = False) -> FeatureSt
         return status
     if not install:
         raise MissingDependencyError(_failure_message(status))
+    if feature != "core":
+        raise DependencyInstallError("Recognition/media dependencies must be installed explicitly before runtime; no packages were installed. " + _failure_message(status))
     if status.conflicts or status.missing_external:
         raise DependencyInstallError(_failure_message(status))
     if not status.missing_requirements:

@@ -53,9 +53,17 @@ def check_member(name: str, data: bytes, *, wheel: bool, version: str) -> None:
             raise ValueError("Local database extra entered release metadata")
         for requirement in meta.get_all("Requires-Dist") or []:
             name = re.split(r"[<>=!~;\[\s]", requirement, maxsplit=1)[0].lower()
-            if name not in {"opencc-python-reimplemented", "packaging", "pytest", "tomli"}:
+            optional = {
+                "faster-whisper": {"asr"}, "paddleocr": {"ocr", "ocr-cpu"},
+                "paddlepaddle": {"ocr-cpu"}, "av": {"video"}, "numpy": {"video"},
+            }
+            if name in optional:
+                marker = re.search(r';\s*extra\s*==\s*[\"\']([\w-]+)[\"\']\s*$', requirement)
+                if marker is None or marker.group(1) not in optional[name]:
+                    raise ValueError("Recognition dependency must be gated by its approved optional extra")
+            elif name not in {"opencc-python-reimplemented", "packaging", "pytest", "tomli"}:
                 raise ValueError("Application dependency entered toolkit metadata")
-        if set(meta.get_all("Provides-Extra") or []) - {"dev"}:
+        if set(meta.get_all("Provides-Extra") or []) - {"dev", "asr", "ocr", "ocr-cpu", "video"}:
             raise ValueError("Application extra entered toolkit metadata")
         if meta["License-Expression"] != "Apache-2.0":
             raise ValueError("Missing Apache-2.0 license expression")
