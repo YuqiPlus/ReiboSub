@@ -16,22 +16,22 @@
 
 ## 流程
 
-1. 以 **0.1.1** 为例：同步修改 `packages/subtitles/pyproject.toml` 的 `version`、`packages/subtitles/src/reibosub/__init__.py` 的 `__version__` 和根目录源码兼容入口 `reibosub/__init__.py` 的工具包版本，更新文档后提交推送公开代码；不能夹带本地配置或存储迁移。根目录 `pyproject.toml` 是网页版本，不必跟着修改。网页可以独立修改，不必发 PyPI。
+1. 以 **0.1.2** 为例：同步修改 `packages/subtitles/pyproject.toml` 的 `version`、`packages/subtitles/src/reibosub/__init__.py` 的 `__version__` 和根目录源码兼容入口 `reibosub/__init__.py` 的工具包版本，更新文档后提交推送公开代码；不能夹带本地配置或存储迁移。根目录 `pyproject.toml` 是网页版本，不必跟着修改。网页可以独立修改，不必发 PyPI。
 2. 在干净副本执行 `python -m build packages/subtitles --outdir dist`、`python -m twine check --strict dist/*`、`python scripts/check_distribution.py dist`，安装 wheel 和源码包测试。
 3. 普通 main 推送和 `v*` 标签推送都不会发布；在 GitHub Actions 手动运行默认只构建和测试，不上传。只有明确的 `publish/v*` 专用标签推送，或手动指定 `publish=true` 才会发布。
-4. 确认全部检查后创建与新版本一致的标签，例如 `git tag -a v0.1.1 -m "ReiboSub 0.1.1"`，再执行 `git push origin v0.1.1`。不要重新创建或移动已发布的 `v0.1.0`。
+4. 确认全部检查后创建与新版本一致的标签，例如 `git tag -a v0.1.2 -m "ReiboSub 0.1.2"`，再执行 `git push origin v0.1.2`。不要重新创建或移动已发布的 `v0.1.0`、`v0.1.1`。
 5. 明确决定发布后，手动选择新版本标签运行流程，并将 `publish` 设为 true；必须从与包版本一致的标签运行。Python 3.10–3.13 独立安装、离线功能和 API 测试通过后，独立发布任务通过 OIDC 上传。构建任务没有 PyPI 身份权限，发布任务不执行仓库构建脚本。
-6. 查看 Actions 和 PyPI 上的版本，另建干净环境从官方索引安装 `python -m pip install --index-url https://pypi.org/simple reibosub==0.1.1` 验证。若环境要求审批，先由维护者批准。
+6. 查看 Actions 和 PyPI 上的版本，另建干净环境从官方索引安装 `python -m pip install --index-url https://pypi.org/simple reibosub==0.1.2` 验证。若环境要求审批，先由维护者批准。
 
 GitHub 页面操作：打开仓库 **Actions → Check or publish subtitle toolkit → Run workflow**。
-只检查时选择 main，保持 `publish` 为 false；正式发布选择新版本标签（如 `v0.1.1`），
+只检查时选择 main，保持 `publish` 为 false；正式发布选择新版本标签（如 `v0.1.2`），
 将 `publish` 设为 true。流程会检查两处版本与标签是否一致；在 main 上请求发布会明确失败。
-这份说明使用 0.1.1 举例。每次发布都必须使用未发布过的新版本，不能覆盖原有包。
+这份说明使用 0.1.2 举例。每次发布都必须使用未发布过的新版本，不能覆盖原有包。
 
 若网页下拉框不显示标签，可在已登录 GitHub CLI、具有仓库写权限的终端执行：
 
 ```bash
-gh workflow run publish.yml --repo YuqiPlus/ReiboSub --ref v0.1.1 -F publish=true
+gh workflow run publish.yml --repo YuqiPlus/ReiboSub --ref v0.1.2 -F publish=true
 ```
 
 未准备正式发布时不要执行该命令。使用的是现有 PyPI 可信发布授权，不需要把
@@ -43,8 +43,8 @@ PyPI Token 放入仓库或聊天。只想预检可用 `--ref main -F publish=fal
 同一提交的发布标签。下列最后一条命令会真正触发 PyPI 发布，不是普通备份：
 
 ```bash
-git tag -a publish/v0.1.1 v0.1.1^{} -m "Publish ReiboSub 0.1.1 to PyPI"
-git push origin publish/v0.1.1
+git tag -a publish/v0.1.2 v0.1.2^{} -m "Publish ReiboSub 0.1.2 to PyPI"
+git push origin publish/v0.1.2
 ```
 
 这条路径仍使用同一个 `publish.yml`、隔离构建、Python 3.10–3.13 安装测试及

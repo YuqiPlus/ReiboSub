@@ -1,7 +1,7 @@
 [project]
 name = "reibosub"
-version = "0.1.1"
-description = "Independent subtitle I/O, format and Chinese script conversion, and pluggable translation."
+version = "0.1.2"
+description = "Independent subtitle tools, pluggable translation, and optional lazy OCR/ASR interfaces."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

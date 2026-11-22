@@ -1,7 +1,8 @@
 # ReiboSub
 
 A lightweight Python subtitle toolkit with read/write, format conversion, Chinese
-Simplified/Traditional conversion, and pluggable, timing-locked LLM translation.
+Simplified/Traditional conversion, pluggable timing-locked LLM translation,
+and optional lazy OCR/ASR interfaces.
 Python 3.10+ · Apache-2.0 · early 0.x API.
 
 ## Install
@@ -75,7 +76,7 @@ reibosub setup core --dry-run
 ```
 
 Website and download extras belong to the root `reibosub-web` source project.
-The unreleased source also provides independent recognition extras described
+Version 0.1.2 also provides independent recognition extras described
 below. These do not install or run the website. See the [web guide](https://github.com/YuqiPlus/ReiboSub/blob/main/docs/web-application.md).
 
 Version **0.1.1** is the first toolkit-only distribution. It retains the subtitle
@@ -87,19 +88,18 @@ a running website; test the package in its own environment first.
 
 [API and extensions](https://github.com/YuqiPlus/ReiboSub/blob/main/packages/subtitles/docs/python-api.md) · [Examples](https://github.com/YuqiPlus/ReiboSub/tree/main/packages/subtitles/examples/python_api)
 
-## Optional OCR and ASR (unreleased source)
+## Optional OCR and ASR
 
-**Not included in the published 0.1.1 release yet.** The package-user commands
-below are for a future recognition-enabled release, not today's 0.1.1:
+**Available starting with 0.1.2.** Ordinary package users do not need to clone
+the repository or know its internal source directory:
 
 ```bash
-# After that release: ordinary users do not need to clone the repository.
-python -m pip install "reibosub[asr]"
-python -m pip install "reibosub[ocr-cpu,video]" # CPU
-python -m pip install "reibosub[ocr,video]"     # CUDA: separately install matching GPU Paddle
+python -m pip install "reibosub[asr]>=0.1.2,<0.2"
+python -m pip install "reibosub[ocr-cpu,video]>=0.1.2,<0.2" # CPU
+python -m pip install "reibosub[ocr,video]>=0.1.2,<0.2"     # CUDA: separately install matching GPU Paddle
 ```
 
-Until then, install from a current checkout in an independent environment:
+Source users/developers can instead install a checkout in an independent environment:
 
 ```bash
 # From the repository root, regular source installation:

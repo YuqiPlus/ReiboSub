@@ -15,7 +15,7 @@ from .ocr import OCR, PaddleOCRBackend
 from .recognition import ASRBackend, OCRBackend, TextRegion
 from .errors import RecognitionError, ModelUnavailableError
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
     "Cue", "Subtitle", "SubtitleIssue", "Progress", "load", "save", "convert", "convert_text",

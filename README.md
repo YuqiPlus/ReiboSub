@@ -26,7 +26,7 @@ reibosub script input.srt simplified.srt --to simplified
 Develop the library with `python -m pip install -e "./packages/subtitles[dev]"`.
 Develop the website with `python -m pip install -e ./packages/subtitles -e ".[web,dev]"`.
 The complete CPU starter remains `requirements.txt`; GPU deployments use `requirements-gpu-cu126.txt` plus a separately selected GPU Paddle engine.
-Root extras (`translate/download/video/ocr/ocr-cpu/asr/diarization/web/all-cpu`) configure the web application. The library's default dependencies stay lightweight; current **unreleased source** additionally offers independent `asr/ocr/ocr-cpu/video` Python interfaces with lazy model loading. These are not in PyPI 0.1.1 yet; see [the toolkit guide](packages/subtitles/README.md#optional-ocr-and-asr-unreleased-source). Web recognition/Agent versions remain separate.
+Root extras (`translate/download/video/ocr/ocr-cpu/asr/diarization/web/all-cpu`) configure the web application. The library's default dependencies stay lightweight; **0.1.2** adds independent `asr/ocr/ocr-cpu/video` Python interfaces with lazy model loading. See [the toolkit guide](packages/subtitles/README.md#optional-ocr-and-asr). Web recognition/Agent versions remain separate.
 OCR/ASR model storage is separate from package installation: both accept optional `cache_dir`, default to the standard user cache and reuse downloaded weights. Source paths in `pip install` are for source users/developers; future package users will select extras by package name. CPU and CUDA instructions are separated in the toolkit guide; the website's cache and environment are unchanged.
 
 Website diagnosis and explicit setup:

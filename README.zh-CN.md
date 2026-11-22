@@ -26,7 +26,7 @@ reibosub script input.srt simplified.srt --to simplified
 开发仓库内的工具包：`python -m pip install -e "./packages/subtitles[dev]"`。
 开发网页：`python -m pip install -e ./packages/subtitles -e ".[web,dev]"`。
 完整 CPU 安装仍用 `requirements.txt`；GPU 仍用 `requirements-gpu-cu126.txt` 并单独安装 GPU Paddle。
-根目录的 `translate/download/video/ocr/ocr-cpu/asr/diarization/web/all-cpu` 选装组配置网页项目；独立工具包默认仍只有轻量依赖。当前**未发布源码**另有 `asr/ocr/ocr-cpu/video` 可选 Python 接口，首次识别才加载或下载模型，尚不在 PyPI 0.1.1 中，见[工具包说明](packages/subtitles/README.md#optional-ocr-and-asr-unreleased-source)。它们不是网页 OCR 3.0、ASR 2.2 或实验 Agent 的完整移植。
+根目录的 `translate/download/video/ocr/ocr-cpu/asr/diarization/web/all-cpu` 选装组配置网页项目；独立工具包默认仍只有轻量依赖。**0.1.2** 新增 `asr/ocr/ocr-cpu/video` 可选 Python 接口，首次识别才加载或下载模型，见[工具包说明](packages/subtitles/README.md#optional-ocr-and-asr)。它们不是网页 OCR 3.0、ASR 2.2 或实验 Agent 的完整移植。
 安装路径与模型路径是两回事：OCR/ASR 均支持可选 `cache_dir`，不填时使用标准用户缓存，首次下载、之后复用；CPU 和 CUDA 安装说明已分开。源码用户/开发者才需要安装源码目录，后续正式包用户直接按包名选功能即可。网页缓存与运行环境不随工具包改动。
 
 网页的依赖检测命令：

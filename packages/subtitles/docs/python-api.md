@@ -1,4 +1,4 @@
-# ReiboSub 编程 API（独立工具包，含未发布识别接口）
+# ReiboSub 编程 API（0.1.2 独立工具包）
 
 `reibosub` 是新增的公开 Python 入口。它不要求网页运行，不创建 Agent 工程，不访问项目数据库，也不自动读取 `.env`、服务商配置或网页密钥。现有 `video_translate`、网页和旧命令行继续保持原来的调用方式，本轮没有迁移或替换它们。
 
@@ -32,22 +32,21 @@ ensure_feature("core")
 # ensure_feature("core", install=True)  # 仅在独立环境中明确授权补齐轻量依赖
 ```
 
-已发布 0.1.1 只诊断 `core`；当前未发布源码新增 `asr/ocr/ocr-cpu/video` 诊断，不导入识别库、不下载模型。识别依赖必须提前显式选装，`ensure_feature(..., install=True)` 不会为这些功能运行 pip；只有 `core` 支持上述轻量修复。网页和下载的依赖管理仍属于[网页应用](../../../docs/web-application.md)。简繁转换仍支持显式 `install_missing=True`；默认不改环境。安装只使用当前解释器的 pip 子进程，要求虚拟环境、环境内锁，拒绝已加载识别库的进程；错误不回显私有索引凭据。不要修改运行中网站使用的环境。源码更新后需重新安装，让元数据与代码一致。
+0.1.2 新增 `asr/ocr/ocr-cpu/video` 诊断，不导入识别库、不下载模型；0.1.1 的诊断范围仍只有 `core`。识别依赖必须提前显式选装，`ensure_feature(..., install=True)` 不会为这些功能运行 pip；只有 `core` 支持上述轻量修复。网页和下载的依赖管理仍属于[网页应用](../../../docs/web-application.md)。简繁转换仍支持显式 `install_missing=True`；默认不改环境。安装只使用当前解释器的 pip 子进程，要求虚拟环境、环境内锁，拒绝已加载识别库的进程；错误不回显私有索引凭据。不要修改运行中网站使用的环境。源码更新后需重新安装，让元数据与代码一致。
 
-## OCR 与 ASR：可选识别接口（尚未发布）
+## OCR 与 ASR：可选识别接口（0.1.2 起）
 
-以下新增接口只在当前源码中提供，**已发布的 0.1.1 没有这些接口或选装组**。不要在运行网站的环境中重新安装；先建独立虚拟环境。
+以下新增接口从 **0.1.2** 起提供；0.1.1 没有这些接口或选装组。不要在运行网站的环境中重新安装；先建独立虚拟环境。
 
-普通用户在后续识别功能正式发布后，不需要克隆仓库，也不需要填写源码路径，安装方式将是：
+普通用户不需要克隆仓库，也不需要填写源码路径，直接按功能选装：
 
 ```bash
-# 以下选装命令要等后续版本发布，不能用于目前的 PyPI 0.1.1。
-python -m pip install "reibosub[asr]"
-python -m pip install "reibosub[ocr-cpu,video]"  # CPU
-python -m pip install "reibosub[ocr,video]"      # CUDA 引擎需要另装
+python -m pip install "reibosub[asr]>=0.1.2,<0.2"
+python -m pip install "reibosub[ocr-cpu,video]>=0.1.2,<0.2"  # CPU
+python -m pip install "reibosub[ocr,video]>=0.1.2,<0.2"      # CUDA 引擎需要另装
 ```
 
-现在要测试未发布源码，从仓库根目录安装；一般使用者不用 `-e`，二次开发者才需要可编辑安装：
+使用源码时，从仓库根目录安装；一般使用者不用 `-e`，二次开发者才需要可编辑安装：
 
 ```bash
 python -m pip install "./packages/subtitles[ocr-cpu,video]"

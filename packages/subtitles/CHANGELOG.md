@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.2 — 2026-11-22
 
 - Add optional, lazily initialized `ASR`/`FasterWhisperBackend` and
   `OCR`/`PaddleOCRBackend` Python interfaces, plus `ASRBackend`/`OCRBackend`
@@ -17,7 +17,10 @@
   developer installs in the guides; document CPU and CUDA setup independently.
 - Keep web OCR 3.0, ASR 2.2 and experimental Agents independent and unchanged.
   Runtime recognition never invokes pip or silently selects fallback models.
-- These are source-only changes, not part of the already published 0.1.1 files.
+- Default installation remains lightweight. Recognition frameworks and model
+  weights are opt-in; CPU/CUDA OCR and cached/offline loading were smoke-tested
+  in independent environments. No website runtime or storage migration is shipped.
+- Previously published 0.1.0 and 0.1.1 artifacts remain unchanged.
 
 ## 0.1.1
 
