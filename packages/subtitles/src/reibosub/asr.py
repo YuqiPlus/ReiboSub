@@ -7,7 +7,7 @@ import threading
 
 from .errors import MissingDependencyError, ModelUnavailableError, RecognitionError, ValidationError
 from .models import Cue, Progress, Subtitle
-from .recognition import ASRBackend, CancelCheck, ProgressCallback, check_cancelled, local_file
+from .recognition import ASRBackend, CancelCheck, ProgressCallback, check_cancelled, local_file, path_option
 
 
 def _model_directory(model: str, *, cache_dir: str | None, local_files_only: bool, revision: str | None) -> str:
@@ -62,8 +62,9 @@ class FasterWhisperBackend:
         if revision is not None and (not isinstance(revision, str) or not revision.strip()):
             raise ValidationError("revision must be a non-empty string or None")
         self._model_name = str(model.expanduser().absolute()) if isinstance(model, Path) else model
+        cache = path_option(cache_dir, "cache_dir")
         self._options = dict(device=device, compute_type=compute_type,
-                             download_root=str(Path(cache_dir).expanduser()) if cache_dir is not None else None,
+                             download_root=str(cache) if cache is not None else None,
                              local_files_only=local_files_only, revision=revision)
         self._beam_size, self._vad_filter = beam_size, vad_filter
         self._model = None

@@ -27,6 +27,15 @@ def local_file(source: str | Path) -> Path:
     return path
 
 
+def path_option(value: str | Path | None, name: str) -> Path | None:
+    """Anchor an optional model/cache path without creating or accessing it."""
+    if value is None:
+        return None
+    if not isinstance(value, (str, Path)) or not str(value).strip():
+        raise ValidationError(f"{name} must be a non-empty path or None")
+    return Path(value).expanduser().absolute()
+
+
 def finite(value: float, name: str, *, minimum: float = 0) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < minimum:
         raise ValidationError(f"{name} must be a finite number >= {minimum}")

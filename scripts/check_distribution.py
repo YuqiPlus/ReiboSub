@@ -56,6 +56,7 @@ def check_member(name: str, data: bytes, *, wheel: bool, version: str) -> None:
             optional = {
                 "faster-whisper": {"asr"}, "paddleocr": {"ocr", "ocr-cpu"},
                 "paddlepaddle": {"ocr-cpu"}, "av": {"video"}, "numpy": {"video"},
+                "huggingface-hub": {"ocr", "ocr-cpu"},
             }
             if name in optional:
                 marker = re.search(r';\s*extra\s*==\s*[\"\']([\w-]+)[\"\']\s*$', requirement)

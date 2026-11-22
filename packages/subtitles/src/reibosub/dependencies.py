@@ -29,8 +29,8 @@ class _Feature:
 _FEATURES = {
     "core": _Feature(None, ("opencc", "packaging")),
     "asr": _Feature("asr", ("faster_whisper",)),
-    "ocr": _Feature("ocr", ("paddleocr", "paddle")),
-    "ocr-cpu": _Feature("ocr-cpu", ("paddleocr", "paddle")),
+    "ocr": _Feature("ocr", ("paddleocr", "paddle", "huggingface_hub")),
+    "ocr-cpu": _Feature("ocr-cpu", ("paddleocr", "paddle", "huggingface_hub")),
     "video": _Feature("video", ("av", "numpy")),
 }
 FEATURES = tuple(_FEATURES)

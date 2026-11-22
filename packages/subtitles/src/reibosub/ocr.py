@@ -14,20 +14,90 @@ from typing import Any
 
 from .errors import MissingDependencyError, ModelUnavailableError, RecognitionError, ValidationError
 from .models import Cue, Progress, Subtitle
-from .recognition import CancelCheck, OCRBackend, ProgressCallback, TextRegion, check_cancelled, finite, local_file
+from .recognition import CancelCheck, OCRBackend, ProgressCallback, TextRegion, check_cancelled, finite, local_file, path_option
+
+
+def _check_model_directory(directory: Path) -> None:
+    if not directory.is_dir() or not (directory / "inference.pdiparams").is_file() or not any((directory / name).is_file() for name in ("inference.json", "inference.pdmodel")):
+        raise ModelUnavailableError("OCR model directory must contain inference.pdiparams and inference.json or inference.pdmodel")
+
+
+def _cached_model(model_name: str, cache_dir: Path | None, *, local_files_only: bool) -> Path:
+    """Use Hub's public cache/locks; never change PaddleX's process-global cache."""
+    if not isinstance(model_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", model_name):
+        raise ModelUnavailableError("Invalid official OCR model name; use an explicit local directory for custom models")
+    try:
+        hub = import_module("huggingface_hub")
+    except ImportError:
+        raise MissingDependencyError('OCR caching needs huggingface-hub; install the current reibosub[ocr] or reibosub[ocr-cpu] extra') from None
+    options = dict(repo_id=f"PaddlePaddle/{model_name}", cache_dir=str(cache_dir) if cache_dir is not None else None,
+                   # Only inference assets, never arbitrary repository code.
+                   allow_patterns=["inference.json", "inference.pdmodel", "inference.pdiparams", "inference.yml", "config.json"])
+    try:
+        try:
+            directory = hub.snapshot_download(**options, local_files_only=True)
+        except Exception as exc:
+            if local_files_only:
+                raise
+            errors = import_module("huggingface_hub.errors")
+            missing = tuple(getattr(errors, name) for name in ("LocalEntryNotFoundError", "IncompleteSnapshotError") if isinstance(getattr(errors, name, None), type))
+            if not isinstance(exc, missing):
+                raise
+            directory = None
+        if directory is not None:
+            try:
+                _check_model_directory(Path(directory))
+            except ModelUnavailableError:
+                if local_files_only:
+                    raise
+                # Old/incomplete snapshots may contain metadata but lack one
+                # of the inference assets; allow the Hub to resume them online.
+                directory = None
+        if directory is None:
+            directory = hub.snapshot_download(**options, local_files_only=False)
+        directory = Path(directory)
+        _check_model_directory(directory)
+        return directory
+    except ModelUnavailableError:
+        raise
+    except Exception:
+        raise ModelUnavailableError("Could not resolve OCR model in the selected cache. Check network/cache permissions or pre-download complete models for offline use; no fallback cache or model was selected") from None
+
+
+def _model_names(factory, options: dict) -> tuple[str, str]:
+    detection = options.get("text_detection_model_name")
+    recognition = options.get("text_recognition_model_name")
+    if detection is None or recognition is None:
+        # PaddleOCR currently exposes language selection only as this pure
+        # instance helper. Calling it without constructing a pipeline avoids
+        # unwanted default-cache downloads. Guard it to fail clearly if the
+        # upstream adapter changes; explicit names bypass the helper entirely.
+        selector = getattr(factory, "_get_ocr_model_names", None)
+        if not callable(selector):
+            raise ModelUnavailableError("This PaddleOCR version requires explicit detection_model_name and recognition_model_name for cache-controlled loading")
+        try:
+            defaults = selector(None, options["lang"], options["ocr_version"])
+            detection = detection or defaults[0]
+            recognition = recognition or defaults[1]
+        except Exception:
+            raise ModelUnavailableError("Could not select OCR models for this language/version; provide explicit detection_model_name and recognition_model_name") from None
+    if not all(isinstance(name, str) and name.strip() for name in (detection, recognition)):
+        raise ModelUnavailableError("No OCR models are available for the requested language/version")
+    return detection, recognition
 
 
 class PaddleOCRBackend:
     """PaddleOCR 3.x, with optional local detection/recognition model directories.
 
-    Default downloads/cache are owned by PaddleX, not the ReiboSub wheel.
-    Strict local mode requires both directories and disabling PaddleX's source
-    connectivity probe before process start. No global environment is changed.
+    Models are resolved via the Hugging Face cache and passed as local paths to
+    Paddle, without changing any process-global cache/environment. Missing weights
+    are downloaded only on first use. Explicit local model paths take priority.
     """
 
     def __init__(
         self, *, language: str = "korean", device: str = "cpu",
         ocr_version: str = "PP-OCRv5", local_files_only: bool = False,
+        cache_dir: str | Path | None = None,
         detection_model_dir: str | Path | None = None,
         recognition_model_dir: str | Path | None = None,
         detection_model_name: str | None = None,
@@ -46,11 +116,10 @@ class PaddleOCRBackend:
             if name is not None and (not isinstance(name, str) or not name.strip()):
                 raise ValidationError("model names must be non-empty strings or None")
         self._dirs = {
-            "text_detection_model_dir": Path(detection_model_dir).expanduser() if detection_model_dir is not None else None,
-            "text_recognition_model_dir": Path(recognition_model_dir).expanduser() if recognition_model_dir is not None else None,
+            "text_detection_model_dir": path_option(detection_model_dir, "detection_model_dir"),
+            "text_recognition_model_dir": path_option(recognition_model_dir, "recognition_model_dir"),
         }
-        if local_files_only and any(value is None for value in self._dirs.values()):
-            raise ValidationError("Offline OCR requires both detection_model_dir and recognition_model_dir")
+        self._cache_dir = path_option(cache_dir, "cache_dir")
         self._offline = local_files_only
         self._options = dict(lang=language, device=device, ocr_version=ocr_version,
                              use_doc_orientation_classify=False, use_doc_unwarping=False,
@@ -70,8 +139,7 @@ class PaddleOCRBackend:
                 if directory is not None:
                     # Reject incomplete paths before the upstream loader could
                     # fall back to downloading official model weights.
-                    if not directory.is_dir() or not (directory / "inference.pdiparams").is_file() or not any((directory / name).is_file() for name in ("inference.json", "inference.pdmodel")):
-                        raise ModelUnavailableError("OCR model directory must contain inference.pdiparams and inference.json or inference.pdmodel")
+                    _check_model_directory(directory)
             if self._offline and os.environ.get("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "").lower() not in {"true", "1"}:
                 raise ModelUnavailableError("For offline OCR, set PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True before starting Python to disable the upstream connectivity probe")
             try:
@@ -86,7 +154,16 @@ class PaddleOCRBackend:
                 index = int(device.split(":", 1)[1]) if ":" in device else 0
                 if index >= paddle.device.cuda.device_count():
                     raise ModelUnavailableError("Requested OCR GPU does not exist")
-            options = {**self._options, **{key: str(path) for key, path in self._dirs.items() if path is not None}}
+            detection, recognition = _model_names(factory, self._options)
+            directories = {
+                key: path if path is not None else _cached_model(name, self._cache_dir, local_files_only=self._offline)
+                for (key, path), name in zip(self._dirs.items(), (detection, recognition))
+            }
+            # Names are resolved above, including a partially overridden pair;
+            # do not let Paddle silently ignore language when given directories.
+            options = {key: value for key, value in self._options.items() if key not in {"lang", "ocr_version"}}
+            options.update(text_detection_model_name=detection, text_recognition_model_name=recognition)
+            options.update({key: str(path) for key, path in directories.items()})
             try:
                 self._model = factory(**options)
             except Exception:

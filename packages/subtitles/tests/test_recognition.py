@@ -194,7 +194,9 @@ def fake_paddle(monkeypatch, result=None, gpu=False):
     def factory(**kwargs):
         calls.append(kwargs)
         return model
+    factory._get_ocr_model_names = lambda _, lang, version: ('PP-OCRv5_server_det', f'{lang}_PP-OCRv5_mobile_rec')
     monkeypatch.setattr(ocr, 'import_module', lambda name: paddle if name == 'paddle' else NS(PaddleOCR=factory))
+    monkeypatch.setattr(ocr, '_cached_model', lambda name, cache_dir, **kwargs: (cache_dir or Path('/mock/user-cache')) / name)
     return calls
 
 
@@ -206,7 +208,9 @@ def test_paddle_lazy_reuse_model_options_and_regions(monkeypatch, media):
     engine.read_image(media)
     assert len(calls) == 1
     assert calls[0]['device'] == 'cpu'
-    assert calls[0]['ocr_version'] == 'PP-OCRv5'
+    assert calls[0]['text_detection_model_name'] == 'PP-OCRv5_server_det'
+    assert calls[0]['text_recognition_model_name'] == 'ch_PP-OCRv5_mobile_rec'
+    assert 'lang' not in calls[0] and 'ocr_version' not in calls[0]
     assert calls[0]['use_doc_orientation_classify'] is False
     assert calls[0]['enable_mkldnn'] is False
     engine.backend.close()
@@ -217,8 +221,7 @@ def test_paddle_lazy_reuse_model_options_and_regions(monkeypatch, media):
 
 def test_paddle_offline_fail_before_import_with_missing_models(monkeypatch, tmp_path):
     monkeypatch.setattr(ocr, 'import_module', lambda _: pytest.fail('unexpected import/download'))
-    with pytest.raises(ValidationError):
-        OCR(local_files_only=True)
+    OCR(local_files_only=True)  # Lazy construction no longer requires explicit directories.
     engine = OCR(local_files_only=True, detection_model_dir=tmp_path, recognition_model_dir=tmp_path)
     with pytest.raises(ModelUnavailableError, match='inference'):
         engine.backend.prepare()
