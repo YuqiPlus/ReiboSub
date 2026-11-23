@@ -16,6 +16,8 @@ from video_translate.youtube.download_video import (
     normalize_thumbnail_format,
     thumbnail_extension,
     thumbnail_url_from_info,
+    thumbnail_candidates,
+    download_thumbnail as save_video_thumbnail,
 )
 from video_translate.youtube.filenames import filesystem_safe_title, youtube_project_dir
 from video_translate.video_source import platform_options, video_title, video_platform, validate_video_info
@@ -46,19 +48,16 @@ def download_thumbnail(url, output_dir=DEFAULT_OUTPUT_DIR, *, proxy=DEFAULT_PROX
         info = ydl.extract_info(video_url, download=False)
         validate_video_info(info, video_url)
         thumbnail_url = thumbnail_url_from_info(info)
-        if not thumbnail_url:
+        candidates = thumbnail_candidates(info, video_url)
+        if not thumbnail_url and not candidates:
             raise RuntimeError("没有找到视频封面 URL")
-        proxies = {"http": proxy or "", "https": proxy or ""} if video_platform(video_url) == "bilibili" else ({"http": proxy, "https": proxy} if proxy else None)
-        response = requests.get(thumbnail_url, timeout=30, proxies=proxies)
-        response.raise_for_status()
-        extension = thumbnail_extension(thumbnail_url, response.headers.get("Content-Type", ""), image_format=image_format)
         title = video_title(str(info.get("title") or "youtube_video"), video_url)
         safe_title = filesystem_safe_title(title)
-        thumbnail_path = youtube_project_dir(output_dir, title) / f"{safe_title}{extension}"
-        thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
-        thumbnail_path.write_bytes(convert_thumbnail_bytes(response.content, image_format=image_format))
-        print(f"thumbnail_path: {thumbnail_path}", flush=True)
-        return thumbnail_path
+        base = youtube_project_dir(output_dir, title) / f'{safe_title}.mp4'
+        base.parent.mkdir(parents=True, exist_ok=True)
+        # An explicit empty proxy also prevents inherited proxy settings for Bilibili.
+        return save_video_thumbnail(thumbnail_url, base, proxy=proxy or '', image_format=image_format, fallback_urls=candidates,
+                                    disable_env_proxy=video_platform(video_url)=='bilibili')
 
 
 def main(argv=None):

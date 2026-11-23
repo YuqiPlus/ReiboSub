@@ -2,6 +2,12 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { assetRoleLabel, fileLabel, localModifiedLabel, filterLibraryProjects, projectMediaSummary, visibleSubtitleRows, projectMedia, preferredProjectSubtitle } from './studioTools.js'
 
+test('BCC delivery copies never replace SRT as the subtitle-editing shortcut', () => {
+  const srt = { path: '/task/zh.srt', role: 'translated', delivered_at: 1 }
+  const bcc = { path: '/task/zh.bcc', role: 'translated', delivered_at: 2 }
+  assert.equal(preferredProjectSubtitle({ subtitles: [bcc, srt] }), srt)
+})
+
 test('file labels handle both path styles without changing the original', () => {
   assert.equal(fileLabel('/example/한글 中文.srt'), '한글 中文.srt')
   assert.equal(fileLabel('C:\\example\\zh.srt'), 'zh.srt')

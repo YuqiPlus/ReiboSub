@@ -397,7 +397,11 @@ def download_video(
                     videos = [archive_video_path(path) for path in videos]
                 thumbnail = thumbnail_url_from_info(info)
                 for video_path in videos:
-                    download_thumbnail(thumbnail, video_path, proxy=ydl_opts.get("proxy"), image_format=thumbnail_format)
+                    try:
+                        download_thumbnail(thumbnail, video_path, proxy=ydl_opts.get("proxy"), image_format=thumbnail_format,
+                                           fallback_urls=thumbnail_candidates(info, video_url), disable_env_proxy=video_platform(video_url)=='bilibili')
+                    except (RuntimeError, OSError, ValueError, requests.RequestException) as exc:
+                        print(f'thumbnail_warning: 视频已保存，封面暂未取得 ({type(exc).__name__})', flush=True)
                 return videos
             except DownloadError as error:
                 last_error = error
@@ -440,18 +444,58 @@ def thumbnail_url_from_info(info):
     return str(info.get("thumbnail") or "")
 
 
-def download_thumbnail(url, video_path: Path, *, proxy="", image_format=DEFAULT_THUMBNAIL_FORMAT):
-    if not url:
+def thumbnail_candidates(info=None, video_url=''):
+    info = info if isinstance(info, dict) else {}
+    preferred = thumbnail_url_from_info(info)
+    candidates = [preferred] if preferred else []
+    from urllib.parse import urlparse
+    parsed = urlparse(video_url)
+    youtube = (parsed.hostname or '').lower() in {'youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be'}
+    if youtube:
+        from video_translate.video_source import video_id
+        key = parsed.path.strip('/').split('/')[0] if (parsed.hostname or '').lower() == 'youtu.be' else video_id(video_url)
+        if re.fullmatch(r'[A-Za-z0-9_-]{11}', key):
+            candidates.extend(f'https://i.ytimg.com/vi/{key}/{size}.jpg'
+                              for size in ('maxresdefault', 'sddefault', 'hqdefault', 'mqdefault', 'default'))
+    candidates.extend(str(item['url']) for item in reversed(info.get('thumbnails') or []) if isinstance(item, dict) and item.get('url'))
+    return list(dict.fromkeys(candidates))[:8]
+
+
+def download_thumbnail(url, video_path: Path, *, proxy="", image_format=DEFAULT_THUMBNAIL_FORMAT, fallback_urls=(), disable_env_proxy=False):
+    candidates = list(dict.fromkeys([item for item in (url, *fallback_urls) if item]))[:8]
+    if not candidates:
         return None
     image_format = normalize_thumbnail_format(image_format)
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    response = requests.get(url, timeout=30, proxies=proxies)
-    response.raise_for_status()
-    extension = thumbnail_extension(url, response.headers.get("Content-Type", ""), image_format=image_format)
-    thumbnail_path = video_path.with_suffix(extension)
-    thumbnail_path.write_bytes(convert_thumbnail_bytes(response.content, image_format=image_format))
-    print(f"thumbnail_path: {thumbnail_path}", flush=True)
-    return thumbnail_path
+    proxies = {"http": proxy or '', "https": proxy or ''} if proxy or disable_env_proxy else None
+    last_error = None
+    for index, candidate in enumerate(candidates, 1):
+        response = None
+        try:
+            response = requests.get(candidate, timeout=8, proxies=proxies)
+            response.raise_for_status()
+            with Image.open(io.BytesIO(response.content)) as image:
+                width = image.width
+                image.verify()
+            if ('maxresdefault' in candidate and width < 640) or ('sddefault' in candidate and width < 480):
+                raise ValueError('高分辨率封面返回了占位小图，尝试其他尺寸')
+            extension = thumbnail_extension(candidate, response.headers.get("Content-Type", ""), image_format=image_format)
+            thumbnail_path = video_path.with_suffix(extension)
+            content = convert_thumbnail_bytes(response.content, image_format=image_format)
+            from video_translate.subtitle.delivery import copy_delivery_file
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix='.thumbnail-', dir=video_path.parent) as folder:
+                temporary = Path(folder) / 'image'
+                temporary.write_bytes(content)
+                thumbnail_path = copy_delivery_file(temporary, thumbnail_path, version='cover')
+            print(f"thumbnail_path: {thumbnail_path}", flush=True)
+            return thumbnail_path
+        except (requests.RequestException, OSError, ValueError) as exc:
+            last_error = exc
+            print(f'thumbnail_fallback: {index}/{len(candidates)} ({type(exc).__name__})', flush=True)
+        finally:
+            if response is not None and callable(getattr(response, 'close', None)):
+                response.close()
+    raise RuntimeError('可用封面尺寸均下载失败；视频与字幕不受影响。') from last_error
 
 
 def normalize_thumbnail_format(value: str | None) -> str:

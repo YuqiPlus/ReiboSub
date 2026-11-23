@@ -155,6 +155,16 @@ test('running task keeps its immediate decision visible above the closed history
   assert.doesNotMatch(html, /中文字幕已生成/)
 })
 
+
+test('completed delivery makes server saving explicit and exposes the optional BCC', async () => {
+  const html = await render('AgentSessionPanel', { session: { id: 'done', status: 'done', payload: { agent_mode: 'autonomous' },
+    result: { translated_srt: '/safe/zh.srt', translated_bcc: '/safe/zh.bcc', input_video: '/safe/video.mp4', subtitle_library_linked: true } } })
+  assert.match(html, /字幕已自动保存并关联素材库/)
+  assert.match(html, /无需点击下载才会保存/)
+  assert.match(html, /BCC 字幕/)
+  assert.match(html, /打开素材库/)
+})
+
 test('navigation retains tools, settings and recent tasks with full accessible titles', async () => {
   const html = await render('SideNav', {
     activeView: 'glossary', items: [

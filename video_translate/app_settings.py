@@ -61,6 +61,8 @@ def save_app_settings(payload: dict[str, Any], root: Path | None = None) -> dict
         project_root = _project_root(root)
         providers = list_provider_profiles(project_root)
         provider_ids = {provider.id for provider in providers}
+        if 'delivery' not in payload:
+            payload = {**payload, 'delivery': _read_settings(project_root / APP_SETTINGS_PATH).get('delivery', {})}
         normalized = _validate_settings(payload, providers, provider_ids)
         _atomic_write_yaml(project_root / APP_SETTINGS_PATH, normalized)
         return get_app_settings_payload(project_root)
@@ -68,6 +70,13 @@ def save_app_settings(payload: dict[str, Any], root: Path | None = None) -> dict
 
 def _project_root(root: Path | None) -> Path:
     return Path(root).expanduser() if root is not None else ROOT
+
+
+def get_delivery_settings(root: Path | None = None) -> dict[str, bool]:
+    """Local-only delivery preferences; no model/provider discovery required."""
+    raw = _read_settings(_project_root(root) / APP_SETTINGS_PATH)
+    delivery = raw.get('delivery') if isinstance(raw.get('delivery'), dict) else {}
+    return {'youtube_bcc': delivery.get('youtube_bcc') is True}
 
 
 def _read_settings(path: Path) -> dict[str, Any]:
@@ -127,6 +136,7 @@ def _normalize_loaded_settings(
 
     return {
         "version": APP_SETTINGS_VERSION,
+        "delivery": {'youtube_bcc': (raw.get('delivery') or {}).get('youtube_bcc') is True} if isinstance(raw.get('delivery'), dict) else {'youtube_bcc': False},
         "defaults": {
             "source_language": _choice_or_default(
                 defaults.get("source_language"), SOURCE_LANGUAGES, "korean"
@@ -154,6 +164,9 @@ def _validate_settings(
         raise ValueError(f"设置 version 必须是 {APP_SETTINGS_VERSION}")
 
     defaults = payload.get("defaults", {})
+    delivery = payload.get('delivery', {})
+    if not isinstance(delivery, dict) or type(delivery.get('youtube_bcc', False)) is not bool:
+        raise ValueError('delivery.youtube_bcc 必须为布尔值')
     tasks = payload.get("tasks", {})
     if not isinstance(defaults, dict):
         raise ValueError("defaults 必须是对象")
@@ -202,6 +215,7 @@ def _validate_settings(
 
     return {
         "version": APP_SETTINGS_VERSION,
+        "delivery": {'youtube_bcc': delivery.get('youtube_bcc', False)},
         "defaults": {
             "source_language": source_language,
             "ocr_language": ocr_language,

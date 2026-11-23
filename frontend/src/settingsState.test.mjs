@@ -60,6 +60,14 @@ test('normalizes empty settings to Korean defaults and all task bindings', () =>
   assert.deepEqual(result.tasks.subtitle_translation, { provider_profile: '', model: '' })
 })
 
+test('delivery option survives settings edits and defaults to off', () => {
+  assert.deepEqual(normalizeSettings({}).delivery, { youtube_bcc: false })
+  const settings = normalizeSettings({ delivery: { youtube_bcc: true }, defaults: { provider_profile: 'one' } })
+  assert.deepEqual(buildSettingsPayload(settings).delivery, { youtube_bcc: true })
+  assert.deepEqual(buildSettingsPayload(useSharedTextModel(settings)).delivery, { youtube_bcc: true })
+  assert.deepEqual(applyDefaultProviderChange(settings, 'two').delivery, { youtube_bcc: true })
+})
+
 test('shared model survives saves, clears across providers and keeps vision separate on text unification', () => {
   const settings = normalizeSettings({ defaults: { provider_profile: 'one', model: 'main-model' }, tasks: {
     video_analysis: { provider_profile: 'vision', model: 'image-model' }, glossary: { model: 'custom' }, subtitle_translation: { provider_profile: 'two', model: 'other' },

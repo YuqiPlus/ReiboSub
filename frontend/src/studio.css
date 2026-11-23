@@ -127,6 +127,8 @@ summary.nav-group-title:hover { background: #eeeeee; }
 .agent-submit button:hover { background: var(--teal-dark); }
 .agent-submit button:disabled { opacity: 1; background: #e8e8e8; border-color: var(--line); color: #aaa; }
 .agent-submit .agent-operation-spinner { border-color: var(--line-strong); border-top-color: #222; margin: 0; }
+.settings-export-toggle { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+.settings-export-toggle input[type="checkbox"] { width: 18px; height: 18px; min-height: 18px; margin: 0; accent-color: var(--teal); }
 .agent-advanced-settings { margin-top: 12px; padding: 0; border: 0; background: transparent; border-radius: 0; }
 .agent-advanced-settings > summary { padding: 3px 6px; color: #757575; font-size: 12px; font-weight: 400; }
 .agent-advanced-settings[open] { padding: 12px; background: #f8f8f8; border-radius: 12px; }

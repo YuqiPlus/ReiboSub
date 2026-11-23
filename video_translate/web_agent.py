@@ -124,10 +124,8 @@ from video_translate.translate.volcengine import (
 from video_translate.utils.timecode import format_srt_time, parse_srt_time
 from video_translate.utils.text import normalize_ocr_text
 from video_translate.youtube.download_video import (
-    convert_thumbnail_bytes,
     normalize_download_container,
     normalize_exact_format_id,
-    thumbnail_extension,
     thumbnail_url_from_info,
 )
 from video_translate.youtube.filenames import filesystem_safe_title, normalize_download_format_tag
@@ -3077,9 +3075,12 @@ _AGENT_TASK_ARCHIVE_FIELDS = {
     "glossary_path",
     "translated_srt",
     "translated_sidecar",
+    "translated_bcc",
+    "source_sidecar",
+    "bcc_sidecar",
     "subtitle_path",
 }
-_AGENT_TASK_ARCHIVE_EXTENSIONS = {".srt", ".vtt", ".ass", ".ssa", ".yaml", ".yml", ".json"}
+_AGENT_TASK_ARCHIVE_EXTENSIONS = {".srt", ".vtt", ".ass", ".ssa", ".bcc", ".yaml", ".yml", ".json"}
 
 
 def _archive_agent_task_run(task_dir: Path, data: dict[str, Any]) -> Path | None:
@@ -3455,6 +3456,11 @@ def _agent_session_from_task(task: dict[str, Any]) -> AgentSession:
         result["translated_srt"] = translated_srt
     if translated_sidecar:
         result["translated_sidecar"] = translated_sidecar
+    for field in ('translated_bcc', 'bcc_export', 'subtitle_saved', 'subtitle_library_linked', 'source_sidecar',
+                  'bcc_sidecar', 'thumbnail_path', 'thumbnail_warning', 'subtitle_delivery_warning'):
+        value = _task_stage_value(task, 'translate', field)
+        if translate_done and value is not None:
+            result[field] = value
     with _LOCK:
         session.result.update(result)
         _AGENT_SESSIONS[session.id] = session
@@ -4613,10 +4619,127 @@ def _agent_wait(session_id: str, phase: str, question: dict[str, Any]) -> None:
         )
 
 
+def _ensure_delivery_thumbnail(session: AgentSession, video: Path, context: dict[str, Any]) -> dict[str, Any]:
+    existing = _matching_project_thumbnail(video.parent, str(context.get('title') or video.stem)) or _matching_thumbnail_file(video)
+    url = str(context.get('normalized_url') or session.payload.get('url') or '')
+    if not existing:
+        from video_translate.youtube.download_video import download_thumbnail, thumbnail_candidates
+        candidates = thumbnail_candidates(context.get('probe'), url)
+        if not candidates:
+            return {}
+        try:
+            options = platform_options(url, youtube_proxy=DEFAULT_PROXY)
+            existing = download_thumbnail(candidates[0], video, proxy=options.get('proxy') or '',
+                                          image_format='jpg', fallback_urls=candidates[1:],
+                                          disable_env_proxy=video_platform(url)=='bilibili')
+        except Exception as exc:
+            _agent_log(session.id, f'thumbnail_delivery_warning: {type(exc).__name__}')
+            return {'thumbnail_warning': '字幕与视频已保存；其他封面尺寸也未能下载，可稍后单独补下载封面。'}
+    if existing:
+        if url:
+            update_youtube_project_manifest(video, source_url=url, title=str(context.get('title') or video.stem), thumbnail_path=existing)
+        return {'thumbnail_path': str(existing)}
+    return {}
+
+
+def _prepare_agent_subtitle_delivery(session: AgentSession, values: dict[str, Any]) -> dict[str, Any]:
+    """Publish existing SRTs and optional format exports, without inference."""
+    result = dict(values)
+    raw = result.get('translated_srt')
+    if not raw:
+        return result
+    source = Path(raw).expanduser().resolve()
+    _ensure_under_root(source)
+    if not source.is_file():
+        return result
+    result['subtitle_saved'] = True
+    video = _agent_input_video_path(session)
+    if video:
+        result.update(input_video=str(video), project_dir=str(video.parent), subtitle_library_linked=True)
+    context = {**session.result, **result}
+    draft=context.get('completion_status') in {'completed_with_issues','completed_manually'}
+    if draft:
+        for key in ('completion_status','review_passed','human_review_completed','manual_reviewed_cue_ids','skipped_cue_ids','original_source_srt','unresolved_cue_ids','unresolved_issues','quality_warning','completion_report'):
+            if key in context:result[key]=context[key]
+    origin = context.get('source_type') or context.get('probe', {}).get('source_type')
+    url = str(context.get('normalized_url') or session.payload.get('url') or '')
+    if not origin and url:
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or '').lower()
+        if host in {'youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be'}:
+            origin = 'youtube'
+    result.update(translated_bcc='', bcc_export={'status': 'not_requested'})
+    if origin == 'youtube':
+        try:
+            from video_translate.app_settings import get_delivery_settings
+            if get_delivery_settings(ROOT)['youtube_bcc']:
+                from video_translate.subtitle.delivery import export_bcc
+                result['translated_bcc'] = str(export_bcc(source))
+                result['bcc_export'] = {'status': 'done'}
+        except Exception as exc:
+            result['bcc_export'] = {'status': 'failed', 'message': '自动 BCC 转换未完成，SRT 已保留；可在工具箱重试格式转换。'}
+            _agent_log(session.id, f'bcc_export_failed: {type(exc).__name__}')
+    if video:
+        from video_translate.subtitle.delivery import copy_delivery_file
+        language = target_language_code(session.payload.get('target_language'))
+        source_code = {'korean':'ko', 'japanese':'ja', 'english':'en', 'chinese':'zh'}.get(_session_source_language(session), 'source')
+        suffix='.draft' if draft else ''
+        files = [('translated_sidecar', source, video.with_name(f'{video.stem}.{language}{suffix}.srt'))]
+        original = result.get('source_srt') or session.result.get('source_srt')
+        if original and Path(original).is_file() and Path(original).resolve()!=source:
+            _ensure_under_root(Path(original).resolve())
+            files.append(('source_sidecar', Path(original), video.with_name(f'{video.stem}.source.{source_code}{suffix}.srt')))
+        if result.get('translated_bcc'):
+            files.append(('bcc_sidecar', Path(result['translated_bcc']), video.with_name(f'{video.stem}.{language}{suffix}.bcc')))
+        for key, original, destination in files:
+            try:
+                result[key] = str(copy_delivery_file(original, destination, version=session.id))
+                if key == 'translated_sidecar':
+                    result['translated_sidecar_warning'] = ''
+            except (OSError, ValueError) as exc:
+                result['subtitle_delivery_warning'] = '任务中的字幕已保留，但部分视频目录副本未能保存，请查看任务文件。'
+                _agent_log(session.id, f'subtitle_copy_warning: {key} {type(exc).__name__}')
+        result.update(_ensure_delivery_thumbnail(session, video, context))
+        from video_translate.project_manifest import load_project_manifest
+        manifest = load_project_manifest(video.parent)
+        delivery={key:result[key] for key in ('source_sidecar','translated_sidecar','bcc_sidecar','thumbnail_path') if result.get(key)}
+        delivery.update(task_id=session.result.get('task_id',''),session_id=session.id)
+        if draft:delivery.update(completion_status=result['completion_status'],review_passed=False,unresolved_cue_ids=result.get('unresolved_cue_ids',[]))
+        if draft and manifest.get('subtitle_delivery') and manifest['subtitle_delivery'].get('completion_status')!='completed_with_issues':
+            history=manifest.setdefault('subtitle_drafts',[])
+            if delivery not in history:history.append(delivery)
+        else:manifest['subtitle_delivery']=delivery
+        save_project_manifest(video.parent, manifest)
+    task_id = session.result.get('task_id')
+    if task_id:
+        fields = {key: result[key] for key in ('source_srt', 'translated_srt', 'translated_bcc', 'bcc_export',
+                  'subtitle_saved', 'subtitle_library_linked', 'input_video', 'project_dir', 'source_sidecar',
+                  'translated_sidecar', 'bcc_sidecar', 'thumbnail_path', 'thumbnail_warning', 'subtitle_delivery_warning',
+                  'completion_status','review_passed','human_review_completed','manual_reviewed_cue_ids','skipped_cue_ids','original_source_srt','unresolved_cue_ids','unresolved_issues','quality_warning','completion_report') if key in result}
+        _update_task_stage(task_id, 'translate', 'done', current_stage='done',
+                           expected_generation=_session_run_generation(session), **fields)
+    return result
+
+
+def repair_agent_delivery(session_id: str) -> dict[str, Any]:
+    session = get_agent_session(session_id)
+    if not session or session.status != 'done':
+        raise ValueError('只能补齐已完成任务的交付文件，不会启动识别或翻译。')
+    if not _session_task_is_current(session):
+        raise ValueError('这不是任务的当前轮次，未修改历史交付。')
+    fields = ('translated_srt','source_srt','input_video','project_dir','title','source_type','normalized_url')
+    values = _prepare_agent_subtitle_delivery(session, {key:session.result[key] for key in fields if session.result.get(key)})
+    with _LOCK:
+        session.result.update(values)
+        session.updated_at = time.time()
+        session.logs.append('delivery_repaired_without_translation')
+    return {key:values[key] for key in ('source_sidecar','translated_sidecar','bcc_sidecar','thumbnail_path','thumbnail_warning','subtitle_delivery_warning') if values.get(key)}
+
+
 def _agent_done(session_id: str, values: dict[str, Any]) -> None:
     with _LOCK:
         session = _AGENT_SESSIONS.get(session_id)
-        if not session or session.status == "cancelled":
+        if not session or session.status in {"cancelled", "archived"}:
             return
     if not _session_task_is_current(session):
         with _LOCK:
@@ -4627,9 +4750,14 @@ def _agent_done(session_id: str, values: dict[str, Any]) -> None:
                 current.logs.append("agent_superseded_before_done")
                 current.updated_at = time.time()
         return
+    try:
+        values = _prepare_agent_subtitle_delivery(session, values)
+    except Exception as exc:
+        values = {**values, 'subtitle_delivery_warning': '字幕已保留，素材库关联或附加格式准备未完成，请查看任务文件。'}
+        _agent_log(session_id, f'subtitle_delivery_warning: {type(exc).__name__}')
     with _LOCK:
         session = _AGENT_SESSIONS.get(session_id)
-        if not session or session.status == "cancelled":
+        if not session or session.status in {"cancelled", "archived"}:
             return
         session.result.update(values)
         session.result["translation_pending"] = False
@@ -5325,17 +5453,14 @@ def download_video_job(payload: dict[str, Any]) -> Job:
         thumbnail = _matching_thumbnail_file(videos[0]) if videos else None
         if not thumbnail:
             before_images = _snapshot_image_files(DOWNLOAD_DIR)
-            _run_command(
-                job_id,
-                _module_command(
-                    "video_translate.youtube.download_thumbnail",
-                    url,
-                    "--output-dir",
-                    DOWNLOAD_DIR,
-                    "--format",
-                    thumbnail_format,
-                ),
-            )
+            try:
+                _run_command(job_id, _module_command("video_translate.youtube.download_thumbnail", url,
+                                                    "--output-dir", DOWNLOAD_DIR, "--format", thumbnail_format))
+            except Exception as exc:
+                job = get_job(job_id)
+                if job and job.status in {'cancel_requested', 'cancelled'}:
+                    raise
+                _append_log(job_id, f'thumbnail_warning: 视频已保存，封面补下载未完成 ({type(exc).__name__})')
             images = _matching_image_files(intended_project_dir, intended_project_dir.name) if intended_project_dir is not None else []
             if not images and intended_project_dir is None:
                 images = _changed_image_files(DOWNLOAD_DIR, before_images)
@@ -9139,16 +9264,15 @@ def _ensure_probe_thumbnail(normalized_url: str, title: str, info: dict[str, Any
         update_youtube_project_metadata(project_dir, source_url=normalized_url, title=title)
         return None
     try:
-        proxies = {"http": proxy or "", "https": proxy or ""} if video_platform(normalized_url) == "bilibili" else ({"http": proxy, "https": proxy} if proxy else None)
-        response = requests.get(thumbnail_url, timeout=30, proxies=proxies)
-        response.raise_for_status()
+        from video_translate.youtube.download_video import download_thumbnail, thumbnail_candidates
+        thumbnail_path = download_thumbnail(thumbnail_url, project_dir / f'{_filesystem_safe_title(title)}.mp4',
+                                            proxy=proxy or '', image_format='jpg',
+                                            fallback_urls=thumbnail_candidates(info, normalized_url),
+                                            disable_env_proxy=video_platform(normalized_url)=='bilibili')
     except Exception as exc:
         print(f"thumbnail_probe_skip: {type(exc).__name__}: {exc}", flush=True)
         update_youtube_project_metadata(project_dir, source_url=normalized_url, title=title)
         return None
-    extension = thumbnail_extension(thumbnail_url, response.headers.get("Content-Type", ""), image_format="jpg")
-    thumbnail_path = project_dir / f"{_filesystem_safe_title(title)}{extension}"
-    thumbnail_path.write_bytes(convert_thumbnail_bytes(response.content, image_format="jpg"))
     update_youtube_project_metadata(project_dir, source_url=normalized_url, title=title, thumbnail_path=thumbnail_path)
     return thumbnail_path
 
@@ -10353,6 +10477,9 @@ class AgentHandler(BaseHTTPRequestHandler):
             elif self.path.startswith("/api/agent/") and self.path.rstrip("/").endswith("/retry"):
                 session_id = self.path.rstrip("/").split("/")[-2]
                 self._send_json(retry_agent_session(session_id).to_dict())
+            elif self.path.startswith("/api/agent/") and self.path.rstrip("/").endswith("/repair-delivery"):
+                session_id = _api_path_segment(self.path, -2)
+                self._send_json(repair_agent_delivery(session_id))
             elif self.path.startswith("/api/agent/") and self.path.rstrip("/").endswith("/cancel"):
                 session_id = self.path.rstrip("/").split("/")[-2]
                 session = cancel_agent_session(session_id)

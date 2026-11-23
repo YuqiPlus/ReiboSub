@@ -169,7 +169,12 @@
           <a class="button-link delivery-primary" :href="`/api/file?path=${encodeURIComponent(session.result.translated_srt)}`" download><AppIcon name="download" :size="15" />下载{{ deliverySubtitleLabel }}</a>
           <a v-if="session.result.source_srt" class="delivery-secondary" :href="`/api/file?path=${encodeURIComponent(session.result.source_srt)}`" download>原文字幕</a>
           <a v-if="session.result.input_video" class="delivery-secondary" :href="`/api/file?path=${encodeURIComponent(session.result.input_video)}`" download>视频</a>
+          <a v-if="session.result.translated_bcc" class="delivery-secondary" :href="`/api/file?path=${encodeURIComponent(session.result.translated_bcc)}`" download>BCC 字幕</a>
         </div>
+        <p v-if="session.status === 'done'" class="delivery-quality-note">字幕已自动保存{{ session.result.subtitle_library_linked || session.result.input_video ? '并关联素材库' : '到服务器任务目录' }}，无需点击下载才会保存。<span v-if="session.result.translated_sidecar">字幕副本已保存到视频目录，任务版本记录保留。</span><button v-if="session.result.input_video" class="ghost mini" type="button" @click="$emit('open-view', 'assets')">打开素材库</button></p>
+        <p v-if="session.result.bcc_export?.status === 'failed'" class="delivery-quality-note" role="status">{{ session.result.bcc_export.message }}</p>
+        <p v-if="session.result.subtitle_delivery_warning" class="delivery-quality-note" role="status">{{ session.result.subtitle_delivery_warning }}</p>
+        <p v-if="session.result.thumbnail_warning" class="delivery-quality-note" role="status">{{ session.result.thumbnail_warning }}</p>
         <p class="delivery-quality-note">{{ autonomousDraftMessage(session) }}</p>
         <p v-if="session.result.suppressed_cue_ids?.length" class="delivery-quality-note">交付副本已合并 {{ session.result.suppressed_cue_ids.length }} 条重复词尾；原稿与编号映射保留。</p>
       </div>
@@ -616,6 +621,11 @@ const resultItems = computed(() => {
     ['Glossary', result.glossary_path],
     [deliverySubtitleLabel.value, result.translated_srt],
     ['视频', result.input_video],
+    ['BCC 字幕', result.translated_bcc],
+    ['视频目录译文副本', result.translated_sidecar],
+    ['视频目录原文副本', result.source_sidecar],
+    ['视频目录 BCC 副本', result.bcc_sidecar],
+    ['封面', result.thumbnail_path],
     ['标准链接', result.normalized_url],
   ]
     .filter(([, value]) => value)

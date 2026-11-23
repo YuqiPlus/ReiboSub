@@ -391,6 +391,7 @@ function artifactItems(stage, task = {}) {
     { kind: 'source_srt', label: '查看原文 SRT', path: stage?.source_srt || nested.source_srt },
     { kind: 'translated_srt', label: `查看${targetSubtitleLabel(task.payload?.target_language || task.target_language)}`, path: stage?.translated_srt || nested.translated_srt },
     { kind: 'translated_sidecar', label: '查看字幕副本', path: stage?.translated_sidecar || nested.translated_sidecar },
+    { kind: 'translated_bcc', label: '下载 BCC 字幕', path: stage?.bcc_export?.status === 'done' ? stage.translated_bcc : '' },
     { kind: 'subtitle', label: '查看字幕', path: stage?.subtitle_path || nested.subtitle_path },
   ]
   const seen = new Set()
@@ -436,6 +437,7 @@ function archiveArtifactLabel(artifact) {
     glossary_path: '旧版术语表',
     translated_srt: `旧版${targetSubtitleLabel(language)}`,
     translated_sidecar: '旧版字幕副本',
+    translated_bcc: '旧版 BCC 字幕',
     subtitle_path: '旧版字幕',
   }[artifact?.kind] || '打开历史产物'
 }

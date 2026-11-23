@@ -1,6 +1,6 @@
 <template>
   <section class="panel settings-panel settings-studio">
-    <header class="studio-page-head"><div><span class="studio-kicker">设置</span><h2>让工作台按你的习惯工作</h2><p>语言和模型用于新任务；连接信息单独保存，已有任务不受影响。</p></div></header>
+    <header class="studio-page-head"><div><span class="studio-kicker">设置</span><h2>让工作台按你的习惯工作</h2><p>语言和模型用于新任务；字幕交付选项在任务完成时生效，连接信息单独保存。</p></div></header>
     <div v-if="loading" class="studio-empty" role="status">正在读取设置…</div>
     <template v-else>
       <nav class="studio-tabs settings-page-tabs" aria-label="设置分类"><button type="button" :class="{ active: activeSection === 'defaults' }" :aria-pressed="activeSection === 'defaults'" @click="activeSection = 'defaults'">常用设置</button><button type="button" :class="{ active: activeSection === 'providers' }" :aria-pressed="activeSection === 'providers'" @click="activeSection = 'providers'">服务商管理<span>{{ providers.length }}</span></button></nav>
@@ -24,6 +24,11 @@
             </select></label></div>
           <div class="settings-default-provider-line"><span :class="credentialBadgeClass">{{ credential.label }}</span><button class="secondary mini" :disabled="!defaultProviderId || defaultProviderFetching" @click="requestModels(defaultProviderId)">{{ defaultProviderFetching ? '正在获取模型…' : '刷新默认服务商模型' }}</button><button class="ghost mini" @click="openDefaultConnection">管理默认服务商</button></div>
           <details class="studio-disclosure settings-ocr-default"><summary>画面文字语言</summary><label for="settingsOcrLanguage">OCR 语言<select id="settingsOcrLanguage" v-model="draft.defaults.ocr_language"><option value="auto">跟随原文语言</option><option value="korean">韩语</option><option value="japanese">日语</option><option value="english">英语</option><option value="chinese">中文</option></select></label></details>
+        </section>
+        <section class="settings-section">
+          <div class="studio-section-head"><div><h3>字幕自动保存与交付</h3><p>完成的字幕自动保存在服务器并关联素材库；下载按钮只是保存到你的电脑。</p></div></div>
+          <label class="settings-export-toggle"><input v-model="draft.delivery.youtube_bcc" type="checkbox" aria-label="YouTube 任务自动生成 BCC" /><span>YouTube 任务完成时，额外生成 BCC 字幕</span></label>
+          <p class="muted settings-field-help">保留 SRT，并生成一份 B 站 BCC 文件；不调用模型。对开启后完成的 YouTube 任务生效，包括沿用现成字幕；不批量修改过往结果，也不影响 B 站任务。转换异常不会丢失 SRT。</p>
         </section>
         <section class="settings-section settings-bindings">
           <div class="studio-section-head"><div><h3>通用模型</h3><p>选一次，供翻译、术语、OCR 整理和 Agent 判断共用。不是把这些步骤合成一次请求。</p></div></div>
@@ -409,7 +414,7 @@
         </section>
       </div>
       <p v-if="status && status !== '设置已加载。'" class="settings-action-status" :class="statusClass" role="status">{{ status }}</p>
-      <footer class="studio-save-bar settings-main-save"><div class="studio-save-copy" role="status"><span class="save-dot" :class="dirty ? 'dirty' : 'saved'"></span><span>{{ dirty ? '语言与模块模型有未保存修改' : '语言与模块模型已保存' }}</span></div><span v-if="activeSection === 'providers'" class="settings-separate-save-note">{{ connectionDirty || editProviderDirty && showEditProvider ? '连接 / 服务商资料请使用各自的保存按钮' : '连接信息在对应编辑区单独保存' }}</span><button type="button" :disabled="saving || !dirty" @click="saveSettings">{{ saving ? '正在保存…' : '保存设置' }}</button></footer>
+      <footer class="studio-save-bar settings-main-save"><div class="studio-save-copy" role="status"><span class="save-dot" :class="dirty ? 'dirty' : 'saved'"></span><span>{{ dirty ? '设置有未保存修改' : '设置已保存' }}</span></div><span v-if="activeSection === 'providers'" class="settings-separate-save-note">{{ connectionDirty || editProviderDirty && showEditProvider ? '连接 / 服务商资料请使用各自的保存按钮' : '连接信息在对应编辑区单独保存' }}</span><button type="button" :disabled="saving || !dirty" @click="saveSettings">{{ saving ? '正在保存…' : '保存设置' }}</button></footer>
     </template>
   </section>
 </template>

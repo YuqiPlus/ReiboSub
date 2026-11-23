@@ -5670,6 +5670,20 @@ def test_download_video_job_fetches_missing_thumbnail_for_existing_video(monkeyp
     assert manifest['thumbnail'] == str(thumbnail)
 
 
+def test_download_job_cover_failure_is_a_warning_not_video_failure(monkeypatch, tmp_path):
+    downloads=tmp_path/'downloads';project=downloads/'Demo';project.mkdir(parents=True)
+    video=project/'Demo.mp4';video.write_bytes(b'video')
+    monkeypatch.setattr(web_agent,'DOWNLOAD_DIR',downloads)
+    monkeypatch.setattr(web_agent,'PYTHON','/python')
+    def command(job_id,args):
+        if 'video_translate.youtube.download_thumbnail' in args:raise RuntimeError('all cover sizes failed')
+    monkeypatch.setattr(web_agent,'_run_command',command)
+    job=web_agent.download_video_job({'url':'https://youtu.be/abc123','title':'Demo'})
+    snapshot=_wait_job_status(job.id,'done')
+    assert snapshot['result']['input_video']==str(video)
+    assert any('thumbnail_warning' in line for line in snapshot['logs'])
+
+
 def test_continue_after_glossary_path_reruns_completed_translation(monkeypatch, tmp_path: Path):
     tasks = tmp_path / 'agent_tasks'
     task_dir = tasks / 'task_done'
@@ -5827,6 +5841,10 @@ def test_done_agent_task_is_listed_as_completed(monkeypatch, tmp_path: Path):
 
 
 def test_probe_video_downloads_thumbnail_for_new_project(monkeypatch, tmp_path: Path):
+    import io
+    from PIL import Image
+    image_bytes = io.BytesIO()
+    Image.new('RGB', (480, 360), 'green').save(image_bytes, 'JPEG')
     downloads = tmp_path / 'YoutubeDownloads'
     downloads.mkdir()
     monkeypatch.setattr(web_agent, 'DOWNLOAD_DIR', downloads)
@@ -5853,21 +5871,21 @@ def test_probe_video_downloads_thumbnail_for_new_project(monkeypatch, tmp_path: 
 
     class FakeResponse:
         headers = {'Content-Type': 'image/jpeg'}
-        content = b'jpg-bytes'
+        content = image_bytes.getvalue()
 
         def raise_for_status(self):
             return None
 
     monkeypatch.setattr(web_agent.yt_dlp, 'YoutubeDL', FakeYoutubeDL)
     monkeypatch.setattr(web_agent.requests, 'get', lambda *args, **kwargs: FakeResponse())
-    monkeypatch.setattr(web_agent, 'convert_thumbnail_bytes', lambda content, image_format='jpg': content)
 
     result = web_agent.probe_video('https://www.youtube.com/watch?v=abc123&t=99s')
 
     project = downloads / 'Target Video'
     thumbnail = project / 'Target Video.jpg'
     manifest = yaml.safe_load((project / 'project.yaml').read_text(encoding='utf-8'))
-    assert thumbnail.read_bytes() == b'jpg-bytes'
+    with Image.open(thumbnail) as image:
+        assert image.format == 'JPEG' and image.size == (480, 360)
     assert result['existing_project']['path'] == str(project)
     assert result['existing_project']['thumbnail'] == str(thumbnail)
     assert result['thumbnail_path'] == str(thumbnail)

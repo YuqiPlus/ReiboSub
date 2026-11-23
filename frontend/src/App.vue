@@ -851,7 +851,7 @@ async function saveAppSettings(settings) {
     if (defaultProviderId && defaultProviderId !== settingsConnectionProviderId.value) {
       await loadProviderConnection(defaultProviderId, { quiet: true })
     }
-    setStatus(settingsStatus, '设置已保存；之后发起的任务会使用新的默认语言和模型。', 'ok')
+    setStatus(settingsStatus, '设置已保存；语言和模型用于新任务，自动 BCC 选项在任务完成时生效。', 'ok')
   } catch (error) {
     setStatus(settingsStatus, error.message, 'bad')
   } finally {
@@ -1535,6 +1535,13 @@ async function openTaskArtifact(payload) {
   const path = String(payload?.path || '')
   if (!path) {
     setStatus(taskHistoryStatus, '这个阶段没有可打开的字幕文件。', 'bad')
+    return
+  }
+  if (payload?.kind === 'translated_bcc') {
+    const link = document.createElement('a')
+    link.href = `/api/file?path=${encodeURIComponent(path)}`
+    link.download = path.split('/').at(-1)
+    link.click()
     return
   }
   if (payload?.kind === 'source_srt') sourceSrt.value = path

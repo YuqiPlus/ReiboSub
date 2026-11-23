@@ -82,6 +82,21 @@ def test_shared_model_roundtrip_inherits_missing_task_bindings(tmp_path: Path) -
     assert get_app_settings_payload(tmp_path)["settings"] == saved
 
 
+def test_delivery_preference_roundtrip_and_old_client_does_not_disable_it(tmp_path):
+    from video_translate.app_settings import get_delivery_settings
+    assert get_delivery_settings(tmp_path) == {'youtube_bcc': False}
+    saved = save_app_settings({'delivery': {'youtube_bcc': True}}, tmp_path)
+    assert saved['settings']['delivery'] == {'youtube_bcc': True}
+    assert get_delivery_settings(tmp_path) == {'youtube_bcc': True}
+    save_app_settings({'defaults': {'source_language': 'japanese'}}, tmp_path)
+    assert get_delivery_settings(tmp_path) == {'youtube_bcc': True}
+    save_app_settings({'delivery': {'youtube_bcc': False}}, tmp_path)
+    assert get_delivery_settings(tmp_path) == {'youtube_bcc': False}
+    for value in ['true', 1, None]:
+        with pytest.raises(ValueError, match='布尔值'):
+            save_app_settings({'delivery': {'youtube_bcc': value}}, tmp_path)
+
+
 @pytest.mark.parametrize("model", [123, "x\nbad", "x" * 257])
 def test_shared_model_validated_like_task_models(tmp_path: Path, model) -> None:
     _write_provider(tmp_path, "volcano")

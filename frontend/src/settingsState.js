@@ -78,6 +78,7 @@ export function normalizeSettings(settings = {}, providers = []) {
 
   return {
     version: 1,
+    delivery: { youtube_bcc: asObject(source.delivery).youtube_bcc === true },
     defaults: {
       source_language: validChoice(defaults.source_language, SOURCE_LANGUAGES, 'korean'),
       ocr_language: validChoice(defaults.ocr_language, OCR_LANGUAGES, 'auto'),
@@ -103,6 +104,7 @@ export function buildSettingsPayload(settings = {}) {
 
   return {
     version: 1,
+    delivery: { ...normalized.delivery },
     defaults: { ...normalized.defaults },
     tasks,
   }

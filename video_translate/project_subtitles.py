@@ -1,7 +1,7 @@
-"""Read-only links from task-owned subtitles to an exact media project.
+"""Read-only links from delivered subtitles to an exact media project.
 
-Subtitle bytes stay with their task/run. No title matching, file copies, manifest
-rewrites or inference calls are needed to expose completed artifacts in assets.
+Prefer video-directory delivery copies when available; task/run originals remain
+in history. Indexing itself does no copying, title matching or inference.
 """
 from __future__ import annotations
 
@@ -81,8 +81,9 @@ def task_subtitle_links(task: dict, *, task_dir: Path, media_root: Path,
 
     done_translation = translation.get('status') == 'done'
     source_rows = ([translation] if done_translation else []) + [row for row in (stage('ocr'), stage('asr')) if row.get('status') == 'done']
-    source = artifact(source_rows, ('source_srt',))
-    target = artifact([translation], ('translated_srt', 'translated_sidecar', 'subtitle_path')) if done_translation else None
+    source = artifact(source_rows, ('source_sidecar', 'source_srt'))
+    target = artifact([translation], ('translated_sidecar', 'translated_srt', 'subtitle_path')) if done_translation else None
+    bcc = artifact([translation], ('bcc_sidecar', 'translated_bcc')) if done_translation and translation.get('bcc_export', {}).get('status') == 'done' else None
     payload = task.get('payload') if isinstance(task.get('payload'), dict) else {}
     try:
         generation = max(1, int(task.get('run_generation') or 1))
@@ -94,7 +95,8 @@ def task_subtitle_links(task: dict, *, task_dir: Path, media_root: Path,
               'delivered_at': _time(translation.get('updated_at') or task.get('completed_at') or task.get('updated_at'))}
     results = []
     for path, role, language in [(source, 'source', _language(payload.get('source_language'))),
-                                  (target, 'translated', _language(payload.get('target_language'), 'zh'))]:
+                                  (target, 'translated', _language(payload.get('target_language'), 'zh')),
+                                  (bcc, 'translated', _language(payload.get('target_language'), 'zh'))]:
         if path is None or (role == 'source' and path == target):
             continue
         results.append({**common, 'path': str(path), 'role': role, 'language': language})

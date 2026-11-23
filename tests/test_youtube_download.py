@@ -204,6 +204,24 @@ def test_thumbnail_download_uses_project_folder_and_downloads_image(monkeypatch,
     assert requests_seen["url"] == "https://img.youtube.com/demo.webp"
 
 
+def test_missing_cover_does_not_fail_an_already_downloaded_video(monkeypatch, tmp_path):
+    module = _load_video_module()
+    folder = tmp_path/'Demo Video'
+    video = folder/'Demo Video.mp4'
+    class FakeYoutubeDL:
+        def __init__(self, opts):self.params=opts
+        def __enter__(self):return self
+        def __exit__(self,*_):return False
+        def extract_info(self,*_,**__):return {'title':'Demo Video','thumbnail':'https://example/missing.jpg'}
+        def download(self,*_):
+            folder.mkdir(exist_ok=True);video.write_bytes(b'video')
+    monkeypatch.setattr(module.yt_dlp,'YoutubeDL',FakeYoutubeDL)
+    monkeypatch.setattr(module,'download_thumbnail',lambda *a,**k:(_ for _ in ()).throw(RuntimeError('no covers')))
+    monkeypatch.setattr(module.shutil,'which',lambda *_:None)
+    assert module.download_video('abc123',output_dir=tmp_path)==[video]
+    assert video.read_bytes()==b'video'
+
+
 def test_thumbnail_download_can_keep_source_format(monkeypatch, tmp_path):
     module = _load_thumbnail_module()
     source_bytes = _image_bytes("WEBP")
