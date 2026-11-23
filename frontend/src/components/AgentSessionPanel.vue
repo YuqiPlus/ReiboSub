@@ -582,6 +582,7 @@ const autonomousToolLabels = { decide: '判断下一步', planner: '检查下一
   refine_screen_ocr: '核查画面文字候选', finalize_screen_ocr: '整理内嵌字幕',
   analyze_frames: '分析画面', ocr_trial: '试跑OCR与遮罩', ocr: '提取画面字幕', asr: '听取音频', detect_language: '判断音源语言',
   select_source: '选择原文', inspect: '检查原文', review_audio: '局部重听', patch: '修正原文', translate: '翻译字幕',
+  review_screen_roles: '区分画面配字与对白', assemble_mixed_source: '合并画面配字与原声字幕', scoped_recovery: '复用结果恢复处理',
   verify: '检查译文', align: '校准时间', question: '需要一点线索', review_result: '局部复核已结束', issue_review: '人工处理未确认项', finish: '交付字幕',
   inspect_target: '检查现成目标字幕', deliver_target: '直接交付现成目标字幕', ask_target: '确认现成字幕疑点', read_subtitles: '查看字幕上下文', review_target: '对照原文抽查现成目标字幕', transcribe_clip: '局部音频取证', target_review: '确认现成字幕覆盖', target_caption_choice: '选择现成字幕处理方式',
   internal_recovery: '恢复验收状态', format_recovery: '恢复已确认的格式清理', review_scope: '暂停于局部复核边界', internal_error: '内部错误（字幕已保留）', verification_review: '已有具体疑点，未改稿',

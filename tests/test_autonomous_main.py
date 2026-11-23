@@ -156,6 +156,39 @@ def test_main_route_with_captions_skips_video_download_ocr_and_asr(runtime,monke
     assert Path(session.result['translated_srt']).is_file()
 
 
+def test_mixed_source_translation_preserves_screen_brackets_in_srt_and_bcc(runtime):
+    import hashlib
+    import json
+    from video_translate.subtitle.delivery import export_bcc
+    from video_translate.subtitle.srt import read_srt
+
+    r,session,app,_=runtime
+    source=r.root/'source.mixed.srt'
+    write_srt([SubtitleCue(1,0,3,'[제목]'),SubtitleCue(2,1,2,'안녕하세요'),
+               SubtitleCue(3,3,4,'[첫 줄][둘째 줄]'),SubtitleCue(4,4,5,'[편지]')],source)
+    info=r.add_source(source,'mixed',mixed_provenance={'screen_cue_ids':[1,3,4]})
+    r.state['selected']=info['source_id']
+    glossary=r.root/'approved.yaml';glossary.write_text('characters: []\n',encoding='utf-8')
+    r.state['glossary_review']={'human_approved':True,'snapshot_path':str(glossary),
+        'source_text_sha256':agent.source_text_digest(r.state),'sha256':hashlib.sha256(glossary.read_bytes()).hexdigest()}
+    r.state['counts']['translate']=1
+    r.execute('inspect',{})
+    model_output=r.root/'zh_1.srt'
+    def translate(payload):
+        assert '[内容]' in payload['extra_prompt']
+        assert payload['source_srt']==str(source)
+        write_srt([SubtitleCue(1,0,3,'标题'),SubtitleCue(2,1,2,'大家好'),
+                   SubtitleCue(3,3,4,'[第一行][第二行]'),SubtitleCue(4,4,5,'【画面配字】手写信')],model_output)
+        return SimpleNamespace(result={'translated_srt':str(model_output)})
+    app.translate_subtitle_job=translate
+    assert r.execute('translate',{})=={'translated':True}
+    target=Path(session.result['translated_srt'])
+    expected=[(0,3,'[标题]'),(1,2,'大家好'),(3,4,'[第一行][第二行]'),(4,5,'[手写信]')]
+    assert target!=model_output and read_srt(model_output)[0].text=='标题'
+    assert [(c.start,c.end,c.text) for c in read_srt(target)]==expected
+    assert [(c['from'],c['to'],c['content']) for c in json.loads(export_bcc(target).read_text())['body']]==expected
+
+
 def test_chinese_to_english_agent_waits_for_human_terms_then_translates_and_verifies(runtime, monkeypatch):
     import hashlib
     from scripts import asr_review_agent

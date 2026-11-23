@@ -12,6 +12,7 @@ export function subtitleSourceLabel(result) {
   if (result?.source_kind === 'ocr') return '原文来源：画面内嵌字幕 · OCR 3.0'
   if (result?.source_kind === 'asr') return '原文来源：语音识别 · ASR 2.2'
   if (result?.source_kind === 'captions') return '原文来源：外挂字幕'
+  if (result?.source_kind === 'mixed') return '原文来源：OCR 画面配字＋原声字幕（混合）'
   if (result?.screen_source_assessment?.enabled && result.screen_source_assessment.status === 'present') {
     return '已发现内嵌字幕，优先提取画面文字'
   }

@@ -80,6 +80,20 @@ def test_existing_proposal_is_checked_and_exported_without_model_repeating_unava
     assert result['changed_ids']==[2] and result['unresolved_ids']==[] and len(planning)==2
 
 
+def test_screen_caption_revision_keeps_brackets_before_independent_check(inputs):
+    source,zh,out=inputs
+    def llm(*args):
+        assert args[-1]['proposals'][0]['target']['screen_caption'] is True
+        assert args[-1]['proposals'][0]['proposal']['replacement']=='[送给妈妈]'
+        return approvals()
+    review=TranslationReview(source,zh,[],[2,3],out,llm,screen_cue_ids={2})
+    review.execute('read_context',{'cue_ids':[2,3],'radius':1})
+    review.execute('propose',{'decisions':proposals()})
+    review.execute('check',{})
+    result=review.execute('finish',{})
+    assert [c.text for c in read_srt(Path(result['translated_srt']))]==['买礼物','[送给妈妈]','很有레이的风格','结束']
+
+
 def test_uncertain_or_rejected_edits_are_not_applied(inputs):
     source,zh,out=inputs
     review=TranslationReview(source,zh,[],[2,3],out,lambda *a:approvals('uncertain'))

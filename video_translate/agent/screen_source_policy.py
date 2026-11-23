@@ -45,9 +45,11 @@ def assessment(state):
     absent = (surveyed and len(negative_times) >= 4 and duration
               and (max(negative_times) - min(negative_times)) / duration >= .6)
     status = 'present' if present else 'not_seen_in_samples' if absent else 'unknown'
+    mixed = (present and state.get('screen_role_review',{}).get('screen_text_role')=='supplementary_only'
+             and any(row.get('kind') in {'captions','asr'} for row in state.get('sources',{}).values()))
     return {'enabled': enabled(state), 'status': status, 'surveyed': surveyed,
             'analyzed_frame_count': len(times), 'sample_times': times,
-            'sample_span_ratio': round(spread, 3), 'primary_source_required': 'ocr' if present else None,
+            'sample_span_ratio': round(spread, 3), 'primary_source_required': 'mixed' if mixed else 'ocr' if present else None,
             'notice': '有内嵌字幕时以画面原文为底本；无字幕结论仅适用于已抽查画面，不代表整片证明。'}
 
 
@@ -55,8 +57,20 @@ def protected_regions(state):
     return [box for row in state.get('screen_observations', []) for box in row.get('subtitle_regions', [])]
 
 
+def role_review_possible(state):
+    times=sorted(f.get('time_seconds') for f in state.get('frames',[]) if type(f.get('time_seconds')) in (int,float))
+    duration=state.get('probe',{}).get('duration')
+    return bool(len(set(times))>=4 and duration and (times[-1]-times[0])/duration>=.6)
+
+
 def source_allowed(state, source):
     check = assessment(state)
+    if source.get('kind')=='mixed':
+        from video_translate.agent.mixed_source import valid
+        return check['surveyed'] and check['status']=='present' and valid(state,source)
+    if (check['status']=='present' and state.get('screen_role_review',{}).get('screen_text_role')=='supplementary_only'
+            and any(row.get('kind') in {'captions','asr'} for row in state.get('sources',{}).values())):
+        return False  # Both written content and available spoken content must survive.
     if source.get('kind') not in {'ocr', 'captions', 'asr'}:
         return False
     if not check['surveyed'] or check['status'] == 'unknown':
