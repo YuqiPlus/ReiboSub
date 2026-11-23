@@ -88,6 +88,30 @@ def test_copy_keeps_old_files_and_original_task_versions(tmp_path):
     assert copied.stat().st_mtime_ns == stamp
 
 
+def test_unverified_conclusion_is_terminal_but_draft_named_and_never_replaces_final(delivery):
+    web,session,source,project,_=delivery
+    final=project/'video.zh.srt';final.write_text('previous verified version')
+    session.status='waiting';session.question={'kind':'autonomous_review_result'}
+    web._agent_done(session.id,{'translated_srt':str(source),'completion_status':'completed_with_issues',
+        'review_passed':False,'unresolved_cue_ids':[83],'unresolved_issues':[{'id':83,'kind':'semantic_uncertain'}],
+        'quality_warning':'第83条未核准，任务已结束，草稿保留。'})
+    assert session.status=='done' and session.question=={} and session.result['review_passed'] is False
+    assert final.read_text()=='previous verified version'
+    assert Path(session.result['translated_sidecar']).name=='video.zh.draft.srt'
+    assert Path(session.result['bcc_sidecar']).name=='video.zh.draft.bcc'
+    task=web._read_task('task-one')
+    assert task['workflow_status']=='completed' and task['current_stage']=='done'
+    assert task['completion_status']=='completed_with_issues' and task['review_passed'] is False
+    assert task['stages']['translate']['review_passed'] is False
+    from video_translate.project_subtitles import task_subtitle_links
+    _,files=task_subtitle_links(task,task_dir=source.parent,media_root=project.parent,validate_path=web._ensure_under_root)
+    assert all(f['review_passed'] is False and '未核准草稿' in f['version_label'] for f in files)
+    assert files
+    # Repairing sidecars later must not accidentally promote this draft.
+    web.repair_agent_delivery(session.id)
+    assert '.draft.' in session.result['translated_sidecar'] and final.read_text()=='previous verified version'
+
+
 def test_repair_only_copies_existing_files_without_running_translation(delivery, monkeypatch):
     web, session, source, project, _ = delivery
     session.status = 'done'

@@ -68,6 +68,18 @@ def test_agent_reads_context_repairs_only_approved_cue_and_exports_new_version(i
     assert len([name for name in calls if name.startswith('proposal-check')])==1
 
 
+def test_existing_proposal_is_checked_and_exported_without_model_repeating_unavailable_propose(inputs):
+    source,zh,out=inputs;planning=[]
+    def llm(root,name,task,instruction,data):
+        if name.startswith('proposal-check'):return approvals()
+        planning.append(name)
+        if len(planning)==1:return {'tool':'read_context','args':{'cue_ids':[2,3],'radius':1}}
+        if len(planning)==2:return {'tool':'propose','args':{'decisions':proposals()}}
+        pytest.fail('After a valid proposal, checking and export should not wait for more planning')
+    result=TranslationReview(source,zh,[],[2,3],out,llm).run()
+    assert result['changed_ids']==[2] and result['unresolved_ids']==[] and len(planning)==2
+
+
 def test_uncertain_or_rejected_edits_are_not_applied(inputs):
     source,zh,out=inputs
     review=TranslationReview(source,zh,[],[2,3],out,lambda *a:approvals('uncertain'))

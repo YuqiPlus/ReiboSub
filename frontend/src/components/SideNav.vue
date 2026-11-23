@@ -45,7 +45,7 @@
 
       <section v-if="sessions.length" class="nav-recents" aria-label="最近任务">
         <h2 class="nav-group-title">最近任务</h2>
-        <button v-for="item in sessions.slice(0, 10)" :key="item.id" type="button" class="nav-recent" :class="{ active: item.id === selectedSessionId && activeView === 'agent' }" :title="sessionTitle(item)" :aria-label="`${sessionTitle(item)} · ${statusLabel(item.status)}`" @click="$emit('select-session', item.id)">
+        <button v-for="item in sessions.slice(0, 10)" :key="item.id" type="button" class="nav-recent" :class="{ active: item.id === selectedSessionId && activeView === 'agent' }" :title="sessionTitle(item)" :aria-label="`${sessionTitle(item)} · ${statusLabel(item)}`" @click="$emit('select-session', item.id)">
           <span class="session-dot" :class="item.status"></span><span>{{ sessionTitle(item) }}</span>
         </button>
         <button class="nav-all-tasks" type="button" @click="$emit('select', 'task-history')">查看全部任务<AppIcon name="chevron" :size="14" /></button>
@@ -72,8 +72,8 @@ defineEmits(['select', 'new-task', 'select-session', 'close'])
 
 const icons = { agent: 'spark', toolbox: 'toolbox', 'task-history': 'history', assets: 'folder', 'new-task': 'download', 'subtitle-edit': 'edit', glossary: 'book', subtitles: 'language', 'ocr-dev': 'scan', 'asr-dev': 'audio', 'video-overlay': 'video', settings: 'settings', jobs: 'log' }
 const footerItems = computed(() => props.items.filter(item => ['settings', 'jobs'].includes(item.id)))
-function sessionTitle(item) { return String(item.result?.probe?.title || item.payload?.url || '字幕任务') }
-function statusLabel(value) { return { running: '进行中', waiting: '待你确认', failed: '需要重试', done: '已完成', cancelled: '已中断' }[value] || '已保存' }
+function sessionTitle(item) { return String(item.result?.title || item.result?.probe?.title || item.payload?.url || '字幕任务') }
+function statusLabel(item) { return item.result?.completion_status === 'completed_manually' ? '已结束，人工已处理' : item.result?.completion_status === 'completed_with_issues' ? '已结束，有未确认项' : { running: '进行中', waiting: '待你确认', failed: '需要重试', done: '已完成', cancelled: '已中断' }[item.status] || '已保存' }
 
 const headingIdPrefix = useId()
 

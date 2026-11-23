@@ -8,13 +8,14 @@
     <div v-else-if="!visibleTasks.length" class="studio-empty"><AppIcon name="history" :size="30" /><h3>{{ query ? '没有匹配的任务' : emptyTitle }}</h3><p>{{ query ? '试试其他标题或链接。' : emptyDescription }}</p><button v-if="query" class="secondary" @click="query = ''">清除搜索</button></div>
     <div v-else class="history-task-list">
       <article v-for="task in visibleTasks" :key="task.id" class="history-task-card" :class="[taskState(task), { busy: isBusy(task) }]">
-        <header class="history-task-heading"><div><h3>{{ task.title || task.url || task.id || '未命名任务' }}</h3><div class="history-card-meta"><span>{{ currentStageLabel(task.current_stage) }}</span><span>第 {{ runGeneration(task) }} 轮<span v-if="archivedRunCount(task)"> · {{ archivedRunCount(task) }} 轮归档</span></span><time>{{ localTime(task.updated_at || task.completed_at || task.created_at) }}</time><a v-if="safeSourceUrl(task.url)" :href="safeSourceUrl(task.url)" target="_blank" rel="noreferrer">原视频<AppIcon name="link" :size="12" /></a></div></div><span class="history-state" :class="taskState(task)"><span></span>{{ taskStateLabel(task) }}</span></header>
+        <header class="history-task-heading"><div><h3>{{ task.title || task.url || task.id || '未命名任务' }}</h3><div class="history-card-meta"><span>{{ completedWithIssues(task) ? '已结束，保留未确认项' : currentStageLabel(task.current_stage) }}</span><span>第 {{ runGeneration(task) }} 轮<span v-if="archivedRunCount(task)"> · {{ archivedRunCount(task) }} 轮归档</span></span><time>{{ localTime(task.updated_at || task.completed_at || task.created_at) }}</time><a v-if="safeSourceUrl(task.url)" :href="safeSourceUrl(task.url)" target="_blank" rel="noreferrer">原视频<AppIcon name="link" :size="12" /></a></div></div><span class="history-state" :class="taskState(task)"><span></span>{{ taskStateLabel(task) }}</span></header>
         <div v-if="task.stage_items?.length" class="history-stage-snapshot" aria-label="各阶段状态">
           <span v-for="stage in task.stage_items" :key="stage.id" :class="`snapshot-${resolvedStageStatus(stage, task)}`"><i aria-hidden="true"></i>{{ stageDisplayLabel(stage) }}<b>{{ stageStatusLabel(stage, task) }}</b></span>
         </div>
         <p v-if="taskError(task)" class="history-card-error" :title="taskError(task)"><AppIcon name="log" :size="14" /><span>{{ taskError(task) }}</span></p>
+        <p v-if="completedWithIssues(task)" class="history-review-status"><b>草稿 · 未通过验收</b><span>{{ task.quality_warning || task.stages?.translate?.quality_warning || '任务已结束，未确认项保留在复核记录中。' }}</span></p>
         <div class="history-card-footer">
-          <div class="history-primary-actions"><button v-if="!isCompleted(task)" :disabled="anyBusy" @click="emit('continue-task', task.id)">{{ isBusy(task) ? '处理中…' : isTaskRunning(task) ? '查看运行' : '继续任务' }}</button><button v-else class="secondary" @click="toggleDetails(task.id)">查看记录</button><button v-for="entry in artifactShortcuts(task)" :key="entry.artifact.path" class="secondary" :title="entry.artifact.path" @click="openArtifact(task, entry.stage, entry.artifact)"><AppIcon :name="entry.artifact.kind === 'glossary' ? 'book' : 'log'" :size="15" />{{ entry.label }}</button></div>
+          <div class="history-primary-actions"><button v-if="!isCompleted(task)" :disabled="anyBusy" @click="emit('continue-task', task.id)">{{ isBusy(task) ? '处理中…' : isTaskRunning(task) ? '查看运行' : '继续任务' }}</button><button v-else class="secondary" @click="toggleDetails(task.id)">查看记录</button><button v-if="isCompleted(task) && task.payload?.agent_mode === 'autonomous' && (completedWithIssues(task) || completedManually(task))" class="secondary" :disabled="anyBusy" @click="emit('continue-task', task.id)">处理字幕</button><button v-for="entry in artifactShortcuts(task)" :key="entry.artifact.path" class="secondary" :title="entry.artifact.path" @click="openArtifact(task, entry.stage, entry.artifact)"><AppIcon :name="entry.artifact.kind === 'glossary' ? 'book' : 'log'" :size="15" />{{ entry.label }}</button></div>
           <button class="danger secondary history-delete-task" type="button" :disabled="anyBusy || isTaskRunning(task)" :title="isTaskRunning(task) ? '请先中断正在运行的任务' : '删除任务档案与任务产物，保留已下载视频'" @click="emit('delete-task', task)">删除任务…</button>
         </div>
         <details class="history-task-details" :open="expandedIds.has(task.id)" @toggle="setDetailsOpen(task.id, $event.target.open)"><summary>阶段记录、重跑与更多</summary>
@@ -227,12 +228,22 @@ function taskState(task) {
 }
 
 function taskStateLabel(task) {
+  if (completedManually(task)) return '已结束 · 人工已处理'
+  if (completedWithIssues(task)) return '已结束 · 有未确认项'
   return {
     completed: '已完成',
     failed: '运行失败',
     attention: '等待处理',
     active: '进行中',
   }[taskState(task)]
+}
+
+function completedWithIssues(task) {
+  return task?.completion_status === 'completed_with_issues' || task?.stages?.translate?.completion_status === 'completed_with_issues'
+}
+
+function completedManually(task) {
+  return task?.completion_status === 'completed_manually' || task?.stages?.translate?.completion_status === 'completed_manually'
 }
 
 function isBusy(task) {
@@ -297,6 +308,7 @@ function currentStageLabel(stage) {
     autonomous_running: 'Agent 正在处理',
     autonomous_failed: 'Agent 处理失败',
     autonomous_waiting: '等待确认',
+    autonomous_issue_review: '人工处理字幕疑点',
     autonomous_verification_review: '字幕疑点待复核',
     autonomous_review_required: '字幕疑点待复核',
     probe: '检测中',

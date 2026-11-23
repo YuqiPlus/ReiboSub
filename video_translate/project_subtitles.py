@@ -93,6 +93,10 @@ def task_subtitle_links(task: dict, *, task_dir: Path, media_root: Path,
               'version_label': f'第 {generation} 轮', 'is_archived': bool(archived),
               'origin': 'agent_task', 'linked': True,
               'delivered_at': _time(translation.get('updated_at') or task.get('completed_at') or task.get('updated_at'))}
+    if translation.get('completion_status') in {'completed_with_issues','completed_manually'}:
+        manual=translation['completion_status']=='completed_manually'
+        common.update(completion_status=translation['completion_status'],review_passed=False,
+                      version_label=f'第 {generation} 轮 · '+('人工处理稿' if manual else '未核准草稿'),unresolved_cue_ids=translation.get('unresolved_cue_ids',[]))
     results = []
     for path, role, language in [(source, 'source', _language(payload.get('source_language'))),
                                   (target, 'translated', _language(payload.get('target_language'), 'zh')),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import gc
 import hashlib
 import ipaddress
@@ -196,6 +197,7 @@ def _module_command(module: str, *args: object) -> list[str]:
 _JOBS: dict[str, Job] = {}
 _AGENT_SESSIONS: dict[str, AgentSession] = {}
 _LOCK = threading.Lock()
+_ISSUE_REVIEW_LOCKS: dict[str, threading.Lock] = {}
 _TASK_FILE_LOCK = threading.RLock()
 _AGENT_TRANSLATION_START_LOCK = threading.RLock()
 _YOUTUBE_PROJECT_BIND_LOCK = threading.RLock()
@@ -963,7 +965,16 @@ def get_agent_session(session_id: str) -> AgentSession | None:
 def list_agent_sessions() -> list[dict[str, Any]]:
     with _LOCK:
         sessions = sorted(_AGENT_SESSIONS.values(), key=lambda item: item.created_at, reverse=True)
-        return [session.to_dict() for session in sessions]
+        snapshots=[session.to_dict() for session in sessions]
+    return [_present_agent_session(data) for data in snapshots]
+
+
+def _present_agent_session(data):
+    if data.get('question',{}).get('kind')=='autonomous_question':
+        from video_translate.agent.subtitle_questions import clean
+        data={**data,'question':clean(data['question'],data.get('result',{}).get('autonomous_verification'))}
+    return data
+
 
 
 def list_agent_tasks() -> list[dict[str, Any]]:
@@ -983,7 +994,17 @@ def get_agent_task(task_id: str) -> dict[str, Any] | None:
 
 def continue_agent_task(task_id: str) -> AgentSession:
     task = _read_task(task_id)
+    _require_unarchived_task(task)
     if task.get('payload',{}).get('agent_mode') == 'autonomous':
+        with _LOCK:
+            related=[s for s in _AGENT_SESSIONS.values() if s.result.get('task_id')==task_id and _session_run_generation(s)==int(task.get('run_generation') or 0)]
+        latest=max(related,key=lambda s:s.updated_at,default=None)
+        if latest and ((latest.status=='waiting' and latest.question.get('kind') in {'autonomous_review_result','autonomous_issue_review'})
+                       or (latest.status=='done' and latest.result.get('completion_status') in {'completed_with_issues','completed_manually'})):
+            return latest
+        if (task.get('current_stage') in {'autonomous_issue_review','autonomous_review_result'}
+                or task.get('completion_status') in {'manual_review_in_progress','completed_with_issues','completed_manually'}):
+            return _restore_issue_review_session(task)
         from video_translate.agent.autonomous import run
         session=_agent_session_from_task(task)
         _run_agent_async(session.id,lambda item:run(item,sys.modules[__name__]))
@@ -1001,6 +1022,43 @@ def continue_agent_task(task_id: str) -> AgentSession:
         _run_agent_async(session.id, lambda item: _agent_generate_glossary_review(item, str(item.result.get("source_srt") or "")))
     else:
         _run_agent_async(session.id, _agent_start)
+    return session
+
+
+def _restore_issue_review_session(task: dict[str, Any]) -> AgentSession:
+    """Reopen saved user decisions without invoking the autonomous planner."""
+    from video_translate.asr_review_web import read_json
+    raw=_task_stage_value(task,'probe','autonomous_workspace')
+    if not raw:raise ValueError('人工处理记录缺少工作目录，未自动重跑识别或翻译。')
+    root=Path(raw).resolve();_ensure_under_root(root);state=read_json(root/'state.json')
+    manual=state.get('manual_issue_review',{});exports=manual.get('exports',{})
+    selected=state.get('sources',{}).get(state.get('selected'),{})
+    source=exports.get('source_srt') or _task_stage_path(task,'translate','source_srt') or selected.get('path')
+    target=exports.get('translated_srt') or _task_stage_path(task,'translate','translated_srt') or state.get('translated')
+    for path in (source,target):
+        if not path:raise ValueError('人工处理记录缺少字幕路径，未启动新的翻译。')
+        _ensure_under_root(Path(path).resolve())
+        if not Path(path).is_file():raise ValueError('人工处理字幕文件缺失，未自动覆盖或重翻。')
+    ended=task.get('workflow_status')=='completed'
+    result={'task_id':task['id'],'task_dir':str(_task_yaml_path(task['id']).parent),'run_generation':int(task.get('run_generation') or 0),
+        'title':task.get('title',''),'source_kind':selected.get('kind'),'source_srt':str(source),'translated_srt':str(target),
+        'autonomous_workspace':str(root),'autonomous_tools':True,'autonomous_controller_version':state.get('controller_version',1),
+        'manual_issue_review':manual,'review_passed':False,'glossary_path':state.get('glossary_review',{}).get('path','')}
+    if state.get('media'):result['input_video']=state['media']
+    for key in ('completion_status','quality_warning','human_review_completed','manual_reviewed_cue_ids','unresolved_cue_ids','unresolved_issues','skipped_cue_ids'):
+        value=task.get(key,_task_stage_value(task,'translate',key))
+        if value is not None:result[key]=value
+    if exports:result.update({k:exports[k] for k in ('original_source_srt','delivery_cue_count','skipped_cue_ids') if k in exports})
+    if ended:
+        for field in ('translated_bcc','bcc_export','subtitle_saved','subtitle_library_linked','translated_sidecar',
+                      'source_sidecar','bcc_sidecar','thumbnail_path','thumbnail_warning','subtitle_delivery_warning'):
+            value=_task_stage_value(task,'translate',field)
+            if value is not None:result[field]=value
+    if state.get('human_reply_reviews'):result['human_reply_review']=state['human_reply_reviews'][-1]
+    session=AgentSession(id=uuid.uuid4().hex[:12],payload=dict(task.get('payload') or {}),status='done' if ended else 'waiting',
+        phase='done' if ended else 'autonomous_issue_review',result=result,
+        question={} if ended else {'kind':'autonomous_issue_review','title':'处理字幕未确认项','options':[]})
+    with _LOCK:_AGENT_SESSIONS[session.id]=session
     return session
 
 
@@ -1364,6 +1422,16 @@ def reopen_agent_task(task_id: str) -> dict[str, Any]:
     return {"reopened": True, "task_id": Path(str(task_id)).name, "workflow_status": "active"}
 
 
+def _require_unarchived_task(task: dict[str, Any]) -> None:
+    if task.get('workflow_status') == 'archived':
+        raise ValueError('任务已归档，请先恢复为活动任务；恢复不会自动运行。')
+
+
+def _require_unarchived_session(session: AgentSession) -> None:
+    if session.status == 'archived' or session.result.get('task_archived'):
+        raise ValueError('任务已归档，请先恢复为活动任务；恢复不会自动运行。')
+
+
 def delete_download_project(payload: dict[str, Any]) -> dict[str, Any]:
     project_dir = _resolve_project_path(_required_str(payload, "path"))
     _ensure_download_project_dir(project_dir)
@@ -1473,7 +1541,13 @@ def answer_agent_session(session_id: str, answer: dict[str, Any]) -> AgentSessio
     session = get_agent_session(session_id)
     if not session:
         raise KeyError("agent session not found")
+    _require_unarchived_session(session)
+    from video_translate.agent.subtitle_questions import ACTION_LABELS
+    if session.question.get('question_type')=='translation' and isinstance(answer.get('confirmed_text'),str) and answer['confirmed_text'] in ACTION_LABELS:
+        raise ValueError('这是旧的控制动作标签，不是字幕正文；请播放片段后直接补充内容线索。')
     action = str(answer.get("action") or "")
+    if session.question.get('kind') in {'autonomous_review_result','autonomous_issue_review'}:
+        raise ValueError('本轮局部复核已经结束，已有线索和结论均已保存，不会再次提交相同线索或绕过验收。')
     if session.payload.get('agent_mode')=='autonomous' and session.question.get('kind')=='autonomous_verification_review':
         raise ValueError('本轮仅验收且仍有具体疑点，不能确认跳过或重翻；请另行授权修订或针对性核查')
     if session.payload.get('agent_mode')=='autonomous' and action=='skip_glossary':
@@ -1522,6 +1596,83 @@ def answer_agent_session(session_id: str, answer: dict[str, Any]) -> AgentSessio
     return session
 
 
+def recover_existing_agent_session(session_id: str, mode: str, *, review_existing_clue_id: int | None = None) -> AgentSession:
+    """Explicitly scoped recovery in a new workspace, not a fresh translation."""
+    from video_translate.asr_review_web import read_json,write_json_atomic
+    session=get_agent_session(session_id)
+    if not session or session.payload.get('agent_mode')!='autonomous':raise ValueError('只能恢复已有自主任务')
+    _require_unarchived_session(session)
+    if mode not in {'translation','glossary'}:raise ValueError('恢复范围必须是translation或glossary')
+    clue_recovery=review_existing_clue_id is not None
+    if clue_recovery and (type(review_existing_clue_id) is not int or mode!='translation'):
+        raise ValueError('复用已提交线索仅接受明确的整数字幕id和translation范围')
+    with _LOCK:
+        previous_status,previous_question,previous_error=session.status,dict(session.question),session.error
+        previous_result=dict(session.result)
+        if clue_recovery:
+            if session.status!='waiting' or session.question.get('kind')!='autonomous_question' or session.question.get('cue_id')!=review_existing_clue_id:
+                raise ValueError('只能复核当前等待处理的这一条疑点，不中断运行任务或重开已结束复核')
+        elif session.status!='failed':raise ValueError('只能显式恢复已失败任务，不中断运行中的任务')
+        child=_JOBS.get(session.result.get('current_job_id'))
+        if child and child.status in {'running','queued','cancel_requested'}:
+            raise ValueError('底层任务尚未结束，请等待完成后恢复；不会中断该任务。')
+        session.status='recovering'
+    try:
+        old=Path(str(session.result.get('autonomous_workspace') or '')).resolve()
+        _ensure_under_root(old)
+        state=read_json(old/'state.json')
+        if not _session_task_is_current(session):raise ValueError('任务已有较新轮次，不能恢复旧结果')
+        if clue_recovery:
+            from video_translate.agent import reply_review
+            if not reply_review.guidance(state,review_existing_clue_id):raise ValueError('这条字幕没有已提交的线索')
+        recovery_id=uuid.uuid4().hex[:10]
+        root=old.parent/f'autonomous_recovery_{recovery_id}'
+        _ensure_under_root(root)
+        shutil.copytree(old,root,symlinks=True)
+        state['recovery_id']=recovery_id
+        policy=dict(state.get('execution_policy') or {})
+        if mode=='translation':
+            selected=state.get('sources',{}).get(state.get('selected'),{})
+            source=Path(str(selected.get('path') or '')).resolve();translated=Path(str(state.get('translated') or '')).resolve()
+            for path in (source,translated):_ensure_under_root(path)
+            if not source.is_file() or not translated.is_file():raise ValueError('缺少可复用的原文或译稿')
+            policy.update(continue_existing_translation=True,preserve_existing_outputs=True,
+                          source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+                          original_translation_path=str(translated),translated_sha256=hashlib.sha256(translated.read_bytes()).hexdigest())
+            state.setdefault('recovery_allowances',{})['review_translation']=max(
+                state.get('recovery_allowances',{}).get('review_translation',0),state.get('counts',{}).get('review_translation',0))
+        else:
+            if state.get('translated'):raise ValueError('已有译稿的任务不能通过术语恢复入口重翻')
+            policy.update(stop_at_glossary=True,preserve_existing_outputs=True)
+        state['execution_policy']=policy
+        if clue_recovery:
+            policy['allowed_repair_cue_ids']=[review_existing_clue_id]
+            reply_review.queue(state,review_existing_clue_id)
+            state.pop('pending_question',None)
+        state.setdefault('events',[]).append({'tool':'scoped_recovery','status':'done','reason':
+            '用户授权恢复；旧工作区与全部产物保留，新的操作记录独立另存。',
+            'result':{'mode':mode,'previous_workspace':str(old),'recovery_workspace':str(root),'full_translation_allowed':False if mode=='translation' else None}})
+        write_json_atomic(root/'state.json',state)
+        with _LOCK:
+            session.result.update(autonomous_workspace=str(root),recovery_previous_workspace=str(old),recovery_mode=mode,autonomous_internal_error=None)
+            session.status='running';session.error='';session.question={};session.updated_at=time.time()
+        task_id=session.result.get('task_id')
+        if task_id:
+            _update_task_stage(task_id,'probe','done',autonomous_workspace=str(root),expected_generation=_session_run_generation(session))
+        _run_agent_async(session.id,_agent_retry_current_phase)
+        return session
+    except Exception:
+        with _LOCK:
+            if session.status in {'recovering','running'}:
+                if clue_recovery:
+                    session.status,session.question,session.error=previous_status,previous_question,previous_error
+                    session.result=previous_result
+                else:
+                    session.status='failed'
+                    session.error='恢复准备未完成，旧工作区与字幕仍保留，可检查后重试。'
+        raise
+
+
 def retry_agent_session(session_id: str) -> AgentSession:
     session = get_agent_session(session_id)
     if not session:
@@ -1536,6 +1687,156 @@ def retry_agent_session(session_id: str) -> AgentSession:
         session.updated_at = time.time()
     _run_agent_async(session_id, _agent_retry_current_phase)
     return session
+
+
+def finish_agent_reply_review(session_id: str, signature: str) -> AgentSession:
+    """Close a legacy waiting conclusion, without approving its uncertain cue."""
+    from video_translate.agent import autonomous,reply_review
+    from video_translate.asr_review_web import read_json,write_json_atomic
+    session=get_agent_session(session_id)
+    if not session:raise KeyError('agent session not found')
+    _require_unarchived_session(session)
+    with _LOCK:
+        if session.status!='waiting' or session.question.get('kind')!='autonomous_review_result':
+            raise ValueError('只能结束已经给出复核结论的等待任务，不中断其他处理。')
+        child=_JOBS.get(session.result.get('current_job_id'))
+        if child and child.status in {'running','queued','cancel_requested'}:raise ValueError('底层任务仍在运行，未中断。')
+        old=Path(session.result['autonomous_workspace']).resolve();_ensure_under_root(old)
+        state=read_json(old/'state.json');record=reply_review.completed(state)
+        if not record or not signature or record['signature']!=signature or record['outcome']!='unresolved':
+            raise ValueError('复核结论与当前文件不一致，未结束或跳过验收。')
+        if not _session_task_is_current(session):raise ValueError('不能修改历史轮次。')
+        root=old.parent/f'autonomous_conclusion_{uuid.uuid4().hex[:10]}'
+        shutil.copytree(old,root,symlinks=True)
+        write_json_atomic(root/'state.json',state)
+        session.result.update(autonomous_workspace=str(root),recovery_previous_workspace=str(old))
+        session.status='running';session.question={};session.error='';session.updated_at=time.time()
+    def close(item):
+        runtime=autonomous.Runtime(sys.modules[__name__],item)
+        runtime.publish_reply_review(record)
+    _run_agent_async(session.id,close)
+    return session
+
+
+def agent_issue_review(session_id: str) -> dict[str, Any]:
+    from video_translate.agent import issue_review
+    from video_translate.asr_review_web import read_json
+    session=get_agent_session(session_id)
+    if not session:raise KeyError('agent session not found')
+    _require_unarchived_session(session)
+    if session.payload.get('agent_mode')!='autonomous':raise ValueError('仅支持自主任务的局部人工处理。')
+    waiting=session.status=='waiting' and session.question.get('kind') in {'autonomous_review_result','autonomous_issue_review'}
+    ended=session.status=='done' and session.result.get('completion_status') in {'completed_with_issues','completed_manually'}
+    if not (waiting or ended):raise ValueError('当前任务不在可人工处理疑点的状态，未中断任务。')
+    if not _session_task_is_current(session):raise ValueError('不能改写历史轮次。')
+    root=Path(session.result['autonomous_workspace']).resolve();_ensure_under_root(root)
+    state=read_json(root/'state.json')
+    manual=state.get('manual_issue_review',{})
+    source=Path(manual.get('working_source_srt') or session.result['source_srt']).resolve()
+    target=Path(manual.get('working_translated_srt') or session.result['translated_srt']).resolve()
+    for path in (source,target):_ensure_under_root(path);_ensure_web_readable(path)
+    issues=manual.get('original_issues') or state.get('verification',{}).get('issues',[])
+    result=issue_review.snapshot(source,target,issues,resolutions=manual.get('resolutions'),guidance=state.get('translation_guidance'),
+        video=session.result.get('input_video') or state.get('media'),duration=state.get('probe',{}).get('duration'))
+    result.update(session_id=session.id,source_srt=str(source),translated_srt=str(target))
+    result['review_token']=hashlib.sha256(json.dumps([str(root),str(target),result['source_sha256'],result['translation_sha256'],manual],sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+    return result
+
+
+def apply_agent_issue_action(session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    from video_translate.agent import issue_review
+    from video_translate.asr_review_web import read_json,write_json_atomic
+    action=payload.get('action')
+    if action not in {'set_translation','skip_translation','finish'}:raise ValueError('未知的字幕处理操作。')
+    session=get_agent_session(session_id)
+    if not session:raise KeyError('agent session not found')
+    with _LOCK:edit_lock=_ISSUE_REVIEW_LOCKS.setdefault(session_id,threading.Lock())
+    with edit_lock:
+        review=agent_issue_review(session_id)
+        if payload.get('expected_translation_sha256')!=review['translation_sha256']:
+            raise ValueError('字幕版本已变化，请重新加载后处理，未覆盖旧文件。')
+        if payload.get('expected_review_token')!=review['review_token']:raise ValueError('处理记录已变化，请重新加载，未重复提交或覆盖。')
+        child=_JOBS.get(session.result.get('current_job_id'))
+        if child and child.status in {'running','queued','cancel_requested'}:raise ValueError('底层任务仍在运行，未中断。')
+        text=payload.get('text');cue_id=payload.get('cue_id')
+        if action in {'set_translation','skip_translation'}:
+            if type(cue_id) is not int or cue_id not in {r['cue_id'] for r in review['issues']}:
+                raise ValueError('只能修改当前列出的疑点字幕。')
+        if action=='set_translation':
+            if not isinstance(text,str) or not text.strip() or len(text)>2000:raise ValueError('请填写1到2000字的整条译文。')
+            # Validate before cloning, so malformed requests do not mutate sessions.
+            from video_translate.agent.translation_review import replace_only_cue_text
+            replace_only_cue_text(Path(review['translated_srt']).read_bytes(),{cue_id:text})
+        before_status,before_phase,before_error,before_question,before_result=session.status,session.phase,session.error,dict(session.question),dict(session.result)
+        old=Path(session.result['autonomous_workspace']);state=read_json(old/'state.json')
+        root=old.parent/f'autonomous_manual_{uuid.uuid4().hex[:10]}';_ensure_under_root(root)
+        shutil.copytree(old,root,symlinks=True)
+        folder=root/f'issue_edit_{uuid.uuid4().hex[:10]}';folder.mkdir()
+        manual=copy.deepcopy(state.get('manual_issue_review') or {'original_issues':state.get('verification',{}).get('issues',[]),'resolutions':{},'history':[]})
+        from video_translate.subtitle.delivery import copy_delivery_file
+        source=copy_delivery_file(Path(review['source_srt']),folder/'source.working.srt',version=session.id)
+        if issue_review.sha(source)!=review['source_sha256']:raise ValueError('原文版本已变化，未采用修改。')
+        language=target_language_code(session.payload.get('target_language'))
+        target=folder/f'{language}.working.srt'
+        if action=='set_translation':
+            resolution=issue_review.write_manual_translation(source,review['translated_srt'],review,cue_id,text,review['translation_sha256'],target)
+            resolution['confirmed_at']=time.time()
+            manual['resolutions'][str(cue_id)]=resolution;manual['history'].append(resolution)
+        else:
+            target=copy_delivery_file(Path(review['translated_srt']),target,version=session.id)
+            if action=='skip_translation':
+                row=next(r for r in review['issues'] if r['cue_id']==cue_id)
+                resolution={'cue_id':cue_id,'action':'skip_translation','source':row['source'],'before':row['translation'],'after':None,
+                    'reason':'user_chose_not_to_translate','confirmed_at':time.time(),'machine_verified':False,
+                    'input_sha256':review['translation_sha256'],'output_sha256':issue_review.sha(target)}
+                manual['resolutions'][str(cue_id)]=resolution;manual['history'].append(resolution)
+        next_review=issue_review.snapshot(source,target,manual['original_issues'],resolutions=manual['resolutions'],
+            guidance=state.get('translation_guidance'),video=session.result.get('input_video') or state.get('media'),duration=state.get('probe',{}).get('duration'))
+        manual.update(source_sha256=next_review['source_sha256'],translation_sha256=next_review['translation_sha256'])
+        exported=issue_review.export_skips(source,target,next_review,folder,language)
+        report=folder/'manual-review.json';manual.update(report_path=str(report),working_source_srt=str(source),working_translated_srt=str(target),exports=exported)
+        write_json_atomic(report,manual)
+        state['manual_issue_review']=manual;state['translated']=str(target)
+        for key in ('closed_reply_review','completed_delivery','pending_reply_review','pending_question','reply_review_hold'):state.pop(key,None)
+        write_json_atomic(root/'state.json',state)
+        with _LOCK:
+            if session.status!=before_status or session.result.get('autonomous_workspace')!=str(old) or session.result.get('task_archived'):
+                raise ValueError('任务状态已变化，未采用人工修改。')
+            session.result.update(autonomous_workspace=str(root),recovery_previous_workspace=str(old),**{key:exported[key] for key in ('source_srt','translated_srt','original_source_srt','skipped_cue_ids','delivery_cue_count')},
+                manual_issue_review=manual,local_translation_review_current=False,completion_status='manual_review_in_progress',
+                human_review_completed=False,review_passed=False,manual_reviewed_cue_ids=next_review['manual_reviewed_ids'],
+                unresolved_cue_ids=next_review['remaining_ids'],completion_report=str(report))
+            session.result['autonomous_verification']=None
+            session.status='waiting';session.phase='autonomous_issue_review';session.error='';session.updated_at=time.time()
+            session.question={'kind':'autonomous_issue_review','title':'处理字幕未确认项','message':'可以播放原片、按人工指定保存整条译文，或保留未确认项结束；不会重翻整片。','options':[]}
+            session.logs.append(f'manual_issue_action: {action}'+(f' cue={cue_id}' if action!='finish' else ''))
+        try:
+            if not _update_task_stage(session.result['task_id'],'probe','done',expected_generation=_session_run_generation(session),autonomous_workspace=str(root)):
+                raise ValueError('任务轮次已变化，未改写历史轮次。')
+            if action=='finish':
+                remaining=next_review['remaining_ids'];outstanding=len(remaining)+len(next_review['unscoped_issues'])
+                status='completed_with_issues' if outstanding else 'completed_manually'
+                notice=(f'任务已结束，仍有{outstanding}项未确认，已保存未核准草稿。' if outstanding else
+                        '任务已结束，列出的字幕疑点已按你的选择处理；这不是机器核准原文准确性的声明。')
+                if next_review['skipped_ids']:notice+=f' 已按你的选择跳过{len(next_review["skipped_ids"])}条，不在输出中显示；完整原文与旧版保留。'
+                unresolved=[r for r in manual['original_issues'] if r.get('id') in remaining or r in next_review['unscoped_issues']]
+                _agent_done(session.id,{**{key:exported[key] for key in ('source_srt','translated_srt','original_source_srt','skipped_cue_ids','delivery_cue_count')},'completion_status':status,'review_passed':False,
+                    'human_review_completed':not outstanding,'manual_reviewed_cue_ids':next_review['manual_reviewed_ids'],
+                    'unresolved_cue_ids':remaining,'unresolved_issues':unresolved,'quality_warning':notice,'completion_report':str(report),
+                    'delivery_mode':'user_reviewed_draft'})
+            else:
+                updated=_update_task_stage(session.result['task_id'],'translate','waiting',current_stage='autonomous_issue_review',
+                    expected_generation=_session_run_generation(session),**{key:exported[key] for key in ('source_srt','translated_srt','original_source_srt','skipped_cue_ids','delivery_cue_count')},
+                    completion_status='manual_review_in_progress',review_passed=False)
+                if not updated:raise ValueError('当前任务轮次已变化，未采用人工处理结果。')
+                _update_task_fields(session.result['task_id'],{'workflow_status':'active','current_stage':'autonomous_issue_review',
+                    'completion_status':'manual_review_in_progress','review_passed':False},expected_generation=_session_run_generation(session))
+        except Exception:
+            with _LOCK:
+                if session.status not in {'cancelled','archived'} and session.result.get('autonomous_workspace')==str(root):
+                    session.status,session.phase,session.error,session.question,session.result=before_status,before_phase,before_error,before_question,before_result
+            raise
+        return {'session':_present_agent_session(session.to_dict()),'review':agent_issue_review(session.id)}
 
 
 def cancel_agent_session(session_id: str) -> AgentSession | None:
@@ -4755,6 +5056,10 @@ def _agent_done(session_id: str, values: dict[str, Any]) -> None:
     except Exception as exc:
         values = {**values, 'subtitle_delivery_warning': '字幕已保留，素材库关联或附加格式准备未完成，请查看任务文件。'}
         _agent_log(session_id, f'subtitle_delivery_warning: {type(exc).__name__}')
+    if values.get('completion_status') in {'completed_with_issues','completed_manually'} and session.result.get('task_id'):
+        _update_task_fields(session.result['task_id'],{'workflow_status':'completed','current_stage':'done','completed_at':time.time(),
+            **{key:values[key] for key in ('completion_status','review_passed','human_review_completed','manual_reviewed_cue_ids','skipped_cue_ids','unresolved_cue_ids','unresolved_issues','quality_warning') if key in values}},
+            expected_generation=_session_run_generation(session))
     with _LOCK:
         session = _AGENT_SESSIONS.get(session_id)
         if not session or session.status in {"cancelled", "archived"}:
@@ -10293,13 +10598,17 @@ class AgentHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(task)
             return
+        if parsed.path.startswith('/api/agent/') and parsed.path.rstrip('/').endswith('/issue-review'):
+            try:self._send_json(agent_issue_review(_api_path_segment(parsed.path,-2)))
+            except (ValueError,KeyError,OSError) as exc:self._send_json({'error':str(exc)},status=HTTPStatus.BAD_REQUEST)
+            return
         if parsed.path.startswith("/api/agent/"):
             session_id = parsed.path.rstrip("/").rsplit("/", 1)[-1]
             session = get_agent_session(session_id)
             if not session:
                 self._send_json({"error": "agent session not found"}, status=HTTPStatus.NOT_FOUND)
                 return
-            self._send_json(session.to_dict())
+            self._send_json(_present_agent_session(session.to_dict()))
             return
         if parsed.path == "/api/jobs":
             self._send_json({"jobs": list_jobs()})
@@ -10477,9 +10786,18 @@ class AgentHandler(BaseHTTPRequestHandler):
             elif self.path.startswith("/api/agent/") and self.path.rstrip("/").endswith("/retry"):
                 session_id = self.path.rstrip("/").split("/")[-2]
                 self._send_json(retry_agent_session(session_id).to_dict())
+            elif self.path.startswith('/api/agent/') and self.path.rstrip('/').endswith('/finish-review'):
+                session_id=_api_path_segment(self.path,-2)
+                self._send_json(finish_agent_reply_review(session_id,str(payload.get('signature') or '')).to_dict())
+            elif self.path.startswith('/api/agent/') and self.path.rstrip('/').endswith('/issue-review'):
+                self._send_json(apply_agent_issue_action(_api_path_segment(self.path,-2),payload))
             elif self.path.startswith("/api/agent/") and self.path.rstrip("/").endswith("/repair-delivery"):
                 session_id = _api_path_segment(self.path, -2)
                 self._send_json(repair_agent_delivery(session_id))
+            elif self.path.startswith("/api/agent/") and self.path.rstrip("/").endswith("/recover-existing"):
+                session_id = _api_path_segment(self.path, -2)
+                self._send_json(recover_existing_agent_session(session_id, str(payload.get('mode') or ''),
+                    review_existing_clue_id=payload.get('review_existing_clue_id')).to_dict())
             elif self.path.startswith("/api/agent/") and self.path.rstrip("/").endswith("/cancel"):
                 session_id = self.path.rstrip("/").split("/")[-2]
                 session = cancel_agent_session(session_id)

@@ -253,6 +253,8 @@ Maximum quality is limited to the formats accessible to the current session. MP4
 
 Under **设置 → 常用设置 → 字幕自动保存与交付**, enable **YouTube 任务完成时，额外生成 BCC 字幕**, then save settings to produce both SRT and Bilibili **BCC** (`.bcc`, not `.bbc`) for subsequent YouTube deliveries, including checked existing target captions. This is a local format conversion, with no extra model/GPU requests. The option is off by default and is read when a task completes; it does not bulk-convert old results or affect Bilibili tasks. Both files appear in Assets; a conversion failure leaves SRT intact and displays a warning. Existing different BCC files are never overwritten.
 
+If the Agent cannot resolve a specific cue, use its original video/audio excerpt and submit a clue. It reviews that cue without retranslating the video. In **处理字幕未确认项**, you can enter an exact translation, keep the current one, or explicitly skip a cue in the output. Finishing saves a new version without overwriting the full working subtitles or promoting unresolved cues to machine-verified status. For an ended manual draft, **所有任务 → 处理字幕** reopens the saved choices without rerunning the Agent.
+
 Defaults for new tasks:
 
 | Platform | Source language | Target language |

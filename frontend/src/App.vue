@@ -44,6 +44,7 @@
               :status-class="agentStatus.class"
               @start-agent="startAgent"
               @answer-agent="answerAgent"
+              @issue-review-updated="issueReviewUpdated"
               @cancel-agent="cancelAgent"
               @retry-agent="retryAgent"
               @select-agent="selectAgentSession"
@@ -1126,6 +1127,12 @@ async function answerAgent(action) {
   } catch (error) {
     setStatus(agentStatus, error.message, 'bad')
   }
+}
+
+async function issueReviewUpdated(session) {
+  if (agentSession.value?.id === session.id) agentSession.value = session
+  await loadAgentSessions()
+  await loadAgentTasks()
 }
 
 async function cancelAgent() {

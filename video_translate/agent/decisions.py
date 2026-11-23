@@ -25,6 +25,7 @@ assessment只写简短的证据摘要，不输出内部思维过程。evidence_r
 plan是当前可修订的1到5个短目标，不是固定步骤，也不是所有工具的待办清单。工具失败、出现矛盾或取得新证据后修订它。
 next_check说明这次动作期望得到什么可观察结果；下一轮根据真实返回判断，不因模型说“已完成”就算通过。
 可以read_subtitles读取指定字幕及前后文，也可以sample_frames自主选时间点，再analyze_frames看图。看见配字不代表所有画面都如此；看见静止画面也不能推定没有对白。
+读取字幕时严格使用subtitle_catalog中的source_id；当前译文固定为translated，不是target:1。evidence_catalog中的依据id和可读字幕id是两套标识，不要混用。
 缺口或疑句可用transcribe_clip只识别4到30秒，不必启动整片ASR。局部候选不能当成完整原字幕，也不能证明停顿确实有人说话。
 需要检查现成目标语言字幕含义时，可以取得原文源，再review_target做独立的局部对照。先判断是否值得这项成本，不强制每条视频双重识别。
 对现成目标语言字幕的结构/范围检查不等于听音或语义认证。首尾缺口只是疑点，先考虑是否有证据可以查，再ask_target请用户选；不得伪造听音结论。
@@ -81,6 +82,8 @@ def evidence_catalog(state):
         rows.append({'id': f'target:{index}', 'kind': 'target_caption_check', 'facts': {
             k: v for k, v in report.items() if k != 'path'
         }})
+    if state.get('translated'):
+        rows.append({'id':'source:translated','kind':'current_translation','facts':{'read_source_id':'translated','target_language':state.get('target_language','zh')}})
     for clip in state.get('audio_observations', []):
         rows.append({'id': clip['id'], 'kind': 'local_asr_candidate', 'facts': {
             k: v for k, v in clip.items() if k not in {'audio_path', 'workspace'}

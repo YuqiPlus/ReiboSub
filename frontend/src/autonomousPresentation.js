@@ -64,6 +64,10 @@ export function publicAgentDecision(result) {
 }
 
 export function autonomousDraftMessage(session) {
+  if (session?.question?.kind === 'autonomous_issue_review') return '请在上方处理字幕疑点；只保存你指定的条目，可随时保留未确认项并结束。'
+  if (session?.result?.completion_status === 'completed_manually') return session.result.quality_warning || '任务已结束，译文疑点已按人工指定处理；并非机器已核准原文。'
+  if (session?.result?.completion_status === 'completed_with_issues') return session.result.quality_warning || '任务已结束，已保存有未确认项的字幕草稿；未标记验收通过，不再等待输入。'
+  if (session?.question?.kind === 'autonomous_review_result') return '已使用保存的线索完成局部复核；草稿保留，仍有无法核准的条目，不再重复索要线索。'
   if (session?.status === 'waiting' && session?.phase === 'autonomous_verification_review') return '结构检查已完成，尚有译文疑点需要局部复核；当前为草稿，未标记完成。'
   if (session?.status === 'running' && session?.phase === 'autonomous_download') return `${targetSubtitleLabel(sessionTargetLanguage(session))}已保留，正在保存视频素材，不会重新翻译。`
   if (session?.status === 'failed') return `${targetSubtitleLabel(sessionTargetLanguage(session))}已保留，但最终检查尚未完成。工具失败详情见操作记录，不是等待检测。`

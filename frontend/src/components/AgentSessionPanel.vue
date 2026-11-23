@@ -27,6 +27,16 @@
 
       <div class="agent-response-heading"><span class="assistant-avatar"><AppIcon name="language" :size="20" /></span><b>ReiboSub</b><span v-if="!operationStatus && session.status !== 'done'">{{ phaseLabel }}</span></div>
       <p v-if="subtitleSourceLabel(session.result)" class="agent-source-note" role="status">{{ subtitleSourceLabel(session.result) }}</p>
+      <section v-if="closedDraft" class="agent-question" aria-label="任务结束说明">
+        <div class="question-pulse">{{ manuallyCompleted ? '任务已结束 · 人工已处理' : `任务已结束 · ${session.result.unresolved_cue_ids?.length || 1} 条未确认` }}</div>
+        <h3>{{ manuallyCompleted ? '字幕已按你的选择保存' : '字幕草稿已保存，未通过验收' }}</h3>
+        <p>{{ session.result.quality_warning }}</p>
+        <details v-if="session.result.human_reply_review"><summary>查看第 {{ session.result.human_reply_review.cue_id }} 条的复核结论与已提交线索</summary>
+          <p>{{ session.result.human_reply_review.independent_reason_zh }}</p>
+          <p v-for="(row, i) in session.result.human_reply_review.guidance || []" :key="i">{{ row.clue || row.preferred_zh }}</p>
+        </details>
+        <AgentIssueReview :session="session" @updated="$emit('issue-review-updated', $event)" />
+      </section>
 
       <div v-if="operationStatus" class="agent-operation-status" role="status" aria-live="polite">
         <span class="agent-operation-spinner" aria-hidden="true"></span>
@@ -38,9 +48,11 @@
       </div>
 
       <div v-if="session?.question?.kind" class="agent-question">
-        <div class="question-pulse">待你处理</div>
-        <h3>{{ session.question.title || '需要确认' }}</h3>
-        <p>{{ session.question.message }}</p>
+        <div class="question-pulse">{{ session.question.kind === 'autonomous_review_result' ? '复核结论' : '待你处理' }}</div>
+        <h3>{{ ['autonomous_review_result','autonomous_issue_review'].includes(session.question.kind) ? '处理字幕未确认项' : session.question.title || '需要确认' }}</h3>
+        <p v-if="!['autonomous_review_result','autonomous_issue_review'].includes(session.question.kind)">{{ session.question.message }}</p>
+        <template v-if="session.question.kind === 'autonomous_review_result'"><details><summary>上次复核结论</summary><p>{{ session.question.review?.independent_reason_zh }}</p><p v-for="(row, i) in session.question.review?.guidance || []" :key="i">{{ row.clue || row.preferred_zh }}</p></details></template>
+        <AgentIssueReview v-if="['autonomous_review_result','autonomous_issue_review'].includes(session.question.kind)" :session="session" @updated="$emit('issue-review-updated', $event)" />
         <div v-if="session.question.kind === 'autonomous_verification_review'" class="autonomous-question">
           <details v-for="(issue, i) in session.question.verification_issues || []" :key="i">
             <summary>{{ issue.id ? `第 ${issue.id} 条` : '结构检查' }}<span v-if="issue.source_quote" class="issue-preview">{{ issue.source_quote.slice(0, 60) }}</span><span v-else>查看待核查问题</span></summary>
@@ -50,13 +62,14 @@
           </details>
         </div>
         <div v-if="session.question.kind === 'autonomous_question'" class="autonomous-question">
-          <p v-if="session.question.question_type === 'translation'">这是译文含义/译法的求证，不是重新识别原文。选择后只对这条继续复核，不会重翻整片。</p>
-          <audio v-if="session.question.audio_path" controls preload="none" :src="`/api/file?path=${encodeURIComponent(session.question.audio_path)}`" aria-label="疑句原音" />
+          <p v-if="session.question.question_type === 'translation'">请结合原片补充线索或确认译法；只对这条继续复核，不会重翻整片。</p>
+          <AgentQuestionMedia :question="session.question" />
           <button v-for="candidate in session.question.candidate_details || []" :key="candidate.text" class="secondary" type="button"
             @click="$emit('answer-agent', { action: 'autonomous_reply', confirmed_text: candidate.text })">
             <b>{{ candidate.text }}</b><br /><small>{{ candidate.romanization }}</small><br /><span>{{ candidate.meaning_zh }}</span><br />确认采用
           </button>
           <input v-model="autonomousClue" placeholder="补一句线索，或说明你的字幕要求" aria-label="给自主Agent的线索" />
+          <p v-if="session.question.unverified_suggestions?.length" class="muted">未证实的猜测：{{ session.question.unverified_suggestions.join(' / ') }}。这些不是原文证据，需你听片段后补充线索，不会自动写入字幕。</p>
         </div>
         <div v-if="session.question.selected_subtitle" class="agent-selected">
           <span>字幕</span>
@@ -162,12 +175,12 @@
       <div v-if="isAutonomous && session.result.translated_srt" class="agent-decision-card agent-delivery-card">
         <div class="delivery-file-icon"><AppIcon name="log" :size="21" /></div>
         <div class="delivery-heading">
-          <h3>{{ session.status === 'done' ? `${deliverySubtitleLabel}${session.result.delivery_mode === 'existing_target_subtitle' ? '已就绪' : '已生成'}` : '已有字幕草稿' }}</h3>
+          <h3>{{ closedDraft ? '已保存的字幕草稿' : session.status === 'done' ? `${deliverySubtitleLabel}${session.result.delivery_mode === 'existing_target_subtitle' ? '已就绪' : '已生成'}` : '已有字幕草稿' }}</h3>
           <span v-if="deliveryCount" class="delivery-count">{{ deliveryCount }} 条 · SRT</span>
         </div>
         <div class="delivery-actions">
-          <a class="button-link delivery-primary" :href="`/api/file?path=${encodeURIComponent(session.result.translated_srt)}`" download><AppIcon name="download" :size="15" />下载{{ deliverySubtitleLabel }}</a>
-          <a v-if="session.result.source_srt" class="delivery-secondary" :href="`/api/file?path=${encodeURIComponent(session.result.source_srt)}`" download>原文字幕</a>
+          <a class="button-link delivery-primary" :href="`/api/file?path=${encodeURIComponent(session.result.translated_srt)}`" download><AppIcon name="download" :size="15" />{{ closedDraft ? '下载字幕草稿' : `下载${deliverySubtitleLabel}` }}</a>
+          <a v-if="session.result.source_srt" class="delivery-secondary" :href="`/api/file?path=${encodeURIComponent(session.result.original_source_srt || session.result.source_srt)}`" download>{{ session.result.original_source_srt ? '完整原文' : '原文字幕' }}</a>
           <a v-if="session.result.input_video" class="delivery-secondary" :href="`/api/file?path=${encodeURIComponent(session.result.input_video)}`" download>视频</a>
           <a v-if="session.result.translated_bcc" class="delivery-secondary" :href="`/api/file?path=${encodeURIComponent(session.result.translated_bcc)}`" download>BCC 字幕</a>
         </div>
@@ -177,6 +190,7 @@
         <p v-if="session.result.thumbnail_warning" class="delivery-quality-note" role="status">{{ session.result.thumbnail_warning }}</p>
         <p class="delivery-quality-note">{{ autonomousDraftMessage(session) }}</p>
         <p v-if="session.result.suppressed_cue_ids?.length" class="delivery-quality-note">交付副本已合并 {{ session.result.suppressed_cue_ids.length }} 条重复词尾；原稿与编号映射保留。</p>
+        <p v-if="session.result.skipped_cue_ids?.length" class="delivery-quality-note">已按你的选择不翻译原第 {{ session.result.skipped_cue_ids.join('、') }} 条，当前输出已跳过；完整原文与旧版保留。</p>
       </div>
       <p v-if="agentDecision && session.status !== 'done'" class="agent-current-summary">{{ agentDecision.summary }}</p>
       <details v-if="agentDecision || session?.result?.autonomous_actions?.length" class="agent-decision-card agent-activity-details">
@@ -215,13 +229,13 @@
         <summary>局部复核记录<span class="agent-detail-count">{{ localReview.decisions.length }} 条</span></summary>
         <p>只复核已授权条目，未重翻整片；未通过检查的修改不会写入。</p>
         <details v-for="row in localReview.decisions" :key="row.id">
-          <summary>{{ row.suppressed_in_delivery ? '原字幕' : '字幕' }} {{ row.id }} · {{ row.suppressed_in_delivery ? '重复词尾已并入前句（仅交付副本）' : row.action === 'revise' ? '已局部修改' : row.action === 'keep' ? '保留当前译文' : '仍待确认，未修改' }}</summary>
+          <summary>{{ row.suppressed_in_delivery ? '原字幕' : '字幕' }} {{ row.id }} · {{ row.suppressed_in_delivery ? '重复词尾已并入前句（仅交付副本）' : row.action === 'revise' ? '已局部修改' : row.action === 'keep' ? '保留当前译文' : concludedWithIssues ? '未确认，已随草稿结束' : '仍待确认，未修改' }}</summary>
           <p>原译：{{ row.before || '（空）' }}</p><p v-if="row.after !== row.before">修订：{{ row.after }}</p>
           <p>{{ row.reason_zh }}</p>
         </details>
       </details>
       <details v-if="session?.question?.kind !== 'autonomous_verification_review' && session?.result?.autonomous_verification?.status === 'complete' && session.result.autonomous_verification.issues?.length" class="agent-decision-card agent-review-details">
-        <summary>检查结果 · {{ session.result.autonomous_verification.issues.length }} 处待复核</summary>
+        <summary>{{ concludedWithIssues ? '保留的未确认项' : '检查结果' }} · {{ session.result.autonomous_verification.issues.length }} {{ concludedWithIssues ? '条' : '处待复核' }}</summary>
         <p v-if="session.result.autonomous_verification.structure">原文 {{ session.result.autonomous_verification.structure.source_count }} 条 · 译文 {{ session.result.autonomous_verification.structure.target_count }} 条</p>
         <details v-for="(issue, i) in session.result.autonomous_verification.issues.slice(0, 12)" :key="i">
           <summary>{{ issue.id ? `第 ${issue.id} 条：` : '' }}{{ issue.reason_zh }}</summary>
@@ -428,6 +442,8 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
+import AgentQuestionMedia from './AgentQuestionMedia.vue'
+import AgentIssueReview from './AgentIssueReview.vue'
 import { targetLanguages, targetSubtitleLabel, sessionTargetLanguage } from '../translationLanguages.js'
 import { currentLocalReview, autonomousDraftMessage, publicAgentDecision, friendlyAgentText, evidenceRefLabel, subtitleSourceLabel } from '../autonomousPresentation.js'
 import OcrCropControls from './OcrCropControls.vue'
@@ -491,6 +507,7 @@ const emit = defineEmits([
   'update:extraHint',
   'start-agent',
   'answer-agent',
+  'issue-review-updated',
   'cancel-agent',
   'retry-agent',
   'select-agent',
@@ -508,6 +525,9 @@ const sourceLink = computed(() => {
 })
 const autonomousClue = ref('')
 const isAutonomous = computed(() => props.session?.payload?.agent_mode === 'autonomous')
+const concludedWithIssues = computed(() => props.session?.result?.completion_status === 'completed_with_issues')
+const manuallyCompleted = computed(() => props.session?.result?.completion_status === 'completed_manually')
+const closedDraft = computed(() => concludedWithIssues.value || manuallyCompleted.value)
 const deliveryCount = computed(() => {
   const result = props.session?.result || {}
   const count = result.delivery_cue_count ?? result.autonomous_verification?.structure?.delivery_cue_count ?? result.autonomous_verification?.structure?.target_count
@@ -542,6 +562,9 @@ const currentSessionOcrScope = computed(() => (
 
 const statusLabel = computed(() => {
   if (!props.session) return ''
+  if (manuallyCompleted.value) return '已结束 · 人工已处理'
+  if (concludedWithIssues.value) return '已结束 · 有未确认项'
+  if (['autonomous_review_result','autonomous_issue_review'].includes(props.session.question?.kind)) return '待人工处理字幕疑点'
   if (props.session.status === 'running') return '运行中'
   if (props.session.status === 'waiting') return '等待确认'
   if (props.session.status === 'done') return '完成'
@@ -559,7 +582,7 @@ const autonomousToolLabels = { decide: '判断下一步', planner: '检查下一
   refine_screen_ocr: '核查画面文字候选', finalize_screen_ocr: '整理内嵌字幕',
   analyze_frames: '分析画面', ocr_trial: '试跑OCR与遮罩', ocr: '提取画面字幕', asr: '听取音频', detect_language: '判断音源语言',
   select_source: '选择原文', inspect: '检查原文', review_audio: '局部重听', patch: '修正原文', translate: '翻译字幕',
-  verify: '检查译文', align: '校准时间', question: '需要一点线索', finish: '交付字幕',
+  verify: '检查译文', align: '校准时间', question: '需要一点线索', review_result: '局部复核已结束', issue_review: '人工处理未确认项', finish: '交付字幕',
   inspect_target: '检查现成目标字幕', deliver_target: '直接交付现成目标字幕', ask_target: '确认现成字幕疑点', read_subtitles: '查看字幕上下文', review_target: '对照原文抽查现成目标字幕', transcribe_clip: '局部音频取证', target_review: '确认现成字幕覆盖', target_caption_choice: '选择现成字幕处理方式',
   internal_recovery: '恢复验收状态', format_recovery: '恢复已确认的格式清理', review_scope: '暂停于局部复核边界', internal_error: '内部错误（字幕已保留）', verification_review: '已有具体疑点，未改稿',
   review_translation: '局部复核译文（不重翻整片）', ask_user: '询问具体字幕疑点', reuse_source: '复用既有原字幕', reuse_translation: '复用既有译文字幕',

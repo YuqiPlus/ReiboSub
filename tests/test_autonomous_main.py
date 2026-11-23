@@ -218,6 +218,33 @@ def test_user_question_cannot_invent_candidate(runtime):
     with pytest.raises(ValueError):r.ask({'message':'确认？','cue_id':1,'candidates':['凭空的新字幕']})
 
 
+def test_source_question_can_use_an_obtained_unselected_source_without_confirming_guesses(runtime,monkeypatch):
+    from scripts import asr_review_agent
+    r,session,_,_=runtime
+    path=r.root/'captions.srt';write_srt([SubtitleCue(1,0,2,'안녕하세요')],path)
+    r.state['sources']={'captions_1':{'path':str(path),'kind':'captions'}}
+    monkeypatch.setattr(asr_review_agent,'llm_json',lambda *a:(_ for _ in ()).throw(RuntimeError('offline')))
+    r.ask({'message':'请听这句补充线索','cue_id':1,'candidates':['안녕하세요','猜出来的韩文']})
+    assert session.status=='waiting' and session.question['candidates']==['안녕하세요']
+    assert session.question['unverified_suggestions']==['猜出来的韩文']
+    assert r.state['pending_question']['source_id']=='captions_1' and not r.state.get('selected')
+    assert read_srt_for_test(path)=='안녕하세요'
+
+
+def test_translated_catalog_aliases_are_unambiguous_and_do_not_steal_external_target(runtime):
+    from video_translate.agent import subtitle_catalog
+    r,_,_,_=runtime
+    r.state['translated']=str(r.root/'translated.srt')
+    assert subtitle_catalog.normalize_id(r.state,'target:translated')=='translated'
+    assert subtitle_catalog.normalize_id(r.state,'target:1')=='translated'
+    r.state['target_caption_checks']={'1':{'path':'external.srt'}}
+    assert subtitle_catalog.normalize_id(r.state,'target:1')=='target:1'
+    assert subtitle_catalog.normalize_id(r.state,'target:99')=='target:99'
+    call=agent.normalize_call({'tool':'read_subtitles','args':{'source_id':'target:translated','cue_ids':[1]}},r.state)
+    assert call['args']['source_id']=='translated'
+    assert 'translated' in {row['source_id'] for row in subtitle_catalog.catalog(r.state)}
+
+
 def test_important_weak_words_cannot_pass_on_fluent_chinese_alone(runtime,monkeypatch):
     from scripts import asr_review_agent
     r,_,_,_=runtime;s=r.state
@@ -471,6 +498,26 @@ def test_scoped_translation_review_isolated_from_whole_translation_and_source_ed
     assert source.read_bytes()==source_before and original.read_bytes()==zh_before
 
 
+def test_failed_local_review_uses_new_directory_even_when_retry_count_is_reused(runtime,monkeypatch):
+    from video_translate.agent import translation_review
+    r,_,_,_=prepared_translation(runtime)
+    r.state['execution_policy']={'targeted_translation_review':True,'allowed_cue_ids':[1],
+        'original_translation_path':r.state['translated'],
+        'source_sha256':__import__('hashlib').sha256(Path(r.selected()['path']).read_bytes()).hexdigest(),
+        'translated_sha256':__import__('hashlib').sha256(Path(r.state['translated']).read_bytes()).hexdigest()}
+    r.state['verification']={'issues':[{'id':1,'kind':'translation_error'}]}
+    directories=[]
+    def fail(source,target,issues,ids,folder,**kwargs):
+        folder.mkdir();directories.append(folder)
+        raise RuntimeError('partial attempt retained')
+    monkeypatch.setattr(translation_review,'review_translation_cues',fail)
+    for _ in range(2):
+        r.state['counts']['review_translation']=1
+        with pytest.raises(RuntimeError,match='partial attempt'):
+            r.execute('review_translation',{'cue_ids':[1]})
+    assert len(set(directories))==2 and all(path.is_dir() for path in directories)
+
+
 def test_formal_translation_and_delivery_cannot_skip_human_glossary(runtime):
     r,_,_,calls=prepared_translation(runtime);r.state.pop('execution_policy')
     r.state['verification']={'schema_version':agent.SCHEMA_VERSION,'acceptable':True}
@@ -597,6 +644,61 @@ def test_chinese_question_is_not_checked_as_source_evidence_or_saved_as_korean(r
     assert saved['translation_guidance']==[{'cue_id':1,'preferred_zh':'还没吃'}]
     assert saved['user_confirmations']=={} and Path(r.selected()['path']).read_bytes()==before
     assert calls==[]
+
+
+def test_human_reply_forces_one_scoped_review_then_concludes_without_reasking(runtime,monkeypatch):
+    import hashlib
+    from scripts import asr_review_agent
+    from video_translate.agent import reply_review,translation_review
+    r,session,app,calls=prepared_translation(runtime)
+    original=Path(r.state['translated']);source=Path(r.selected()['path'])
+    old_bytes=(source.read_bytes(),original.read_bytes())
+    r.state.update(controller_version=2,events=[{},{}],counts={'translate':1,'review_translation':2,'ask_user':4},
+        verification={'schema_version':agent.SCHEMA_VERSION,'issues':[{'id':1,'kind':'semantic_uncertain','reason_zh':'原文不确定'}]},
+        translation_guidance=[{'cue_id':1,'clue':'以前提交的线索'}])
+    r.state['execution_policy'].update(continue_existing_translation=True,original_translation_path=str(original),allowed_repair_cue_ids=[1])
+    r.state['execution_policy'].pop('verification_only')
+    r.state['pending_question']={'cue_id':1,'question_type':'translation','candidates':[]}
+    r.save();session.status='running';received=[]
+    monkeypatch.setattr(asr_review_agent,'llm_json',lambda *a:pytest.fail('收到线索后不能先询问planner'))
+    def local(source_path,target_path,issues,ids,folder,**options):
+        received.append((ids,options));folder.mkdir();output=folder/'zh.local.srt';output.write_bytes(original.read_bytes())
+        row={'id':1,'source':'안 먹었어요','before':'没吃','after':'没吃','action':'uncertain','reason_zh':'原文证据不足',
+             'independent_review':{'reason_zh':'用户提供的中文意思不能替代原文证据'}}
+        return {'target_ids':ids,'translated_srt':str(output),'output_sha256':hashlib.sha256(output.read_bytes()).hexdigest(),
+            'translation_sha256':hashlib.sha256(Path(target_path).read_bytes()).hexdigest(),'unresolved_ids':[1],
+            'changed_ids':[],'decisions':[row],'audit':str(folder/'audit.json')}
+    monkeypatch.setattr(translation_review,'review_translation_cues',local)
+    agent.run(session,app,{'clue':'新提交的线索'})
+    saved=read_json(r.path)
+    assert received[0][0]==[1] and received[0][1]['user_guidance']==[{'cue_id':1,'clue':'以前提交的线索'},{'cue_id':1,'clue':'新提交的线索'}]
+    assert saved['counts']['review_translation']==3 and saved['counts']['translate']==1 and saved['counts']['ask_user']==4
+    assert session.status=='done' and session.question=={}
+    assert session.result['completion_status']=='completed_with_issues' and session.result['review_passed'] is False
+    assert saved['closed_reply_review']['result']['unresolved_cue_ids']==[1]
+    assert not saved['verification']['acceptable'] and 'pending_reply_review' not in saved
+    assert (source.read_bytes(),original.read_bytes())==old_bytes and calls==[]
+    assert reply_review.completed(saved,1)['outcome']=='unresolved'
+    agent.run(session,app)
+    assert len(received)==1 and session.status=='done'
+    # Even a planner trying the old question cannot reopen the same input form.
+    restored=agent.Runtime(app,session)
+    restored.ask({'cue_id':1,'question_type':'translation','message':'请再填一次','candidates':[]})
+    assert session.status=='done' and session.question=={}
+    assert len(list(r.root.glob('draft_conclusion_*')))==1
+
+
+def test_pending_human_reply_disables_other_tools_and_blocks_direct_ask(runtime):
+    from video_translate.agent import reply_review
+    r,_,_,_=prepared_translation(runtime)
+    r.state['execution_policy'].pop('verification_only')
+    r.state['execution_policy']['continue_existing_translation']=True
+    r.state.update(events=[{},{}],translation_guidance=[{'cue_id':1,'clue':'上下文'}],
+        verification={'issues':[{'id':1,'kind':'semantic_uncertain'}]})
+    reply_review.queue(r.state,1)
+    assert [t.name for t in agent.ready(r.state)]==['review_translation']
+    with pytest.raises(agent.EvidenceRequired,match='必须先'):
+        r.ask({'cue_id':1,'question_type':'translation','message':'再问一次','candidates':[]})
 
 
 def test_transient_tool_error_does_not_disable_real_content_question(runtime):

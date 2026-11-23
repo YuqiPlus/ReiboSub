@@ -17,6 +17,45 @@ async function render(name, props) {
   return renderToString(createSSRApp({ render: () => h(component, props) }))
 }
 
+test('concluded reply review shows reasons and saved clues, never another reply form or a passing delivery', async () => {
+  const html = await render('AgentSessionPanel', { session: { id: 'reviewed', status: 'waiting', phase: 'autonomous_review_result',
+    payload: { agent_mode: 'autonomous' }, result: { translated_srt: '/draft.srt' }, question: { kind: 'autonomous_review_result',
+      title: '第83条复核已结束', message: '原文证据不足，未验收通过', review: { independent_reason_zh: '不能据中文线索编造原文',
+        after: '旧译文', guidance: [{ clue: '已提交的线索' }] }, options: [] } } })
+  for (const text of ['复核结论', '处理字幕未确认项', '已提交的线索', '不能据中文线索编造原文', '不再重复索要线索']) assert(html.includes(text), text)
+  assert.doesNotMatch(html, /提交线索并继续|给自主Agent的线索|待你处理|中文字幕已生成/)
+})
+
+test('ended tasks with issues are terminal in the cockpit and history without claiming review passed', async () => {
+  const result={completion_status:'completed_with_issues',review_passed:false,unresolved_cue_ids:[83],translated_srt:'/zh.draft.srt',
+    quality_warning:'任务已结束，第83条未确认，草稿未通过验收。',human_reply_review:{cue_id:83,independent_reason_zh:'原文证据不足',guidance:[{clue:'已保存线索'}]}}
+  const html=await render('AgentSessionPanel',{session:{id:'ended',status:'done',phase:'done',payload:{agent_mode:'autonomous'},result,question:{}}})
+  for(const text of ['已结束 · 有未确认项','任务已结束 · 1 条未确认','未通过验收','下载字幕草稿']) assert(html.includes(text),text)
+  assert.doesNotMatch(html,/提交线索并继续|待你处理|等待确认|中文字幕已生成/)
+  const history=await render('TaskHistoryPanel',{tasks:[{id:'ended',title:'有未决项的任务',workflow_status:'completed',current_stage:'done',
+    payload:{agent_mode:'autonomous'},completion_status:'completed_with_issues',review_passed:false,quality_warning:result.quality_warning}]})
+  assert.match(history,/已结束 · 有未确认项/)
+  assert.match(history,/>处理字幕<\/button>/)
+  assert.doesNotMatch(history,/继续任务|全部完成/)
+})
+
+test('issue controls make not translating explicit and manual translation optional', async () => {
+  const html = await render('AgentIssueReview', { session: { id: 'issues', status: 'waiting', result: {} } })
+  assert.match(html, /BGM、听不清或不需要的条目/)
+  assert.match(html, /不必填写译文/)
+})
+
+test('Agent questions expose explicit segment playback and independent original-video and audio fallbacks', async () => {
+  const question = { kind: 'autonomous_question', question_type: 'translation', video_path: '/video #10.mp4',
+    video_start: 183.833, video_end: 188.127, audio_path: '/clip.wav', options: [] }
+  const html = await render('AgentSessionPanel', { session: { id: 'question', status: 'waiting', phase: 'autonomous_question',
+    payload: { agent_mode: 'autonomous' }, result: {}, question } })
+  for (const text of ['播放疑点片段', '单独打开原片', '单独打开原音', '只听这一段原音', '3:03', '3:08']) assert(html.includes(text), text)
+  assert.match(html, /aria-label="疑句原画面"/)
+  assert.match(html, /%23.*#t=183.833,188.127/)
+  assert.doesNotMatch(html, /不是重新识别原文|undefined/)
+})
+
 test('subtitle toolbox directly uploads files and retains all three independent operations', async () => {
   const html = await render('SubtitleToolbox', {})
   for (const text of ['上传字幕', '字幕翻译', '格式转换', '简繁转换', 'Big5', '不需要视频', '不强制生成或审核术语表']) assert(html.includes(text), text)
